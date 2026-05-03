@@ -1,0 +1,19 @@
+[project]
+name = "unified-mm"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "accelerate>=1.13.0",
+    "datasets>=4.8.5",
+    "deepspeed>=0.18.9",
+    "flash-attn==2.8.3",
+    "omegaconf>=2.3.0",
+    "ruamel-yaml>=0.19.1",
+    "torch==2.8.0",
+    "torchao>=0.17.0",
+    "torchvision>=0.23.0",
+    "tqdm>=4.67.3",
+    "transformers>=5.7.0",
+]
