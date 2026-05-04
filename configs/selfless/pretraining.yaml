@@ -1,5 +1,5 @@
 experiment:
-    project: "selfless-1.7B-multimodal"
+    project: "selfless-0.6B-multimodal"
     name: "selfless"
     output_dir: "output"
     save_every: 100
@@ -13,7 +13,7 @@ experiment:
     resume_from_checkpoint: none
 
 model:
-    model_path: "public/models/Qwen/Qwen3-1.7B-Base"
+    model_path: "public/models/Qwen/Qwen3-0.6B-Base"
     attention_pattern: "random"
     loss_attention_pattern: "likelihood"
     mask_id: -1
@@ -51,7 +51,7 @@ lr_scheduler:
         min_lr_scale: 0.01
 
 training:
-    batch_size: 8
+    batch_size: 32
     total_batch_size: 512
     mixed_precision: "bf16"
     enable_tf32: false
@@ -61,6 +61,6 @@ training:
     max_grad_norm: 1.0
     ar_ratio: -1.0
     mc_samples: 16
-    use_gradient_checkpointing: false
+    use_gradient_checkpointing: true
     step_scheduler_with_optimizer: false
     from_scratch: false

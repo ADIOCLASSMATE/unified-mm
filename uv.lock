@@ -1643,15 +1643,6 @@ wheels = [
 ]
 
 [[package]]
-name = "ruamel-yaml"
-version = "0.19.1"
-source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }
-sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/c7/3b/ebda527b56beb90cb7652cb1c7e4f91f48649fbcd8d2eb2fb6e77cd3329b/ruamel_yaml-0.19.1.tar.gz", hash = "sha256:53eb66cd27849eff968ebf8f0bf61f46cdac2da1d1f3576dd4ccee9b25c31993", size = 142709, upload-time = "2026-01-02T16:50:31.84Z" }
-wheels = [
-    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/b8/0c/51f6841f1d84f404f92463fc2b1ba0da357ca1e3db6b7fbda26956c3b82a/ruamel_yaml-0.19.1-py3-none-any.whl", hash = "sha256:27592957fedf6e0b62f281e96effd28043345e0e66001f97683aa9a40c667c93", size = 118102, upload-time = "2026-01-02T16:50:29.201Z" },
-]
-
-[[package]]
 name = "safetensors"
 version = "0.7.0"
 source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }
@@ -1782,15 +1773,6 @@ wheels = [
 ]
 
 [[package]]
-name = "torchao"
-version = "0.17.0"
-source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }
-wheels = [
-    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/32/fe/a4036a8e80fa800c92dbcbf75f541cd4c106248b6b579db6dab1800f616a/torchao-0.17.0-cp310-abi3-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:87a418ce0ec064a821ceab83c921b501acef0ce9a6ccd1be358fcd16c3ae8c58", size = 3206172, upload-time = "2026-03-30T22:25:52.974Z" },
-    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/c9/37/ef37ca885265e5f79a168616767dd416a3cea1cc3b28bb6b503ce4a5b652/torchao-0.17.0-py3-none-any.whl", hash = "sha256:02eba449036715b9ae784fbaa1a6f97994bb7b0421ce92d1d5d1c08e5bd6d349", size = 1200680, upload-time = "2026-03-30T22:25:54.457Z" },
-]
-
-[[package]]
 name = "torchvision"
 version = "0.23.0"
 source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }
@@ -1914,11 +1896,8 @@ dependencies = [
     { name = "deepspeed" },
     { name = "flash-attn" },
     { name = "omegaconf" },
-    { name = "ruamel-yaml" },
     { name = "torch" },
-    { name = "torchao" },
     { name = "torchvision" },
-    { name = "tqdm" },
     { name = "transformers" },
 ]
 
@@ -1929,11 +1908,8 @@ requires-dist = [
     { name = "deepspeed", specifier = ">=0.18.9" },
     { name = "flash-attn", specifier = "==2.8.3" },
     { name = "omegaconf", specifier = ">=2.3.0" },
-    { name = "ruamel-yaml", specifier = ">=0.19.1" },
     { name = "torch", specifier = "==2.8.0" },
-    { name = "torchao", specifier = ">=0.17.0" },
     { name = "torchvision", specifier = ">=0.23.0" },
-    { name = "tqdm", specifier = ">=4.67.3" },
     { name = "transformers", specifier = ">=5.7.0" },
 ]
 
