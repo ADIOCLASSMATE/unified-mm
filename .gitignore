@@ -6,3 +6,4 @@ output
 public
 __pycache__
 *.log
+api*
