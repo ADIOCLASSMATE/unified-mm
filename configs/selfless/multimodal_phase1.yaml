@@ -1,6 +1,6 @@
 experiment:
     project: "selfless-0.6B-multimodal"
-    name: "selfless"
+    name: "selfless-phase1"
     output_dir: "output"
     save_every: 100
     eval_every: 100
@@ -18,19 +18,20 @@ model:
     loss_attention_pattern: "likelihood"
     mask_id: -1
     use_flex_attention: true
+    text_vocab_size: 151936
+    image_vocab_size: 16384
+    lambda_image: 0.5
+    image_tokens_per_img: 512
 
 dataset:
-    class_name: "ArrowDataset"
+    class_name: "MultimodalDataset"
     params:
-        data_path: "public/.cache/huggingface/datasets/fwb-arrow-eos"
-        data_class: "parquet"
-        shuffle_buffer_size: 50000
-        num_workers: 8
-        pin_memory: true
-        persistent_workers: true
-
-    preprocessing:
+        jsonl_paths:
+            - "public/datasets/coco/synthetic/train.jsonl"
+            - "public/datasets/fineweb/phase1/train.jsonl"
+        image_token_dir: "public/datasets/coco/image_tokens"
         max_seq_length: 2048
+        image_tokens_per_img: 512
 
 optimizer:
     name: adamw
@@ -47,20 +48,20 @@ lr_scheduler:
     params:
         learning_rate: ${optimizer.params.learning_rate}
         warmup_steps: 400
-        decay_steps: 8000
+        decay_steps: 5000
         min_lr_scale: 0.01
 
 training:
-    batch_size: 8
-    total_batch_size: 512
+    batch_size: 4
+    total_batch_size: 256
     mixed_precision: "bf16"
     enable_tf32: false
     seed: 42
-    dataloader_workers: 8
-    max_train_steps: 80000
+    dataloader_workers: 4
+    max_train_steps: 5000
     max_grad_norm: 1.0
     ar_ratio: -1.0
     mc_samples: 16
-    use_gradient_checkpointing: false
+    use_gradient_checkpointing: true
     step_scheduler_with_optimizer: false
     from_scratch: false

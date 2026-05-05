@@ -15,8 +15,14 @@ def get_dataloaders(config, tokenizer):
                 config=config,
                 tokenizer=tokenizer,
             )
+    elif "multimodal" in dataset_class.lower():
+        from .dataset_multimodal import build_multimodal_dataloaders
+        train_dataloader, val_dataloader = build_multimodal_dataloaders(
+                config=config,
+                tokenizer=tokenizer,
+            )
     else:
         raise ValueError(f"Unknown dataset class: {dataset_class}")
-    
-    
+
+
     return train_dataloader, val_dataloader

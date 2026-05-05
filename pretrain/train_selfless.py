@@ -241,30 +241,65 @@ def main():
         # *-------*-------*-------*-------*-------*-------*
         # Data Processing
         # *-------*-------*-------*-------*-------*-------*
-        text_ids = batch["input_ids"][:, :-1].contiguous() # 与自回归训练token数量完全对齐
-        B, L = text_ids.shape
+        is_multimodal = "token_types" in batch
+        t_1 = 0.0
 
-        t_sample, v_sample = selfless_sampler.sample_v(text_ids)
-        t_1 = t_sample[0,0].item()
+        if is_multimodal:
+            input_ids = batch["input_ids"].contiguous()  # [B, L] — no shift for selfless
+            token_types = batch["token_types"]  # [B, L]
+            task_modes = batch["task_mode"]  # list of strings
+            B, L = input_ids.shape
 
-        v_sample = v_sample.to(accelerator.device)
-        selfless_attention_mask = get_selfless_mask(v_sample=v_sample, seq_len=L, device=accelerator.device)
-        del t_sample, v_sample
-        
-        # 仅在调试时打印一次
-        if global_step == 0 and accelerator.is_main_process:
-            logger.info(f"Input ids shape: {text_ids.shape}")
+            # Per-sample sigma assignment
+            from utils.selfless_utils import assign_sigma_multimodal_batch
+            v_sample = assign_sigma_multimodal_batch(
+                token_types, task_modes, L
+            ).to(accelerator.device)
+
+            selfless_attention_mask = get_selfless_mask(
+                v_sample=v_sample, seq_len=L, device=accelerator.device
+            )
+
+            if global_step == 0 and accelerator.is_main_process:
+                logger.info(f"Input ids shape: {input_ids.shape}, multimodal mode")
+                logger.info(f"token type counts: text={(token_types==0).sum().item()}, "
+                           f"image={(token_types==1).sum().item()}, "
+                           f"special={(token_types==2).sum().item()}")
+
+        else:
+            # Legacy text-only path
+            text_ids = batch["input_ids"][:, :-1].contiguous()
+            token_types = None
+            B, L = text_ids.shape
+
+            t_sample, v_sample = selfless_sampler.sample_v(text_ids)
+            t_1 = t_sample[0, 0].item()
+
+            v_sample = v_sample.to(accelerator.device)
+            selfless_attention_mask = get_selfless_mask(
+                v_sample=v_sample, seq_len=L, device=accelerator.device
+            )
+            del t_sample
+
+            if global_step == 0 and accelerator.is_main_process:
+                logger.info(f"Input ids shape: {text_ids.shape}, text-only mode")
+            input_ids = text_ids
 
         # *-------*-------*-------*-------*-------*-------*
         # Forward & Backward
         # *-------*-------*-------*-------*-------*-------*
         with accelerator.accumulate(model):
-            loss = model(
-                X0_input_ids=text_ids,
-                labels=text_ids,
-                attention_mask=selfless_attention_mask,
-            ).loss
-            
+            forward_kwargs = {
+                "X0_input_ids": input_ids,
+                "labels": input_ids,
+                "attention_mask": selfless_attention_mask,
+            }
+            if token_types is not None:
+                forward_kwargs["token_types"] = token_types
+
+            model_output = model(**forward_kwargs)
+            loss = model_output.loss
+
             accelerator.backward(loss)
 
             if accelerator.sync_gradients:
@@ -304,6 +339,17 @@ def main():
                     "samples/sec/gpu": samples_per_second_per_gpu,
                     "batch_time": batch_time_m.val,
                 }
+
+                # Per-modality loss logging (multimodal mode)
+                per_mod = getattr(model_output, "per_modality_loss", None)
+                if per_mod is not None:
+                    text_l = accelerator.reduce(per_mod["text_loss"], reduction="mean")
+                    image_l = accelerator.reduce(per_mod["image_loss"], reduction="mean")
+                    logs["train/loss_text"] = text_l.item()
+                    logs["train/loss_image"] = image_l.item()
+                    logs["train/ppl_text"] = math.exp(text_l.item()) if text_l.item() < 100 else float("inf")
+                    logs["train/ppl_image"] = math.exp(image_l.item()) if image_l.item() < 100 else float("inf")
+
                 accelerator.log(logs, step=global_step)
 
                 if accelerator.is_main_process:
@@ -345,73 +391,146 @@ def main():
 
 @torch.no_grad()
 def validate(model, val_dataloader, selfless_sampler, accelerator, global_step):
-    # 初始化统计变量
-    local_total_loss_selfless = torch.tensor(0.0, device=accelerator.device) # Selfless Loss
-    local_total_loss_ar = torch.tensor(0.0, device=accelerator.device)   # Standard AR Loss
+    # Check if validation data is multimodal
+    is_multimodal = hasattr(val_dataloader.dataset, 'samples') or (
+        hasattr(val_dataloader.dataset, 'dataset') and
+        hasattr(val_dataloader.dataset.dataset, 'samples')
+    )
+    # Heuristic: if first batch has token_types, we're in multimodal mode
+    test_batch = next(iter(val_dataloader))
+    is_multimodal = "token_types" in test_batch
+
+    if is_multimodal:
+        _validate_multimodal(model, val_dataloader, test_batch, accelerator, global_step)
+    else:
+        _validate_text_only(model, val_dataloader, test_batch, selfless_sampler, accelerator, global_step)
+
+
+@torch.no_grad()
+def _validate_text_only(model, val_dataloader, first_batch, selfless_sampler, accelerator, global_step):
+    local_total_loss_selfless = torch.tensor(0.0, device=accelerator.device)
+    local_total_loss_ar = torch.tensor(0.0, device=accelerator.device)
     local_total_count = torch.tensor(0.0, device=accelerator.device)
-    
-    for step, batch in enumerate(val_dataloader):
+
+    # Process first batch (already fetched)
+    for step, batch in enumerate(_prepend_first_batch(first_batch, val_dataloader)):
         text_ids = batch["input_ids"][:, :-1].contiguous()
         current_batch_size = text_ids.size(0)
 
         _, v_sample = selfless_sampler.sample_v(text_ids)
         B, L = text_ids.shape
-
         v_sample = v_sample.to(accelerator.device)
-        selfless_attention_mask = get_selfless_mask(v_sample=v_sample, seq_len=L, device=accelerator.device)
-        del v_sample
 
+        selfless_attention_mask = get_selfless_mask(v_sample=v_sample, seq_len=L, device=accelerator.device)
         loss_selfless = model(
-            X0_input_ids=text_ids,
-            labels=text_ids,
+            X0_input_ids=text_ids, labels=text_ids,
             attention_mask=selfless_attention_mask,
         ).loss
-
         local_total_loss_selfless += loss_selfless.detach() * current_batch_size
-        
+
         AR_mask = get_selfless_ar_mask(seq_len=L, device=accelerator.device)
         loss_ar = model(
-            X0_input_ids=text_ids,
-            labels=text_ids,
+            X0_input_ids=text_ids, labels=text_ids,
             attention_mask=AR_mask,
         ).loss
-        
         local_total_loss_ar += loss_ar.detach() * current_batch_size
-        
-        # 计数
         local_total_count += current_batch_size
 
     global_total_count = accelerator.reduce(local_total_count, reduction="sum")
-    
-    # 计算 Selfless metrics
     global_total_loss_selfless = accelerator.reduce(local_total_loss_selfless, reduction="sum")
     avg_loss_selfless = (global_total_loss_selfless / global_total_count).item()
     ppl_selfless = math.exp(avg_loss_selfless)
-    
-    # 计算 AR metrics
     global_total_loss_ar = accelerator.reduce(local_total_loss_ar, reduction="sum")
     avg_loss_ar = (global_total_loss_ar / global_total_count).item()
     ppl_ar = math.exp(avg_loss_ar)
-    
-    # ==========================================
-    # 4. Logging
-    # ==========================================
+
     if accelerator.is_main_process:
         logs = {
             "val/loss_selfless": avg_loss_selfless,
             "val/ppl_selfless": ppl_selfless,
             "val/loss_ar": avg_loss_ar,
-            "val/ppl_ar": ppl_ar
+            "val/ppl_ar": ppl_ar,
         }
         accelerator.log(logs, step=global_step)
-        
         logger.info(
             f"[Validation] Step {global_step + 1} | "
             f"Selfless Loss: {avg_loss_selfless:.4f} (PPL: {ppl_selfless:.2f}) | "
-            f"AR Loss: {avg_loss_ar:.4f} (PPL: {ppl_ar:.2f}) | "
+            f"AR Loss: {avg_loss_ar:.4f} (PPL: {ppl_ar:.2f})"
         )
 
     return avg_loss_selfless, ppl_selfless
+
+
+@torch.no_grad()
+def _validate_multimodal(model, val_dataloader, first_batch, accelerator, global_step):
+    from utils.selfless_utils import assign_sigma_multimodal_batch
+
+    local_total_loss = torch.tensor(0.0, device=accelerator.device)
+    local_text_loss = torch.tensor(0.0, device=accelerator.device)
+    local_image_loss = torch.tensor(0.0, device=accelerator.device)
+    local_total_count = torch.tensor(0.0, device=accelerator.device)
+
+    for batch in _prepend_first_batch(first_batch, val_dataloader):
+        input_ids = batch["input_ids"].contiguous()
+        token_types = batch["token_types"]
+        task_modes = batch["task_mode"]
+        B, L = input_ids.shape
+        current_batch_size = B
+
+        v_sample = assign_sigma_multimodal_batch(token_types, task_modes, L)
+        v_sample = v_sample.to(accelerator.device)
+
+        # Selfless sigma validation
+        selfless_attention_mask = get_selfless_mask(v_sample=v_sample, seq_len=L, device=accelerator.device)
+        output = model(
+            X0_input_ids=input_ids, labels=input_ids,
+            attention_mask=selfless_attention_mask,
+            token_types=token_types,
+        )
+        local_total_loss += output.loss.detach() * current_batch_size
+        if hasattr(output, "per_modality_loss"):
+            local_text_loss += output.per_modality_loss["text_loss"] * current_batch_size
+            local_image_loss += output.per_modality_loss["image_loss"] * current_batch_size
+
+        local_total_count += current_batch_size
+
+    global_total_count = accelerator.reduce(local_total_count, reduction="sum")
+    global_total_loss = accelerator.reduce(local_total_loss, reduction="sum")
+    avg_loss = (global_total_loss / global_total_count).item()
+    ppl = math.exp(avg_loss) if avg_loss < 100 else float("inf")
+
+    logs = {
+        "val/loss": avg_loss,
+        "val/ppl": ppl,
+    }
+    # Per-modality metrics
+    if local_text_loss.item() > 0:
+        global_text_loss = accelerator.reduce(local_text_loss, reduction="sum")
+        avg_text = (global_text_loss / global_total_count).item()
+        logs["val/loss_text"] = avg_text
+        logs["val/ppl_text"] = math.exp(avg_text) if avg_text < 100 else float("inf")
+    if local_image_loss.item() > 0:
+        global_image_loss = accelerator.reduce(local_image_loss, reduction="sum")
+        avg_image = (global_image_loss / global_total_count).item()
+        logs["val/loss_image"] = avg_image
+        logs["val/ppl_image"] = math.exp(avg_image) if avg_image < 100 else float("inf")
+
+    if accelerator.is_main_process:
+        accelerator.log(logs, step=global_step)
+        msg = f"[Validation] Step {global_step + 1} | Loss: {avg_loss:.4f} (PPL: {ppl:.2f})"
+        if "val/loss_text" in logs:
+            msg += f" | Text: {logs['val/loss_text']:.4f}"
+        if "val/loss_image" in logs:
+            msg += f" | Image: {logs['val/loss_image']:.4f}"
+        logger.info(msg)
+
+    return avg_loss, ppl
+
+
+def _prepend_first_batch(first_batch, dataloader):
+    """Yield first_batch, then remaining batches from dataloader."""
+    yield first_batch
+    yield from dataloader
 
 
 if __name__ == "__main__":

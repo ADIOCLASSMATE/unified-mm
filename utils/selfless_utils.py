@@ -1,4 +1,138 @@
 import torch
+import random
+
+
+def assign_sigma_multimodal(token_types, task_mode, seq_len):
+    """Per-sample sigma assignment for multimodal training.
+
+    Follows RESEARCH.md §1.1-1.3 spec with three training modes.
+    Returns sigma tensor of shape [seq_len] with values in ℝ.
+
+    Token types: 0=text, 1=image, 2=special(BOS/BOI/EOI), 3=padding
+
+    Modes:
+      text_to_image: text σ ∈ [2, 2+N] (condition), image σ ∈ [0,1] (target)
+      image_to_text: image σ ∈ [2, 3] (condition), text σ ∈ [0, N] (target)
+      text_only:     text σ = AR descending, image σ = -1 (nonexistent)
+      interleaved:   per-segment sigma (condition segments get high σ, target get low)
+
+    Special tokens: σ = max(all_other_sigmas) + 1 (dynamic global max)
+    Padding: σ = -1
+    """
+    sigma = torch.zeros(seq_len, dtype=torch.float32)
+
+    text_mask = token_types == 0
+    image_mask = token_types == 1
+    special_mask = token_types == 2
+    pad_mask = token_types == 3
+
+    n_text = text_mask.sum().item()
+    n_image = image_mask.sum().item()
+
+    if task_mode == "text_to_image":
+        # Text is condition (high sigma), image is target (low sigma)
+        if n_text > 0:
+            sigma[text_mask] = 2.0 + n_text - torch.arange(
+                n_text, dtype=torch.float32
+            )  # σ ∈ [2, 2+N], AR descending within text
+            # Add small random jitter to avoid degenerate patterns
+            sigma[text_mask] += torch.rand(n_text) * 0.1 - 0.05
+        if n_image > 0:
+            sigma[image_mask] = torch.rand(n_image)  # σ ∈ [0, 1]
+
+    elif task_mode == "image_to_text":
+        # Image is condition (high sigma), text is target (low sigma)
+        if n_image > 0:
+            sigma[image_mask] = 2.0 + torch.rand(n_image)  # σ ∈ [2, 3]
+        if n_text > 0:
+            sigma[text_mask] = n_text - torch.arange(
+                n_text, dtype=torch.float32
+            )  # σ ∈ [0, N], AR descending
+            sigma[text_mask] += torch.rand(n_text) * 0.1 - 0.05
+
+    elif task_mode == "text_only":
+        # Standard AR for pure text
+        if n_text > 0:
+            sigma[text_mask] = n_text - torch.arange(
+                n_text, dtype=torch.float32
+            )
+        if n_image > 0:
+            sigma[image_mask] = -1.0  # shouldn't exist but handle gracefully
+
+    elif task_mode == "interleaved":
+        # Mixed mode: alternating condition/target regions
+        # Strategy: assign AR sigma within each text block, random sigma for images
+        # Text blocks get descending sigma, images get random in [0,1]
+        pos = 0
+        text_block_start = None
+        while pos < seq_len:
+            if pad_mask[pos]:
+                break
+            if text_mask[pos]:
+                if text_block_start is None:
+                    text_block_start = pos
+            else:
+                # End of text block
+                if text_block_start is not None:
+                    block_len = pos - text_block_start
+                    if block_len > 0:
+                        sigma[text_block_start:pos] = (
+                            block_len - torch.arange(block_len, dtype=torch.float32)
+                        )
+                    text_block_start = None
+                if image_mask[pos]:
+                    sigma[pos:pos+512] = torch.rand(512)  # image block
+            pos += 1
+        # Handle trailing text block
+        if text_block_start is not None:
+            block_len = seq_len - text_block_start
+            if block_len > 0:
+                sigma[text_block_start:seq_len] = (
+                    block_len - torch.arange(block_len, dtype=torch.float32)
+                )
+
+    else:
+        raise ValueError(f"Unknown task_mode: {task_mode}")
+
+    # Special tokens: set to global max + 1 (visible to all)
+    other_sigmas = sigma[~(special_mask | pad_mask)]
+    if other_sigmas.numel() > 0:
+        max_sigma = other_sigmas.max().item()
+    else:
+        max_sigma = 1.0
+    sigma[special_mask] = max_sigma + 1.0
+
+    # Padding: set to -1 (excluded from attention)
+    sigma[pad_mask] = -1.0
+
+    # Clamp to avoid extreme values
+    sigma = sigma.clamp(-1.0, 1e4)
+
+    return sigma
+
+
+def assign_sigma_multimodal_batch(token_types, task_modes, seq_len):
+    """Vectorized batch sigma assignment.
+
+    Args:
+        token_types: [B, L] tensor of token type masks
+        task_modes: list of B strings
+        seq_len: int
+
+    Returns:
+        sigma: [B, L] tensor
+    """
+    B = token_types.shape[0]
+    sigma = torch.zeros(B, seq_len, dtype=torch.float32)
+
+    for b in range(B):
+        sigma[b] = assign_sigma_multimodal(
+            token_types=token_types[b],
+            task_mode=task_modes[b],
+            seq_len=seq_len,
+        )
+
+    return sigma
 
 
 class SelflessSampler():

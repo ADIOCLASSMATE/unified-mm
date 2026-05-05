@@ -76,9 +76,22 @@ def load_model_tokenizer(config: OmegaConf, logger=None):
         mask_token_id = tokenizer.convert_tokens_to_ids(mask_token)
 
     config.model.mask_token_id = mask_token_id
-    
+
+    # Register BOI/EOI tokens for multimodal (begin/end of image)
+    boi_token = "<|boi|>"
+    eoi_token = "<|eoi|>"
+
+    if boi_token not in tokenizer.get_vocab():
+        tokenizer.add_tokens([boi_token, eoi_token], special_tokens=True)
+
+    config.model.boi_token_id = tokenizer.convert_tokens_to_ids(boi_token)
+    config.model.eoi_token_id = tokenizer.convert_tokens_to_ids(eoi_token)
+    config.model.text_vocab_size = len(tokenizer) - 2  # before adding BOI/EOI
+
     if logger is not None:
         logger.info('special tokens : \n', tokenizer.special_tokens_map)
+        logger.info(f'BOI token id: {config.model.boi_token_id}, '
+                    f'EOI token id: {config.model.eoi_token_id}')
     
     
     project = config.experiment.project
@@ -153,6 +166,12 @@ def load_model_tokenizer(config: OmegaConf, logger=None):
         model.config.mask_token_id = config.model.mask_token_id
         model.config.use_flex_attention = config.model.use_flex_attention
         model.config.eos_token_id = tokenizer.eos_token_id
+        # Propagate multimodal config values from YAML to model config
+        for key in ("image_vocab_size", "text_vocab_size", "lambda_image",
+                     "boi_token_id", "eoi_token_id"):
+            val = config.model.get(key)
+            if val is not None:
+                setattr(model.config, key, val)
         # 设置 im_end_token_id
         if hasattr(tokenizer, 'im_end_token_id') and tokenizer.im_end_token_id is not None:
             model.config.im_end_token_id = tokenizer.im_end_token_id
@@ -476,7 +495,7 @@ def get_selfless_mask(v_sample: torch.Tensor, seq_len: int, device) -> BlockMask
     for content stream), which allows the diagonal shortcut.
 
     Args:
-        v_sample: Permutation sorting values, shape: (batch_size, seq_len+1)
+        v_sample: Permutation sorting values, shape: (batch_size, seq_len)
         seq_len: Sequence length
 
     Returns:

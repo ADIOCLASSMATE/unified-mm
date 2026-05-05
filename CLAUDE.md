@@ -182,7 +182,7 @@ unified-mm/
 ```yaml
 # configs/selfless/pretraining.yaml
 model:
-    model_path: "public/models/Qwen/Qwen3-1.7B-Base"
+    model_path: "public/models/Qwen/Qwen3-0.6B-Base"
     attention_pattern: "random"     # "random" or "ar"
     use_flex_attention: true
 
@@ -217,7 +217,7 @@ Environment: Python 3.12, uv for package management, `.venv/` for virtual enviro
 | Validation (AR + random loss) | ✅ Done | `train_selfless.py` |
 | Text-only training pipeline | ✅ Done | `pretrain/train_selfless.py` |
 | XLNet baseline mask | ✅ Defined | `utils/utils.py` |
-| Qwen3-1.7B-Base model | ✅ Downloaded | `public/models/Qwen/Qwen3-1.7B-Base` |
+| Qwen3-0.6B-Base model | ✅ Downloaded | `public/models/Qwen/Qwen3-0.6B-Base` |
 | XQ-GAN VP2-16384 tokenizer | ✅ Downloaded | `public/models/xqgan_vp2_16384/` |
 | Image tokenizer integration | ❌ Not started | — |
 | Multimodal data pipeline | ❌ Not started | — |

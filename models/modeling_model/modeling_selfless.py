@@ -168,7 +168,7 @@ def compiled_flex_attention(query, key, value, attention_mask, scaling, enable_g
     fullgraph=True,
     mode="default",
     dynamic=True
-)  
+)
 def uncompiled_flex_attention(query, key, value, attention_mask, scaling, enable_gqa):
     """不适用编译优化的 flex_attention 包装函数"""
     return flex_attention(
@@ -465,6 +465,8 @@ class Qwen3Model(Qwen3PreTrainedModel):
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.image_vocab_size = getattr(config, "image_vocab_size", 16384)
+        self.image_embed_tokens = nn.Embedding(self.image_vocab_size, config.hidden_size)
         self.layers = nn.ModuleList(
             [Qwen3DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
@@ -502,10 +504,26 @@ class Qwen3Model(Qwen3PreTrainedModel):
             raise ValueError("attention_mask must be provided for diffusion-causal attention.")
 
         if X0_inputs_embeds is None:
-            X0_inputs_embeds = self.embed_tokens(X0_input_ids)
+            text_vocab_size = getattr(self.config, "text_vocab_size", self.vocab_size)
+            is_text = X0_input_ids < text_vocab_size
+            is_image = X0_input_ids >= text_vocab_size
+
+            X0_inputs_embeds = torch.zeros(
+                (*X0_input_ids.shape, self.config.hidden_size),
+                dtype=self.embed_tokens.weight.dtype,
+                device=X0_input_ids.device,
+            )
+            # Text tokens -> text embedding
+            X0_inputs_embeds[is_text] = self.embed_tokens(X0_input_ids[is_text])
+            # Image tokens -> image embedding (undo offset)
+            if is_image.any():
+                img_indices = X0_input_ids[is_image] - text_vocab_size
+                X0_inputs_embeds[is_image] = self.image_embed_tokens(img_indices)
+
         if self.training:
             if self.XT_input_ids is None or self.XT_input_ids.shape[-1] != X0_input_ids.shape[-1]:
                 self.XT_input_ids = torch.full_like(X0_input_ids, self.config.mask_token_id)
+            # XT stream: mask tokens use text embedding (XT always gets [MASK] embeddings)
             XT_inputs_embeds = self.embed_tokens(self.XT_input_ids)
         else:
             self.XT_input_ids = None
@@ -566,6 +584,9 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         self.model = Qwen3Model(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.image_vocab_size = getattr(config, "image_vocab_size", 16384)
+        self.image_lm_head = nn.Linear(config.hidden_size, self.image_vocab_size, bias=False)
+        self.lambda_image = getattr(config, "lambda_image", 0.5)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -626,18 +647,63 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
-        
+
+        # Check for token_types (multimodal mode)
+        token_types = kwargs.get("token_types", None)
+
         loss = None
         if labels is not None:
-            loss = self.loss_function(logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=-100)
+            if token_types is not None:
+                # ── Modality-aware loss ──
+                text_vocab_size = getattr(self.config, "text_vocab_size", self.vocab_size)
+                text_mask = (token_types == 0) | (token_types == 2)  # text + special
+                image_mask = token_types == 1  # image tokens only
+                pad_mask = token_types == 3  # padding, ignore
 
-        return CausalLMOutputWithPast(
+                flat_hidden = hidden_states.view(-1, hidden_states.size(-1))
+                flat_labels = labels.view(-1)
+
+                text_flat_mask = text_mask.view(-1)
+                image_flat_mask = image_mask.view(-1)
+
+                # Text loss
+                text_loss = 0.0
+                if text_flat_mask.any():
+                    text_logits = self.lm_head(flat_hidden[text_flat_mask])
+                    text_loss = F.cross_entropy(
+                        text_logits, flat_labels[text_flat_mask], ignore_index=-100
+                    )
+
+                # Image loss (with offset undo)
+                image_loss = 0.0
+                if image_flat_mask.any():
+                    image_logits = self.image_lm_head(flat_hidden[image_flat_mask])
+                    image_labels = flat_labels[image_flat_mask] - text_vocab_size
+                    image_loss = F.cross_entropy(
+                        image_logits, image_labels, ignore_index=-100
+                    )
+
+                loss = text_loss + self.lambda_image * image_loss
+            else:
+                # ── Text-only loss (backward compatible) ──
+                loss = self.loss_function(
+                    logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=-100
+                )
+
+        output = CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+        # Attach per-modality losses for logging
+        if token_types is not None and loss is not None:
+            output.per_modality_loss = {
+                "text_loss": text_loss.detach() if isinstance(text_loss, torch.Tensor) else text_loss,
+                "image_loss": image_loss.detach() if isinstance(image_loss, torch.Tensor) else image_loss,
+            }
+        return output
         
     @torch.compile(mode="max-autotune-no-cudagraphs")
     def loss_function(self, logits, labels, ignore_index, reduction='mean'):
