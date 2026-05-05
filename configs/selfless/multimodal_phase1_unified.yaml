@@ -1,6 +1,6 @@
 experiment:
     project: "selfless-0.6B-multimodal"
-    name: "selfless-phase1"
+    name: "selfless-phase1-unified"
     output_dir: "output"
     save_every: 100
     eval_every: 100
@@ -18,7 +18,7 @@ model:
     loss_attention_pattern: "likelihood"
     mask_id: -1
     use_flex_attention: true
-    image_offset: 200000
+    unified_head: true
     image_vocab_size: 16384
     lambda_image: 0.5
     image_tokens_per_img: 512

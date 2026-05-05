@@ -10,6 +10,7 @@ dependencies = [
     "deepspeed>=0.18.9",
     "flash-attn==2.8.3",
     "omegaconf>=2.3.0",
+    "openai>=2.34.0",
     "peft>=0.19.1",
     "ruamel-yaml>=0.19.1",
     "scipy>=1.17.1",

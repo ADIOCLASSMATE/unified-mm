@@ -504,9 +504,9 @@ class Qwen3Model(Qwen3PreTrainedModel):
             raise ValueError("attention_mask must be provided for diffusion-causal attention.")
 
         if X0_inputs_embeds is None:
-            text_vocab_size = getattr(self.config, "text_vocab_size", self.vocab_size)
-            is_text = X0_input_ids < text_vocab_size
-            is_image = X0_input_ids >= text_vocab_size
+            image_offset = getattr(self.config, "image_offset", 200000)
+            is_image = X0_input_ids >= image_offset
+            is_text = ~is_image
 
             X0_inputs_embeds = torch.zeros(
                 (*X0_input_ids.shape, self.config.hidden_size),
@@ -517,7 +517,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
             X0_inputs_embeds[is_text] = self.embed_tokens(X0_input_ids[is_text])
             # Image tokens -> image embedding (undo offset)
             if is_image.any():
-                img_indices = X0_input_ids[is_image] - text_vocab_size
+                img_indices = X0_input_ids[is_image] - image_offset
                 X0_inputs_embeds[is_image] = self.image_embed_tokens(img_indices)
 
         if self.training:
@@ -575,7 +575,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
 @auto_docstring
 class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
-    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
+    _tied_weights_keys = {}  # Don't tie — multimodal needs separate spaces
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
@@ -583,10 +583,19 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.model = Qwen3Model(config)
         self.vocab_size = config.vocab_size
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.image_vocab_size = getattr(config, "image_vocab_size", 16384)
-        self.image_lm_head = nn.Linear(config.hidden_size, self.image_vocab_size, bias=False)
+        self.unified_head = getattr(config, "unified_head", False)
         self.lambda_image = getattr(config, "lambda_image", 0.5)
+
+        if self.unified_head:
+            # Single unified head: text vocab (already includes special tokens) + image vocab
+            image_offset = getattr(config, "image_offset", len(config) if hasattr(config, '__len__') else 200000)
+            total_vocab = image_offset + self.image_vocab_size
+            self.lm_head = nn.Linear(config.hidden_size, total_vocab, bias=False)
+            self.image_lm_head = None
+        else:
+            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+            self.image_lm_head = nn.Linear(config.hidden_size, self.image_vocab_size, bias=False)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -644,21 +653,17 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         )
 
         hidden_states = outputs.last_hidden_state
-        # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 
-        # Check for token_types (multimodal mode)
         token_types = kwargs.get("token_types", None)
 
         loss = None
         if labels is not None:
             if token_types is not None:
-                # ── Modality-aware loss ──
-                text_vocab_size = getattr(self.config, "text_vocab_size", self.vocab_size)
-                text_mask = (token_types == 0) | (token_types == 2)  # text + special
-                image_mask = token_types == 1  # image tokens only
-                pad_mask = token_types == 3  # padding, ignore
+                image_offset = getattr(self.config, "image_offset", 200000)
+                text_mask = (token_types == 0) | (token_types == 2)
+                image_mask = token_types == 1
 
                 flat_hidden = hidden_states.view(-1, hidden_states.size(-1))
                 flat_labels = labels.view(-1)
@@ -666,26 +671,44 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 text_flat_mask = text_mask.view(-1)
                 image_flat_mask = image_mask.view(-1)
 
-                # Text loss
-                text_loss = 0.0
-                if text_flat_mask.any():
-                    text_logits = self.lm_head(flat_hidden[text_flat_mask])
-                    text_loss = F.cross_entropy(
-                        text_logits, flat_labels[text_flat_mask], ignore_index=-100
+                if self.unified_head:
+                    # Single head: one CE loss over all positions
+                    loss = F.cross_entropy(
+                        self.lm_head(flat_hidden), flat_labels, ignore_index=-100
                     )
+                    # Post-hoc per-modality metrics
+                    text_loss = torch.tensor(0.0, device=flat_hidden.device)
+                    image_loss = torch.tensor(0.0, device=flat_hidden.device)
+                    with torch.no_grad():
+                        if text_flat_mask.any():
+                            text_logits = self.lm_head(flat_hidden[text_flat_mask])
+                            text_loss = F.cross_entropy(
+                                text_logits, flat_labels[text_flat_mask], ignore_index=-100
+                            )
+                        if image_flat_mask.any():
+                            image_logits = self.lm_head(flat_hidden[image_flat_mask])
+                            image_loss = F.cross_entropy(
+                                image_logits, flat_labels[image_flat_mask], ignore_index=-100
+                            )
+                else:
+                    # Dual head: separate heads for text and image
+                    text_loss = 0.0
+                    if text_flat_mask.any():
+                        text_logits = self.lm_head(flat_hidden[text_flat_mask])
+                        text_loss = F.cross_entropy(
+                            text_logits, flat_labels[text_flat_mask], ignore_index=-100
+                        )
 
-                # Image loss (with offset undo)
-                image_loss = 0.0
-                if image_flat_mask.any():
-                    image_logits = self.image_lm_head(flat_hidden[image_flat_mask])
-                    image_labels = flat_labels[image_flat_mask] - text_vocab_size
-                    image_loss = F.cross_entropy(
-                        image_logits, image_labels, ignore_index=-100
-                    )
+                    image_loss = 0.0
+                    if image_flat_mask.any():
+                        image_logits = self.image_lm_head(flat_hidden[image_flat_mask])
+                        image_labels = flat_labels[image_flat_mask] - image_offset
+                        image_loss = F.cross_entropy(
+                            image_logits, image_labels, ignore_index=-100
+                        )
 
-                loss = text_loss + self.lambda_image * image_loss
+                    loss = text_loss + self.lambda_image * image_loss
             else:
-                # ── Text-only loss (backward compatible) ──
                 loss = self.loss_function(
                     logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=-100
                 )
@@ -700,8 +723,8 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         # Attach per-modality losses for logging
         if token_types is not None and loss is not None:
             output.per_modality_loss = {
-                "text_loss": text_loss.detach() if isinstance(text_loss, torch.Tensor) else text_loss,
-                "image_loss": image_loss.detach() if isinstance(image_loss, torch.Tensor) else image_loss,
+                "text_loss": text_loss.detach() if isinstance(text_loss, torch.Tensor) else torch.tensor(text_loss or 0.0, device=hidden_states.device),
+                "image_loss": image_loss.detach() if isinstance(image_loss, torch.Tensor) else torch.tensor(image_loss or 0.0, device=hidden_states.device),
             }
         return output
         

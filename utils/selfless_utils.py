@@ -19,7 +19,8 @@ def assign_sigma_multimodal(token_types, task_mode, seq_len):
     Special tokens: σ = max(all_other_sigmas) + 1 (dynamic global max)
     Padding: σ = -1
     """
-    sigma = torch.zeros(seq_len, dtype=torch.float32)
+    device = token_types.device
+    sigma = torch.zeros(seq_len, dtype=torch.float32, device=device)
 
     text_mask = token_types == 0
     image_mask = token_types == 1
@@ -33,28 +34,27 @@ def assign_sigma_multimodal(token_types, task_mode, seq_len):
         # Text is condition (high sigma), image is target (low sigma)
         if n_text > 0:
             sigma[text_mask] = 2.0 + n_text - torch.arange(
-                n_text, dtype=torch.float32
+                n_text, dtype=torch.float32, device=device
             )  # σ ∈ [2, 2+N], AR descending within text
-            # Add small random jitter to avoid degenerate patterns
-            sigma[text_mask] += torch.rand(n_text) * 0.1 - 0.05
+            sigma[text_mask] += torch.rand(n_text, device=device) * 0.1 - 0.05
         if n_image > 0:
-            sigma[image_mask] = torch.rand(n_image)  # σ ∈ [0, 1]
+            sigma[image_mask] = torch.rand(n_image, device=device)  # σ ∈ [0, 1]
 
     elif task_mode == "image_to_text":
         # Image is condition (high sigma), text is target (low sigma)
         if n_image > 0:
-            sigma[image_mask] = 2.0 + torch.rand(n_image)  # σ ∈ [2, 3]
+            sigma[image_mask] = 2.0 + torch.rand(n_image, device=device)  # σ ∈ [2, 3]
         if n_text > 0:
             sigma[text_mask] = n_text - torch.arange(
-                n_text, dtype=torch.float32
+                n_text, dtype=torch.float32, device=device
             )  # σ ∈ [0, N], AR descending
-            sigma[text_mask] += torch.rand(n_text) * 0.1 - 0.05
+            sigma[text_mask] += torch.rand(n_text, device=device) * 0.1 - 0.05
 
     elif task_mode == "text_only":
         # Standard AR for pure text
         if n_text > 0:
             sigma[text_mask] = n_text - torch.arange(
-                n_text, dtype=torch.float32
+                n_text, dtype=torch.float32, device=device
             )
         if n_image > 0:
             sigma[image_mask] = -1.0  # shouldn't exist but handle gracefully
@@ -77,18 +77,20 @@ def assign_sigma_multimodal(token_types, task_mode, seq_len):
                     block_len = pos - text_block_start
                     if block_len > 0:
                         sigma[text_block_start:pos] = (
-                            block_len - torch.arange(block_len, dtype=torch.float32)
+                            block_len - torch.arange(block_len, dtype=torch.float32, device=device)
                         )
                     text_block_start = None
                 if image_mask[pos]:
-                    sigma[pos:pos+512] = torch.rand(512)  # image block
+                    block_end = min(pos + 512, seq_len)
+                    block_len = block_end - pos
+                    sigma[pos:block_end] = torch.rand(block_len, device=device)
             pos += 1
         # Handle trailing text block
         if text_block_start is not None:
             block_len = seq_len - text_block_start
             if block_len > 0:
                 sigma[text_block_start:seq_len] = (
-                    block_len - torch.arange(block_len, dtype=torch.float32)
+                    block_len - torch.arange(block_len, dtype=torch.float32, device=device)
                 )
 
     else:
@@ -123,14 +125,14 @@ def assign_sigma_multimodal_batch(token_types, task_modes, seq_len):
         sigma: [B, L] tensor
     """
     B = token_types.shape[0]
-    sigma = torch.zeros(B, seq_len, dtype=torch.float32)
+    sigma = torch.zeros(B, seq_len, dtype=torch.float32, device=token_types.device)
 
     for b in range(B):
         sigma[b] = assign_sigma_multimodal(
             token_types=token_types[b],
             task_mode=task_modes[b],
             seq_len=seq_len,
-        )
+        ).to(token_types.device)
 
     return sigma
 

@@ -86,7 +86,15 @@ def load_model_tokenizer(config: OmegaConf, logger=None):
 
     config.model.boi_token_id = tokenizer.convert_tokens_to_ids(boi_token)
     config.model.eoi_token_id = tokenizer.convert_tokens_to_ids(eoi_token)
-    config.model.text_vocab_size = len(tokenizer) - 2  # before adding BOI/EOI
+
+    # image_offset: where image codebook indices start in the unified input_ids space
+    # For unified_head: offset = len(tokenizer) so image tokens sit right after text vocab
+    # For dual_head: use a large safe offset (200000)
+    unified_head = getattr(config.model, "unified_head", False)
+    if unified_head:
+        config.model.image_offset = len(tokenizer)
+    else:
+        config.model.image_offset = getattr(config.model, "image_offset", 200000)
 
     if logger is not None:
         logger.info('special tokens : \n', tokenizer.special_tokens_map)
@@ -167,11 +175,31 @@ def load_model_tokenizer(config: OmegaConf, logger=None):
         model.config.use_flex_attention = config.model.use_flex_attention
         model.config.eos_token_id = tokenizer.eos_token_id
         # Propagate multimodal config values from YAML to model config
-        for key in ("image_vocab_size", "text_vocab_size", "lambda_image",
-                     "boi_token_id", "eoi_token_id"):
+        for key in ("image_vocab_size", "image_offset", "lambda_image",
+                     "boi_token_id", "eoi_token_id", "unified_head"):
             val = config.model.get(key)
             if val is not None:
                 setattr(model.config, key, val)
+
+        # Unified head: expand lm_head to include image vocab after text vocab
+        if config.model.get("unified_head", False):
+            model.unified_head = True
+            image_offset = model.config.image_offset
+            image_vocab_size = model.config.image_vocab_size
+            total_vocab = image_offset + image_vocab_size
+            old_weight = model.lm_head.weight.data  # [151936, hidden_dim]
+            hidden_dim = old_weight.shape[1]
+
+            new_lm_head = torch.nn.Linear(hidden_dim, total_vocab, bias=False)
+            new_lm_head.weight.data[:old_weight.shape[0]] = old_weight
+            # Random init image portion
+            new_lm_head.weight.data[old_weight.shape[0]:] = old_weight.mean() + \
+                torch.randn(total_vocab - old_weight.shape[0], hidden_dim) * old_weight.std()
+            new_lm_head = new_lm_head.to(dtype=old_weight.dtype, device=old_weight.device)
+            model.lm_head = new_lm_head
+            model.image_lm_head = None
+            if logger is not None:
+                logger.info(f"Expanded lm_head: {old_weight.shape[0]} -> {total_vocab}")
         # 设置 im_end_token_id
         if hasattr(tokenizer, 'im_end_token_id') and tokenizer.im_end_token_id is not None:
             model.config.im_end_token_id = tokenizer.im_end_token_id

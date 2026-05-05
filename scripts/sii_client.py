@@ -67,7 +67,9 @@ class SIIClient:
                         kwargs["response_format"] = response_format
 
                     response = await client.chat.completions.create(**kwargs)
-                    return response.choices[0].message.content
+                    msg = response.choices[0].message
+                    # Some models return content in 'reasoning' field instead of 'content'
+                    return msg.content or getattr(msg, 'reasoning', None) or ""
                 except Exception as e:
                     if attempt == self.max_retries - 1:
                         raise

@@ -4,7 +4,7 @@ Multimodal dataset class for selfless attention training.
 Replaces dataset_arrow.py for multimodal (text+image) training.
 Reads JSONL files, tokenizes text on-the-fly, loads pre-computed image tokens.
 
-Image tokens stored with offset: img_codebook_idx + TEXT_VOCAB_SIZE
+Image tokens stored with offset: img_codebook_idx + IMAGE_OFFSET (200000)
 to avoid collision with text token IDs.
 
 Returns: (input_ids, token_types), task_mode per sample
@@ -28,7 +28,7 @@ class MultimodalDataset(Dataset):
     Loads pre-computed image tokens lazily from .pt files.
     """
 
-    TEXT_VOCAB_SIZE = 151936  # Qwen3-0.6B
+    IMAGE_OFFSET = 200000  # Default offset (overridden by config for unified head)
 
     def __init__(
         self,
@@ -40,19 +40,21 @@ class MultimodalDataset(Dataset):
         eos_token_id: int,
         max_seq_length: int = 2048,
         image_tokens_per_img: int = 512,
+        image_offset: int = 200000,
         shuffle: bool = True,
         seed: int = 42,
     ):
         self.jsonl_paths = jsonl_paths
         self.tokenizer = tokenizer
         self.image_token_dir = Path(image_token_dir)
-        self.bos_id = tokenizer.bos_token_id
+        self.bos_id = tokenizer.bos_token_id or tokenizer.eos_token_id
         self.boi_id = boi_token_id
         self.eoi_id = eoi_token_id
         self.eos_id = eos_token_id
         self.pad_id = getattr(tokenizer, "pad_token_id", None) or 0
         self.max_seq_length = max_seq_length
-        self.image_tokens_per_img = image_tokens_per_img  # 512 for product_quant=2
+        self.image_tokens_per_img = image_tokens_per_img
+        self.image_offset = image_offset
 
         # Load all samples into memory (Phase 1 scale: ~1M samples, fine in RAM)
         self.samples: List[Dict] = []
@@ -109,7 +111,7 @@ class MultimodalDataset(Dataset):
     def _build_text_to_image(self, sample):
         text_ids = self.tokenizer.encode(sample["text"], add_special_tokens=False)
         img_tokens = self._load_image_tokens(sample["img_id"])
-        img_tokens = img_tokens + self.TEXT_VOCAB_SIZE  # Offset
+        img_tokens = img_tokens + self.image_offset  # Offset
 
         max_text_len = self.max_seq_length - self.image_tokens_per_img - 3
         if len(text_ids) > max_text_len:
@@ -124,7 +126,7 @@ class MultimodalDataset(Dataset):
     def _build_image_to_text(self, sample):
         text_ids = self.tokenizer.encode(sample["text"], add_special_tokens=False)
         img_tokens = self._load_image_tokens(sample["img_id"])
-        img_tokens = img_tokens + self.TEXT_VOCAB_SIZE
+        img_tokens = img_tokens + self.image_offset
 
         max_text_len = self.max_seq_length - self.image_tokens_per_img - 3
         if len(text_ids) > max_text_len:
@@ -149,7 +151,7 @@ class MultimodalDataset(Dataset):
                 img_idx = seg.get("img_idx", 0)
                 img_id = sample["img_ids"][img_idx]
                 img = self._load_image_tokens(img_id)
-                img = img + self.TEXT_VOCAB_SIZE
+                img = img + self.image_offset
                 ids.extend([self.boi_id] + img.tolist() + [self.eoi_id])
                 types.extend([2] + [1] * self.image_tokens_per_img + [2])
 
@@ -256,6 +258,7 @@ def build_multimodal_dataloaders(config, tokenizer):
         eos_token_id=tokenizer.eos_token_id,
         max_seq_length=params.get("max_seq_length", 2048),
         image_tokens_per_img=params.get("image_tokens_per_img", 512),
+        image_offset=config.model.get("image_offset", 200000),
         shuffle=True,
     )
 

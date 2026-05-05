@@ -260,7 +260,8 @@ def main():
                 v_sample=v_sample, seq_len=L, device=accelerator.device
             )
 
-            if global_step == 0 and accelerator.is_main_process:
+            if global_step == 0 and accelerator.is_main_process and not hasattr(main, '_logged_first_batch'):
+                main._logged_first_batch = True
                 logger.info(f"Input ids shape: {input_ids.shape}, multimodal mode")
                 logger.info(f"token type counts: text={(token_types==0).sum().item()}, "
                            f"image={(token_types==1).sum().item()}, "
@@ -281,7 +282,8 @@ def main():
             )
             del t_sample
 
-            if global_step == 0 and accelerator.is_main_process:
+            if global_step == 0 and accelerator.is_main_process and not hasattr(main, '_logged_first_batch'):
+                main._logged_first_batch = True
                 logger.info(f"Input ids shape: {text_ids.shape}, text-only mode")
             input_ids = text_ids
 
@@ -343,12 +345,16 @@ def main():
                 # Per-modality loss logging (multimodal mode)
                 per_mod = getattr(model_output, "per_modality_loss", None)
                 if per_mod is not None:
-                    text_l = accelerator.reduce(per_mod["text_loss"], reduction="mean")
-                    image_l = accelerator.reduce(per_mod["image_loss"], reduction="mean")
-                    logs["train/loss_text"] = text_l.item()
-                    logs["train/loss_image"] = image_l.item()
-                    logs["train/ppl_text"] = math.exp(text_l.item()) if text_l.item() < 100 else float("inf")
-                    logs["train/ppl_image"] = math.exp(image_l.item()) if image_l.item() < 100 else float("inf")
+                    t_loss = per_mod["text_loss"]
+                    i_loss = per_mod["image_loss"]
+                    if isinstance(t_loss, torch.Tensor) and t_loss.numel() > 0:
+                        text_l = accelerator.reduce(t_loss, reduction="mean")
+                        logs["train/loss_text"] = text_l.item()
+                        logs["train/ppl_text"] = math.exp(min(text_l.item(), 100))
+                    if isinstance(i_loss, torch.Tensor) and i_loss.numel() > 0:
+                        image_l = accelerator.reduce(i_loss, reduction="mean")
+                        logs["train/loss_image"] = image_l.item()
+                        logs["train/ppl_image"] = math.exp(min(image_l.item(), 100))
 
                 accelerator.log(logs, step=global_step)
 
