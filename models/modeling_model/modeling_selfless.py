@@ -54,6 +54,17 @@ except ImportError:
     liger_kernel_is_available = False
     
 
+def _compute_default_rope_parameters(config: Qwen3Config, device=None):
+    base = getattr(config, "rope_theta", 10000.0)
+    head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+    partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
+    dim = int(head_dim * partial_rotary_factor)
+    inv_freq = 1.0 / (
+        base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
+    )
+    return inv_freq, 1.0
+
+
 @use_kernel_forward_from_hub("RMSNorm")
 class Qwen3RMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
@@ -169,8 +180,8 @@ def compiled_flex_attention(query, key, value, attention_mask, scaling, enable_g
     mode="default",
     dynamic=True
 )
-def uncompiled_flex_attention(query, key, value, attention_mask, scaling, enable_gqa):
-    """不适用编译优化的 flex_attention 包装函数"""
+def dynamic_flex_attention(query, key, value, attention_mask, scaling, enable_gqa):
+    """自适应tokens长度的 flex_attention 包装函数"""
     return flex_attention(
         query=query,
         key=key,
@@ -181,34 +192,6 @@ def uncompiled_flex_attention(query, key, value, attention_mask, scaling, enable
         enable_gqa=enable_gqa,
         return_lse=False,
     )
-    
-# @torch.compile()
-def eager_diffusion_attention(
-    module: nn.Module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask: Optional[torch.Tensor],
-    scaling: float,
-    dropout: float = 0.0,
-    **kwargs: Unpack[TransformersKwargs],
-):
-    key_states = repeat_kv(key, module.num_key_value_groups)
-    value_states = repeat_kv(value, module.num_key_value_groups)
-
-    attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
-    if attention_mask is not None:
-        if attention_mask.dim() == 3:
-            attention_mask = attention_mask.unsqueeze(1)
-        diffusion_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-        attn_weights = attn_weights + diffusion_mask
-
-    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
-    attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
-    attn_output = torch.matmul(attn_weights, value_states)
-    attn_output = attn_output.transpose(1, 2).contiguous()
-
-    return attn_output, attn_weights
 
     
 class Qwen3Attention(nn.Module):
@@ -252,7 +235,7 @@ class Qwen3Attention(nn.Module):
         input_shape = X0_hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
             
-        XT_query_states = self.q_norm(self.q_proj(XT_hidden_states).view(hidden_shape)).transpose(1, 2) if self.training else None
+        XT_query_states = self.q_norm(self.q_proj(XT_hidden_states).view(hidden_shape)).transpose(1, 2) if XT_hidden_states is not None else None
         
         X0_query_states = self.q_norm(self.q_proj(X0_hidden_states).view(hidden_shape)).transpose(1, 2)
         X0_key_states = self.k_norm(self.k_proj(X0_hidden_states).view(hidden_shape)).transpose(1, 2)
@@ -269,8 +252,8 @@ class Qwen3Attention(nn.Module):
         # 检查是否需要 GQA (Grouped Query Attention)
         enable_gqa = self.config.num_attention_heads != self.config.num_key_value_heads
         
-        if self.config.use_flex_attention == False or self.training == False:
-            X0_attn_output = uncompiled_flex_attention(
+        if self.training == False:
+            X0_attn_output = dynamic_flex_attention(
                 query=X0_query_states,
                 key=X0_key_states,
                 value=X0_value_states,
@@ -278,14 +261,14 @@ class Qwen3Attention(nn.Module):
                 scaling=self.scaling,  # 使用预定义的缩放因子
                 enable_gqa=enable_gqa,  # 如果 kv heads 少于 q heads，需要启用
             )
-            XT_attn_output = uncompiled_flex_attention(
+            XT_attn_output = dynamic_flex_attention(
                 query=XT_query_states,
                 key=X0_key_states,
                 value=X0_value_states,
                 attention_mask=attention_mask,  # 直接传入 BlockMask
                 scaling=self.scaling,  # 使用预定义的缩放因子
                 enable_gqa=enable_gqa,  # 如果 kv heads 少于 q heads，需要启用
-            ) if self.training else None
+            ) if XT_query_states is not None else None
             attn_weights = None
         else:
             # 调用 flex_attention
@@ -304,15 +287,15 @@ class Qwen3Attention(nn.Module):
                 attention_mask=attention_mask,  # 直接传入 BlockMask
                 scaling=self.scaling,  # 使用预定义的缩放因子
                 enable_gqa=enable_gqa,  # 如果 kv heads 少于 q heads，需要启用
-            ) if self.training else None
+            ) if XT_query_states is not None else None
             attn_weights = None
         
         # attn_output 形状: (batch, heads, seq_len, head_dim)
         # 需要转换回 (batch, seq_len, hidden_size)
         X0_attn_output = X0_attn_output.transpose(1, 2).reshape(*input_shape, -1).contiguous()
-        XT_attn_output = XT_attn_output.transpose(1, 2).reshape(*input_shape, -1).contiguous() if self.training else None
+        XT_attn_output = XT_attn_output.transpose(1, 2).reshape(*input_shape, -1).contiguous() if XT_attn_output is not None else None
         X0_attn_output = self.o_proj(X0_attn_output)
-        XT_attn_output = self.o_proj(XT_attn_output) if self.training else None
+        XT_attn_output = self.o_proj(XT_attn_output) if XT_attn_output is not None else None
         
         return X0_attn_output, XT_attn_output, attn_weights
 
@@ -343,9 +326,9 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
         X0_residual = X0_hidden_states
-        XT_residual = XT_hidden_states if self.training else None
+        XT_residual = XT_hidden_states if XT_hidden_states is not None else None
         X0_hidden_states = self.input_layernorm(X0_hidden_states)
-        XT_hidden_states = self.input_layernorm(XT_hidden_states) if self.training else None
+        XT_hidden_states = self.input_layernorm(XT_hidden_states) if XT_hidden_states is not None else None
         # Self Attention
         X0_hidden_states, XT_hidden_states, _ = self.self_attn(
             X0_hidden_states=X0_hidden_states,
@@ -359,17 +342,17 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
             **kwargs,
         )
         X0_hidden_states = X0_residual + X0_hidden_states
-        XT_hidden_states = XT_residual + XT_hidden_states if self.training else None
+        XT_hidden_states = XT_residual + XT_hidden_states if XT_hidden_states is not None else None
 
         # Fully Connected
         X0_residual = X0_hidden_states
-        XT_residual = XT_hidden_states if self.training else None
+        XT_residual = XT_hidden_states if XT_hidden_states is not None else None
         X0_hidden_states = self.post_attention_layernorm(X0_hidden_states)
-        XT_hidden_states = self.post_attention_layernorm(XT_hidden_states) if self.training else None
+        XT_hidden_states = self.post_attention_layernorm(XT_hidden_states) if XT_hidden_states is not None else None
         X0_hidden_states = self.mlp(X0_hidden_states)
-        XT_hidden_states = self.mlp(XT_hidden_states) if self.training else None
+        XT_hidden_states = self.mlp(XT_hidden_states) if XT_hidden_states is not None else None
         X0_hidden_states = X0_residual + X0_hidden_states
-        XT_hidden_states = XT_residual + XT_hidden_states if self.training else None
+        XT_hidden_states = XT_residual + XT_hidden_states if XT_hidden_states is not None else None
         return X0_hidden_states, XT_hidden_states
 
 
@@ -395,51 +378,29 @@ class Qwen3PreTrainedModel(PreTrainedModel):
 class Qwen3RotaryEmbedding(nn.Module):
     inv_freq: torch.Tensor  # fix linting for `register_buffer`
 
+    @staticmethod
+    def compute_default_rope_parameters(config: Qwen3Config, device=None):
+        return _compute_default_rope_parameters(config, device)
+
     def __init__(self, config: Qwen3Config, device=None):
         super().__init__()
+        # BC: "rope_type" was originally "type"
+        if hasattr(config, "rope_scaling") and isinstance(config.rope_scaling, dict):
+            self.rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type"))
+        else:
+            self.rope_type = "default"
         self.max_seq_len_cached = config.max_position_embeddings
         self.original_max_seq_len = config.max_position_embeddings
 
         self.config = config
+        if self.rope_type in (None, "default"):
+            self.rope_init_fn = ROPE_INIT_FUNCTIONS.get("default", _compute_default_rope_parameters)
+        else:
+            self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
 
-        self.rope_type = self.config.rope_parameters["rope_type"]
-        rope_init_fn: Callable = self.compute_default_rope_parameters
-        if self.rope_type != "default":
-            rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
-        inv_freq, self.attention_scaling = rope_init_fn(self.config, device)
-
+        inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self.register_buffer("original_inv_freq", inv_freq.clone(), persistent=False)
-
-    @staticmethod
-    def compute_default_rope_parameters(
-        config: Qwen3Config | None = None,
-        device: Optional["torch.device"] = None,
-        seq_len: int | None = None,
-    ) -> tuple["torch.Tensor", float]:
-        """
-        Computes the inverse frequencies according to the original RoPE implementation
-        Args:
-            config ([`~transformers.PreTrainedConfig`]):
-                The model configuration.
-            device (`torch.device`):
-                The device to use for initialization of the inverse frequencies.
-            seq_len (`int`, *optional*):
-                The current sequence length. Unused for this type of RoPE.
-        Returns:
-            Tuple of (`torch.Tensor`, `float`), containing the inverse frequencies for the RoPE embeddings and the
-            post-processing scaling factor applied to the computed cos/sin (unused in this type of RoPE).
-        """
-        base = config.rope_parameters["rope_theta"]
-        dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
-
-        attention_factor = 1.0  # Unused in this type of RoPE
-
-        # Compute the inverse frequencies
-        inv_freq = 1.0 / (
-            base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim)
-        )
-        return inv_freq, attention_factor
+        self.original_inv_freq = self.inv_freq
 
     @torch.no_grad()
     @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
@@ -448,7 +409,7 @@ class Qwen3RotaryEmbedding(nn.Module):
         position_ids_expanded = position_ids[:, None, :].float()
 
         device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
-        with maybe_autocast(device_type=device_type, enabled=False):  # Force float32
+        with torch.autocast(device_type=device_type, enabled=False):  # Force float32
             freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
             emb = torch.cat((freqs, freqs), dim=-1)
             cos = emb.cos() * self.attention_scaling
@@ -464,9 +425,17 @@ class Qwen3Model(Qwen3PreTrainedModel):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.image_vocab_size = getattr(config, "image_vocab_size", 16384)
-        self.image_embed_tokens = nn.Embedding(self.image_vocab_size, config.hidden_size)
+        self.unified_head = getattr(config, "unified_head", False)
+
+        if self.unified_head:
+            image_offset = getattr(config, "image_offset", 200000)
+            total_vocab = image_offset + self.image_vocab_size
+            self.embed_tokens = nn.Embedding(total_vocab, config.hidden_size, self.padding_idx)
+            self.image_embed_tokens = None
+        else:
+            self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+            self.image_embed_tokens = nn.Embedding(self.image_vocab_size, config.hidden_size)
         self.layers = nn.ModuleList(
             [Qwen3DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
@@ -477,6 +446,12 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
         # Initialize weights and apply final processing
         self.post_init()
+
+    def get_input_embeddings(self):
+        return self.embed_tokens
+
+    def set_input_embeddings(self, new_embeddings):
+        self.embed_tokens = new_embeddings
 
     # @check_model_inputs
     @auto_docstring
@@ -489,14 +464,17 @@ class Qwen3Model(Qwen3PreTrainedModel):
         X0_inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        calculate_likelihood: Optional[bool] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
         r"""
         Args:
-            time_sample (`torch.Tensor` of shape `(batch_size, sequence_length + 1)`, *optional*):
-                Time sampling tensor for diffusion-causal attention. Each element represents the diffusion time step
-                for the corresponding token. Tokens with larger time values cannot attend to tokens with smaller time
-                values. The first element should be 1.1 to ensure all tokens can attend to the first position.
+            X0_input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+                Indices of input sequence tokens in the vocabulary.
+            attention_mask (`BlockMask`, *optional*):
+                Attention mask for Flex Attention. Should be a block mask of shape `(batch_size, sequence_length)`.
+            calculate_likelihood (`bool`, *optional*):
+                Whether to calculate the likelihood of the input sequence. If `True`, the model will compute the likelihood using the XT stream, which is necessary for training. If `False`, the model will only compute the hidden states for the X0 stream, which can be used for efficient decoding.
         """
         if (X0_input_ids is None) ^ (X0_inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -504,24 +482,53 @@ class Qwen3Model(Qwen3PreTrainedModel):
             raise ValueError("attention_mask must be provided for diffusion-causal attention.")
 
         if X0_inputs_embeds is None:
-            image_offset = getattr(self.config, "image_offset", 200000)
-            is_image = X0_input_ids >= image_offset
-            is_text = ~is_image
+            token_types = kwargs.get("token_types", None)
+            if self.unified_head:
+                if token_types is not None:
+                    token_types = token_types.to(X0_input_ids.device)
+                    image_offset = getattr(self.config, "image_offset", 200000)
+                    is_image_token = (token_types == 1) & (X0_input_ids != self.config.mask_token_id)
+                    embed_ids = X0_input_ids.clone()
+                    embed_ids[is_image_token] = embed_ids[is_image_token] + image_offset
+                    X0_inputs_embeds = self.embed_tokens(embed_ids)
+                else:
+                    X0_inputs_embeds = self.embed_tokens(X0_input_ids)
+            else:
+                if token_types is None:
+                    image_offset = getattr(self.config, "image_offset", 200000)
+                    is_image = X0_input_ids >= image_offset
+                    is_text = ~is_image
+                    img_indices = X0_input_ids[is_image] - image_offset if is_image.any() else None
+                else:
+                    token_types = token_types.to(X0_input_ids.device)
+                    is_image = (token_types == 1) & (X0_input_ids != self.config.mask_token_id)
+                    is_text = ~is_image
+                    img_indices = X0_input_ids[is_image] if is_image.any() else None
 
-            X0_inputs_embeds = torch.zeros(
-                (*X0_input_ids.shape, self.config.hidden_size),
-                dtype=self.embed_tokens.weight.dtype,
-                device=X0_input_ids.device,
-            )
-            # Text tokens -> text embedding
-            X0_inputs_embeds[is_text] = self.embed_tokens(X0_input_ids[is_text])
-            # Image tokens -> image embedding (undo offset)
-            if is_image.any():
-                img_indices = X0_input_ids[is_image] - image_offset
-                X0_inputs_embeds[is_image] = self.image_embed_tokens(img_indices)
+                X0_inputs_embeds = torch.zeros(
+                    (*X0_input_ids.shape, self.config.hidden_size),
+                    dtype=self.embed_tokens.weight.dtype,
+                    device=X0_input_ids.device,
+                )
+                # Text tokens -> text embedding
+                X0_inputs_embeds[is_text] = self.embed_tokens(X0_input_ids[is_text])
+                # Image tokens -> image embedding. When token_types are provided,
+                # image ids are raw codebook indices; otherwise fall back to the
+                # legacy offset-encoded input convention.
+                if is_image.any():
+                    X0_inputs_embeds[is_image] = self.image_embed_tokens(img_indices)
+                elif self.training:
+                    # DeepSpeed ZeRO-2 requires all parameters in computation graph
+                    # on every rank, even when no image tokens in this micro-batch.
+                    # Feed a dummy index through image_embed_tokens and connect it
+                    # (with zero contribution) to the input embeddings so the
+                    # parameter participates in the backward graph.
+                    dummy_idx = torch.zeros(1, dtype=torch.long, device=X0_input_ids.device)
+                    dummy_embed = self.image_embed_tokens(dummy_idx)
+                    X0_inputs_embeds = X0_inputs_embeds + dummy_embed.sum() * 0.0
 
-        if self.training:
-            if self.XT_input_ids is None or self.XT_input_ids.shape[-1] != X0_input_ids.shape[-1]:
+        if self.training or calculate_likelihood:
+            if self.XT_input_ids is None or self.XT_input_ids.shape != X0_input_ids.shape:
                 self.XT_input_ids = torch.full_like(X0_input_ids, self.config.mask_token_id)
             # XT stream: mask tokens use text embedding (XT always gets [MASK] embeddings)
             XT_inputs_embeds = self.embed_tokens(self.XT_input_ids)
@@ -559,23 +566,23 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 **kwargs,
             )
 
-        if not self.training:
-            X0_hidden_states = self.norm(X0_hidden_states)
-            return BaseModelOutputWithPast(
-                last_hidden_state=X0_hidden_states,
-                past_key_values=past_key_values if use_cache else None,
-            )
-        else:
+        if self.training or calculate_likelihood:
             XT_hidden_states = self.norm(XT_hidden_states)
             return BaseModelOutputWithPast(
                 last_hidden_state=XT_hidden_states,
+                past_key_values=past_key_values if use_cache else None,
+            )
+        else:
+            X0_hidden_states = self.norm(X0_hidden_states)
+            return BaseModelOutputWithPast(
+                last_hidden_state=X0_hidden_states,
                 past_key_values=past_key_values if use_cache else None,
             )
 
 
 @auto_docstring
 class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
-    _tied_weights_keys = {}  # Don't tie — multimodal needs separate spaces
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
@@ -600,6 +607,15 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         # Initialize weights and apply final processing
         self.post_init()
 
+    def tie_weights(self, missing_keys: set[str] | None = None, recompute_mapping: bool = True):
+        # Delegate standard tie (lm_head ↔ embed_tokens) to parent
+        super().tie_weights(missing_keys=missing_keys, recompute_mapping=recompute_mapping)
+
+        # Dual-head mode: also tie image_lm_head to image_embed_tokens
+        if self.image_lm_head is not None and self.model.image_embed_tokens is not None:
+            if self.image_lm_head.weight.shape == self.model.image_embed_tokens.weight.shape:
+                self.image_lm_head.weight = self.model.image_embed_tokens.weight
+
     @can_return_tuple
     @auto_docstring
     def forward(
@@ -613,34 +629,28 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         use_cache: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
+        calculate_likelihood: bool = False,
         **kwargs: Unpack[TransformersKwargs],
     ) -> CausalLMOutputWithPast:
         r"""
-        labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
-            Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
-            config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
-            (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
-        
-        time_sample (`torch.Tensor` of shape `(batch_size, sequence_length + 1)`, *optional*):
-                Time sampling tensor for diffusion-causal attention. Each element represents the diffusion time step
-                for the corresponding token. Tokens with larger time values cannot attend to tokens with smaller time
-                values. The first element should be 1.1 to ensure all tokens can attend to the first position.
-        Example:
-
-        ```python
-        >>> from transformers import AutoTokenizer, Qwen3ForCausalLM
-
-        >>> model = Qwen3ForCausalLM.from_pretrained("Qwen/Qwen3-8B")
-        >>> tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
-
-        >>> prompt = "Hey, are you conscious? Can you talk to me?"
-        >>> inputs = tokenizer(prompt, return_tensors="pt")
-
-        >>> # Generate
-        >>> generate_ids = model.generate(inputs.input_ids, max_length=30)
-        >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-        "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
+        Args:
+            X0_input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+                Indices of input sequence tokens in the vocabulary. The input sequence should be formatted as
+                `[X0_1, X0_2, ..., X0_n]`, where `X0_i` represents the tokens at diffusion time step 0 for the i-th
+                position. All tokens in `X0_input_ids` should have the same diffusion time step (i.e., all should be
+                from the same "diffusion slice"). If `inputs_embeds` is not provided, this argument will be used to
+                compute the input embeddings.
+            attention_mask (`BlockMask`, *optional*):
+                Attention mask for diffusion-causal attention. Should be a block mask of shape `(batch_size,
+                sequence_length)` where each block corresponds to a diffusion time step. The mask should be designed
+                such that tokens can only attend to tokens from the same or earlier diffusion time steps, and not to
+                tokens from later diffusion time steps.
+            labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+                Labels for language modeling. Tokens with labels set to -100 will be ignored when computing the loss.
+            calculate_likelihood (`bool`, *optional*, defaults to `False`):
+                Whether to calculate the likelihood of the input sequence. If `True`, the model will compute the likelihood using the XT stream, which is necessary for training. If `False`, the model will only compute the hidden states for the X0 stream, which can be used for efficient decoding. Note that when `calculate_likelihood` is `True`, the model will return the likelihood loss in the `loss` field of the output, and the `logits` field will contain the logits from the XT stream.
         ```"""
+        calculate_likelihood = calculate_likelihood or labels is not None
         outputs: BaseModelOutputWithPast = self.model(
             X0_input_ids=X0_input_ids,
             attention_mask=attention_mask,
@@ -649,6 +659,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             cache_position=cache_position,
+            calculate_likelihood=calculate_likelihood,
             **kwargs,
         )
 
@@ -661,6 +672,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         loss = None
         if labels is not None:
             if token_types is not None:
+                token_types = token_types.to(hidden_states.device)
                 image_offset = getattr(self.config, "image_offset", 200000)
                 text_mask = (token_types == 0) | (token_types == 2)
                 image_mask = token_types == 1
@@ -672,9 +684,12 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 image_flat_mask = image_mask.view(-1)
 
                 if self.unified_head:
+                    unified_labels = flat_labels.clone()
+                    image_label_mask = image_flat_mask & (unified_labels != -100)
+                    unified_labels[image_label_mask] = unified_labels[image_label_mask] + image_offset
                     # Single head: one CE loss over all positions
                     loss = F.cross_entropy(
-                        self.lm_head(flat_hidden), flat_labels, ignore_index=-100
+                        self.lm_head(flat_hidden), unified_labels, ignore_index=-100
                     )
                     # Post-hoc per-modality metrics
                     text_loss = torch.tensor(0.0, device=flat_hidden.device)
@@ -687,11 +702,14 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                             )
                         if image_flat_mask.any():
                             image_logits = self.lm_head(flat_hidden[image_flat_mask])
+                            image_labels = unified_labels[image_flat_mask]
                             image_loss = F.cross_entropy(
-                                image_logits, flat_labels[image_flat_mask], ignore_index=-100
+                                image_logits, image_labels, ignore_index=-100
                             )
                 else:
-                    # Dual head: separate heads for text and image
+                    # DeepSpeed ZeRO-2 requires all parameters in computation graph
+                    # on every rank, even when no image tokens in this micro-batch.
+                    # Always compute through image_lm_head with zero contribution.
                     text_loss = 0.0
                     if text_flat_mask.any():
                         text_logits = self.lm_head(flat_hidden[text_flat_mask])
@@ -699,13 +717,16 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                             text_logits, flat_labels[text_flat_mask], ignore_index=-100
                         )
 
-                    image_loss = 0.0
+                    # Always compute through image_lm_head to keep it in the graph
+                    image_logits = self.image_lm_head(flat_hidden[image_flat_mask])
                     if image_flat_mask.any():
-                        image_logits = self.image_lm_head(flat_hidden[image_flat_mask])
-                        image_labels = flat_labels[image_flat_mask] - image_offset
+                        image_labels = flat_labels[image_flat_mask]
                         image_loss = F.cross_entropy(
                             image_logits, image_labels, ignore_index=-100
                         )
+                    else:
+                        # Zero contribution but keeps image_lm_head in the computation graph
+                        image_loss = image_logits.sum() * 0.0
 
                     loss = text_loss + self.lambda_image * image_loss
             else:
@@ -731,193 +752,225 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
     @torch.compile(mode="max-autotune-no-cudagraphs")
     def loss_function(self, logits, labels, ignore_index, reduction='mean'):
         return F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=ignore_index, reduction=reduction)
-    
-    # def forward_process(
-    #     self,
-    #     X0_input_ids, 
-    #     labels,
-    #     attention_mask,
-    #     return_logits=False,
-    # ):
-    #     logits = self.forward(X0_input_ids=X0_input_ids, attention_mask=attention_mask).logits  # shape: [B, L, V]
 
-    #     loss = self.loss_function(logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=-100)
-    
-    #     if return_logits:
-    #         return loss, logits.detach()
-    #     else:
-    #         return loss
-        
-    # def forward_process_inference(
-    #     self,
-    #     input_ids, 
-    #     labels,
-    #     p_mask,
-    #     masked_indices,
-    #     attention_mask=None,
-    #     return_logits=False,
-    # ):
-    #     logits = self.forward(X0_input_ids=input_ids, attention_mask=attention_mask).logits  # shape: [B, L, V]
-        
-    #     loss = self.loss_function(
-    #         logits[masked_indices],
-    #         labels[masked_indices],
-    #         ignore_index=-100,
-    #         reduction='none',
-    #     )
-    #     loss = loss / p_mask[masked_indices]
-    #     loss = loss.sum() / (labels.shape[0] * labels.shape[1])
-        
-    #     if return_logits:
-    #         return loss, logits.detach()
-    #     else:
-    #         return loss 
-        
-        
-    # def forward_process_sft(
-    #     self,
-    #     X0_input_ids,
-    #     labels,
-    #     attention_mask,
-    #     return_logits=False,
-    # ):
-    #     logits = self.forward(X0_input_ids=X0_input_ids, attention_mask=attention_mask).logits  # shape: [B, L, V]
-    #     # 使用 reduction='none' 获取每个token的loss，然后对每个样本求平均，再对batch求平均
-    #     # 这样每个样本的贡献是相等的，而不是每个token的贡献相等
-    #     loss_per_token =  self.loss_function(
-    #         logits.view(-1, logits.size(-1)), 
-    #         labels.view(-1), 
-    #         ignore_index=-100,
-    #         reduction='none'
-    #     )  # shape: [B*L]
-    #     loss_per_token = loss_per_token.view(labels.shape)  # shape: [B, L]
-    #     # 对每个样本求平均（忽略-100的token）
-    #     valid_mask = (labels != -100).float()  # shape: [B, L]
-    #     loss_per_sample = (loss_per_token * valid_mask).sum(dim=1) / valid_mask.sum(dim=1).clamp(min=1)  # shape: [B]
-    #     # 对所有样本求平均
-    #     loss = loss_per_sample.mean()
-        
-    #     if return_logits:
-    #         return loss, logits.detach()
-    #     else:
-    #         return loss
-        
+    def _image_logits_from_hidden(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.unified_head:
+            image_offset = getattr(self.config, "image_offset", 200000)
+            return self.lm_head(hidden_states)[..., image_offset:image_offset + self.image_vocab_size]
+        return self.image_lm_head(hidden_states)
+
+    def _sample_from_logits(self, logits: torch.Tensor, temperature: float) -> tuple[torch.Tensor, torch.Tensor]:
+        if temperature < 1e-6:
+            probs = torch.softmax(logits, dim=-1)
+            next_token = logits.argmax(dim=-1)
+        else:
+            probs = torch.softmax(logits / temperature, dim=-1)
+            next_token = torch.multinomial(probs, 1).squeeze(-1)
+        conf = probs.gather(-1, next_token.unsqueeze(-1)).squeeze(-1)
+        return next_token, conf
+
+    def _select_fill_mask(self, conf: torch.Tensor, valid_mask: torch.Tensor, ratio, parallel_rate, decode_strategy: str) -> torch.Tensor:
+        masked_conf = conf.masked_fill(~valid_mask, -1.0)
+        fill_mask = torch.zeros_like(valid_mask, dtype=torch.bool)
+        if not valid_mask.any():
+            return fill_mask
+
+        if decode_strategy == "random":
+            k = 1 if parallel_rate is None else max(1, min(int(parallel_rate), int(valid_mask.sum().item())))
+            cols = torch.multinomial(valid_mask.float(), num_samples=k, replacement=False)
+            fill_mask[cols] = True
+            return fill_mask
+
+        if decode_strategy != "confidence":
+            raise ValueError(f"Unknown decode_strategy: {decode_strategy}")
+
+        if parallel_rate is not None:
+            k = max(1, min(int(parallel_rate), int(valid_mask.sum().item())))
+            _, cols = torch.topk(masked_conf, k=k, dim=-1)
+            fill_mask[cols] = True
+        elif ratio is not None:
+            fill_mask = masked_conf >= ratio
+            if not fill_mask.any():
+                fill_mask[masked_conf.argmax(dim=-1)] = True
+        else:
+            fill_mask[masked_conf.argmax(dim=-1)] = True
+        return fill_mask
+
     @torch.no_grad()
-    def generate(self, prompt_ids, gen_length, num_response=1, prompt_task='ar', block_size=4, temperature=1.0, ratio=None, parallel_rate=None, decode_strategy='confidence'):
+    def _generate_one(
+        self,
+        prompt_ids: torch.Tensor,
+        gen_length: int,
+        prompt_task: str,
+        block_size: int,
+        temperature: float,
+        ratio,
+        parallel_rate,
+        decode_strategy: str,
+    ) -> tuple[torch.Tensor, torch.Tensor, int, int]:
         from utils.utils import get_selfless_mask
-        # 确保 prompt_ids 是 [1, L] 并复制为 [batch, L]
-        if prompt_ids.dim() == 1:
-            prompt_ids = prompt_ids.unsqueeze(0)
-        prompt_ids = prompt_ids.repeat(num_response, 1)
-        
-        prompt_len = prompt_ids.shape[-1]
-        prefix = prompt_ids.to(self.device)
-        # sigma 需要足够长以容纳 prompt + gen_length + block_size
-        max_seq_len = prompt_len + gen_length + block_size
-        sigma = torch.zeros((num_response, max_seq_len), dtype=torch.float32, device=self.device)
-        
-        # init sigma for prompt tokens
-        if prompt_task == 'ar':
-            sigma[:, :prompt_len] = prompt_len + 1 - torch.arange(0, prompt_len, device=self.device)
-        elif prompt_task == 'diffusion':
-            sigma[:, :prompt_len] = torch.rand(num_response, prompt_len, device=self.device) + 1.0
+
+        device = self.device
+        image_tokens_per_img = getattr(self.config, "image_tokens_per_img", 256)
+        boi_token_id = getattr(self.config, "boi_token_id", None)
+        eoi_token_id = getattr(self.config, "eoi_token_id", None)
+        eos_token_id = getattr(self.config, "eos_token_id", None)
+        if boi_token_id is None or eoi_token_id is None:
+            raise ValueError("boi_token_id and eoi_token_id must be set for multimodal generation.")
+
+        seq = prompt_ids.to(device=device, dtype=torch.long).flatten().clone()
+        token_types = torch.zeros_like(seq, dtype=torch.uint8)
+        sigma = torch.empty(seq.shape[0], dtype=torch.float32, device=device)
+        if prompt_task == "ar":
+            sigma[:] = torch.arange(seq.shape[0], device=device, dtype=sigma.dtype)
+        elif prompt_task == "diffusion":
+            sigma[:] = torch.rand(seq.shape[0], device=device, dtype=sigma.dtype)
         else:
             raise ValueError(f"Invalid prompt task: {prompt_task}")
-        step = 0
-        generated_tokens = 0
 
-        while (prefix.shape[-1] < prompt_len + gen_length):
-            # seq: [batch, seq_len + block_size]
-            seq_len = prefix.shape[-1] + block_size
-            seq = torch.full((num_response, seq_len), self.config.mask_token_id, device=self.device)
-            # 将 prefix 的内容复制到 seq 的前面部分
-            seq[:, :prefix.shape[-1]] = prefix
-            attention_mask = get_selfless_mask(v_sample=sigma[:, :seq_len], seq_len=seq_len, device=self.device)
-                        
-            # 只要 batch 中任意一个样本在当前 block 还有 mask，就继续循环
-            while seq.eq(self.config.mask_token_id).any():
-                logits = self(seq, attention_mask=attention_mask).logits # [batch, L, V]
-                
-                if temperature < 1e-6:
-                    probs = torch.softmax(logits, dim=-1)
-                    next_token = logits.argmax(dim=-1)
-                else:
-                    probs = torch.softmax(logits / temperature, dim=-1)
-                    # 展平 batch 维度进行采样，然后再恢复形状 [batch, L]
-                    next_token = torch.multinomial(probs.reshape(-1, probs.size(-1)), 1).view(num_response, -1)
-                
-                # 计算置信度
-                conf = probs.gather(-1, next_token.unsqueeze(-1)).squeeze(-1)  # [batch, L]
-                
-                # 构建掩码 [batch, L]
-                valid_mask = seq.eq(self.config.mask_token_id)
-                masked_conf = conf.masked_fill(~valid_mask, -1.0)
-                
-                # 决策填充位置
-                if decode_strategy == 'random':
-                    fill_mask = torch.zeros_like(masked_conf, dtype=torch.bool)
-                    rows_still_have_mask = valid_mask.any(dim=-1)  # [batch]
-                    if rows_still_have_mask.any():
-                        rows_idx = rows_still_have_mask.nonzero(as_tuple=True)[0]  # 需采样的 batch 行
-                        # 在各行的有效 mask 位置上均匀采样parallel_rate个列索引
-                        sampled_cols = torch.multinomial(valid_mask[rows_idx].float(), num_samples=1 if parallel_rate is None else max(1, int(parallel_rate)), replacement=False)
-                        fill_mask[rows_idx, sampled_cols] = True
-                elif decode_strategy == 'confidence':
-                    if parallel_rate is not None:
-                        k = int(parallel_rate)
-                        k = max(1, k)
-                        # 选取置信度最高的 k 个位置
-                        topk_values, topk_indices = torch.topk(masked_conf, k=k, dim=-1)
-                        
-                        fill_mask = torch.zeros_like(masked_conf, dtype=torch.bool)
-                        # 过滤掉非mask位置（值为-1.0的位置），确保只填充有效的mask token
-                        fill_mask.scatter_(1, topk_indices, topk_values > -0.5)
-                    elif ratio is not None:
-                        fill_mask = (masked_conf >= ratio)
-                        # Fallback: 检查哪些 batch 样本没有选中任何位置，强制选最好的一个
-                        # 但需要排除已经生成完的样本（没有mask token的样本）
-                        rows_with_no_fill = ~(fill_mask.any(dim=-1))
-                        # 只对还有mask token的样本进行fallback
-                        rows_still_have_mask = valid_mask.any(dim=-1)  # [batch]
-                        rows_need_fallback = rows_with_no_fill & rows_still_have_mask
-                        if rows_need_fallback.any():
-                            fallback_cols = masked_conf[rows_need_fallback].argmax(dim=-1)
-                            fill_mask[rows_need_fallback, fallback_cols] = True
-                    else:
-                        # 每个 batch 样本选一个置信度最高的
-                        fill_mask = torch.zeros_like(masked_conf, dtype=torch.bool)
-                        fill_mask.scatter_(1, masked_conf.argmax(dim=-1, keepdim=True), True)
-                
-                # 批量更新：获取 batch 索引(rows)和位置索引(cols)
-                rows, cols = fill_mask.nonzero(as_tuple=True)
-                seq[rows, cols] = next_token[rows, cols]
-                # 更新sigma
-                sigma[rows, cols] = 0.1 + 0.8 * (1.0 - step / (gen_length + 1.0))
-                generated_tokens += len(rows)
-                step += 1
-            prefix = seq
-            # 如果batch中所有样本都包含了<|im_end|> token，则停止生成
-            # 注意：只检查生成的部分（prompt_len之后），不检查prompt部分
-            # end_token_id = getattr(self.config, 'im_end_token_id', None)
-            end_token_id = getattr(self.config, 'eos_token_id', None)
-            if end_token_id is not None:
-                # 只检查生成的部分（prompt_len之后）是否包含 end_token_id
-                generated_part = seq[:, prompt_len:]  # [batch, generated_len]
-                has_end = (generated_part == end_token_id).any(dim=-1)  # [batch]
-                if has_end.all():
-                    seq = seq.masked_fill(seq.eq(self.config.mask_token_id), end_token_id)
-                    break
-        
-        if step > 0:
-            parallel_rate = (generated_tokens / num_response) / step
-        else:
-            parallel_rate = 0.0
-        out_put = {
-            'seq': seq,
-            'parallel_rate': parallel_rate,
+        generated_text_tokens = 0
+        image_fill_steps = 0
+        image_tokens_filled = 0
+
+        def next_sigma_values(n: int) -> torch.Tensor:
+            start = float(sigma.max().item() + 1.0) if sigma.numel() > 0 else 0.0
+            return torch.arange(start, start + n, device=device, dtype=sigma.dtype)
+
+        while generated_text_tokens < gen_length:
+            seq = torch.cat([seq, torch.tensor([self.config.mask_token_id], device=device, dtype=torch.long)])
+            token_types = torch.cat([token_types, torch.tensor([0], device=device, dtype=torch.uint8)])
+            sigma = torch.cat([sigma, next_sigma_values(1)])
+            L = seq.shape[0]
+            attention_mask = get_selfless_mask(sigma=sigma.unsqueeze(0), seq_len=L, device=device)
+            hidden = self.model(
+                X0_input_ids=seq.unsqueeze(0),
+                attention_mask=attention_mask,
+                token_types=token_types.unsqueeze(0),
+                calculate_likelihood=True,
+            ).last_hidden_state[0, -1]
+            text_logits = self.lm_head(hidden.unsqueeze(0))
+            if self.unified_head:
+                text_logits = text_logits[..., :getattr(self.config, "image_offset", 200000)]
+            next_token, _ = self._sample_from_logits(text_logits, temperature)
+            next_token = next_token.item()
+            seq[-1] = next_token
+            generated_text_tokens += 1
+
+            if eos_token_id is not None and next_token == eos_token_id:
+                break
+
+            if next_token != boi_token_id:
+                continue
+
+            image_masks = torch.full(
+                (image_tokens_per_img,), self.config.mask_token_id, device=device, dtype=torch.long
+            )
+            eoi = torch.tensor([eoi_token_id], device=device, dtype=torch.long)
+            seq = torch.cat([seq, image_masks, eoi])
+            image_types = torch.full((image_tokens_per_img,), 1, device=device, dtype=torch.uint8)
+            eoi_type = torch.tensor([2], device=device, dtype=torch.uint8)
+            token_types = torch.cat([token_types, image_types, eoi_type])
+            # EOI gets earlier sigma than image mask tokens, matching training:
+            # image queries can condition on the known fixed image boundary.
+            eoi_sigma = next_sigma_values(1)
+            image_sigma = torch.full(
+                (image_tokens_per_img,),
+                float(eoi_sigma.item() + image_tokens_per_img + 1.0),
+                device=device,
+                dtype=sigma.dtype,
+            )
+            sigma = torch.cat([sigma, image_sigma, eoi_sigma])
+
+            image_start = seq.shape[0] - image_tokens_per_img - 1
+            image_end = seq.shape[0] - 1
+            next_image_order = float(eoi_sigma.item() + 1.0)
+            while seq[image_start:image_end].eq(self.config.mask_token_id).any():
+                L = seq.shape[0]
+                attention_mask = get_selfless_mask(sigma=sigma.unsqueeze(0), seq_len=L, device=device)
+                hidden = self.model(
+                    X0_input_ids=seq.unsqueeze(0),
+                    attention_mask=attention_mask,
+                    token_types=token_types.unsqueeze(0),
+                    calculate_likelihood=True,
+                ).last_hidden_state[0]
+                valid_mask = seq[image_start:image_end].eq(self.config.mask_token_id)
+                image_hidden = hidden[image_start:image_end]
+                image_logits = self._image_logits_from_hidden(image_hidden)
+                next_image_tokens, conf = self._sample_from_logits(image_logits, temperature)
+                fill_local = self._select_fill_mask(conf, valid_mask, ratio, parallel_rate, decode_strategy)
+                fill_positions = image_start + fill_local.nonzero(as_tuple=True)[0]
+                seq[fill_positions] = next_image_tokens[fill_local]
+                if fill_positions.numel() > 0:
+                    new_sigma = torch.arange(
+                        next_image_order,
+                        next_image_order + fill_positions.numel(),
+                        device=device,
+                        dtype=sigma.dtype,
+                    )
+                    sigma[fill_positions] = new_sigma
+                    next_image_order += float(fill_positions.numel())
+                    image_tokens_filled += int(fill_positions.numel())
+                image_fill_steps += 1
+
+        return seq, token_types, image_tokens_filled, image_fill_steps
+
+    @torch.no_grad()
+    def generate(self, prompt_ids, gen_length, num_response=1, prompt_task='ar', block_size=4, temperature=1.0, ratio=None, parallel_rate=None, decode_strategy='confidence', **kwargs):
+        if prompt_ids.dim() == 1:
+            prompt_ids = prompt_ids.unsqueeze(0)
+        base_prompts = prompt_ids.to(self.device)
+        if base_prompts.shape[0] == 1:
+            base_prompts = base_prompts.repeat(num_response, 1)
+        elif base_prompts.shape[0] != num_response:
+            raise ValueError("prompt_ids batch size must be 1 or equal to num_response")
+
+        seqs = []
+        type_seqs = []
+        total_image_tokens = 0
+        total_image_steps = 0
+        for i in range(num_response):
+            seq, token_types, image_tokens, image_steps = self._generate_one(
+                prompt_ids=base_prompts[i],
+                gen_length=gen_length,
+                prompt_task=prompt_task,
+                block_size=block_size,
+                temperature=temperature,
+                ratio=ratio,
+                parallel_rate=parallel_rate,
+                decode_strategy=decode_strategy,
+            )
+            seqs.append(seq)
+            type_seqs.append(token_types)
+            total_image_tokens += image_tokens
+            total_image_steps += image_steps
+
+        max_len = max(seq.shape[0] for seq in seqs)
+        pad_id = getattr(self.config, "eos_token_id", None)
+        if pad_id is None:
+            pad_id = 0
+        output = torch.full((num_response, max_len), pad_id, device=self.device, dtype=torch.long)
+        raw_output = torch.full((num_response, max_len), pad_id, device=self.device, dtype=torch.long)
+        output_token_types = torch.full((num_response, max_len), 3, device=self.device, dtype=torch.uint8)
+        image_offset = getattr(self.config, "image_offset", 200000)
+        for i, seq in enumerate(seqs):
+            token_types = type_seqs[i]
+            raw_output[i, :seq.shape[0]] = seq
+            output_token_types[i, :token_types.shape[0]] = token_types
+            display_seq = seq.clone()
+            image_mask = token_types == 1
+            display_seq[image_mask] = display_seq[image_mask] + image_offset
+            output[i, :seq.shape[0]] = display_seq
+
+        effective_parallel_rate = (
+            (total_image_tokens / max(1, num_response)) / total_image_steps
+            if total_image_steps > 0 else 0.0
+        )
+        return {
+            'seq': output,
+            'raw_seq': raw_output,
+            'token_types': output_token_types,
+            'parallel_rate': effective_parallel_rate,
         }
-        
-        return out_put
         
     @torch.no_grad()
     def speculative_generate(self, prompt_ids, gen_length, num_response=1, prompt_task='ar', block_size=4, temperature=1.0, ratio=None, parallel_rate=None):
@@ -937,9 +990,9 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         
         # Context 的 Sigma 设置
         if prompt_task == 'ar':
-            sigma[:, :prompt_len] = prompt_len + 1 - torch.arange(0, prompt_len, device=self.device)
+            sigma[:, :prompt_len] = torch.arange(0, prompt_len, device=self.device)
         elif prompt_task == 'diffusion':
-            sigma[:, :prompt_len] = torch.rand(num_response, prompt_len, device=self.device) + 1.0
+            sigma[:, :prompt_len] = torch.rand(num_response, prompt_len, device=self.device)
         else:
             raise ValueError(f"Invalid prompt task: {prompt_task}")
 
@@ -952,6 +1005,8 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             curr_block_size = min(block_size, prompt_len + gen_length - curr_len)
             if curr_block_size <= 0: break
             seq_len = curr_len + curr_block_size
+            block_order = torch.arange(curr_len, seq_len, device=self.device, dtype=sigma.dtype)
+            sigma[:, curr_len:seq_len] = block_order.unsqueeze(0)
             
             # ==============================================================
             # Phase 1: Draft
@@ -962,12 +1017,12 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             draft_sigma = sigma.clone() 
             # 保持 float32 以确保精度
             draft_token_probs = torch.zeros((num_response, curr_block_size), dtype=torch.float32, device=self.device)
-            draft_inner_step = global_step
+            draft_inner_order = float(curr_len)
             
             while draft_seq[:, curr_len:].eq(self.config.mask_token_id).any():
-                attention_mask = get_selfless_mask(v_sample=draft_sigma[:, :seq_len], seq_len=seq_len, device=self.device)
+                attention_mask = get_selfless_mask(sigma=draft_sigma[:, :seq_len], seq_len=seq_len, device=self.device)
                 
-                logits = self(draft_seq, attention_mask=attention_mask).logits
+                logits = self(draft_seq, attention_mask=attention_mask, calculate_likelihood=True).logits
                 
                 if temperature < 1e-6:
                     probs = torch.softmax(logits, dim=-1)
@@ -1009,8 +1064,8 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                     # 【修复点】：显式转换 dtype，解决 BFloat16 -> Float32 赋值报错
                     draft_token_probs[r_, bc_] = conf[r_, c_].to(dtype=draft_token_probs.dtype)
 
-                draft_sigma[rows, cols] = 0.1 + 0.8 * (1.0 - draft_inner_step / (gen_length + 1.0))
-                draft_inner_step += 1
+                draft_sigma[rows, cols] = draft_inner_order
+                draft_inner_order += 1.0
             
             draft_tokens = draft_seq[:, curr_len:]
 
@@ -1019,14 +1074,13 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             # ==============================================================
             verify_sigma = sigma.clone()
             
-            block_steps = torch.arange(curr_block_size, device=self.device) + global_step
-            block_ar_sigmas = 0.1 + 0.8 * (1.0 - block_steps / (gen_length + 1.0))
+            block_ar_sigmas = torch.arange(curr_len, seq_len, device=self.device, dtype=sigma.dtype)
             
             verify_sigma[:, curr_len:seq_len] = block_ar_sigmas.unsqueeze(0)
             
-            verify_attention_mask = get_selfless_mask(v_sample=verify_sigma[:, :seq_len], seq_len=seq_len, device=self.device)
+            verify_attention_mask = get_selfless_mask(sigma=verify_sigma[:, :seq_len], seq_len=seq_len, device=self.device)
             
-            verify_outputs = self(draft_seq, attention_mask=verify_attention_mask)
+            verify_outputs = self(draft_seq, attention_mask=verify_attention_mask, calculate_likelihood=True)
             verify_logits = verify_outputs.logits[:, curr_len:, :]
             
             if temperature < 1e-6:
@@ -1048,8 +1102,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             
             prefix = torch.cat([prefix, draft_tokens[:, :safe_n]], dim=1)
             
-            accepted_steps = torch.arange(safe_n, device=self.device) + global_step
-            accepted_sigmas = 0.1 + 0.8 * (1.0 - accepted_steps / (gen_length + 1.0))
+            accepted_sigmas = torch.arange(curr_len, curr_len + safe_n, device=self.device, dtype=sigma.dtype)
             sigma[:, curr_len : curr_len+safe_n] = accepted_sigmas.unsqueeze(0)
             
             global_step += safe_n
@@ -1059,8 +1112,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 resampled_token = torch.multinomial(target_probs[:, safe_n, :], 1)
                 prefix = torch.cat([prefix, resampled_token], dim=1)
                 
-                new_sigma = 0.1 + 0.8 * (1.0 - global_step / (gen_length + 1.0))
-                sigma[:, curr_len+safe_n] = new_sigma
+                sigma[:, curr_len+safe_n] = float(curr_len + safe_n)
                 
                 global_step += 1
                 generated_tokens += 1

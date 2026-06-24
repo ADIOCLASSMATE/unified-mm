@@ -8,16 +8,16 @@ def assign_sigma_multimodal(token_types, task_mode, seq_len):
     Follows RESEARCH.md §1.1-1.3 spec with three training modes.
     Returns sigma tensor of shape [seq_len] with values in ℝ.
 
-    Token types: 0=text, 1=image, 2=special(BOS/BOI/EOI), 3=padding
+    Token types: 0=text, 1=image, 2=special(BOI/EOI/EOS), 3=padding
 
     Modes:
-      text_to_image: text σ ∈ [2, 2+N] (condition), image σ ∈ [0,1] (target)
-      image_to_text: image σ ∈ [2, 3] (condition), text σ ∈ [0, N] (target)
-      text_only:     text σ = AR descending, image σ = -1 (nonexistent)
-      interleaved:   per-segment sigma (condition segments get high σ, target get low)
+      text_to_image: text gets earlier generation-order sigma, image gets later sigma
+      image_to_text: image gets earlier generation-order sigma, text gets later sigma
+      text_only:     text σ = AR generation order, image σ = -1 (nonexistent)
+      interleaved:   per-segment sigma in generation order
 
-    Special tokens: σ = max(all_other_sigmas) + 1 (dynamic global max)
-    Padding: σ = -1
+    Special tokens: σ follows their document order unless a task mode overrides it
+    Padding: σ = seq_len + 1
     """
     device = token_types.device
     sigma = torch.zeros(seq_len, dtype=torch.float32, device=device)
@@ -31,29 +31,29 @@ def assign_sigma_multimodal(token_types, task_mode, seq_len):
     n_image = image_mask.sum().item()
 
     if task_mode == "text_to_image":
-        # Text is condition (high sigma), image is target (low sigma)
+        # Text is condition: generated first, so it is visible to later image queries.
         if n_text > 0:
-            sigma[text_mask] = 2.0 + n_text - torch.arange(
+            sigma[text_mask] = torch.arange(
                 n_text, dtype=torch.float32, device=device
-            )  # σ ∈ [2, 2+N], AR descending within text
+            )
             sigma[text_mask] += torch.rand(n_text, device=device) * 0.1 - 0.05
         if n_image > 0:
-            sigma[image_mask] = torch.rand(n_image, device=device)  # σ ∈ [0, 1]
+            sigma[image_mask] = n_text + torch.rand(n_image, device=device)
 
     elif task_mode == "image_to_text":
-        # Image is condition (high sigma), text is target (low sigma)
+        # Image is condition: generated first, so it is visible to later text queries.
         if n_image > 0:
-            sigma[image_mask] = 2.0 + torch.rand(n_image, device=device)  # σ ∈ [2, 3]
+            sigma[image_mask] = torch.rand(n_image, device=device)
         if n_text > 0:
-            sigma[text_mask] = n_text - torch.arange(
+            sigma[text_mask] = n_image + torch.arange(
                 n_text, dtype=torch.float32, device=device
-            )  # σ ∈ [0, N], AR descending
+            )
             sigma[text_mask] += torch.rand(n_text, device=device) * 0.1 - 0.05
 
     elif task_mode == "text_only":
         # Standard AR for pure text
         if n_text > 0:
-            sigma[text_mask] = n_text - torch.arange(
+            sigma[text_mask] = torch.arange(
                 n_text, dtype=torch.float32, device=device
             )
         if n_image > 0:
@@ -61,8 +61,8 @@ def assign_sigma_multimodal(token_types, task_mode, seq_len):
 
     elif task_mode == "interleaved":
         # Mixed mode: alternating condition/target regions
-        # Strategy: assign AR sigma within each text block, random sigma for images
-        # Text blocks get descending sigma, images get random in [0,1]
+        # Strategy: assign generation-order sigma within each text block,
+        # random local order for image spans.
         pos = 0
         text_block_start = None
         while pos < seq_len:
@@ -76,39 +76,31 @@ def assign_sigma_multimodal(token_types, task_mode, seq_len):
                 if text_block_start is not None:
                     block_len = pos - text_block_start
                     if block_len > 0:
-                        sigma[text_block_start:pos] = (
-                            block_len - torch.arange(block_len, dtype=torch.float32, device=device)
-                        )
+                        sigma[text_block_start:pos] = torch.arange(block_len, dtype=torch.float32, device=device)
                     text_block_start = None
                 if image_mask[pos]:
                     block_end = min(pos + 512, seq_len)
                     block_len = block_end - pos
-                    sigma[pos:block_end] = torch.rand(block_len, device=device)
+                    sigma[pos:block_end] = pos + torch.rand(block_len, device=device)
             pos += 1
         # Handle trailing text block
         if text_block_start is not None:
             block_len = seq_len - text_block_start
             if block_len > 0:
-                sigma[text_block_start:seq_len] = (
-                    block_len - torch.arange(block_len, dtype=torch.float32, device=device)
-                )
+                sigma[text_block_start:seq_len] = torch.arange(block_len, dtype=torch.float32, device=device)
 
     else:
         raise ValueError(f"Unknown task_mode: {task_mode}")
 
-    # Special tokens: set to global max + 1 (visible to all)
-    other_sigmas = sigma[~(special_mask | pad_mask)]
-    if other_sigmas.numel() > 0:
-        max_sigma = other_sigmas.max().item()
-    else:
-        max_sigma = 1.0
-    sigma[special_mask] = max_sigma + 1.0
+    # Special tokens keep their absolute positions by default.
+    if special_mask.any():
+        sigma[special_mask] = torch.arange(seq_len, dtype=torch.float32, device=device)[special_mask]
 
-    # Padding: set to -1 (excluded from attention)
-    sigma[pad_mask] = -1.0
+    # Padding gets a high sigma so real tokens cannot attend to it as K/V.
+    sigma[pad_mask] = float(seq_len + 1)
 
     # Clamp to avoid extreme values
-    sigma = sigma.clamp(-1.0, 1e4)
+    sigma = sigma.clamp(0.0, 1e4)
 
     return sigma
 
@@ -185,8 +177,8 @@ class SelflessSampler():
             # ensure first token is not masked
             v_sample[:, 0] = 2
         elif self.attention_pattern == "ar":
-            # ar: autoregressive — build strictly decreasing v_sample for AR modeling
-            # earlier tokens have larger values (processed first), later tokens have smaller values (processed later)
+            # ar: autoregressive generation order.
+            # Earlier tokens have smaller sigma and are visible to later tokens.
             b, l = text_ids.shape
 
             # t_sample set to zero
@@ -194,15 +186,10 @@ class SelflessSampler():
 
             # create position indices [0, 1, 2, ..., l-1]
             pos_idx = torch.arange(l, device=text_ids.device, dtype=torch.float32).unsqueeze(0)  # (1, L)
-            # build strictly decreasing v_sample: from near 1 to near 0
-            # first token has largest v (near 1), last token has smallest v (near 0)
-            # linear interpolation: from 1-eps decreasing to eps
             if l > 1:
-                # linear decrease from 1-eps to eps
-                v_sample = 1 - eps - (1 - 2 * eps) * pos_idx / (l - 1)  # (1, L)
+                v_sample = eps + (1 - 2 * eps) * pos_idx / (l - 1)  # (1, L)
             else:
-                # when l=1, only one token, set to 1-eps
-                v_sample = torch.ones(1, 1, device=text_ids.device) * (1 - eps)
+                v_sample = torch.ones(1, 1, device=text_ids.device) * eps
             v_sample = v_sample.expand(b, l)  # (B, L)
 
         else:
@@ -222,45 +209,32 @@ class SelflessSampler():
     def prompt_process(self, text_ids, v_sample, prompt_lengths, pad_ids):
         prompt_attention_pattern = getattr(self.config.training, 'prompt_attention_pattern', None)
         if prompt_attention_pattern == "ar":
-            # prompt tokens have decreasing v values, min value = 2
-            #
+            # Prompt tokens use AR generation order and are lower than solution
+            # tokens, so the solution can attend to the full prompt.
             # Example: prompt_length=10, solution_length=5, L=15
             # structure: [prompt(0-9) | solution(10-14) | padding(15+)]
-            # for prompt: v_sample = [11, 10, 9, 8, 7, 6, 5, 4, 3, 2] (decreasing, min=2)
-            # solution keeps random values [0,1]
-            # padding set to -1
-            #
+            # prompt: [0, 1, ..., 9], solution: 10 + original local sigma.
             B, L = text_ids.shape
 
             # absolute position index for each token [0, 1, 2, ..., L-1]
             pos_idx = torch.arange(L, device=text_ids.device, dtype=torch.long).unsqueeze(0)  # [1, L]
             # prompt_mask: which positions belong to prompt (position < prompt_length)
             prompt_mask = pos_idx < prompt_lengths.unsqueeze(1)  # [B, L]
-            # offset within the prompt
-            # for prompt_length=10, positions [0,1,2,...,9] have offset [0, 1, 2, ..., 9]
-            prompt_offset = pos_idx  # [1, L]
-            # decreasing index: from prompt_length-1 down to 0
-            # for prompt_length=10, reverse_idx = [9, 8, 7, 6, 5, 4, 3, 2, 1, 0]
-            prompt_reverse_idx = prompt_lengths.unsqueeze(1) - 1 - prompt_offset  # [B, L]
-            # final v values: 2 + reverse_idx, min value = 2 (when offset=prompt_length-1)
-            # for prompt_length=10, values = 2 + [9,8,7,6,5,4,3,2,1,0] = [11,10,9,8,7,6,5,4,3,2]
-            prompt_values = 2 + prompt_reverse_idx  # [B, L]
-            # only apply new values to prompt portion, solution keeps original (random [0,1])
-            v_sample = torch.where(prompt_mask, prompt_values, v_sample)
-            # set padding to -1
+            prompt_values = pos_idx.to(v_sample.dtype)
+            solution_values = prompt_lengths.unsqueeze(1).to(v_sample.dtype) + v_sample
+            v_sample = torch.where(prompt_mask, prompt_values, solution_values)
             if pad_ids is not None:
-                v_sample.masked_fill_(text_ids == pad_ids, -1)
+                v_sample.masked_fill_(text_ids == pad_ids, L + 1)
         elif prompt_attention_pattern == "random":
-            # prompt tokens have random v values > 2, meaning prompt uses random order (non-autoregressive)
+            # Prompt tokens use random order but remain lower than solution tokens.
             B, L = text_ids.shape
 
             pos_idx = torch.arange(L, device=text_ids.device, dtype=torch.long).unsqueeze(0)  # [1, L]
             prompt_mask = pos_idx < prompt_lengths.unsqueeze(1)  # [B, L]
-            # add 2 to v values in prompt region, shifting range from [0,1] to [2,3]
-            v_sample = torch.where(prompt_mask, v_sample + 2, v_sample)
-            # set padding to -1
+            solution_values = 2 + v_sample
+            v_sample = torch.where(prompt_mask, v_sample, solution_values)
             if pad_ids is not None:
-                v_sample.masked_fill_(text_ids == pad_ids, -1)
+                v_sample.masked_fill_(text_ids == pad_ids, L + 1)
 
         else:
             raise ValueError(f"UNKNOWN PROMPT attention_pattern, get {prompt_attention_pattern}")

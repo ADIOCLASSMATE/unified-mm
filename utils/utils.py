@@ -7,11 +7,12 @@ import re
 import shutil
 import sys
 import torch
+from torch import nn
 import torch.nn.functional as F
 from omegaconf import DictConfig, ListConfig, OmegaConf
 from typing import Any, List, Tuple, Union
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask, or_masks, and_masks
-from transformers import AutoTokenizer
+from transformers import AutoConfig, AutoTokenizer
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
@@ -19,8 +20,37 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 #              config utils
 ##################################################
 def get_config():
-    cli_conf = OmegaConf.from_cli()
-    yaml_conf = OmegaConf.load(cli_conf.config)
+    argv = sys.argv[1:]
+    config_path = None
+    cleaned_argv = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--config":
+            if i + 1 >= len(argv):
+                raise ValueError("--config requires a path")
+            config_path = argv[i + 1]
+            i += 2
+            continue
+        if arg.startswith("--config="):
+            config_path = arg.split("=", 1)[1]
+            i += 1
+            continue
+        cleaned_argv.append(arg)
+        i += 1
+
+    old_argv = sys.argv
+    try:
+        sys.argv = [old_argv[0]] + cleaned_argv
+        cli_conf = OmegaConf.from_cli()
+    finally:
+        sys.argv = old_argv
+
+    config_path = config_path or cli_conf.get("config")
+    if config_path is None:
+        raise ValueError("Missing config path. Pass config=path.yaml or --config path.yaml")
+
+    yaml_conf = OmegaConf.load(config_path)
     conf = OmegaConf.merge(yaml_conf, cli_conf)
 
     return conf
@@ -87,14 +117,11 @@ def load_model_tokenizer(config: OmegaConf, logger=None):
     config.model.boi_token_id = tokenizer.convert_tokens_to_ids(boi_token)
     config.model.eoi_token_id = tokenizer.convert_tokens_to_ids(eoi_token)
 
-    # image_offset: where image codebook indices start in the unified input_ids space
-    # For unified_head: offset = len(tokenizer) so image tokens sit right after text vocab
-    # For dual_head: use a large safe offset (200000)
+    # image_offset: where image codebook indices start in the unified input_ids space.
+    # Keep the configured value so dual-head and unified-head ablations can share
+    # the same pre-tokenized Arrow shards.
     unified_head = getattr(config.model, "unified_head", False)
-    if unified_head:
-        config.model.image_offset = len(tokenizer)
-    else:
-        config.model.image_offset = getattr(config.model, "image_offset", 200000)
+    config.model.image_offset = getattr(config.model, "image_offset", None) or (len(tokenizer) if unified_head else 200000)
 
     if logger is not None:
         logger.info('special tokens : \n', tokenizer.special_tokens_map)
@@ -124,6 +151,9 @@ def load_model_tokenizer(config: OmegaConf, logger=None):
     elif "xlnet" in project.lower():
         from models.modeling_model.modeling_xlnet import Qwen3ForCausalLM
         model_class = Qwen3ForCausalLM
+    elif "flow" in project.lower():
+        from models.modeling_model.modeling_selfless_flow import Qwen3ForCausalLM
+        model_class = Qwen3ForCausalLM
     elif "selfless" in project.lower() or "sigma" in project.lower():
         from models.modeling_model.modeling_selfless import Qwen3ForCausalLM
         model_class = Qwen3ForCausalLM
@@ -140,6 +170,13 @@ def load_model_tokenizer(config: OmegaConf, logger=None):
         raise ValueError
     
     
+    multimodal_config_keys = (
+        "image_vocab_size", "image_offset", "lambda_image", "lambda_text",
+        "boi_token_id", "eoi_token_id", "unified_head", "image_tokens_per_img",
+        "image_latent_dim", "continuous_image_latents", "flow_width", "flow_depth",
+        "flow_time_scale", "flow_sample_method",
+    )
+
     if config.training.from_scratch:
         if logger is not None:
             logger.info(f"Initializing model from scratch (Random Weights) based on config from: {config.model.model_path}")
@@ -149,6 +186,11 @@ def load_model_tokenizer(config: OmegaConf, logger=None):
         model_config.mask_token_id = config.model.mask_token_id
         model_config.use_flex_attention = config.model.use_flex_attention
         model_config.eos_token_id = tokenizer.eos_token_id
+        # Propagate multimodal config values from YAML to model config
+        for key in multimodal_config_keys:
+            val = config.model.get(key)
+            if val is not None:
+                setattr(model_config, key, val)
         # 设置 im_end_token_id
         if hasattr(tokenizer, 'im_end_token_id') and tokenizer.im_end_token_id is not None:
             model_config.im_end_token_id = tokenizer.im_end_token_id
@@ -166,40 +208,69 @@ def load_model_tokenizer(config: OmegaConf, logger=None):
     else:
         if logger is not None:
             logger.info(f"Loading pretrained model weights from: {config.model.model_path}")
+        model_config = AutoConfig.from_pretrained(config.model.model_path, trust_remote_code=True)
+        model_config.mask_token_id = config.model.mask_token_id
+        model_config.use_flex_attention = config.model.use_flex_attention
+        model_config.eos_token_id = tokenizer.eos_token_id
+        for key in multimodal_config_keys:
+            val = config.model.get(key)
+            if val is not None:
+                setattr(model_config, key, val)
         model = model_class.from_pretrained(
             pretrained_model_name_or_path=config.model.model_path,
+            config=model_config,
             dtype=torch.bfloat16, 
             trust_remote_code=True
         )
-        model.config.mask_token_id = config.model.mask_token_id
-        model.config.use_flex_attention = config.model.use_flex_attention
-        model.config.eos_token_id = tokenizer.eos_token_id
-        # Propagate multimodal config values from YAML to model config
-        for key in ("image_vocab_size", "image_offset", "lambda_image",
-                     "boi_token_id", "eoi_token_id", "unified_head"):
-            val = config.model.get(key)
-            if val is not None:
-                setattr(model.config, key, val)
 
-        # Unified head: expand lm_head to include image vocab after text vocab
-        if config.model.get("unified_head", False):
+        if "flow" in project.lower():
+            if len(tokenizer) > model.config.vocab_size:
+                model.resize_token_embeddings(len(tokenizer))
+        # Unified head: expand embeddings + lm_head to include image vocab
+        elif config.model.get("unified_head", False):
             model.unified_head = True
+            model.model.unified_head = True
+            model.model.image_embed_tokens = None
             image_offset = model.config.image_offset
             image_vocab_size = model.config.image_vocab_size
             total_vocab = image_offset + image_vocab_size
-            old_weight = model.lm_head.weight.data  # [151936, hidden_dim]
-            hidden_dim = old_weight.shape[1]
-
-            new_lm_head = torch.nn.Linear(hidden_dim, total_vocab, bias=False)
-            new_lm_head.weight.data[:old_weight.shape[0]] = old_weight
-            # Random init image portion
-            new_lm_head.weight.data[old_weight.shape[0]:] = old_weight.mean() + \
-                torch.randn(total_vocab - old_weight.shape[0], hidden_dim) * old_weight.std()
-            new_lm_head = new_lm_head.to(dtype=old_weight.dtype, device=old_weight.device)
-            model.lm_head = new_lm_head
+            # resize_token_embeddings expands both embed_tokens and lm_head (tied)
+            model.resize_token_embeddings(total_vocab)
             model.image_lm_head = None
             if logger is not None:
-                logger.info(f"Expanded lm_head: {old_weight.shape[0]} -> {total_vocab}")
+                logger.info(f"Resized embeddings + lm_head to {total_vocab} (unified)")
+        else:
+            # Dual-head: resize text embedding for any new special tokens
+            model.unified_head = False
+            model.model.unified_head = False
+            if len(tokenizer) > model.config.vocab_size:
+                model.resize_token_embeddings(len(tokenizer))
+
+            # Resize image embedding/lm_head to match config (from_pretrained uses default 16384)
+            target_vocab = model.config.image_vocab_size
+            current_vocab = model.model.image_embed_tokens.weight.shape[0]
+            if current_vocab != target_vocab:
+                hidden_dim = model.model.image_embed_tokens.weight.shape[1]
+                device = model.model.image_embed_tokens.weight.device
+                dtype = model.model.image_embed_tokens.weight.dtype
+
+                new_embed = nn.Embedding(target_vocab, hidden_dim)
+                n_copy = min(current_vocab, target_vocab)
+                new_embed.weight.data[:n_copy] = model.model.image_embed_tokens.weight.data[:n_copy]
+                model.model.image_embed_tokens = new_embed.to(device=device, dtype=dtype)
+                model.model.image_vocab_size = target_vocab
+
+                new_head = nn.Linear(hidden_dim, target_vocab, bias=False)
+                new_head.weight.data[:n_copy] = model.image_lm_head.weight.data[:n_copy]
+                model.image_lm_head = new_head.to(device=device, dtype=dtype)
+                model.image_vocab_size = target_vocab
+
+                # Re-tie image pair
+                model.image_lm_head.weight = model.model.image_embed_tokens.weight
+
+            if logger is not None:
+                logger.info("Dual-head mode: text lm_head tied to embed_tokens, "
+                            "image_lm_head tied to image_embed_tokens")
         # 设置 im_end_token_id
         if hasattr(tokenizer, 'im_end_token_id') and tokenizer.im_end_token_id is not None:
             model.config.im_end_token_id = tokenizer.im_end_token_id
@@ -466,146 +537,26 @@ def get_config_by_model_size(model_path: str, model_size_key: str):
 
     return config
 
-
-
-
-def get_AR_attention_mask(seq_len: int, B=None, device="cuda") -> BlockMask:
-    """
-    获取 AR attention mask，用于 causal attention。
-    
-    Args:
-        v_sample: 序列采样的转移速率，速率较大的不能atten到速率较小的位置, shape: (batch_size, seq_len+1)
-        v_sample的第一个值必须是1.1，表示任何token都要能atten到这个位置，防止attention score全为0
-        seq_len: 序列长度
-        
-    Returns:
-        BlockMask 对象，表示 attention mask。
-    """
-
-    def causal_mask(b, h, q_idx, kv_idx):
-        return kv_idx <= q_idx # True表示要atten的部分
-        
-    return create_block_mask(causal_mask, B=None, H=None, Q_LEN=seq_len, KV_LEN=seq_len, device=device)
-
-def get_full_attention_mask(seq_len: int, B=None, device="cuda") -> BlockMask:
-    
-    def full_mask(b, h, q_idx, kv_idx):
-        return torch.tensor(True, device=device)
-        
-    return create_block_mask(full_mask, B=None, H=None, Q_LEN=seq_len, KV_LEN=seq_len, device=device)
-
-def get_AR_attention_mask_4eage(seq_len: int, device=None) -> torch.Tensor:
-    """
-    返回标准 causal attention mask:
-    shape: (1, seq_len, seq_len)
-      mask[q, k] = 0    if k <= q
-      mask[q, k] = -inf if k > q
-    """
-    # causal mask: upper-triangular part is True (should be masked)
-    # torch.triu: diagonal offset = 1 means strictly k > q
-    causal_mask = torch.triu(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device), diagonal=1)
-
-    # Convert True → -inf, False → 0
-    attention_mask = torch.zeros(seq_len, seq_len, device=device)
-    attention_mask.masked_fill_(causal_mask, float("-inf"))
-
-    # Add batch dimension (optional)
-    return attention_mask.unsqueeze(0)
-
-
-
-def get_selfless_mask(v_sample: torch.Tensor, seq_len: int, device) -> BlockMask:
+def get_selfless_mask(sigma: torch.Tensor, seq_len: int, device) -> BlockMask:
     """
     Selfless Attention mask — removes the diagonal (self-attention) from both streams.
 
-    Both content and query streams use strict v_kv > v_q, meaning no position can
-    attend to itself. This is the key difference from XLNet's selfish mask (v_kv >= v_q
+    Both content and query streams use strict S_kv < S_q, meaning no position can
+    attend to itself. This is the key difference from XLNet's selfish mask (S_kv <= S_q
     for content stream), which allows the diagonal shortcut.
 
     Args:
-        v_sample: Permutation sorting values, shape: (batch_size, seq_len)
+        sigma: Permutation sorting values, shape: (batch_size, seq_len)
         seq_len: Sequence length
 
     Returns:
         BlockMask for selfless attention.
     """
 
-    B = v_sample.shape[0]
+    B = sigma.shape[0]
     def selfless_fn(b, h, q_idx, kv_idx):
-        v_q = v_sample[b, q_idx]
-        v_kv = v_sample[b, kv_idx]
-        return v_kv > v_q  # strict — no diagonal, no self-view
+        S_q = sigma[b, q_idx]
+        S_kv = sigma[b, kv_idx]
+        return S_kv < S_q  # strict — no diagonal, no self-view
 
     return create_block_mask(selfless_fn, B=B, H=None, Q_LEN=seq_len, KV_LEN=seq_len, device=device)
-
-
-def get_selfless_ar_mask(seq_len: int, B=None, device="cuda") -> BlockMask:
-    """
-    Selfless AR attention mask — strict causal with no self-attention.
-    mask[q, k] = 0    if k < q  (strict: diagonal excluded)
-    mask[q, k] = -inf if k >= q
-    """
-    def causal_mask(b, h, q_idx, kv_idx):
-        return kv_idx < q_idx  # strict — no diagonal
-
-    return create_block_mask(causal_mask, B=None, H=None, Q_LEN=seq_len, KV_LEN=seq_len, device=device)
-
-
-def get_xlnet_mask(v_sample: torch.Tensor, seq_len: int, device) -> BlockMask:
-    """
-    获取 xlnet attention mask。
-    
-    Args:
-        v_sample: 序列采样的转移速率，速率较大的不能atten到速率较小的位置, shape: (batch_size, seq_len+1)
-        v_sample的第一个值必须是1.1，表示任何token都要能atten到这个位置，防止attention score全为0
-        seq_len: 序列长度
-        
-    Returns:
-        BlockMask 对象，表示 attention mask。
-    """
-
-    B = v_sample.shape[0]
-    def query_attention_mask(b, h, q_idx, kv_idx):
-        v_q = v_sample[b, q_idx] # 当前q的采样速率
-        v_kv = v_sample[b, kv_idx] # 当前kv的采样速率
-        return v_kv > v_q # True表示要atten的部分
-    
-    def kv_attention_mask(b, h, q_idx, kv_idx):
-        v_q = v_sample[b, q_idx] # 当前q的采样速率
-        v_kv = v_sample[b, kv_idx] # 当前kv的采样速率
-        return v_kv >= v_q # True表示要atten的部分
-    
-    # def prompt_mask(b, h, q_idx, kv_idx):
-    #     v_kv = v_sample[b, kv_idx] # 当前kv的采样速率
-    #     return v_kv > 1.0 # True表示为prompt位置，必须atten
-    
-    # def prompt_causal_mask(b, h, q_idx, kv_idx):
-    #     return q_idx > kv_idx
-    
-    # prompt_combined_mask = and_masks(prompt_mask, prompt_causal_mask)
-    # combined_mask = or_masks(selfless_fn, prompt_combined_mask)
-        
-    return create_block_mask(query_attention_mask, B=B, H=None, Q_LEN=seq_len, KV_LEN=seq_len, device=device), create_block_mask(kv_attention_mask, B=B, H=None, Q_LEN=seq_len, KV_LEN=seq_len, device=device)
-
-def get_xlnet_mask_ar(seq_len: int, device) -> BlockMask:
-    """
-    获取 xlnet attention mask。
-    
-    Args:
-        v_sample: 序列采样的转移速率，速率较大的不能atten到速率较小的位置, shape: (batch_size, seq_len+1)
-        v_sample的第一个值必须是1.1，表示任何token都要能atten到这个位置，防止attention score全为0
-        seq_len: 序列长度
-        
-    Returns:
-        BlockMask 对象，表示 attention mask。
-    """
-
-    def query_attention_mask(b, h, q_idx, kv_idx):
-
-        return kv_idx < q_idx # True表示要atten的部分
-    
-    def kv_attention_mask(b, h, q_idx, kv_idx):
-
-        return kv_idx <= q_idx # True表示要atten的部分
-        
-    return create_block_mask(query_attention_mask, B=None, H=None, Q_LEN=seq_len, KV_LEN=seq_len, device=device), create_block_mask(kv_attention_mask, B=None, H=None, Q_LEN=seq_len, KV_LEN=seq_len, device=device)

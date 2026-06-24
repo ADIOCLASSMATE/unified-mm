@@ -1,0 +1,70 @@
+experiment:
+    project: "selfless-0.6B-omnicorpus-smoke-unified"
+    name: "omnicorpus-smoke-unified-head"
+    wandb_project: "unified-mm"
+    output_dir: "output"
+    save_every: 100
+    eval_every: 20
+    generate_every: 10000
+    log_every: 5
+    log_grad_norm_every: 20
+    checkpoints_total_limit: 20
+    save_hfmodel_every: 500
+    val_every: 20
+    resume_from_checkpoint: none
+
+model:
+    model_path: "public/models/Qwen/Qwen3-0.6B-Base"
+    attention_pattern: "ar"
+    loss_attention_pattern: "likelihood"
+    mask_id: -1
+    use_flex_attention: true
+    image_offset: 200000
+    image_vocab_size: 262144
+    unified_head: true
+    lambda_image: 0.5
+    image_tokens_per_img: 256
+
+dataset:
+    class_name: "OmniCorpusPackedDataset"
+    params:
+        tokenized_path: "public/datasets/omnicorpus/pretrain_smoke/arrow"
+        max_seq_length: 2048
+        image_tokens_per_img: 256
+        val_ratio: 0.01
+        max_samples: 512
+    preprocessing:
+        max_seq_length: 2048
+
+optimizer:
+    name: adamw
+    params:
+        learning_rate: 2.0e-4
+        scale_lr: false
+        beta1: 0.8
+        beta2: 0.95
+        weight_decay: 0.1
+        epsilon: 1e-8
+
+lr_scheduler:
+    scheduler: "cosine"
+    params:
+        learning_rate: ${optimizer.params.learning_rate}
+        warmup_steps: 10
+        decay_steps: 100
+        min_lr_scale: 0.01
+
+training:
+    batch_size: 8
+    total_batch_size: 256
+    mixed_precision: "bf16"
+    enable_tf32: false
+    seed: 42
+    dataloader_workers: 2
+    max_train_steps: 1000
+    max_grad_norm: 1.0
+    ar_ratio: -1.0
+    mc_samples: 16
+    use_gradient_checkpointing: false
+    step_scheduler_with_optimizer: false
+    from_scratch: false

@@ -18,7 +18,6 @@ from torch.optim import AdamW
 import torch.nn.functional as F
 
 
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import DistributedType, set_seed
@@ -28,9 +27,18 @@ from utils.selfless_utils import SelflessSampler
 from utils.wsd_schedule import get_wsd_schedule
 from models.logging import set_verbosity_info, set_verbosity_error
 
-from utils.utils import get_config, flatten_omega_conf, get_selfless_mask, get_selfless_ar_mask, load_model_tokenizer, log_grad_norm, AverageMeter, save_checkpoint, save_hf_model
+from utils.utils import get_config, flatten_omega_conf, get_selfless_mask, load_model_tokenizer, log_grad_norm, AverageMeter, save_checkpoint, save_hf_model
 
 logger = get_logger(__name__, log_level="INFO")
+
+
+def _unwrap_omnicorpus_dataset(dataset):
+    ds = dataset
+    while hasattr(ds, "dataset"):
+        if hasattr(ds, "_packs") or ds.__class__.__name__ == "OmniCorpusPackedDataset":
+            return ds
+        ds = ds.dataset
+    return ds
 
 
 def main():
@@ -42,8 +50,7 @@ def main():
     total_batch_size_per_gpu = config.training.batch_size
     
     config.experiment.output_dir = os.path.join(config.experiment.output_dir, config.experiment.project)
-    config.experiment.logging_dir = os.path.join(config.experiment.output_dir, "logs")
-    
+
     #########################
     # SETUP Accelerator     #
     #########################
@@ -56,8 +63,7 @@ def main():
     accelerator = Accelerator(
         gradient_accumulation_steps=((config.training.total_batch_size // config.training.batch_size) // num_processes),
         mixed_precision=config.training.mixed_precision,
-        log_with="tensorboard",
-        project_dir=config.experiment.logging_dir,
+        log_with="wandb",
         step_scheduler_with_optimizer=config.training.step_scheduler_with_optimizer,
     )
     print(f"Accelerator state: {accelerator.state}")
@@ -90,8 +96,9 @@ def main():
         log_config.pop("experiment.resume_from_checkpoint", None)
 
         accelerator.init_trackers(
-            config.experiment.name,
+            config.experiment.wandb_project,
             config=log_config,
+            init_kwargs={"wandb": {"name": config.experiment.name}},
         )
 
     # Set training seed
@@ -103,7 +110,11 @@ def main():
     #########################
     logger.info("Loading tokenizer and model")
     model, tokenizer = load_model_tokenizer(config=config, logger=logger)
-    
+
+    if config.training.get("use_gradient_checkpointing", False):
+        model.gradient_checkpointing_enable()
+        logger.info("Gradient checkpointing enabled")
+
     selfless_sampler = SelflessSampler(mask_token_id=model.config.mask_token_id, config=config)
     
     ##################################
@@ -143,7 +154,7 @@ def main():
         num_warmup_steps=config.lr_scheduler.params.warmup_steps,
         num_decay_steps=config.lr_scheduler.params.decay_steps,
         num_training_steps=config.training.max_train_steps,
-        min_lr_ratio=optimizer_config.learning_rate * config.lr_scheduler.params.min_lr_scale
+        min_lr_ratio=config.lr_scheduler.params.min_lr_scale
     )
 
     ##################################
@@ -159,6 +170,11 @@ def main():
     #       Prepare accelerator     #
     ##################################
     logger.info("Preparing model, optimizer and dataloaders")
+
+    # Store ref to underlying packed dataset for epoch-level reshuffling/repacking.
+    ds = _unwrap_omnicorpus_dataset(train_dataloader.dataset)
+    _is_multimodal_ds = hasattr(ds, 'set_epoch')
+
     model, optimizer, train_dataloader, val_dataloader, lr_scheduler = accelerator.prepare(model, optimizer, train_dataloader, val_dataloader, lr_scheduler)
 
     ##################################
@@ -230,11 +246,20 @@ def main():
 
     train_iter = iter(train_dataloader)
 
+    # Accumulators for per-modality loss across gradient-accumulation micro-batches.
+    # Reset after each optimizer step (sync_gradients=True).
+    acc_loss = torch.tensor(0.0, device=accelerator.device)
+    acc_text_loss = torch.tensor(0.0, device=accelerator.device)
+    acc_image_loss = torch.tensor(0.0, device=accelerator.device)
+
+    epoch = 0
     while global_step < config.training.max_train_steps:
         try:
             batch = next(train_iter)
         except StopIteration:
-            # 一个 epoch 跑完了，重新来
+            epoch += 1
+            if _is_multimodal_ds:
+                ds.set_epoch(epoch)
             train_iter = iter(train_dataloader)
             batch = next(train_iter)
         
@@ -247,17 +272,12 @@ def main():
         if is_multimodal:
             input_ids = batch["input_ids"].contiguous()  # [B, L] — no shift for selfless
             token_types = batch["token_types"]  # [B, L]
-            task_modes = batch["task_mode"]  # list of strings
+            sigma = batch["sigma"]  # [B, L], pre-computed by dataloader
+            labels = batch["labels"]  # [B, L], pre-computed by dataloader
             B, L = input_ids.shape
 
-            # Per-sample sigma assignment
-            from utils.selfless_utils import assign_sigma_multimodal_batch
-            v_sample = assign_sigma_multimodal_batch(
-                token_types, task_modes, L
-            ).to(accelerator.device)
-
             selfless_attention_mask = get_selfless_mask(
-                v_sample=v_sample, seq_len=L, device=accelerator.device
+                sigma=sigma.to(accelerator.device), seq_len=L, device=accelerator.device
             )
 
             if global_step == 0 and accelerator.is_main_process and not hasattr(main, '_logged_first_batch'):
@@ -265,7 +285,10 @@ def main():
                 logger.info(f"Input ids shape: {input_ids.shape}, multimodal mode")
                 logger.info(f"token type counts: text={(token_types==0).sum().item()}, "
                            f"image={(token_types==1).sum().item()}, "
-                           f"special={(token_types==2).sum().item()}")
+                           f"special={(token_types==2).sum().item()}, "
+                           f"padding={(token_types==3).sum().item()}")
+                logger.info(f"sigma range: [{sigma.min().item()}, {sigma.max().item()}], "
+                           f"labels -100 ratio: {(labels==-100).sum().item() / labels.numel():.3f}")
 
         else:
             # Legacy text-only path
@@ -278,7 +301,7 @@ def main():
 
             v_sample = v_sample.to(accelerator.device)
             selfless_attention_mask = get_selfless_mask(
-                v_sample=v_sample, seq_len=L, device=accelerator.device
+                sigma=v_sample, seq_len=L, device=accelerator.device
             )
             del t_sample
 
@@ -293,7 +316,7 @@ def main():
         with accelerator.accumulate(model):
             forward_kwargs = {
                 "X0_input_ids": input_ids,
-                "labels": input_ids,
+                "labels": labels if is_multimodal else input_ids,
                 "attention_mask": selfless_attention_mask,
             }
             if token_types is not None:
@@ -301,6 +324,15 @@ def main():
 
             model_output = model(**forward_kwargs)
             loss = model_output.loss
+
+            # Track per-modality loss across micro-batches
+            per_mod = getattr(model_output, "per_modality_loss", None)
+            if per_mod is not None:
+                t = per_mod["text_loss"]
+                i = per_mod["image_loss"]
+                acc_text_loss += t.detach() if isinstance(t, torch.Tensor) else 0.0
+                acc_image_loss += i.detach() if isinstance(i, torch.Tensor) else 0.0
+            acc_loss += loss.detach()
 
             accelerator.backward(loss)
 
@@ -327,7 +359,10 @@ def main():
 
             # Logging
             if global_step % config.experiment.log_every == 0:
-                avg_loss = accelerator.reduce(loss.detach(), reduction="mean")
+                grad_accum = accelerator.gradient_accumulation_steps
+                # Average loss across all micro-batches and all ranks
+                avg_loss_per_step = acc_loss / grad_accum
+                global_avg_loss = accelerator.reduce(avg_loss_per_step, reduction="mean")
 
                 samples_per_second_per_gpu = (
                         accelerator.gradient_accumulation_steps * config.training.batch_size / batch_time_m.val
@@ -335,37 +370,40 @@ def main():
 
                 logs = {
                     "t_1": t_1,
-                    "step_loss": avg_loss.item(),
-                    "train_ppl": math.exp(avg_loss.item()),
+                    "step_loss": global_avg_loss.item(),
+                    "train_ppl": math.exp(global_avg_loss.item()),
                     "lr": lr_scheduler.get_last_lr()[0],
                     "samples/sec/gpu": samples_per_second_per_gpu,
                     "batch_time": batch_time_m.val,
                 }
 
-                # Per-modality loss logging (multimodal mode)
-                per_mod = getattr(model_output, "per_modality_loss", None)
-                if per_mod is not None:
-                    t_loss = per_mod["text_loss"]
-                    i_loss = per_mod["image_loss"]
-                    if isinstance(t_loss, torch.Tensor) and t_loss.numel() > 0:
-                        text_l = accelerator.reduce(t_loss, reduction="mean")
-                        logs["train/loss_text"] = text_l.item()
-                        logs["train/ppl_text"] = math.exp(min(text_l.item(), 100))
-                    if isinstance(i_loss, torch.Tensor) and i_loss.numel() > 0:
-                        image_l = accelerator.reduce(i_loss, reduction="mean")
-                        logs["train/loss_image"] = image_l.item()
-                        logs["train/ppl_image"] = math.exp(min(image_l.item(), 100))
+                # Per-modality loss (accumulated across all micro-batches)
+                if is_multimodal:
+                    avg_text_loss = acc_text_loss / grad_accum
+                    global_text_loss = accelerator.reduce(avg_text_loss, reduction="mean")
+                    logs["train/loss_text"] = global_text_loss.item()
+                    logs["train/ppl_text"] = math.exp(min(global_text_loss.item(), 100))
+
+                    avg_image_loss = acc_image_loss / grad_accum
+                    global_image_loss = accelerator.reduce(avg_image_loss, reduction="mean")
+                    logs["train/loss_image"] = global_image_loss.item()
+                    logs["train/ppl_image"] = math.exp(min(global_image_loss.item(), 100))
 
                 accelerator.log(logs, step=global_step)
 
                 if accelerator.is_main_process:
-                    logger.info(
+                    msg = (
                         f"Step: {global_step} | "
-                        f"T: {t_1} | "
-                        f"Loss: {avg_loss.item():0.4f} | "
-                        f"LR: {lr_scheduler.get_last_lr()[0]:0.6f} | "
+                        f"Loss: {global_avg_loss.item():0.4f}"
+                    )
+                    if is_multimodal:
+                        msg += f" | Text: {global_text_loss.item():0.4f}"
+                        msg += f" | Image: {global_image_loss.item():0.4f}"
+                    msg += (
+                        f" | LR: {lr_scheduler.get_last_lr()[0]:0.6f} | "
                         f"Sec/Iter: {batch_time_m.val:0.4f}"
                     )
+                    logger.info(msg)
 
                 batch_time_m.reset()
                 data_time_m.reset()
@@ -385,8 +423,12 @@ def main():
                 #     accelerator.print(f"pre_text: {pre_text}")
                 #     accelerator.print(f"label_text: {label_text}")
                 
-                model.train() 
+                model.train()
 
+            # Reset per-step accumulators for the next optimizer step
+            acc_loss.zero_()
+            acc_text_loss.zero_()
+            acc_image_loss.zero_()
             if global_step >= config.training.max_train_steps:
                 break
 
@@ -397,29 +439,26 @@ def main():
 
 @torch.no_grad()
 def validate(model, val_dataloader, selfless_sampler, accelerator, global_step):
-    # Check if validation data is multimodal
-    is_multimodal = hasattr(val_dataloader.dataset, 'samples') or (
-        hasattr(val_dataloader.dataset, 'dataset') and
-        hasattr(val_dataloader.dataset.dataset, 'samples')
-    )
-    # Heuristic: if first batch has token_types, we're in multimodal mode
-    test_batch = next(iter(val_dataloader))
-    is_multimodal = "token_types" in test_batch
+    model.eval()  # DeepSpeed requires explicit eval mode for no_grad forward
+    ds = _unwrap_omnicorpus_dataset(val_dataloader.dataset)
+    is_multimodal = hasattr(ds, '_packs') or ds.__class__.__name__ == "OmniCorpusPackedDataset"
 
-    if is_multimodal:
-        _validate_multimodal(model, val_dataloader, test_batch, accelerator, global_step)
-    else:
-        _validate_text_only(model, val_dataloader, test_batch, selfless_sampler, accelerator, global_step)
+    try:
+        if is_multimodal:
+            _validate_multimodal(model, val_dataloader, accelerator, global_step)
+        else:
+            _validate_text_only(model, val_dataloader, selfless_sampler, accelerator, global_step)
+    finally:
+        model.train()
 
 
 @torch.no_grad()
-def _validate_text_only(model, val_dataloader, first_batch, selfless_sampler, accelerator, global_step):
+def _validate_text_only(model, val_dataloader, selfless_sampler, accelerator, global_step):
     local_total_loss_selfless = torch.tensor(0.0, device=accelerator.device)
     local_total_loss_ar = torch.tensor(0.0, device=accelerator.device)
     local_total_count = torch.tensor(0.0, device=accelerator.device)
 
-    # Process first batch (already fetched)
-    for step, batch in enumerate(_prepend_first_batch(first_batch, val_dataloader)):
+    for batch in val_dataloader:
         text_ids = batch["input_ids"][:, :-1].contiguous()
         current_batch_size = text_ids.size(0)
 
@@ -427,21 +466,33 @@ def _validate_text_only(model, val_dataloader, first_batch, selfless_sampler, ac
         B, L = text_ids.shape
         v_sample = v_sample.to(accelerator.device)
 
-        selfless_attention_mask = get_selfless_mask(v_sample=v_sample, seq_len=L, device=accelerator.device)
+        selfless_attention_mask = get_selfless_mask(sigma=v_sample, seq_len=L, device=accelerator.device)
         loss_selfless = model(
             X0_input_ids=text_ids, labels=text_ids,
             attention_mask=selfless_attention_mask,
+            calculate_likelihood=True,
         ).loss
         local_total_loss_selfless += loss_selfless.detach() * current_batch_size
 
-        AR_mask = get_selfless_ar_mask(seq_len=L, device=accelerator.device)
+        AR_mask = get_selfless_mask(
+            sigma=torch.arange(L, device=accelerator.device).unsqueeze(0).expand(B, L),
+            seq_len=L, device=accelerator.device
+        )
         loss_ar = model(
             X0_input_ids=text_ids, labels=text_ids,
             attention_mask=AR_mask,
+            calculate_likelihood=True,
         ).loss
         local_total_loss_ar += loss_ar.detach() * current_batch_size
         local_total_count += current_batch_size
 
+    # Ensure all ranks have the same count before reduce
+    # DistributedSampler may give different ranks different numbers of batches.
+    # accelerator.reduce on the count handles rank-level variation — each rank
+    # participates with its own count, and the sum across ranks gives the total.
+    # The model forward calls must be synchronized — each rank must call forward
+    # the same number of times. With DistributedSampler using pad/drop_last,
+    # the dataloader guarantees equal iterations per rank.
     global_total_count = accelerator.reduce(local_total_count, reduction="sum")
     global_total_loss_selfless = accelerator.reduce(local_total_loss_selfless, reduction="sum")
     avg_loss_selfless = (global_total_loss_selfless / global_total_count).item()
@@ -468,56 +519,88 @@ def _validate_text_only(model, val_dataloader, first_batch, selfless_sampler, ac
 
 
 @torch.no_grad()
-def _validate_multimodal(model, val_dataloader, first_batch, accelerator, global_step):
-    from utils.selfless_utils import assign_sigma_multimodal_batch
+def _validate_multimodal(model, val_dataloader, accelerator, global_step):
+    local_weighted_loss = torch.tensor(0.0, device=accelerator.device)
+    local_weighted_text = torch.tensor(0.0, device=accelerator.device)
+    local_weighted_image = torch.tensor(0.0, device=accelerator.device)
+    local_total_tokens = torch.tensor(0.0, device=accelerator.device)
+    local_text_tokens = torch.tensor(0.0, device=accelerator.device)
+    local_image_tokens = torch.tensor(0.0, device=accelerator.device)
 
-    local_total_loss = torch.tensor(0.0, device=accelerator.device)
-    local_text_loss = torch.tensor(0.0, device=accelerator.device)
-    local_image_loss = torch.tensor(0.0, device=accelerator.device)
-    local_total_count = torch.tensor(0.0, device=accelerator.device)
-
-    for batch in _prepend_first_batch(first_batch, val_dataloader):
-        input_ids = batch["input_ids"].contiguous()
-        token_types = batch["token_types"]
-        task_modes = batch["task_mode"]
+    for batch in val_dataloader:
+        input_ids = batch["input_ids"].contiguous().to(accelerator.device)
+        token_types = batch["token_types"].to(accelerator.device)
+        sigma = batch["sigma"].to(accelerator.device)
+        labels = batch["labels"].to(accelerator.device)
         B, L = input_ids.shape
-        current_batch_size = B
 
-        v_sample = assign_sigma_multimodal_batch(token_types, task_modes, L)
-        v_sample = v_sample.to(accelerator.device)
+        # Count valid (non-ignored) tokens per modality for proper weighting.
+        # model.loss is F.cross_entropy(reduction='mean'), so we need to
+        # multiply by the number of valid tokens to recover the sum, then
+        # divide by total valid tokens across all batches.
+        valid_mask = labels != -100
+        n_valid = valid_mask.sum().float()
+        text_mask = ((token_types == 0) | (token_types == 2)) & valid_mask
+        image_mask = (token_types == 1) & valid_mask
 
-        # Selfless sigma validation
-        selfless_attention_mask = get_selfless_mask(v_sample=v_sample, seq_len=L, device=accelerator.device)
+        # Sigma and labels pre-computed by dataloader
+        selfless_attention_mask = get_selfless_mask(
+            sigma=sigma, seq_len=L, device=accelerator.device
+        )
         output = model(
-            X0_input_ids=input_ids, labels=input_ids,
+            X0_input_ids=input_ids, labels=labels,
             attention_mask=selfless_attention_mask,
             token_types=token_types,
+            calculate_likelihood=True,
         )
-        local_total_loss += output.loss.detach() * current_batch_size
         if hasattr(output, "per_modality_loss"):
-            local_text_loss += output.per_modality_loss["text_loss"] * current_batch_size
-            local_image_loss += output.per_modality_loss["image_loss"] * current_batch_size
+            n_text = text_mask.sum().float()
+            n_image = image_mask.sum().float()
+            local_weighted_text += output.per_modality_loss["text_loss"] * n_text
+            local_weighted_image += output.per_modality_loss["image_loss"] * n_image
+            local_text_tokens += n_text
+            local_image_tokens += n_image
+        else:
+            local_weighted_loss += output.loss.detach() * n_valid
+            local_total_tokens += n_valid
 
-        local_total_count += current_batch_size
+    # Reduce across ranks: sum of weighted losses and token counts
+    global_total_tokens = accelerator.reduce(local_total_tokens, reduction="sum")
+    global_weighted_loss = accelerator.reduce(local_weighted_loss, reduction="sum")
 
-    global_total_count = accelerator.reduce(local_total_count, reduction="sum")
-    global_total_loss = accelerator.reduce(local_total_loss, reduction="sum")
-    avg_loss = (global_total_loss / global_total_count).item()
+    # Per-modality: always reduce (even if zero) to keep collective-op count equal
+    global_weighted_text = accelerator.reduce(local_weighted_text, reduction="sum")
+    global_weighted_image = accelerator.reduce(local_weighted_image, reduction="sum")
+    global_text_tokens = accelerator.reduce(local_text_tokens, reduction="sum")
+    global_image_tokens = accelerator.reduce(local_image_tokens, reduction="sum")
+
+    if global_text_tokens.item() > 0 or global_image_tokens.item() > 0:
+        avg_text_for_loss = (
+            global_weighted_text / global_text_tokens
+            if global_text_tokens.item() > 0
+            else torch.tensor(0.0, device=accelerator.device)
+        )
+        avg_image_for_loss = (
+            global_weighted_image / global_image_tokens
+            if global_image_tokens.item() > 0
+            else torch.tensor(0.0, device=accelerator.device)
+        )
+        lambda_image = getattr(accelerator.unwrap_model(model).config, "lambda_image", 0.5)
+        avg_loss = (avg_text_for_loss + lambda_image * avg_image_for_loss).item()
+    else:
+        avg_loss = (global_weighted_loss / global_total_tokens).item()
     ppl = math.exp(avg_loss) if avg_loss < 100 else float("inf")
 
     logs = {
         "val/loss": avg_loss,
         "val/ppl": ppl,
     }
-    # Per-modality metrics
-    if local_text_loss.item() > 0:
-        global_text_loss = accelerator.reduce(local_text_loss, reduction="sum")
-        avg_text = (global_text_loss / global_total_count).item()
+    if global_text_tokens.item() > 0:
+        avg_text = (global_weighted_text / global_text_tokens).item()
         logs["val/loss_text"] = avg_text
         logs["val/ppl_text"] = math.exp(avg_text) if avg_text < 100 else float("inf")
-    if local_image_loss.item() > 0:
-        global_image_loss = accelerator.reduce(local_image_loss, reduction="sum")
-        avg_image = (global_image_loss / global_total_count).item()
+    if global_image_tokens.item() > 0:
+        avg_image = (global_weighted_image / global_image_tokens).item()
         logs["val/loss_image"] = avg_image
         logs["val/ppl_image"] = math.exp(avg_image) if avg_image < 100 else float("inf")
 
@@ -531,12 +614,6 @@ def _validate_multimodal(model, val_dataloader, first_batch, accelerator, global
         logger.info(msg)
 
     return avg_loss, ppl
-
-
-def _prepend_first_batch(first_batch, dataloader):
-    """Yield first_batch, then remaining batches from dataloader."""
-    yield first_batch
-    yield from dataloader
 
 
 if __name__ == "__main__":
