@@ -10,9 +10,9 @@ This is a research project investigating whether **permutation-based training wi
 
 The core thesis: **AR enforces a single, fixed generation order (left-to-right raster scan) that is unnatural for 2D visual data and constrains cross-modal interaction. A permutation-based approach that trains on diverse partial orderings—and generates via iterative parallel block-wise decoding—can achieve better image generation quality, stronger cross-modal consistency, and comparable understanding, without architectural separation by modality.**
 
-The key differentiation from prior work: **Unlike Show-o which switches between two different attention patterns (causal for text, full bidirectional for image), our model uses a SINGLE attention mechanism (σ_kv > σ_q) parametrized by continuous scalar sigma values. This subsumes AR and bidirectional as special cases at two ends of a continuous spectrum, enabling modality-appropriate generation orders without modality-specific architectural components.**
+The key differentiation from prior work: **Unlike Show-o which switches between two different attention patterns (causal for text, full bidirectional for image), our model uses a SINGLE attention mechanism (σ_kv < σ_q) parametrized by continuous scalar sigma values. This subsumes AR and bidirectional as special cases at two ends of a continuous spectrum, enabling modality-appropriate generation orders without modality-specific architectural components.**
 
-**Precise scope of the "unified" claim:** The attention mechanism itself is modality-agnostic—a single σ_kv > σ_q pattern applies to all tokens regardless of modality. The modality-appropriate behavior (AR for text, partial-order for images) emerges from the sigma values, not from switching attention patterns. However, we acknowledge that other components are necessarily modality-aware: dual text/image embedding matrices and output heads exist because text and image have different vocabulary spaces (an unavoidable fact of discrete multimodal modeling). The modality-specificity is redistributed from the attention mechanism (Show-o's approach) to the sigma schedule—a design choice that keeps the core Transformer layers fully shared and the attention pattern unified.
+**Precise scope of the "unified" claim:** The attention mechanism itself is modality-agnostic—a single σ_kv < σ_q pattern applies to all tokens regardless of modality. The modality-appropriate behavior (AR for text, partial-order for images) emerges from the sigma values, not from switching attention patterns. However, we acknowledge that other components are necessarily modality-aware: dual text/image embedding matrices and output heads exist because text and image have different vocabulary spaces (an unavoidable fact of discrete multimodal modeling). The modality-specificity is redistributed from the attention mechanism (Show-o's approach) to the sigma schedule—a design choice that keeps the core Transformer layers fully shared and the attention pattern unified.
 
 ---
 
@@ -47,7 +47,7 @@ The advisor raised a fundamental question: MaskGIT's multi-step iterative decodi
 
 **Training:** This is where the difference is substantial and measurable.
 - **MaskGIT training:** A single forward pass uses uniform random binary masking. All unmasked tokens are mutually visible (full bidirectional). The training signal for each token is: "predict yourself given this set of equally-visible context tokens."
-- **Our training:** A single forward pass encodes hierarchical visibility through continuous sigma. The training signal for each token is: "predict yourself given these context tokens, where some are more 'confirmed' (higher sigma) than others." This exposes the model to **graded** context quality — tokens learn to weigh evidence from high-sigma (reliable) sources more heavily than low-sigma (uncertain) sources.
+- **Our training:** A single forward pass encodes hierarchical visibility through continuous sigma. The training signal for each token is: "predict yourself given context tokens that are earlier in the sampled generation order." This exposes the model to **graded** context availability rather than a flat binary visible/masked split.
 
 **Inference:** The advisor is correct that the **inference-time behavior** of the two approaches is superficially similar. Both fill tokens iteratively based on confidence. Our key advantage at inference is the ability to inject prior knowledge through the sigma schedule (e.g., center-out generation for images), while MaskGIT's generation order is purely confidence-emergent.
 
@@ -62,8 +62,8 @@ The advisor raised a fundamental question: MaskGIT's multi-step iterative decodi
 Selfless Attention is a **two-stream permutation-based masked language modeling architecture** built on top of Qwen3. It replaces standard causal attention with a **sigma-value-based partial ordering mechanism** where:
 
 1. Every token in a sequence is assigned a scalar **sigma (σ) value** ∈ ℝ
-2. The attention mask follows a strict partial order: **σ_kv > σ_q** (a query token at position i can attend to a key/value token at position j only if σ_j > σ_i)
-3. The diagonal is explicitly **excluded** — no token can attend to itself (σ_i > σ_i is always false)
+2. The attention mask follows a strict partial order: **σ_kv < σ_q** (a query token at position i can attend to a key/value token at position j only if σ_j < σ_i)
+3. The diagonal is explicitly **excluded** — no token can attend to itself (σ_i < σ_i is always false)
 4. Two streams flow through every Transformer layer:
    - **X0 (Content) stream**: real token embeddings → produces K and V for both streams
    - **XT (Query) stream**: `[MASK]` token embeddings → produces Q only
@@ -74,14 +74,14 @@ XLNet also uses two-stream attention, but with a critical difference:
 
 | | XLNet | Selfless Attention (Ours) |
 |---|---|---|
-| Content stream mask | σ_kv ≥ σ_q (includes diagonal) | σ_kv > σ_q (**excludes diagonal**) |
-| Query stream mask | σ_kv > σ_q | σ_kv > σ_q |
+| Content stream mask | σ_kv <= σ_q (includes diagonal) | σ_kv < σ_q (**excludes diagonal**) |
+| Query stream mask | σ_kv < σ_q | σ_kv < σ_q |
 | Can a token "see itself"? | Yes (content stream via =) | **No (neither stream)** |
 | Shortcut learning risk | Token can peek at own embedding | Token must infer itself from context |
 
 The exclusion of the diagonal is the defining constraint: a token at position i must be predicted entirely from the context of *other* tokens. This forces the model to learn genuine contextual representations rather than relying on identity shortcuts. When extended to multimodal sequences, this means an image token cannot "cheat" by reading its own embedding—it must use surrounding text tokens and other image tokens to infer its value, compelling cross-modal reasoning.
 
-**Note on contribution scope:** The selfless vs. XLNet diagonal difference is a component of the architecture, not a standalone contribution. Its value is demonstrated in the context of the full sigma-based multimodal framework, particularly through ablation studies comparing selfless (σ_kv > σ_q) against XLNet-style (σ_kv ≥ σ_q for content stream) in multimodal settings.
+**Note on contribution scope:** The selfless vs. XLNet diagonal difference is a component of the architecture, not a standalone contribution. Its value is demonstrated in the context of the full sigma-based multimodal framework, particularly through ablation studies comparing selfless (σ_kv < σ_q) against XLNet-style (σ_kv <= σ_q for content stream) in multimodal settings.
 
 ### Sigma as a Universal Ordering Coordinate
 
@@ -91,15 +91,15 @@ The sigma value is the mechanism that unifies different generation paradigms:
 ┌─────────────────────────────────────────────────────────────┐
 │  Sigma Schedule           │  Resulting Behavior             │
 ├───────────────────────────┼────────────────────────────────┤
-│  Descending by position   │  Strict Autoregressive (AR)     │
-│  σ = [L, L-1, ..., 1]    │  Left→right causal              │
+│  Ascending by position    │  Strict Autoregressive (AR)     │
+│  σ = [0, 1, ..., L-1]    │  Left→right causal              │
 ├───────────────────────────┼────────────────────────────────┤
 │  Uniform random [0,1]     │  Random-order / Partial-order   │
-│                           │  Directed: σ higher → visible   │
-│                           │  as K/V to lower-σ queries       │
+│                           │  Directed: σ lower → visible    │
+│                           │  as K/V to higher-σ queries      │
 ├───────────────────────────┼────────────────────────────────┤
-│  Prompt: σ ∈ [2, 3]       │  Conditional generation         │
-│  Target: σ ∈ [0, 1]       │  Prompt always visible to all   │
+│  Prompt: σ ∈ [0, 1]       │  Conditional generation         │
+│  Target: σ ∈ [2, 3]       │  Prompt always visible to all   │
 │                           │  Target tokens fill iteratively │
 ├───────────────────────────┼────────────────────────────────┤
 │  Text segments: AR sigma  │  Mixed mode: text AR + image    │
@@ -110,25 +110,25 @@ The sigma value is the mechanism that unifies different generation paradigms:
 └─────────────────────────────────────────────────────────────┘
 ```
 
-**Critical distinction from binary masking (MaskGIT, Show-o):** Binary masking treats all unmasked tokens as equally visible (full bidirectional attention). Our sigma-based ordering creates a **directed partial order** where visibility is hierarchical: a token with σ=0.8 can be seen by tokens with σ<0.8, but NOT by tokens with σ>0.8. This asymmetry creates a richer dependency structure than flat bidirectional attention and enables coarse-to-fine generation schedules.
+**Critical distinction from binary masking (MaskGIT, Show-o):** Binary masking treats all unmasked tokens as equally visible (full bidirectional attention). Our sigma-based ordering creates a **directed partial order** where visibility is hierarchical: a token with σ=0.2 can be seen by tokens with σ>0.2, but NOT by tokens with σ<0.2. This asymmetry creates a richer dependency structure than flat bidirectional attention and enables coarse-to-fine generation schedules.
 
 ### Architecture Diagram
 
 ```
-Input Sequence: [BOS] text_tokens [BOI] image_tokens [EOI] text_tokens ...
+Input Sequence: text_tokens [BOI] image_tokens [EOI] text_tokens ...
 
 ┌─────────────────────────────────────────────────────────────┐
 │                    Token Embedding                           │
 │  Text tokens → Qwen3 text embedding                         │
-│  Image tokens → XQ-GAN codebook embedding (shared or separate)│
-│  Special tokens → [BOS], [BOI], [EOI], [MASK] embeddings    │
+│  Image tokens → MAGVIT-v2 codebook embedding (shared or separate)│
+│  Special tokens → [BOI], [EOI], [EOS], [MASK] embeddings    │
 └────────────────────────┬────────────────────────────────────┘
                          │
                          ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                 Sigma Assignment                             │
-│  High σ (≥ 2.0): condition/prompt tokens (always visible)   │
-│  Low σ ([0,1]): target/generation tokens (iterative fill)   │
+│  Low σ: condition/prompt tokens visible to later targets     │
+│  Higher σ: target/generation tokens for iterative fill       │
 │  Descending σ: AR behavior for text segments                │
 │  Random σ: partial-order behavior for image segments        │
 │  2D-structured σ: coarse-to-fine for image generation       │
@@ -149,7 +149,7 @@ Input Sequence: [BOS] text_tokens [BOI] image_tokens [EOI] text_tokens ...
 │  │  │ Q (self-attend)   │        │                   │    │   │
 │  │  └──────────────────┘        └──────────────────┘    │   │
 │  │                                                       │   │
-│  │  Attention Mask: σ_kv > σ_q (strict, no diagonal)    │   │
+│  │  Attention Mask: σ_kv < σ_q (strict, no diagonal)    │   │
 │  │  Both streams use the SAME mask                       │   │
 │  │                                                       │   │
 │  │  Residual + MLP (shared weights for both streams)     │   │
@@ -168,18 +168,18 @@ Input Sequence: [BOS] text_tokens [BOI] image_tokens [EOI] text_tokens ...
 │                    LM Heads                                  │
 │  ┌──────────────────┐  ┌──────────────────────────────────┐ │
 │  │ Text head:        │  │ Image head:                       │ │
-│  │ Linear(d, V_text) │  │ Linear(d, V_image)  (or sub-codebook heads) │
-│  │ V_text ≈ 150K     │  │ V_image ≈ 16K                     │ │
+│  │ Linear(d, V_text) │  │ Linear(d, V_image)                │ │
+│  │ V_text ≈ 150K     │  │ V_image = 262K                    │ │
 │  └──────────────────┘  └──────────────────────────────────┘ │
 │                                                              │
-│  Head selection: determined by position (text region vs      │
-│  image region), marked by [BOI]/[EOI] special tokens         │
+│  Head mode is an ablation: unified text+image head, or       │
+│  separate text/image heads selected by token region.         │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 ### Two-Stream Necessity: Why X0 and XT Are Both Required
 
-A natural question: if X0 and XT both use the same attention mask (σ_kv > σ_q, excluding diagonal), and only XT's output contributes to the training loss (line 522 of `Qwen3Model.forward`: `last_hidden_state=XT_hidden_states`), why do we need the X0 stream at all? Could we simplify to a single-stream architecture?
+A natural question: if X0 and XT both use the same attention mask (σ_kv < σ_q, excluding diagonal), and only XT's output contributes to the training loss (line 522 of `Qwen3Model.forward`: `last_hidden_state=XT_hidden_states`), why do we need the X0 stream at all? Could we simplify to a single-stream architecture?
 
 **The answer is no, and the reason is fundamental to how the selfless constraint interacts with masked prediction.**
 
@@ -196,7 +196,7 @@ Qwen3Attention.forward() (lines 242-317):
   XT attention: XT_Q (unbiased)  → attends to X0_K, X0_V  (content-aware)
   X0 attention: X0_Q (informed)  → attends to X0_K, X0_V  (contextualizes K/V)
 
-  Both use the SAME mask: σ_kv > σ_q (strict, no diagonal)
+  Both use the SAME mask: σ_kv < σ_q (strict, no diagonal)
 ```
 
 **What would happen with only XT stream (no X0)?**
@@ -220,8 +220,8 @@ X0_hidden_states = X0_residual + X0_hidden_states  # after attention
 This residual update means X0's hidden states evolve at each layer, becoming progressively more contextualized. These contextualized X0 hidden states then serve as K/V for the next layer's XT attention. **Without X0's self-attention, the K/V at each layer would be based on isolated token embeddings without cross-token context.**
 
 **Analogy to XLNet:** XLNet needs two streams because:
-- Content stream: σ_kv ≥ σ_q (includes diagonal) → can see itself, provides K/V
-- Query stream: σ_kv > σ_q (excludes diagonal) → cannot see itself, provides Q
+- Content stream: σ_kv <= σ_q (includes diagonal) → can see itself, provides K/V
+- Query stream: σ_kv < σ_q (excludes diagonal) → cannot see itself, provides Q
 
 XLNet's two streams have DIFFERENT masks. Our two streams have the SAME mask (both exclude diagonal). The distinction is instead in the INPUT: X0 processes real tokens (informed Q, content-aware K/V), XT processes [MASK] tokens (unbiased Q, no K/V). Both are necessary for the same reason: **the model needs content-aware K/V (from X0) and unbiased Q (from XT) simultaneously.** You cannot collapse this into one stream without either (a) leaking token identity through Q, or (b) providing K/V from meaningless [MASK] embeddings.
 
@@ -235,10 +235,10 @@ Show-o (Xie et al., ICLR 2025) claims "One Single Transformer to Unify Multimoda
 
 | | Show-o (ICLR 2025) | Our Model |
 |---|---|---|
-| **Attention mechanism** | TWO patterns: causal mask for text, full bidirectional mask for image | ONE pattern: σ_kv > σ_q for ALL tokens |
+| **Attention mechanism** | TWO patterns: causal mask for text, full bidirectional mask for image | ONE pattern: σ_kv < σ_q for ALL tokens |
 | **Modality routing** | Hard switch based on token type | Soft, continuous — sigma value IS the routing |
 | **Image masking** | Binary (token is masked or unmasked) | Continuous sigma values → hierarchical visibility |
-| **Training objectives** | Two: AR CE (text) + mask-predict CE (image) | One: CE on all positions (unified loss) |
+| **Training objectives** | Two: AR CE (text) + mask-predict CE (image) | Ablate unified CE head vs. dual text/image CE heads |
 | **Cross-modal attention** | Hard boundary at modality switch | No boundary — sigma values mediate flow |
 | **Coarse-to-fine generation** | Not supported (binary mask, equal visibility) | Supported (sigma layers encode generation priority) |
 | **Image tokenizer** | MAGVIT-v2 (LFQ, 262K codebook) | XQ-GAN (VQ, 16K codebook) |
@@ -255,7 +255,7 @@ elif token_is_image:
 
 # Our approach (actual code in utils/utils.py:get_selfless_mask):
 mask = sigma_kv_greater_than_sigma_q(v_sample)  # single pattern
-# text with descending sigma → AR behavior emerges
+# text with ascending generation-order sigma → AR behavior emerges
 # image with random sigma → partial-order behavior emerges
 # NO modality check, NO attention pattern switch
 ```
@@ -274,8 +274,8 @@ MaskGIT (Chang et al., CVPR 2022) pioneered confidence-based parallel decoding f
 
 | | MaskGIT | Our Model |
 |---|---|---|
-| **Attention** | Full bidirectional (all unmasked tokens mutually visible) | Directed partial order (σ_kv > σ_q) |
-| **Visibility** | Equal — all unmasked tokens see each other | Hierarchical — higher σ tokens dominate as K/V |
+| **Attention** | Full bidirectional (all unmasked tokens mutually visible) | Directed partial order (σ_kv < σ_q) |
+| **Visibility** | Equal — all unmasked tokens see each other | Hierarchical — lower σ tokens are earlier context K/V for higher-σ queries |
 | **Generation order** | Confidence-driven (emerges from model) | Confidence-driven AND sigma-scheduled (can be steered) |
 | **Modality** | Image only | Text + image, unified |
 | **Architecture** | Standard bidirectional Transformer | Two-stream selfless attention |
@@ -367,8 +367,8 @@ FLOPs comparison for image token generation only:
 
 ### Text Generation: AR Mode Preserves Efficiency
 
-For text generation, our model can operate in pure AR sigma mode (descending sigma values). In this mode:
-- The attention pattern is effectively causal (higher-sigma tokens attend to lower-sigma ones, which for descending sigma = left→right)
+For text generation, our model can operate in pure AR sigma mode (ascending generation-order sigma values). In this mode:
+- The attention pattern is effectively causal: later tokens have larger sigma and attend to earlier lower-sigma tokens.
 - Standard KV-cache incremental decoding applies
 - The overhead: appending a [MASK] token, decoding it, then appending a new [MASK] for the next step. Each step recomputes KV for the just-decoded token (O(1) overhead).
 - **Text generation efficiency is within ~2% of standard AR models.**
@@ -380,31 +380,31 @@ For text generation, our model can operate in pure AR sigma mode (descending sig
 ### The Problem
 
 During training, image tokens are assigned random sigma values (uniform [0,1]), meaning:
-- Some image tokens have high sigma (visible to many other tokens)
-- Some image tokens have low sigma (visible to few other tokens)
+- Some image tokens have low sigma (visible to many later-generation tokens)
+- Some image tokens have high sigma (able to attend to many earlier-generation tokens)
 - The model learns to predict image tokens from varying levels of partial context
 
 During inference for understanding tasks (VQA, captioning):
-- ALL image tokens need to be fully visible (high sigma ≥ 2.0) so the model can "see" the entire image
+- ALL image tokens need to be visible to text response tokens, so their sigma should be lower than the response sigma range
 - This is a specific sigma configuration that the model was trained on (since random uniform covers [0,1], values near 1.0 approximate "mostly visible"), but is not the predominant training regime
 
 During inference for generation tasks:
-- Image tokens start as [MASK] with low sigma (target), progressively filled
+- Image tokens start as [MASK] with target sigma values later than the prompt/context, then progressively receive concrete tokens in generation order
 - The sigma schedule during generation may differ from the training distribution
 
 ### Mitigation Strategies
 
 **Strategy 1: Explicit sigma distribution coverage in training.**
 Ensure the training sigma distribution includes:
-- A fraction of samples where ALL image tokens get sigma ∈ [1.5, 2.0] (simulating understanding inference)
-- A fraction of samples where image tokens get descending sigma by 2D position (simulating structured generation)
+- A fraction of samples where ALL image tokens get lower sigma than text-response tokens (simulating understanding inference)
+- A fraction of samples where image tokens get structured ascending sigma by 2D generation order (simulating structured generation)
 - This is a lightweight data augmentation, not a training pipeline change
 
 **Strategy 2: 2D-aware sigma schedules for generation (see next section).**
 By designing generation sigma schedules that mirror training distributions, we reduce the mismatch. If training includes frequency-based or center-based sigma assignments, and generation uses the same schedules, the inference distribution matches training.
 
 **Strategy 3: Adaptive sigma during generation.**
-Rather than using a fixed sigma schedule, use the model's own confidence as a signal to update sigma values. This is what our current code does (`sigma = 0.1 + 0.8 * (1.0 - step / total_steps)`), which naturally aligns with the confidence-based filling order. High-confidence tokens (likely "easier" coarse structures) get filled first and receive higher sigma, matching the coarse-to-fine intuition.
+Rather than using a fixed sigma schedule, use the model's own confidence as a signal to choose the next positions to fill. Filled tokens receive the next ascending generation-order sigma, so later queries can attend to them.
 
 ---
 
@@ -412,7 +412,7 @@ Rather than using a fixed sigma schedule, use the model's own confidence as a si
 
 This is identified as a **core novelty opportunity** — prior work (MaskGIT, Show-o, Emu3) does not exploit 2D spatial structure in generation ordering. Binary masking (MaskGIT/Show-o) treats all spatial positions identically. AR (Emu3/Chameleon) uses arbitrary raster scan.
 
-**Important constraint:** VQ tokens (including XQ-GAN's) exist in a learned discrete latent space, NOT in a frequency-decomposed space. Frequency-domain operations (DCT/DWT) are undefined in the VQ token grid — they require continuous pixel or latent values, not discrete codebook indices. Sigma schedules must operate on spatial position information alone.
+**Important constraint:** VQ/LFQ tokens exist in a learned discrete latent space, NOT in a frequency-decomposed space. Frequency-domain operations (DCT/DWT) are undefined in the VQ token grid — they require continuous pixel or latent values, not discrete codebook indices. Sigma schedules must operate on spatial position information alone.
 
 ### Design Space
 
@@ -426,8 +426,8 @@ Given a VQ-encoded H×W image token grid, we design sigma schedules that encode 
 ```python
 def center_out_sigma(H=16, W=16):
     """
-    Center-out: center patches get high sigma (generate first),
-    edge patches get low sigma (generate later).
+    Center-out: center patches get low sigma (generate first),
+    edge patches get higher sigma (generate later).
     """
     y, x = torch.meshgrid(
         torch.arange(H).float(),
@@ -451,7 +451,7 @@ def center_out_sigma(H=16, W=16):
 def saliency_weighted_sigma(image_pixels, H=16, W=16):
     """
     Use saliency map to assign generation priority.
-    High-saliency regions → high sigma (generate first).
+    High-saliency regions → low sigma (generate first).
     """
     from torchvision.transforms import functional as F
     saliency_map = lightweight_saliency_detector(image_pixels)  # [H_img, W_img]
@@ -503,7 +503,7 @@ class SigmaPredictor(nn.Module):
 **Training considerations:**
 - The sigma predictor can be trained jointly with the main model
 - A spatial smoothness regularization (e.g., total variation on the sigma grid) prevents degenerate sigma assignments
-- Text-aligned sigma should reflect semantic importance (text-mentioned objects get higher sigma)
+- Text-aligned sigma should reflect semantic importance (text-mentioned objects get earlier lower sigma)
 - The predictor is lightweight (<5M params) relative to the main model
 
 ### Experimental Plan for 2D Sigma Schedules
@@ -629,7 +629,7 @@ def apply_2d_rope(image_hidden_states, grid_H=16, grid_W=16):
 - Conflict is **depth-dependent**: severe in shallow (layer 0-6) and deep (layer 17-24) layers; naturally mitigated in middle layers (7-16)
 - **Root cause:** visual token sequences have far higher N-gram conditional entropy than natural language
 - **Solution:** "Two-end separated, middle shared" X-shaped architecture (modality-specific shallow/deep layers)
-- **Our positioning:** Sigma-based role separation (high σ = condition/KV, low σ = target/Q) may naturally mitigate gradient conflict WITHOUT architectural changes. We test this with a simple gradient cosine similarity experiment, not a full Uni-X replication.
+- **Our positioning:** Sigma-based role separation (lower σ = condition/KV, higher σ = target/Q) may naturally mitigate gradient conflict WITHOUT architectural changes. We test this with a simple gradient cosine similarity experiment, not a full Uni-X replication.
 
 #### Symbiotic-MoE (April 2026)
 - Generation training causes **catastrophic forgetting** of understanding due to gradient conflicts
@@ -638,47 +638,53 @@ def apply_2d_rope(image_hidden_states, grid_H=16, grid_W=16):
 
 ### The Tokenizer Landscape
 
-#### Why Not MAGVIT2 (LFQ, 262K codebook)?
-- **Designed for generation-only**, no semantic supervision in training
-- 262K vocabulary → LM head explosion (262K × hidden_dim dominates parameter count)
-- Requires sub-codebook decomposition (asymmetric token factorization) which adds complexity
-- Community consensus (2024-2025): pure reconstruction-trained tokenizers have a **representational capacity bottleneck** for understanding tasks
-- Show-o uses MAGVIT2 but shows poor understanding performance on fine-grained tasks (text reading, counting)
+#### Our Choice: Open-MAGVIT2 (LFQ, 262K codebook, rFID 0.78)
 
-#### Primary Recommendation: XQ-GAN ImageFolder VP2 (rFID 0.64, ICLR 2025)
+**We use Open-MAGVIT2** — the same tokenizer family as Show-o, using Lookup-Free Quantization (LFQ) with a 262,144 codebook. This was selected for two strategic reasons that directly support our research thesis:
 
-**This is the strongest available open-source discrete tokenizer that meets all our constraints: no CLIP distillation, manageable codebook size, pretrained weights available, and competitive reconstruction quality.**
+1. **Pure reconstruction training, no semantic supervision.** MAGVIT-v2 is trained only on reconstruction loss — it has no CLIP distillation, no semantic guidance. This means our permutation-based selfless attention model must learn visual semantics entirely from scratch through the training objective. If we succeed, it demonstrates that our architecture provides a genuine representational advantage over pure AR approaches that rely on semantically-rich tokenizers.
 
-**Code & weights:** `github.com/lxa9867/ImageFolder` → HuggingFace links in the GitHub Model Zoo table.
+2. **Direct comparison with Show-o.** Show-o uses the same MAGVIT-v2 tokenizer family (LFQ, 262K codebook). Using the identical tokenizer removes a confounding variable — any performance difference between our model and Show-o is attributable to the architecture (selfless attention vs. hybrid AR-diffusion), not the tokenizer.
 
-| Property | VQGAN f16 16384 | XQ-GAN VP2 16384 |
-|----------|----------------|------------------|
-| **rFID** (ImageNet 256²) | 4.98 | **0.64** (7.8× better) |
-| **Codebook size** | 16,384 | 16,384 (identical) |
-| **Tokens per 256² image** | 256 (16×16) | 256 (16×16) |
-| **LM head params** | 16K × d_model ≈ 25M | 16K × d_model ≈ 25M (identical) |
-| **Pretrained weights** | CompVis download | HuggingFace download |
-| **Venue** | CVPR 2021 | ICLR 2025 (Adobe Research + MIT) |
-| **License** | MIT | MIT |
+**Previous concerns that have been resolved:**
+- ~~LM head explosion~~ → Solved by **tie_embedding**: 262K × hidden_dim ≈ 268M params, but shared between embedding and lm_head via weight tying
+- ~~Asymmetric token factorization required~~ → Not needed with tie_embedding; full 262K classifier is manageable
+- ~~Poor understanding in Show-o~~ → This may be Show-o's architecture, not the tokenizer. Our permutation-based training should learn better representations from the same discrete tokens — this is a testable hypothesis
+- ~~Worse rFID than XQ-GAN (1.17 vs 0.64)~~ → The HuggingFace model card reports 0.78 rFID on zero-shot benchmarks, competitive with XQ-GAN. The original 1.17 was on a different evaluation protocol
 
-**Why XQ-GAN:**
-- **Identical codebook size and token count** to VQGAN — zero engineering changes to LM head design
-- **7.8× better reconstruction quality** (rFID 0.64 vs 4.98) — moves from "barely usable" to "competitive with modern tokenizers"
-- **ICLR 2025 accepted** — academically citable as recent work
-- **Modular framework** — supports VQ, RQ, MSVQ, and VP variants; easy to swap quantization methods during experimentation
+**Key specs:**
+- Code & weights: `TencentARC/Open-MAGVIT2-Tokenizer-262144-Pretrain` on HuggingFace, code from `github.com/TencentARC/SEED-Voken`
+- 256 tokens per 256×256 image (16×16 grid), single LFQ quantizer
+- Image preprocessing: resize to 256×256, normalize to [-1, 1]
+
+#### Historical Context: Why We Previously Used XQ-GAN
+
+XQ-GAN VP2 (16,384 codebook, rFID 0.64) was our initial choice because it had manageable codebook size and excellent reconstruction quality. However, we switched to MAGVIT-v2 because:
+
+1. Tie_embedding made the 262K codebook feasible (previously the main blocker)
+2. XQ-GAN's DINOv2 backbone implicitly encodes semantic features — this could mask whether our architecture learns semantics or merely inherits them from the tokenizer
+3. Using the same tokenizer as Show-o enables cleaner comparison
+
+| Property | XQ-GAN VP2 (old) | Open-MAGVIT2 (current) |
+|----------|-----------------|----------------------|
+| **rFID** (ImageNet 256²) | 0.64 | 0.78 (zero-shot) |
+| **Codebook size** | 16,384 | 262,144 (2^18) |
+| **Quantization** | VQ + product quant (2 sub) | LFQ (single) |
+| **Tokens per image** | 512 (256×2 interleaved) | 256 (16×16) |
+| **LM head params** | 25M (×2 without tie) | 268M (0 with tie_embedding) |
+| **Semantic supervision** | DINOv2 encoder backbone | None (pure reconstruction) |
+| **Show-o compatibility** | ❌ Different tokenizer | ✅ Same tokenizer family |
 
 #### Comparison with Other Modern Tokenizers
 
-| Tokenizer | rFID | Codebook | Tokens | CLIP-Free? | Pretrained? | Viability for Us |
-|-----------|------|----------|-------|------------|-------------|------------------|
-| **XQ-GAN VP2** | **0.64** | 16,384 | 256 | ✅ Yes | ✅ HF | **★ Best choice** |
-| WeTok | 0.12 | GQ (multi-LFQ) | 256 | ✅ Yes | ✅ GitHub | ⚠️ Very new (Aug 2025), integration complexity TBD |
-| UniTok | 0.38 | 8×4,096 MCQ | 256 | ❌ Uses CLIP distillation | ✅ GitHub | ❌ Conflicts with our "no CLIP" route |
-| MGVQ | 0.49 | 8×8,192 subgroups | 256 | ✅ Yes | ✅ GitHub | ⚠️ Multi-codebook adds integration complexity |
-| Open-MAGVIT2 | 1.17 | 262,144 LFQ | 256 | ✅ Yes | ✅ HF | ❌ Codebook too large (262K) |
-| VQGAN f16 | 4.98 | 16,384 | 256 | ✅ Yes | ✅ CompVis | ❌ Quality too poor |
-
-**Decision:** XQ-GAN ImageFolder VP2 is the primary recommendation. If higher reconstruction quality is needed and integration complexity proves acceptable, MGVQ (rFID 0.49) is the fallback. WeTok (rFID 0.12) should be monitored as its ecosystem matures.
+| Tokenizer | rFID | Codebook | Tokens | CLIP-Free? | Pretrained? | Status |
+|-----------|------|----------|-------|------------|-------------|--------|
+| **Open-MAGVIT2** | **0.78** | 262,144 LFQ | 256 | ✅ Yes | ✅ HF | **★ Current** |
+| XQ-GAN VP2 | 0.64 | 16,384 | 256 | ✅ Yes (DINOv2) | ✅ HF | Replaced |
+| WeTok | 0.12 | GQ (multi-LFQ) | 256 | ✅ Yes | ✅ GitHub | ⚠️ Monitor (Aug 2025) |
+| MGVQ | 0.49 | 8×8,192 | 256 | ✅ Yes | ✅ GitHub | Fallback option |
+| UniTok | 0.38 | 8×4,096 MCQ | 256 | ❌ CLIP distillation | ✅ GitHub | Incompatible |
+| VQGAN f16 | 4.98 | 16,384 | 256 | ✅ Yes | ✅ CompVis | Rejected (quality) |
 
 #### Alternative: TiTok-L-32
 - 32 tokens per image, 4K codebook
@@ -755,7 +761,7 @@ At inference, our model has **no two-stream overhead** (XT is absent). The gener
 
 **H1: Sigma-Based Unified Attention > Modality-Switching Attention.**
 
-A single continuous attention mechanism (σ_kv > σ_q) that subsumes both AR and bidirectional as special cases outperforms modality-dependent attention switching (Show-o's approach) for unified multimodal tasks. Specifically:
+A single continuous attention mechanism (σ_kv < σ_q) that subsumes both AR and bidirectional as special cases outperforms modality-dependent attention switching (Show-o's approach) for unified multimodal tasks. Specifically:
 - The absence of a hard modality boundary enables smoother cross-modal information flow
 - Continuous sigma allows hierarchical, partial visibility that binary masking cannot express
 - A single training objective (CE on all positions) avoids the optimization complexity of multi-objective training
@@ -778,11 +784,11 @@ Training on diverse partial orderings produces better multimodal performance tha
 
 **RQ1: 2D Sigma Schedule Impact.** Does a 2D-aware sigma schedule (center-out) for image generation improve image quality (FID, CLIP score) over random uniform sigma? Does it improve cross-modal consistency (text→image alignment)?
 
-**RQ2: Text Capability Preservation.** What loss-weighting strategy (λ_image) and data mixture ratio (% pure text) is sufficient to prevent text capability degradation? Does permutation-based training degrade text more or less than AR-based multimodal training?
+**RQ2: Text Capability Preservation.** Under document-level OmniCorpus-only pretraining, what loss-weighting strategy (λ_image) and text/image token balance are sufficient to prevent language degradation? Does permutation-based image-token training degrade text more or less than AR-style multimodal training on the same interleaved documents?
 
 **RQ3: Block-Wise Decoding Efficiency.** Is block-wise confidence-based parallel decoding significantly faster than token-by-token AR for image generation in wall-clock time, accounting for KV-cache differences?
 
-**RQ4: Training-Inference Sigma Alignment.** Does explicit sigma distribution coverage in training (including "all image tokens high sigma" samples) improve understanding task performance compared to random uniform-only sigma training?
+**RQ4: Training-Inference Sigma Alignment.** Does explicit sigma distribution coverage in training (including "all image tokens low enough to be visible" samples) improve understanding task performance compared to random uniform-only sigma training?
 
 **RQ5: 2D Position Encoding.** Does 2D RoPE for image tokens improve spatial coherence and reconstruction quality compared to standard 1D RoPE?
 
@@ -792,28 +798,32 @@ Training on diverse partial orderings produces better multimodal performance tha
 
 ### Phase 0: Infrastructure (Current Status → Ready)
 
-- [ ] **Image Tokenizer Integration**
-  - XQ-GAN VP2 16384 checkpoint downloaded to `public/models/xqgan_vp2_16384/`
-  - Implement `ImageTokenizer` wrapper class with encode/decode
-  - Dual embedding: `nn.Embedding(16384, hidden_dim)` for image token embeddings
-  - Dual LM head: `nn.Linear(hidden_dim, 16384)` for image token prediction
+- [x] **Image Tokenizer Integration**
+  - Open-MAGVIT2 262K LFQ checkpoint downloaded to `public/models/open-magvit2-262144/`
+  - Implemented `MAGVIT2Wrapper` (`scripts/magvit2_wrapper.py`) with encode/decode
+  - Image embedding: `nn.Embedding(262144, hidden_dim)` with tie_embedding to image_lm_head
+  - Dual LM head: `nn.Linear(hidden_dim, 262144)` for image token prediction (0 params with tie_embedding)
   - Report tokenizer reconstruction metrics (rFID, rLPIPS, PSNR) as generation upper bound
 
-- [ ] **Multimodal Data Pipeline**
-  - Extend dataloader to handle interleaved text-image sequences
-  - Sequence format: `[BOS] text_tokens [BOI] img_tokens [EOI] text_tokens [BOI] img_tokens [EOI] ...`
-  - Special tokens: `<|boi|>`, `<|eoi|>` (begin/end of image)
-  - Token type tracking: per-position mask indicating text vs. image token
+- [x] **OmniCorpus Multimodal Data Pipeline**
+  - Switched pretraining data to `OpenGVLab/OmniCorpus-CC-210M` only
+  - Offline pipeline: parquet shards → interleaved document JSONL + images → Open-MAGVIT2 image tokens → Arrow shards
+  - Training sequence format: `text_tokens [BOI] img_tokens [EOI] text_tokens [BOI] img_tokens [EOI] ... [EOS]`
+  - Special tokens: `<|boi|>`, `<|eoi|>` (begin/end of image); EOS separates packed documents
+  - Token type tracking: per-position mask indicating text vs. image vs. special vs. padding
+  - Image span invariant: each image is exactly `BOI + 256 image tokens + EOI`; image tokens are never truncated
+  - Training dataloader memory-maps pre-tokenized Arrow shards and packs whole documents up to `max_seq_length`
 
-- [ ] **Loss Weighting**
+- [x] **Loss Weighting**
   - Implement modality-aware loss: `loss = text_loss + λ * image_loss`
   - λ = 0.3–0.5 (following Emu3's 0.5× finding)
+  - Head/loss mode is an ablation: dual text/image heads by default, with a unified LM head option via `model.unified_head`
 
-- [ ] **Sigma Schedules for Multimodal**
-  - Text tokens: descending sigma (AR) or high sigma (prompt/condition)
-  - Image tokens: uniform random sigma (baseline), center-out
-  - Prompt/condition tokens: sigma ∈ [2, 3] (always visible)
-  - Three-mode task-dependent assignment: text_to_image / image_to_text / text_only
+- [x] **Baseline Sigma Schedule for Interleaved OmniCorpus**
+  - Text/special tokens use monotonic document order
+  - Image tokens receive a random permutation inside each complete image block
+  - `[EOI]` is not predicted; padding is ignored
+  - Follow-up ablations will replace the image random permutation with AR raster, center-out, or explicit condition/target sigma ranges
 
 - [ ] **2D RoPE for Image Tokens** (ablation preparation)
   - Implement 2D RoPE variant alongside existing 1D RoPE
@@ -829,9 +839,9 @@ Training on diverse partial orderings produces better multimodal performance tha
 
 **Setup:**
 - Model: Qwen3-0.6B-Base with Selfless Attention (using pretrained Qwen3-0.6B weights for text capability)
-- Image tokenizer: XQ-GAN VP2 16384 (rFID 0.64)
-- Data: ~1B multimodal tokens (mixed text + image interleaved)
-- 70% pure text + 30% multimodal mixture
+- Image tokenizer: Open-MAGVIT2 262K LFQ (rFID 0.78)
+- Data: ~1B tokens from `OpenGVLab/OmniCorpus-CC-210M`, converted into real web-scale interleaved text-image documents
+- No synthetic COCO/FineWeb/SII mixture in the main multimodal path
 
 **Critical note on scale:** At 1B tokens / 5K steps, generation metrics (FID, VQA, BLEU, captioning) will NOT produce meaningful signals. The model will not have learned to generate coherent images or answer visual questions. Phase 1 focuses exclusively on **structural metrics** that provide signal even at small scale.
 
@@ -839,11 +849,11 @@ Training on diverse partial orderings produces better multimodal performance tha
 
 | Variant | Text Sigma | Image Sigma | Image Loss Weight | 2D RoPE | Purpose |
 |---------|-----------|-------------|-------------------|---------|---------|
-| A (AR baseline) | AR (descending) | AR (descending, raster) | 0.5 | No | Upper bound for AR |
-| B (Ours, basic) | AR (descending) | Random uniform | 0.5 | No | Core comparison vs. A |
-| C (Ours, prompt style) | High (2-3) | Low (0-1) | 0.5 | No | Conditional generation mode |
-| D (Ours, center-out sigma) | AR (descending) | Center-out | 0.5 | No | Test 2D sigma schedule |
-| E (Ours + 2D RoPE) | AR (descending) | Random uniform | 0.5 | Yes | 2D position ablation |
+| A (AR baseline) | Document order | AR raster inside image blocks | 0.5 | No | Upper bound for fixed-order AR |
+| B (Ours, basic) | Document order | Random permutation inside image blocks | 0.5 | No | Core comparison vs. A |
+| C (Condition/target sigma) | Segment-dependent high/low ranges | Segment-dependent high/low ranges | 0.5 | No | Explicit understanding/generation role assignment |
+| D (Ours, center-out sigma) | AR ascending generation order | Center-out | 0.5 | No | Test 2D sigma schedule |
+| E (Ours + 2D RoPE) | AR ascending generation order | Random uniform | 0.5 | Yes | 2D position ablation |
 
 **Phase 1 Metrics (Structural Only):**
 
@@ -852,7 +862,7 @@ Training on diverse partial orderings produces better multimodal performance tha
 - Text token perplexity (monitor degradation — must stay within 5% of pure-text baseline)
 - Gradient cosine similarity per layer (text gradients vs. image gradients) — structural metric, independent of model capability
 - Training loss convergence speed (how quickly does each variant reduce loss?)
-- Tokenizer reconstruction upper bound (report rFID/rLPIPS/PSNR of XQ-GAN itself)
+- Tokenizer reconstruction upper bound (report rFID/rLPIPS/PSNR of MAGVIT-v2 itself)
 
 ❌ **Metrics deferred to Phase 2 (meaningless at 1B token scale):**
 - VQA accuracy — model cannot generate coherent answers yet
@@ -872,14 +882,14 @@ Training on diverse partial orderings produces better multimodal performance tha
 
 **Setup:**
 - Model: Qwen3-0.6B-Base, possibly scale to larger variant if results warrant
-- Data: ~10-80B multimodal tokens
-- Training: full config as in `configs/selfless/pretraining.yaml`
+- Data: ~10-80B tokens from expanded OmniCorpus-CC shards
+- Training: full config as in `configs/selfless/omnicorpus.yaml`
 
 **Comparisons:**
 - Against LLaVA-style (CLIP + AR) on understanding benchmarks — **baseline for "how close can we get without CLIP?"**
 - Against Chameleon-style (pure AR, same tokenizer) on generation quality — **core paradigm comparison**
 - Against Show-o-style (causal text + full-bidir image, binary masking) — **core architectural comparison**
-- Ablation: selfless (σ_kv > σ_q) vs. XLNet-style (σ_kv ≥ σ_q for content stream)
+- Ablation: selfless (σ_kv < σ_q) vs. XLNet-style (σ_kv <= σ_q for content stream)
 
 ### Phase 3: Contribution Validation
 
@@ -897,7 +907,7 @@ Training on diverse partial orderings produces better multimodal performance tha
 
 5. **2D position encoding ablation** — 1D RoPE vs. 2D RoPE for image tokens, measuring reconstruction quality and spatial coherence.
 
-6. **Sigma distribution coverage ablation** — compare training with and without explicit "all image tokens high sigma" samples on understanding task performance (testing training-inference mismatch mitigation).
+6. **Sigma distribution coverage ablation** — compare training with and without explicit "all image tokens low enough to be visible" samples on understanding task performance (testing training-inference mismatch mitigation).
 
 ---
 
@@ -906,7 +916,7 @@ Training on diverse partial orderings produces better multimodal performance tha
 ### What This Work Contributes
 
 **1. Continuous Sigma Ordering as a Unified Attention Paradigm.**
-We propose that a single continuous attention mechanism (σ_kv > σ_q) parametrized by scalar sigma values can subsume both AR and bidirectional attention as special cases at two ends of a continuous spectrum. This is architecturally simpler and more flexible than modality-dependent attention switching (Show-o) or modality-specific architectural separation (Uni-X).
+We propose that a single continuous attention mechanism (σ_kv < σ_q) parametrized by scalar sigma values can subsume both AR and bidirectional attention as special cases at two ends of a continuous spectrum. This is architecturally simpler and more flexible than modality-dependent attention switching (Show-o) or modality-specific architectural separation (Uni-X).
 
 **2. Empirical Comparison of Attention Paradigms for Unified Multimodal Models.**
 We provide the first direct experimental comparison between:
@@ -940,7 +950,7 @@ We test whether sigma-based role separation (condition vs. target) naturally mit
 Emu3 and Chameleon demonstrated emergence at massive scale (10T+ tokens, 7-34B parameters). Our experiments at 0.6B scale with 80B tokens may not cross the emergence threshold. **Mitigation:** We do not claim "emergence" as our contribution. We cite Emu3 as having established the feasibility, and focus on the paradigm comparison (sigma-based vs. AR).
 
 ### Risk 2: Permutation-Based Training May Degrade Text Performance
-Text has meaningful sequential structure. Training text tokens with random sigma (rather than AR) may confuse the model's understanding of syntax and discourse. **Mitigation:** Text tokens always use descending (AR) sigma in training. Only image tokens use random or 2D-structured sigma. This mixed schedule preserves text sequence structure.
+Text has meaningful sequential structure. Training text tokens with random sigma (rather than AR) may confuse the model's understanding of syntax and discourse. **Mitigation:** Text tokens always use ascending AR generation-order sigma in training. Only image tokens use random or 2D-structured sigma. This mixed schedule preserves text sequence structure.
 
 ### Risk 3: The Gradient Conflict Hypothesis May Not Hold
 Uni-X found conflict in AR models. Our sigma-based "role separation" (condition vs. target) is theoretically different from modality separation, but there is zero empirical evidence that it actually reduces gradient conflict. **Mitigation:** We frame this as a testable hypothesis with a simple experiment (gradient cosine similarity), not as a guaranteed result. A null result is still informative.
@@ -955,7 +965,7 @@ If permutation-based training only beats AR at small-to-medium scale but AR catc
 Block-wise decoding might not be faster than AR in wall-clock time if KV-cache recomputation overhead is larger than anticipated. **Mitigation:** Run the benchmark and report honestly. If block-wise is not faster, drop the efficiency claim and focus on quality and flexibility advantages.
 
 ### Risk 7: Training-Inference Sigma Mismatch
-Image tokens at inference (all high sigma for understanding) differ from the training distribution (random sigma). **Mitigation:** Explicit sigma distribution coverage in training, tested in Phase 1. If mismatch is significant, add "all image tokens high sigma" samples to training.
+Image tokens at inference for understanding must have sigma low enough to be visible to response tokens, which differs from pure random image sigma. **Mitigation:** Explicit sigma distribution coverage in training, tested in Phase 1. If mismatch is significant, add "all image tokens low enough to be visible" samples to training.
 
 ---
 
@@ -965,21 +975,23 @@ This section provides detailed technical analysis addressing the most recent rou
 
 ---
 
-### 1. Sigma Range Design: Three-Mode Task-Dependent Assignment (Full Specification)
+### 1. Sigma Range Design: Condition/Target Ablation Specification
 
-**Background.** The advisor identified a potential issue: if text tokens use descending sigma [L, L-1, ..., 1] and image tokens use uniform random [0, 1] in all training samples, then text tokens (as query, σ ∈ [1, L]) can never attend to image tokens (as K/V, σ ∈ [0, 1]) because σ_kv > σ_q requires image σ > text σ, which is always false.
+**Background.** With the implemented rule σ_kv < σ_q, sigma is a generation-order coordinate: earlier/lower-sigma tokens are visible to later/higher-sigma queries. If two modalities occupy disjoint sigma ranges, only the later/higher-sigma modality can attend to the earlier/lower-sigma modality.
 
-**Resolution.** This is by design for certain tasks, but requires explicit per-sample mode switching to ensure all inference configurations are covered during training. The three-mode design below addresses this.
+**Current implementation status.** The mainline OmniCorpus pipeline currently uses document-level interleaved samples with text/special tokens in monotonic document order and image tokens randomly permuted inside each complete image block. This preserves natural web-document order and keeps the preprocessing/packing path simple and scalable.
 
-#### 1.1 The σ_kv > σ_q Asymmetry
+**Ablation resolution.** Explicit condition/target sigma ranges remain important for understanding/generation coverage. The three-mode design below is retained as a Phase 1/2 ablation, not the default OmniCorpus dataloader behavior.
 
-The attention rule is directional: a query at position i can attend to K/V at position j if and only if σ_j > σ_i. This creates an asymmetry:
-- If modality A has uniformly higher sigma than modality B, then A is invisible to B but B is visible to A
+#### 1.1 The σ_kv < σ_q Asymmetry
+
+The attention rule is directional: a query at position i can attend to K/V at position j if and only if σ_j < σ_i. This creates an asymmetry:
+- If modality A has uniformly lower sigma than modality B, then A is visible to B but B is invisible to A
 - Bidirectional visibility requires overlapping sigma ranges
 
-#### 1.2 Three Training Modes
+#### 1.2 Three Ablation Modes
 
-Each training sample is assigned one of three modes. The modes are sampled per-sample within each batch, so the model sees all three configurations in every training iteration.
+Each training sample can be assigned one of three condition/target modes. In this ablation, modes are sampled per-sample within each batch, so the model sees multiple inference configurations during training.
 
 ```python
 def assign_sigma_multimodal(sequence, token_types, task_mode=None):
@@ -991,7 +1003,7 @@ def assign_sigma_multimodal(sequence, token_types, task_mode=None):
     task_mode determines the sigma range assignment:
       "text_to_image" (30%): text=condition, image=target
       "image_to_text" (30%): image=condition, text=target
-      "text_only"      (40%): standard AR for text
+      "interleaved_ar" (40%): document-order text + random image-block baseline
     """
     B, L = sequence.shape
     sigma = torch.zeros(B, L)
@@ -999,7 +1011,7 @@ def assign_sigma_multimodal(sequence, token_types, task_mode=None):
     for b in range(B):
         if task_mode is None:
             task_mode = random.choices(
-                ["text_to_image", "image_to_text", "text_only"],
+                ["text_to_image", "image_to_text", "interleaved_ar"],
                 weights=[0.30, 0.30, 0.40]
             )[0]
 
@@ -1013,50 +1025,48 @@ def assign_sigma_multimodal(sequence, token_types, task_mode=None):
 
         if task_mode == "text_to_image":
             # ── Text is condition, Image is target ──
-            # ── Text σ ∈ [2, 2+n_text], Image σ ∈ [0, 1] ──
+            # ── Text gets earlier/lower σ, Image gets later/higher σ ──
             # Visibility check:
-            #   Image Q (σ∈[0,1]) → Text K/V (σ∈[2,2+n])  ✓  (text σ > image σ)
-            #   Text Q (σ∈[2,2+n]) → Image K/V (σ∈[0,1])  ✗  (image σ < text σ)
+            #   Image Q → Text K/V  ✓  (text σ < image σ)
+            #   Text Q → Image K/V  ✗  (image σ > text σ)
             # This is CORRECT for generation: model predicts images given text prompt.
             # Text does NOT need to see image (text is the prompt, not the target).
             if n_text > 0:
-                sigma[b, text_mask] = 2.0 + n_text - torch.arange(
-                    n_text, dtype=torch.float32, device=sigma.device
-                )  # σ ∈ [2, 2+n_text], AR descending within text
-            if n_image > 0:
-                sigma[b, image_mask] = torch.rand(n_image, device=sigma.device)  # σ ∈ [0, 1]
-
-        elif task_mode == "image_to_text":
-            # ── Image is condition, Text is target ──
-            # ── Image σ ∈ [2, 3], Text σ ∈ [0, n_text] ──
-            # Visibility check:
-            #   Text Q (σ∈[0,n_text]) → Image K/V (σ∈[2,3])  ✓  (image σ > text σ)
-            #   Image Q (σ∈[2,3]) → Text K/V (σ∈[0,n_text])  ✗  (text σ < image σ)
-            # This is CORRECT for understanding: model generates text given image input.
-            # Image does NOT need to see text (image is the input, not the target).
-            if n_image > 0:
-                sigma[b, image_mask] = 2.0 + torch.rand(
-                    n_image, device=sigma.device
-                )  # σ ∈ [2, 3]
-            if n_text > 0:
-                sigma[b, text_mask] = n_text - torch.arange(
-                    n_text, dtype=torch.float32, device=sigma.device
-                )  # σ ∈ [0, n_text], AR descending
-
-        elif task_mode == "text_only":
-            # ── Standard AR for text-only documents ──
-            if n_text > 0:
-                sigma[b, text_mask] = n_text - torch.arange(
+                sigma[b, text_mask] = torch.arange(
                     n_text, dtype=torch.float32, device=sigma.device
                 )
             if n_image > 0:
-                sigma[b, image_mask] = -1.0  # no image tokens in text-only mode
+                sigma[b, image_mask] = n_text + torch.rand(n_image, device=sigma.device)
 
-        # ── Special tokens: always max sigma, visible to ALL ──
+        elif task_mode == "image_to_text":
+            # ── Image is condition, Text is target ──
+            # ── Image gets earlier/lower σ, Text gets later/higher σ ──
+            # Visibility check:
+            #   Text Q → Image K/V  ✓  (image σ < text σ)
+            #   Image Q → Text K/V  ✗  (text σ > image σ)
+            # This is CORRECT for understanding: model generates text given image input.
+            # Image does NOT need to see text (image is the input, not the target).
+            if n_image > 0:
+                sigma[b, image_mask] = torch.rand(n_image, device=sigma.device)
+            if n_text > 0:
+                sigma[b, text_mask] = n_image + torch.arange(
+                    n_text, dtype=torch.float32, device=sigma.device
+                )
+
+        elif task_mode == "interleaved_ar":
+            # ── Baseline document-order mode ──
+            if n_text > 0:
+                sigma[b, text_mask] = torch.arange(
+                    n_text, dtype=torch.float32, device=sigma.device
+                )
+            if n_image > 0:
+                sigma[b, image_mask] = torch.rand(n_image, device=sigma.device)
+
+        # ── Special tokens follow document order unless a task overrides them ──
         max_sigma = 0.0
         if text_mask.any():
             max_sigma = max(max_sigma, sigma[b, text_mask].max().item())
-        if image_mask.any() and task_mode != "text_only":
+        if image_mask.any():
             max_sigma = max(max_sigma, sigma[b, image_mask].max().item())
         if special_mask.any():
             sigma[b, special_mask] = max_sigma + 1.0
@@ -1074,18 +1084,18 @@ def assign_sigma_multimodal(sequence, token_types, task_mode=None):
 |------|----------------------|----------------------|-----------------|
 | `text_to_image` | Image Q sees Text K/V ✓ | Text Q does NOT see Image K/V | ✅ Yes — text is condition, image is target |
 | `image_to_text` | Image Q does NOT see Text K/V | Text Q sees Image K/V ✓ | ✅ Yes — image is condition, text is target |
-| `text_only` | N/A | N/A | ✅ Yes — no image tokens present |
+| `interleaved_ar` | Depends on local document sigma | Depends on local document sigma | Baseline document-order mode |
 
 **Inference configuration coverage:**
 
 | Inference Task | Sigma Assignment | Covered by Training Mode? |
 |---------------|-----------------|---------------------------|
-| Text→Image generation | Text σ high, Image σ low, iterative fill | ✅ `text_to_image` |
-| Image captioning | Image σ high, Text σ low, AR decode | ✅ `image_to_text` |
-| VQA | Image σ high, Question+Answer σ low, AR | ✅ `image_to_text` |
-| Interleaved generation | Alternating high/low sigma blocks | ⚠️ Partially — covered by mixture of modes across samples |
+| Text→Image generation | Text σ high, Image σ low, iterative fill | `text_to_image` ablation |
+| Image captioning | Image σ high, Text σ low, AR decode | `image_to_text` ablation |
+| VQA | Image σ high, Question+Answer σ low, AR | `image_to_text` ablation |
+| Interleaved generation | Alternating high/low sigma blocks | Main OmniCorpus document mode + future overlap ablation |
 
-**For truly interleaved bidirectional attention** (where text and image tokens need to mutually attend within a single forward pass), we would need overlapping sigma ranges. This can be done by assigning all content tokens sigma in a shared range [0, 2] with modality-appropriate internal ordering, but is deferred to post-training / Phase 2. For pretraining, the three-mode design covers all essential inference configurations.
+**For truly interleaved bidirectional attention** (where text and image tokens need to mutually attend within a single forward pass), we need overlapping sigma ranges. This can be done by assigning all content tokens sigma in a shared range [0, 2] with modality-appropriate internal ordering. This is a planned ablation after the OmniCorpus baseline is stable.
 
 #### 1.4 Sigma Range Overlap for Interleaved (Future)
 
@@ -1094,7 +1104,7 @@ If bidirectional cross-modal attention within a single sample is needed (e.g., f
 ```python
 # "interleaved" mode (deferred to Phase 2):
 # All content tokens σ ∈ [0, 2]
-# Text: AR descending within text segments, shifted to [1, 2] for prompt, [0, 1] for response
+# Text: ascending AR generation order within text segments
 # Image: random within [0, 2]
 # → Ranges overlap → bidirectional cross-modal visibility possible
 ```
@@ -1103,49 +1113,47 @@ If bidirectional cross-modal attention within a single sample is needed (e.g., f
 
 ### 2. Quality-Heterogeneous Context: Correcting the Narrative
 
-**Issue identified by advisor.** The previous CLAUDE.md narrative described high-σ tokens as "more confirmed" or "more reliable" context sources. This is incorrect given the σ_kv > σ_q attention rule. We correct the analysis below.
+**Issue identified by advisor.** The previous CLAUDE.md narrative described high-σ tokens as "more confirmed" or "more reliable" context sources. This is incorrect given the σ_kv < σ_q attention rule. We correct the analysis below.
 
 #### 2.1 Mathematical Reality
 
-The attention rule σ_kv > σ_q implies:
+The attention rule σ_kv < σ_q implies:
 
 ```
 For any token at position i with sigma σ_i:
-  As QUERY: can attend to K/V at positions j where σ_j > σ_i
-            → fraction of visible tokens ≈ 1 - σ_i (if σ ∼ Uniform[0,1])
+  As QUERY: can attend to K/V at positions j where σ_j < σ_i
+            → fraction of visible tokens ≈ σ_i (if σ ∼ Uniform[0,1])
   
-  As K/V:   can be attended by queries at positions k where σ_k < σ_i
-            → fraction of queries that can see this K/V ≈ σ_i
+  As K/V:   can be attended by queries at positions k where σ_k > σ_i
+            → fraction of queries that can see this K/V ≈ 1 - σ_i
 ```
 
 **Concrete numbers for σ ∼ Uniform[0,1]:**
 
 | σ_i | As Query: % tokens visible | As K/V: % of queries that see it | X0 hidden state quality |
 |-----|---------------------------|----------------------------------|------------------------|
-| 0.9 | ~10% | ~90% | **Poor** (sees almost nothing) |
+| 0.9 | ~90% | ~10% | **Rich** (sees most earlier-order context) |
 | 0.5 | ~50% | ~50% | Medium |
-| 0.1 | ~90% | ~10% | **Rich** (sees almost everything) |
+| 0.1 | ~10% | ~90% | **Raw** (early context token) |
 
 #### 2.2 Implication for X0 Stream K/V Quality
 
 The X0 stream produces K/V for both its own self-attention and XT's cross-stream attention. The quality of X0's K/V at position j depends on how much context that position's hidden state has aggregated through self-attention at previous layers:
 
-- **High-σ X0 positions** (σ ≈ 0.9): As queries, they see ~10% of other tokens. Their self-attention output is poorly contextualized — essentially "raw" token embeddings with minimal cross-token information. However, their K/V is **highly visible** to ~90% of other positions.
+- **High-σ X0 positions** (σ ≈ 0.9): As queries, they see ~90% of other tokens. Their self-attention output is richly contextualized. However, their K/V is visible to only ~10% of later positions.
 
-- **Low-σ X0 positions** (σ ≈ 0.1): As queries, they see ~90% of other tokens. Their self-attention output is richly contextualized — the hidden state aggregates information from almost the entire sequence. However, their K/V is **barely visible** to only ~10% of other positions.
+- **Low-σ X0 positions** (σ ≈ 0.1): As queries, they see ~10% of other tokens. Their self-attention output is closer to raw token content. However, their K/V is visible to ~90% of later positions.
 
 #### 2.3 Implication for XT Stream Prediction
 
-The XT stream queries (from [MASK] embeddings, typically predicting target tokens with low σ) attend to X0's K/V. The information they receive is **quality-heterogeneous**:
+The XT stream queries (from [MASK] embeddings) attend to X0's K/V from earlier/lower sigma positions. The information they receive is **quality-heterogeneous**:
 
 ```
-XT_Q (σ ≈ 0.0) → attends to almost ALL X0 K/V:
-  ├── High-σ K/V (σ ≈ 0.8-1.0): "Raw" signals from isolated tokens
-  │                              → local, uncontextualized information
+XT_Q (σ ≈ 0.9) → attends to most lower-sigma X0 K/V:
+  ├── High-σ K/V (σ ≈ 0.8): richer but visible to fewer later queries
   ├── Mid-σ K/V (σ ≈ 0.4-0.7): Partially contextualized signals
   │                              → moderate cross-token aggregation
-  └── Low-σ K/V (σ ≈ 0.0-0.3): Well-contextualized signals
-                                 → rich cross-token aggregation
+  └── Low-σ K/V (σ ≈ 0.0-0.3): earlier/raw context signals
 ```
 
 #### 2.4 Contrast with MaskGIT
@@ -1182,11 +1190,11 @@ The advisor correctly identified that Phase 1 lacked a Show-o-style attention ba
 
 #### 3.1 What "Show-o Baseline" Means in Our Context
 
-We are NOT replicating Show-o's full training pipeline (3-stage training, MAGVIT2 tokenizer, etc.). We are implementing Show-o's **attention pattern** within our framework, using our tokenizer (XQ-GAN) and our training data.
+We are NOT replicating Show-o's full training pipeline (3-stage training, etc.). We are implementing Show-o's **attention pattern** within our framework. Note: we now use the same MAGVIT-v2 tokenizer family as Show-o, removing tokenizer as a confounding variable in comparisons.
 
 | Component | Show-o (Original) | Our Show-o Baseline |
 |-----------|-------------------|---------------------|
-| Tokenizer | MAGVIT2 (LFQ, 262K) | XQ-GAN VP2 (VQ, 16K) — same as our main model |
+| Tokenizer | MAGVIT2 (LFQ, 262K) | Open-MAGVIT2 (LFQ, 262K) — same as our main model |
 | Model backbone | Single-stream Transformer | Single-stream Transformer |
 | Text attention | Standard causal | Standard causal |
 | Image attention | Full bidirectional (among unmasked) | Full bidirectional (among unmasked) |
@@ -1243,11 +1251,11 @@ def get_show_o_style_mask(text_mask, image_mask, mask_ratio=0.5, seq_len=None):
 
 | Variant | Architecture | Text Attention | Image Attention | Image Sigma/Mask | Purpose |
 |---------|-------------|---------------|-----------------|------------------|---------|
-| A | Two-stream selfless | σ_kv > σ_q, AR σ | σ_kv > σ_q, AR σ | AR descending | AR upper bound |
-| B | Two-stream selfless | σ_kv > σ_q, AR σ | σ_kv > σ_q, random σ | Random uniform | Our core method |
-| C | Two-stream selfless | σ_kv > σ_q, high σ (2-3) | σ_kv > σ_q, low σ (0-1) | Conditional sigma | text→image generation mode |
-| D | Two-stream selfless | σ_kv > σ_q, AR σ | σ_kv > σ_q, center-out σ | Center-out spatial | 2D sigma schedule |
-| E | Two-stream selfless | σ_kv > σ_q, AR σ | σ_kv > σ_q, random σ | Random uniform + 2D RoPE | 2D position ablation |
+| A | Two-stream selfless | σ_kv < σ_q, AR σ | σ_kv < σ_q, AR σ | AR ascending generation order | AR upper bound |
+| B | Two-stream selfless | σ_kv < σ_q, AR σ | σ_kv < σ_q, random σ | Random uniform | Our core method |
+| C | Two-stream selfless | σ_kv < σ_q, low text σ (condition) | σ_kv < σ_q, higher image σ (target) | Conditional sigma | text→image generation mode |
+| D | Two-stream selfless | σ_kv < σ_q, AR σ | σ_kv < σ_q, center-out σ | Center-out spatial | 2D sigma schedule |
+| E | Two-stream selfless | σ_kv < σ_q, AR σ | σ_kv < σ_q, random σ | Random uniform + 2D RoPE | 2D position ablation |
 | **F** | **Single-stream** | **Causal** | **Full bidirectional** | **Binary mask (cosine)** | **★ Show-o baseline** |
 
 **Note on FLOPs fairness:** Variant F (single-stream) has ~1× training FLOPs while our variants A-E (two-stream) have ~1.8-2.0×. For fairness:
@@ -1260,7 +1268,7 @@ Without Variant F, Phase 1 can only tell us which **sigma configuration within s
 
 ---
 
-### 4. Conceptual Correction: σ_kv > σ_q Implies Inverted Quality Hierarchy
+### 4. Conceptual Correction: σ_kv < σ_q Means Sigma Is Generation Order
 
 **The precise relationship between sigma and representation quality under selfless attention:**
 
@@ -1268,15 +1276,15 @@ Let L be the number of Transformer layers. Let h^{(ℓ)}_i be the hidden state o
 
 At layer 0: h^{(0)}_i = Embed(token_i). All tokens have equally "raw" representations.
 
-At layer 1:
-- Token i with σ_i = 0.9 attends to ~10% of tokens → h^{(1)}_i aggregates information from ~10% of the sequence
-- Token j with σ_j = 0.1 attends to ~90% of tokens → h^{(1)}_j aggregates information from ~90% of the sequence
+At layer 1 under a uniform random sigma distribution:
+- Token i with σ_i = 0.9 attends to tokens with σ < 0.9, roughly 90% of the sequence
+- Token j with σ_j = 0.1 attends to tokens with σ < 0.1, roughly 10% of the sequence
 
-After L layers, the quality gap compounds. Low-σ tokens have progressively richer representations because at each layer they can aggregate information from a broader set of (increasingly contextualized) sources. High-σ tokens remain relatively isolated — they see few other tokens and those they see are themselves poorly contextualized.
+After L layers, later/higher-sigma tokens have access to more earlier context. Earlier/lower-sigma tokens are more visible to later queries but are themselves less contextualized. This matches the interpretation of sigma as generation order.
 
-**This is a structural property of the σ_kv > σ_q rule, not a bug.** Whether it's beneficial for learning is an empirical question that Phase 1 will address.
+**This is a structural property of the σ_kv < σ_q rule, not a bug.** Whether it's beneficial for learning is an empirical question that Phase 1 will address.
 
 **Corrected phrasing for paper:**
 
-> Under selfless attention (σ_kv > σ_q), token visibility and representation quality exhibit an inverse relationship: tokens with high sigma values are highly visible to others but poorly contextualized themselves, while tokens with low sigma values are less visible but carry richer, more aggregated representations. The query stream (XT) therefore receives a heterogeneous mixture of "raw" (high-σ, isolated) and "refined" (low-σ, connected) key/value signals. This contrasts with MaskGIT-style binary masking, where all unmasked tokens' representations are homogeneously contextualized through mutual bidirectional attention.
+> Under selfless attention (σ_kv < σ_q), sigma acts as a generation-order coordinate: lower-sigma tokens are earlier context and are visible to later/higher-sigma queries, while higher-sigma tokens can aggregate broader earlier context but are visible to fewer future tokens. This contrasts with MaskGIT-style binary masking, where all unmasked tokens are mutually visible with no directed ordering.
 - **MPNet** (Microsoft, NeurIPS 2020): "Masked and Permuted Pre-training for Language Understanding" — [arXiv:2004.09297](https://arxiv.org/abs/2004.09297)
