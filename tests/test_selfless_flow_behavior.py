@@ -1,6 +1,8 @@
 import os
+import tempfile
 import types
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
@@ -9,7 +11,8 @@ import torch
 from torch import nn
 from transformers import Qwen3Config
 
-from models.modeling_model.modeling_selfless_flow import FlowMatchingHead, Qwen3ForCausalLM, Qwen3Model
+from models.modeling_model.modeling_selfless_flow import FlowMatchingHead, ImageLatentProjector, Qwen3ForCausalLM, Qwen3Model
+from utils.dataset_imagenet_flow_cache import ImageNetFlowCacheDataset, collate_imagenet_flow_cache
 
 
 def tiny_qwen3_config():
@@ -78,6 +81,19 @@ class FakeFlowHead:
         return torch.zeros(z.shape[0], self.latent_dim, device=z.device, dtype=z.dtype)
 
 
+class FakeTokenizer:
+    def __init__(self):
+        self.vocab = {}
+
+    def encode(self, text, add_special_tokens=False):
+        ids = []
+        for word in text.split():
+            if word not in self.vocab:
+                self.vocab[word] = 100 + len(self.vocab)
+            ids.append(self.vocab[word])
+        return ids
+
+
 class FakeInnerModel:
     def __init__(self, hidden_size):
         self.hidden_size = hidden_size
@@ -105,6 +121,72 @@ class FakeInnerModel:
 
 
 class SelflessFlowBehaviorTest(unittest.TestCase):
+    def test_full_imagenet_cache_collate_trains_boi_and_eos_but_not_eoi(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            latents = torch.arange(16, dtype=torch.float16).view(2, 4, 2)
+            torch.save({"latents": latents, "img_ids": torch.tensor([1, 2])}, root / "latents.pt")
+            (root / "manifest.jsonl").write_text(
+                '{"img_id": 1, "synset": "n00000001"}\n'
+                '{"img_id": 2, "synset": "n00000002"}\n'
+            )
+            (root / "mapping.txt").write_text(
+                "n00000001 test class, alternate name\n"
+                "n00000002 other class\n"
+            )
+
+            dataset = ImageNetFlowCacheDataset(
+                cache_path=str(root / "latents.pt"),
+                tokenizer=FakeTokenizer(),
+                boi_token_id=11,
+                eoi_token_id=12,
+                mask_token_id=13,
+                eos_token_id=14,
+                image_tokens_per_img=4,
+                image_latent_dim=2,
+                manifest_jsonl=str(root / "manifest.jsonl"),
+                prompt_template="a photo of {class_name}",
+                synset_mapping_path=str(root / "mapping.txt"),
+                max_seq_length=16,
+            )
+
+            batch = collate_imagenet_flow_cache([dataset[0]], pad_to_length=16)
+
+        input_ids = batch["input_ids"][0]
+        labels = batch["labels"][0]
+        token_types = batch["token_types"][0]
+        sigma = batch["sigma"][0]
+        image_latents = batch["image_latents"][0]
+
+        prompt_len = 5
+        image_start = prompt_len + 1
+        eoi_pos = image_start + 4
+        eos_pos = eoi_pos + 1
+
+        self.assertEqual(input_ids[prompt_len].item(), 11)
+        self.assertEqual(input_ids[eoi_pos].item(), 12)
+        self.assertEqual(input_ids[eos_pos].item(), 14)
+
+        self.assertEqual(labels[prompt_len].item(), 11)
+        self.assertEqual(labels[eoi_pos].item(), -100)
+        self.assertEqual(labels[eos_pos].item(), 14)
+        self.assertTrue(torch.equal(labels[image_start:eoi_pos], torch.full((4,), -100)))
+
+        self.assertTrue(torch.equal(token_types[image_start:eoi_pos], torch.ones(4, dtype=torch.uint8)))
+        self.assertTrue(torch.equal(image_latents[image_start:eoi_pos], latents[0]))
+
+        self.assertEqual(sigma[prompt_len].item(), prompt_len)
+        self.assertEqual(sigma[eoi_pos].item(), prompt_len + 1)
+        self.assertTrue(torch.all(sigma[image_start:eoi_pos] > sigma[eoi_pos]))
+        self.assertTrue(torch.all(sigma[eos_pos] > sigma[image_start:eoi_pos]))
+
+    def test_image_latent_projector_handles_bfloat16_weights(self):
+        projector = ImageLatentProjector(latent_dim=4, hidden_size=8, projector_width=16).to(dtype=torch.bfloat16)
+        latents = torch.randn(5, 4, dtype=torch.float32)
+        out = projector(latents)
+        self.assertEqual(tuple(out.shape), (5, 8))
+        self.assertEqual(out.dtype, torch.bfloat16)
+
     def test_flow_head_scales_time_and_passes_condition_through(self):
         head = FlowMatchingHead(
             target_channels=4,

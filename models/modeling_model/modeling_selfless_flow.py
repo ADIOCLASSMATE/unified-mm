@@ -211,6 +211,29 @@ class FlowMatchingHead(nn.Module):
         return x
     
 
+class ImageLatentProjector(nn.Module):
+    def __init__(self, latent_dim, hidden_size, projector_width=None):
+        super().__init__()
+        projector_width = int(projector_width or hidden_size * 2)
+        self.in_norm = nn.LayerNorm(latent_dim, eps=1e-6)
+        self.fc1 = nn.Linear(latent_dim, projector_width, bias=True)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(projector_width, hidden_size, bias=True)
+        self.out_norm = nn.LayerNorm(hidden_size, eps=1e-6)
+
+    @property
+    def weight_dtype(self):
+        return self.fc1.weight.dtype
+
+    def forward(self, latents):
+        x = latents.to(dtype=self.in_norm.weight.dtype)
+        x = self.in_norm(x).to(dtype=self.fc1.weight.dtype)
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.fc2(x)
+        return self.out_norm(x)
+
+
 def _compute_default_rope_parameters(config: Qwen3Config, device=None):
     base = getattr(config, "rope_theta", 10000.0)
     head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
@@ -584,7 +607,11 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
         self.image_latent_dim = getattr(config, "image_latent_dim", 4)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        self.image_latent_proj = nn.Linear(self.image_latent_dim, config.hidden_size)
+        self.image_latent_proj = ImageLatentProjector(
+            self.image_latent_dim,
+            config.hidden_size,
+            getattr(config, "image_projector_width", None),
+        )
         self.layers = nn.ModuleList(
             [Qwen3DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
@@ -649,7 +676,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
                             f"image_latents last dimension ({image_latents.shape[-1]}) must match "
                             f"config.image_latent_dim ({self.image_latent_dim})."
                         )
-                    image_latents = image_latents.to(device=X0_input_ids.device, dtype=self.image_latent_proj.weight.dtype)
+                    image_latents = image_latents.to(device=X0_input_ids.device, dtype=self.image_latent_proj.weight_dtype)
                     use_image_latent = is_image
                     if image_latent_mask is not None:
                         image_latent_mask = image_latent_mask.to(device=X0_input_ids.device, dtype=torch.bool)
@@ -661,7 +688,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
                         1,
                         self.image_latent_dim,
                         device=X0_input_ids.device,
-                        dtype=self.image_latent_proj.weight.dtype,
+                        dtype=self.image_latent_proj.weight_dtype,
                     )
                     X0_inputs_embeds = X0_inputs_embeds + self.image_latent_proj(dummy_latent).sum() * 0.0
 

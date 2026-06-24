@@ -174,7 +174,7 @@ def load_model_tokenizer(config: OmegaConf, logger=None):
         "image_vocab_size", "image_offset", "lambda_image", "lambda_text",
         "boi_token_id", "eoi_token_id", "unified_head", "image_tokens_per_img",
         "image_latent_dim", "continuous_image_latents", "flow_width", "flow_depth",
-        "flow_time_scale", "flow_sample_method",
+        "flow_time_scale", "flow_sample_method", "image_projector_width",
     )
 
     if config.training.from_scratch:

@@ -1,5 +1,5 @@
 """
-Cache-backed full ImageNet latent dataset for dual-stream image-flow warmup.
+Cache-backed full ImageNet latent dataset for unified image-flow training.
 
 The cache is the merged tensor produced by the VAE encoder:
     {"latents": [N, image_tokens, latent_dim], "img_ids": [N], ...}
@@ -10,12 +10,15 @@ Each item is represented as:
 The real image latent tokens live only in the parallel `image_latents` tensor.
 The X0 stream receives those latent embeddings; visibility is controlled by the
 selfless attention sigma/order, while the XT stream remains mask queries.
+
+Text, BOI, and EOS positions can be trained with cross-entropy labels. EOI is
+kept as context for image tokens but is ignored by the CE loss.
 """
 
 import json
-import random
+from functools import partial
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from torch.utils.data import DataLoader, Dataset, Subset
@@ -34,6 +37,8 @@ class ImageNetFlowCacheDataset(Dataset):
         image_latent_dim: int = 16,
         manifest_jsonl: Optional[str] = None,
         prompt_template: str = "",
+        synset_mapping_path: Optional[str] = None,
+        max_seq_length: Optional[int] = None,
         max_samples: int = -1,
         seed: int = 42,
     ):
@@ -64,9 +69,13 @@ class ImageNetFlowCacheDataset(Dataset):
         self.image_tokens_per_img = int(image_tokens_per_img)
         self.image_latent_dim = int(image_latent_dim)
         self.prompt_template = prompt_template or ""
+        self.max_seq_length = int(max_seq_length) if max_seq_length else None
         self.seed = int(seed)
         self.epoch = 0
         self.synsets = self._load_synsets(manifest_jsonl)
+        self.synset_names = self._load_synset_names(synset_mapping_path)
+        self.prompt_cache = self._build_prompt_cache()
+        self.sequence_cache = self._build_sequence_cache()
         self.fixed_length = 1 + self.image_tokens_per_img + 2 if not self.prompt_template else None
         if self.fixed_length is not None:
             self.fixed_input_ids = torch.tensor(
@@ -77,10 +86,15 @@ class ImageNetFlowCacheDataset(Dataset):
                 [2] + [1] * self.image_tokens_per_img + [2, 2],
                 dtype=torch.uint8,
             )
-            self.fixed_labels = torch.full((self.fixed_length,), -100, dtype=torch.long)
+            self.fixed_labels = torch.tensor(
+                [self.boi_id]
+                + [-100] * self.image_tokens_per_img
+                + [-100, self.eos_id],
+                dtype=torch.long,
+            )
 
     def _load_synsets(self, manifest_jsonl: Optional[str]) -> Dict[int, str]:
-        if not manifest_jsonl or "{synset}" not in self.prompt_template:
+        if not manifest_jsonl or not self.prompt_template:
             return {}
         path = Path(manifest_jsonl)
         if not path.exists():
@@ -94,18 +108,120 @@ class ImageNetFlowCacheDataset(Dataset):
                 synsets[int(row["img_id"])] = str(row.get("synset", ""))
         return synsets
 
+    def _load_synset_names(self, synset_mapping_path: Optional[str]) -> Dict[str, Tuple[str, str]]:
+        if not synset_mapping_path:
+            return {}
+        path = Path(synset_mapping_path)
+        if not path.exists():
+            raise FileNotFoundError(path)
+        names: Dict[str, Tuple[str, str]] = {}
+        with path.open() as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                synset, _, raw_names = line.partition(" ")
+                class_names = raw_names.strip()
+                class_name = class_names.split(",", 1)[0].strip() if class_names else synset
+                names[synset] = (class_name, class_names or class_name)
+        return names
+
+    def _render_prompt(self, img_id: int, synset: str) -> str:
+        class_name, class_names = self.synset_names.get(synset, (synset, synset))
+        return self.prompt_template.format(
+            img_id=int(img_id),
+            synset=synset,
+            class_name=class_name,
+            class_names=class_names,
+        )
+
+    def _build_prompt_cache(self) -> Dict[str, torch.Tensor]:
+        if not self.prompt_template:
+            return {}
+
+        prompt_cache: Dict[str, torch.Tensor] = {}
+        if self.synsets:
+            unique_synsets = sorted(set(self.synsets.values()))
+            for synset in unique_synsets:
+                text = self._render_prompt(0, synset)
+                prompt_cache[text] = torch.tensor(
+                    self.tokenizer.encode(text, add_special_tokens=False),
+                    dtype=torch.long,
+                )
+        return prompt_cache
+
     def __len__(self) -> int:
         return int(self.latents.shape[0])
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
 
-    def _prompt_ids(self, img_id: int) -> List[int]:
+    def _prompt_ids(self, img_id: int) -> torch.Tensor:
         if not self.prompt_template:
-            return []
+            return torch.empty(0, dtype=torch.long)
         synset = self.synsets.get(int(img_id), "")
-        text = self.prompt_template.format(img_id=int(img_id), synset=synset)
-        return self.tokenizer.encode(text, add_special_tokens=False)
+        text = self._render_prompt(int(img_id), synset)
+        cached = self.prompt_cache.get(text)
+        if cached is None:
+            cached = torch.tensor(self.tokenizer.encode(text, add_special_tokens=False), dtype=torch.long)
+            self.prompt_cache[text] = cached
+        return cached
+
+    def _make_sequence_tensors(self, prompt_ids: torch.Tensor) -> Dict[str, torch.Tensor]:
+        prompt_len = int(prompt_ids.numel())
+        input_ids = torch.cat(
+            [
+                prompt_ids,
+                torch.tensor(
+                    [self.boi_id]
+                    + [self.mask_id] * self.image_tokens_per_img
+                    + [self.eoi_id, self.eos_id],
+                    dtype=torch.long,
+                ),
+            ]
+        )
+        token_types = torch.cat(
+            [
+                torch.zeros(prompt_len, dtype=torch.uint8),
+                torch.tensor([2] + [1] * self.image_tokens_per_img + [2, 2], dtype=torch.uint8),
+            ]
+        )
+        labels = torch.cat(
+            [
+                prompt_ids,
+                torch.tensor(
+                    [self.boi_id]
+                    + [-100] * self.image_tokens_per_img
+                    + [-100, self.eos_id],
+                    dtype=torch.long,
+                ),
+            ]
+        )
+        return {
+            "input_ids": input_ids,
+            "token_types": token_types,
+            "labels": labels,
+            "prompt_len": torch.tensor(prompt_len, dtype=torch.long),
+            "image_start": torch.tensor(prompt_len + 1, dtype=torch.long),
+        }
+
+    def _build_sequence_cache(self) -> Dict[str, Dict[str, torch.Tensor]]:
+        if not self.prompt_template:
+            return {}
+        sequence_cache: Dict[str, Dict[str, torch.Tensor]] = {}
+        for text, prompt_ids in self.prompt_cache.items():
+            sequence_cache[text] = self._make_sequence_tensors(prompt_ids)
+        return sequence_cache
+
+    def _sequence_tensors(self, img_id: int) -> Dict[str, torch.Tensor]:
+        synset = self.synsets.get(int(img_id), "")
+        text = self._render_prompt(int(img_id), synset)
+        cached = self.sequence_cache.get(text)
+        if cached is None:
+            prompt_ids = self._prompt_ids(img_id)
+            cached = self._make_sequence_tensors(prompt_ids)
+            self.sequence_cache[text] = cached
+        return cached
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         if self.fixed_length is not None:
@@ -114,63 +230,36 @@ class ImageNetFlowCacheDataset(Dataset):
                 "token_types": self.fixed_token_types,
                 "labels": self.fixed_labels,
                 "image_latents": self.latents[idx],
+                "prompt_len": torch.tensor(0, dtype=torch.long),
+                "image_start": torch.tensor(1, dtype=torch.long),
             }
 
         img_id = int(self.img_ids[idx].item())
-        prompt_ids = self._prompt_ids(img_id)
-        image_start = len(prompt_ids) + 1
-
-        ids = (
-            prompt_ids
-            + [self.boi_id]
-            + [self.mask_id] * self.image_tokens_per_img
-            + [self.eoi_id, self.eos_id]
-        )
-        types = (
-            [0] * len(prompt_ids)
-            + [2]
-            + [1] * self.image_tokens_per_img
-            + [2, 2]
-        )
-
-        length = len(ids)
-        sigma = torch.empty(length, dtype=torch.long)
-        labels = torch.full((length,), -100, dtype=torch.long)
-
-        counter = 0
-        for pos in range(len(prompt_ids)):
-            sigma[pos] = counter
-            counter += 1
-
-        boi_pos = len(prompt_ids)
-        sigma[boi_pos] = counter
-        counter += 1
-
-        eoi_pos = image_start + self.image_tokens_per_img
-        sigma[eoi_pos] = counter
-        rng = random.Random(self.seed + self.epoch * 1_000_003 + idx)
-        order = rng.sample(range(self.image_tokens_per_img), self.image_tokens_per_img)
-        for local_pos, order_value in enumerate(order):
-            sigma[image_start + local_pos] = counter + 1 + order_value
-        counter += self.image_tokens_per_img + 1
-
-        sigma[eoi_pos + 1] = counter
-
-        image_latents = torch.zeros(length, self.image_latent_dim, dtype=self.latents.dtype)
-        image_latents[image_start : image_start + self.image_tokens_per_img] = self.latents[idx]
+        sequence = self._sequence_tensors(img_id)
+        length = int(sequence["input_ids"].numel())
+        if self.max_seq_length is not None and length > self.max_seq_length:
+            raise ValueError(
+                f"ImageNetFlowCacheDataset item length {length} exceeds max_seq_length={self.max_seq_length}. "
+                "Use a shorter prompt_template or increase dataset.params.max_seq_length."
+            )
 
         return {
-            "input_ids": torch.tensor(ids, dtype=torch.long),
-            "token_types": torch.tensor(types, dtype=torch.uint8),
-            "sigma": sigma,
-            "labels": labels,
-            "image_latents": image_latents,
+            "input_ids": sequence["input_ids"],
+            "token_types": sequence["token_types"],
+            "labels": sequence["labels"],
+            "image_latents": self.latents[idx],
+            "prompt_len": sequence["prompt_len"],
+            "image_start": sequence["image_start"],
         }
 
 
-def collate_imagenet_flow_cache(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+def collate_imagenet_flow_cache(
+    batch: List[Dict[str, torch.Tensor]],
+    pad_to_length: Optional[int] = None,
+    pad_to_multiple_of: Optional[int] = None,
+) -> Dict[str, torch.Tensor]:
     first = batch[0]
-    if "sigma" not in first and first["image_latents"].dim() == 2:
+    if first["image_start"].item() == 1 and first["input_ids"].shape[0] == first["image_latents"].shape[0] + 3:
         bsz = len(batch)
         image_tokens = first["image_latents"].shape[0]
         latent_dim = first["image_latents"].shape[-1]
@@ -205,24 +294,42 @@ def collate_imagenet_flow_cache(batch: List[Dict[str, torch.Tensor]]) -> Dict[st
             ),
         }
 
-    max_len = max(item["input_ids"].shape[0] for item in batch)
+    batch_max_len = max(item["input_ids"].shape[0] for item in batch)
+    max_len = pad_to_length or batch_max_len
+    if pad_to_multiple_of and max_len % pad_to_multiple_of:
+        max_len = ((max_len + pad_to_multiple_of - 1) // pad_to_multiple_of) * pad_to_multiple_of
+    if batch_max_len > max_len:
+        raise ValueError(f"Batch max length {batch_max_len} exceeds pad_to_length={max_len}")
     bsz = len(batch)
     latent_dim = batch[0]["image_latents"].shape[-1]
     latent_dtype = batch[0]["image_latents"].dtype
+    image_tokens = batch[0]["image_latents"].shape[0]
 
     input_ids = torch.zeros(bsz, max_len, dtype=torch.long)
     token_types = torch.full((bsz, max_len), 3, dtype=torch.uint8)
     sigma = torch.full((bsz, max_len), max_len, dtype=torch.long)
     labels = torch.full((bsz, max_len), -100, dtype=torch.long)
     image_latents = torch.zeros(bsz, max_len, latent_dim, dtype=latent_dtype)
+    order = torch.rand(bsz, image_tokens).argsort(dim=-1)
 
     for i, item in enumerate(batch):
         length = item["input_ids"].shape[0]
+        prompt_len = int(item["prompt_len"].item())
+        image_start = int(item["image_start"].item())
+        eoi_pos = image_start + image_tokens
+        eos_pos = eoi_pos + 1
+
         input_ids[i, :length] = item["input_ids"]
         token_types[i, :length] = item["token_types"]
-        sigma[i, :length] = item["sigma"]
         labels[i, :length] = item["labels"]
-        image_latents[i, :length] = item["image_latents"]
+        image_latents[i, image_start:eoi_pos] = item["image_latents"]
+
+        if prompt_len:
+            sigma[i, :prompt_len] = torch.arange(prompt_len, dtype=torch.long)
+        sigma[i, prompt_len] = prompt_len
+        sigma[i, eoi_pos] = prompt_len + 1
+        sigma[i, image_start:eoi_pos] = prompt_len + 2 + order[i]
+        sigma[i, eos_pos] = prompt_len + image_tokens + 2
 
     valid_tokens = (token_types != 3).sum()
     image_tokens = (token_types == 1).sum()
@@ -253,6 +360,8 @@ def build_imagenet_flow_cache_dataloaders(config, tokenizer):
         image_latent_dim=params.get("image_latent_dim", config.model.image_latent_dim),
         manifest_jsonl=params.get("manifest_jsonl", None),
         prompt_template=params.get("prompt_template", ""),
+        synset_mapping_path=params.get("synset_mapping_path", None),
+        max_seq_length=params.get("max_seq_length", config.dataset.preprocessing.max_seq_length),
         max_samples=params.get("max_samples", -1),
         seed=config.training.seed,
     )
@@ -263,6 +372,17 @@ def build_imagenet_flow_cache_dataloaders(config, tokenizer):
     train_dataset = Subset(dataset, list(range(train_size)))
     val_dataset = Subset(dataset, list(range(train_size, len(dataset))))
 
+    pad_to_length = params.get("pad_to_length", None)
+    if params.get("pad_to_max_length", False):
+        pad_to_length = params.get("max_seq_length", config.dataset.preprocessing.max_seq_length)
+    pad_to_multiple_of = params.get("pad_to_multiple_of", None)
+
+    collate_fn = partial(
+        collate_imagenet_flow_cache,
+        pad_to_length=pad_to_length,
+        pad_to_multiple_of=pad_to_multiple_of,
+    )
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.training.batch_size,
@@ -270,7 +390,7 @@ def build_imagenet_flow_cache_dataloaders(config, tokenizer):
         num_workers=config.training.dataloader_workers,
         pin_memory=True,
         drop_last=True,
-        collate_fn=collate_imagenet_flow_cache,
+        collate_fn=collate_fn,
         persistent_workers=config.training.dataloader_workers > 0,
     )
     val_loader = DataLoader(
@@ -280,7 +400,7 @@ def build_imagenet_flow_cache_dataloaders(config, tokenizer):
         num_workers=config.training.dataloader_workers,
         pin_memory=True,
         drop_last=False,
-        collate_fn=collate_imagenet_flow_cache,
+        collate_fn=collate_fn,
         persistent_workers=config.training.dataloader_workers > 0,
     )
     return train_loader, val_loader
