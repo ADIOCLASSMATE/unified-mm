@@ -1,0 +1,93 @@
+experiment:
+    project: "selfless-flow-0.6B-imagenet"
+    name: "imagenet-flow-500c"
+    wandb_project: "unified-mm"
+    output_dir: "output"
+    save_every: 1000
+    eval_every: 100
+    generate_every: 10000
+    log_every: 10
+    log_grad_norm_every: 100
+    checkpoints_total_limit: 200
+    save_hfmodel_every: 5000
+    val_every: 500
+    validation_image_every: 500
+    validation_image_samples: 4
+    validation_flow_steps: 50
+    validation_flow_temperature: 1.0
+    validation_flow_sample_method: "heun"
+    validation_single_stream_images: true
+    validation_single_stream_parallel_rate: 1
+    validation_mar_root: "/inspire/hdd/global_user/wanjiaxin-253108030048/code/mar"
+    validation_vae_path: "public/vae/mar-kl16/kl16.ckpt"
+    validation_vae_scaling_factor: 0.2325
+    resume_from_checkpoint: none
+
+model:
+    model_path: "public/models/Qwen/Qwen3-0.6B-Base"
+    attention_pattern: "ar"
+    loss_attention_pattern: "likelihood"
+    mask_id: -1
+    use_flex_attention: true
+    lambda_text: 1.0
+    lambda_image: 1.0
+    continuous_image_latents: true
+    image_tokens_per_img: 256
+    image_latent_dim: 16
+    flow_depth: 3
+    flow_width: 1024
+    flow_time_scale: 1000.0
+    flow_sample_method: "heun"
+    pretrained_flow_head: null
+
+dataset:
+    class_name: "ImageNetLatentPackedDataset"
+    params:
+        docs_jsonl: "public/datasets/imagenet_prompt_500c_all/docs/train.jsonl"
+        latent_dir: "public/datasets/imagenet_prompt_500c_all/vae_latents_mar_kl16"
+        max_seq_length: 2048
+        image_tokens_per_img: 256
+        image_latent_dim: 16
+        latent_key: "latent"
+        pack_strategy: "best_fit_decreasing"
+        pad_to_max_length: true
+        log_pack_stats: true
+        val_ratio: 0.001
+    preprocessing:
+        max_seq_length: 2048
+
+optimizer:
+    name: adamw
+    params:
+        learning_rate: 1.0e-4
+        backbone_learning_rate: 1.0e-5
+        projector_learning_rate: 1.0e-4
+        flow_learning_rate: 1.0e-4
+        scale_lr: false
+        beta1: 0.9
+        beta2: 0.95
+        weight_decay: 0.02
+        epsilon: 1e-8
+
+lr_scheduler:
+    scheduler: "cosine"
+    params:
+        learning_rate: ${optimizer.params.learning_rate}
+        warmup_steps: 400
+        decay_steps: 5000
+        min_lr_scale: 0.01
+
+training:
+    batch_size: 8
+    total_batch_size: 256
+    mixed_precision: "bf16"
+    enable_tf32: false
+    seed: 42
+    dataloader_workers: 4
+    max_train_steps: 20000
+    max_grad_norm: 1.0
+    ar_ratio: -1.0
+    mc_samples: 16
+    use_gradient_checkpointing: false
+    step_scheduler_with_optimizer: false
+    from_scratch: false
