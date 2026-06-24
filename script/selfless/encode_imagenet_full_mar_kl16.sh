@@ -5,7 +5,6 @@ IMAGENET_TRAIN_DIR="${IMAGENET_TRAIN_DIR:-/inspire/dataset/imagenet/v1/ILSVRC/Da
 OUTPUT_DIR="${OUTPUT_DIR:-public/datasets/imagenet_full/vae_latents_mar_kl16}"
 MANIFEST_JSONL="${MANIFEST_JSONL:-public/datasets/imagenet_full/manifest.jsonl}"
 VAE_PATH="${VAE_PATH:-public/vae/mar-kl16/kl16.ckpt}"
-CONFIG="${CONFIG:-configs/selfless/imagenet_flow_head_pretrain_full.yaml}"
 CACHE_SHARD_DIR="${CACHE_SHARD_DIR:-public/datasets/imagenet_full/vae_latents_mar_kl16_cache_shards}"
 CACHE_PATH="${CACHE_PATH:-public/datasets/imagenet_full/vae_latents_mar_kl16/flow_latents_all_fp16.pt}"
 
@@ -22,7 +21,6 @@ MAX_IMAGES="${MAX_IMAGES:--1}"
 OVERWRITE="${OVERWRITE:-0}"
 SAVE_PER_IMAGE="${SAVE_PER_IMAGE:-0}"
 MERGE_CACHE="${MERGE_CACHE:-1}"
-BUILD_CACHE="${BUILD_CACHE:-0}"
 LOG_DIR="${LOG_DIR:-${OUTPUT_DIR}/logs}"
 
 overwrite_args=()
@@ -120,12 +118,4 @@ if [[ "${MERGE_CACHE}" == "1" ]]; then
     --shard_dir "${CACHE_SHARD_DIR}" \
     --output_path "${CACHE_PATH}" \
     --mmap
-fi
-
-if [[ "${BUILD_CACHE}" == "1" ]]; then
-  uv run python pretrain/build_flow_latent_cache.py \
-    config="${CONFIG}" \
-    dataset.params.latent_dir="${OUTPUT_DIR}" \
-    dataset.params.cache_path="${CACHE_PATH}" \
-    dataset.params.cache_rebuild=true
 fi

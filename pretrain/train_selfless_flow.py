@@ -35,10 +35,117 @@ logger = get_logger(__name__, log_level="INFO")
 _MAR_VAE_CACHE = None
 
 
+def _special_token_ids(config):
+    ids = {
+        "mask": int(config.model.mask_token_id),
+        "boi": int(config.model.boi_token_id),
+        "eoi": int(config.model.eoi_token_id),
+    }
+    return ids
+
+
+def _apply_image_flow_warmup_freeze(model, config):
+    if not config.training.get("freeze_backbone_for_image_flow_warmup", False):
+        return
+
+    for param in model.parameters():
+        param.requires_grad = False
+
+    for param in model.flow_head.parameters():
+        param.requires_grad = True
+    for param in model.model.image_latent_proj.parameters():
+        param.requires_grad = True
+
+    embed_weight = model.model.embed_tokens.weight
+    embed_weight.requires_grad = True
+    train_ids = torch.tensor(
+        list(_special_token_ids(config).values()),
+        device=embed_weight.device,
+        dtype=torch.long,
+    )
+
+    def _mask_special_token_grads(grad):
+        keep = torch.zeros((grad.shape[0], 1), device=grad.device, dtype=grad.dtype)
+        keep[train_ids.to(grad.device)] = 1
+        return grad * keep
+
+    embed_weight.register_hook(_mask_special_token_grads)
+
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    logger.info(
+        "Enabled frozen-Qwen image-flow warmup: "
+        f"trainable={trainable:,}/{total:,} params; "
+        f"special_token_ids={_special_token_ids(config)}"
+    )
+
+
+def _load_image_flow_adapter(model, adapter_path, config):
+    if isinstance(adapter_path, str) and adapter_path.lower() in {"none", "null", "false", ""}:
+        return
+    if adapter_path is None:
+        return
+
+    state = torch.load(adapter_path, map_location="cpu")
+    if "flow_head" in state:
+        missing, unexpected = model.flow_head.load_state_dict(state["flow_head"], strict=False)
+        logger.info(
+            f"Loaded adapter flow_head from {adapter_path}: "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+    if "image_latent_proj" in state:
+        missing, unexpected = model.model.image_latent_proj.load_state_dict(
+            state["image_latent_proj"], strict=False
+        )
+        logger.info(
+            f"Loaded adapter image_latent_proj from {adapter_path}: "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+    if "special_token_embeddings" in state:
+        token_ids = _special_token_ids(config)
+        with torch.no_grad():
+            embed = model.model.embed_tokens.weight
+            for name, token_id in token_ids.items():
+                if name not in state["special_token_embeddings"]:
+                    continue
+                value = state["special_token_embeddings"][name].to(
+                    device=embed.device,
+                    dtype=embed.dtype,
+                )
+                embed[token_id].copy_(value)
+        logger.info(f"Loaded adapter special token embeddings from {adapter_path}")
+
+
+def _save_image_flow_adapter(model, config, accelerator, global_step):
+    if not config.training.get("save_image_flow_adapter", False):
+        return
+    if not accelerator.is_main_process:
+        return
+
+    unwrapped = accelerator.unwrap_model(model)
+    token_ids = _special_token_ids(config)
+    embed = unwrapped.model.embed_tokens.weight.detach().cpu()
+    state = {
+        "flow_head": {k: v.detach().cpu() for k, v in unwrapped.flow_head.state_dict().items()},
+        "image_latent_proj": {
+            k: v.detach().cpu()
+            for k, v in unwrapped.model.image_latent_proj.state_dict().items()
+        },
+        "special_token_ids": token_ids,
+        "special_token_embeddings": {
+            name: embed[token_id].clone()
+            for name, token_id in token_ids.items()
+        },
+    }
+    path = Path(config.experiment.output_dir) / f"image_flow_adapter-{global_step}.pt"
+    torch.save(state, path)
+    logger.info(f"Saved image-flow adapter to {path}")
+
+
 def _unwrap_omnicorpus_dataset(dataset):
     ds = dataset
     while hasattr(ds, "dataset"):
-        if hasattr(ds, "_packs") or ds.__class__.__name__ == "OmniCorpusPackedDataset":
+        if hasattr(ds, "set_epoch") or hasattr(ds, "_packs") or ds.__class__.__name__ == "OmniCorpusPackedDataset":
             return ds
         ds = ds.dataset
     return ds
@@ -114,17 +221,8 @@ def main():
     logger.info("Loading tokenizer and model")
     model, tokenizer = load_model_tokenizer(config=config, logger=logger)
 
-    pretrained_flow_head = config.model.get("pretrained_flow_head", None)
-    if isinstance(pretrained_flow_head, str) and pretrained_flow_head.lower() in {"none", "null", "false", ""}:
-        pretrained_flow_head = None
-    if pretrained_flow_head is not None:
-        state = torch.load(pretrained_flow_head, map_location="cpu")
-        if "flow_head" in state:
-            state = state["flow_head"]
-        if any(key.startswith("flow_head.") for key in state):
-            state = {key.removeprefix("flow_head."): value for key, value in state.items()}
-        missing, unexpected = model.flow_head.load_state_dict(state, strict=False)
-        logger.info(f"Loaded pretrained flow_head from {pretrained_flow_head}: missing={missing}, unexpected={unexpected}")
+    _load_image_flow_adapter(model, config.model.get("pretrained_image_flow_adapter", None), config)
+    _apply_image_flow_warmup_freeze(model, config)
 
     if config.training.get("use_gradient_checkpointing", False):
         model.gradient_checkpointing_enable()
@@ -143,6 +241,7 @@ def main():
     backbone_lr = float(optimizer_config.get("backbone_learning_rate", base_lr))
     flow_lr = float(optimizer_config.get("flow_learning_rate", base_lr))
     projector_lr = float(optimizer_config.get("projector_learning_rate", flow_lr))
+    special_token_lr = float(optimizer_config.get("special_token_learning_rate", projector_lr))
     no_decay = [
         "bias",
         "layer_norm.weight",
@@ -159,6 +258,8 @@ def main():
             return flow_lr
         if "image_latent_proj" in name:
             return projector_lr
+        if "embed_tokens.weight" in name:
+            return special_token_lr
         return backbone_lr
 
     grouped = {}
@@ -176,6 +277,7 @@ def main():
     logger.info(
         "Optimizer LRs: "
         f"backbone={backbone_lr:g}, image_latent_proj={projector_lr:g}, flow_head={flow_lr:g}; "
+        f"special_tokens={special_token_lr:g}; "
         f"weight_decay={optimizer_config.weight_decay:g}"
     )
 
@@ -470,6 +572,7 @@ def main():
             # Checkpointing
             if global_step % config.experiment.save_every == 0:
                 save_checkpoint(model, config, accelerator, global_step)
+                _save_image_flow_adapter(model, config, accelerator, global_step)
             
             if global_step % config.experiment.save_hfmodel_every == 0:
                 save_hf_model(model, tokenizer, config, accelerator, global_step)
@@ -493,6 +596,7 @@ def main():
 
     accelerator.wait_for_everyone()
     save_hf_model(model, tokenizer, config, accelerator, "final")
+    _save_image_flow_adapter(model, config, accelerator, "final")
     accelerator.end_training()
 
 
@@ -500,7 +604,11 @@ def main():
 def validate(model, val_dataloader, selfless_sampler, accelerator, global_step, config=None):
     model.eval()  # DeepSpeed requires explicit eval mode for no_grad forward
     ds = _unwrap_omnicorpus_dataset(val_dataloader.dataset)
-    is_multimodal = hasattr(ds, '_packs') or ds.__class__.__name__ == "OmniCorpusPackedDataset"
+    is_multimodal = (
+        hasattr(ds, "set_epoch")
+        or hasattr(ds, "_packs")
+        or ds.__class__.__name__ in {"OmniCorpusPackedDataset", "ImageNetFlowCacheDataset"}
+    )
 
     try:
         if is_multimodal:

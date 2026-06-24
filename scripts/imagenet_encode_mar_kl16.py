@@ -4,7 +4,7 @@ Encode ImageNet prompt-dataset images with MAR's KL16 VAE.
 This encoder can write per-image .pt files containing:
     {"latent": Tensor[16,16,16], "scaling_factor": 0.2325}
 
-For high-throughput pure-flow pretraining, prefer --cache_shard_dir and
+For high-throughput full-ImageNet flow warmup, prefer --cache_shard_dir and
 --skip_per_image. That writes one Tensor[N,256,16] shard per GPU instead of
 millions of tiny files.
 """
@@ -146,9 +146,9 @@ def main() -> None:
     parser.add_argument("--start_img_id", type=int, default=1)
     parser.add_argument("--manifest_jsonl", default=None)
     parser.add_argument("--cache_path", default=None,
-                        help="Optional pure-flow cache Tensor[N,256,16] written after encoding. Use only with one shard.")
+                        help="Optional latent cache Tensor[N,256,16] written after encoding. Use only with one shard.")
     parser.add_argument("--cache_shard_dir", default=None,
-                        help="Optional directory for per-shard pure-flow cache files.")
+                        help="Optional directory for per-shard latent cache files.")
     parser.add_argument("--skip_per_image", action="store_true",
                         help="Do not save one .pt file per image; intended for fast cache-shard encoding.")
     parser.add_argument("--seed", type=int, default=42)
@@ -257,7 +257,7 @@ def main() -> None:
             },
             cache_path,
         )
-        print(f"Saved pure-flow latent cache to {cache_path}")
+        print(f"Saved latent cache to {cache_path}")
     if cache_tensor is not None and args.cache_shard_dir:
         cache_shard_dir = Path(args.cache_shard_dir)
         cache_shard_dir.mkdir(parents=True, exist_ok=True)
@@ -281,7 +281,7 @@ def main() -> None:
             },
             shard_path,
         )
-        print(f"Saved pure-flow latent cache shard to {shard_path}")
+        print(f"Saved latent cache shard to {shard_path}")
     print(f"Done: {encoded} encoded, {errors} errors, saved to {output_dir}")
 
 
