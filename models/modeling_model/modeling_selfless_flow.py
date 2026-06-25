@@ -143,7 +143,12 @@ class FlowMatchingHead(nn.Module):
         self.input_proj = nn.Linear(target_channels, width)
         self.res_blocks = nn.ModuleList([FlowResBlock(width) for _ in range(depth)])
         self.final_layer = FlowFinalLayer(width, target_channels)
+        self.last_forward_stats = {}
         self.initialize_weights()
+
+    @staticmethod
+    def _rms_stat(x):
+        return x.detach().float().pow(2).mean().sqrt()
 
     def initialize_weights(self):
         def _basic_init(module):
@@ -171,6 +176,14 @@ class FlowMatchingHead(nn.Module):
 
         pred = self.predict_velocity(x_t, t, z)
         loss = (pred - velocity).pow(2).mean(dim=-1)
+        self.last_forward_stats.update(
+            {
+                "flow/target_rms": self._rms_stat(target),
+                "flow/noise_rms": self._rms_stat(noise),
+                "flow/velocity_target_rms": self._rms_stat(velocity),
+                "flow/mse": loss.detach().float().mean(),
+            }
+        )
         if mask is not None:
             mask = mask.to(loss.dtype)
             return (loss * mask).sum() / mask.sum().clamp_min(1.0)
@@ -185,7 +198,16 @@ class FlowMatchingHead(nn.Module):
         y = self.time_embed(scaled_t).to(dtype=model_dtype) + cond
         for block in self.res_blocks:
             x = block(x, y)
-        return self.final_layer(x, y).float()
+        pred = self.final_layer(x, y).float()
+        self.last_forward_stats = {
+            "flow/input_xt_rms": self._rms_stat(x_t),
+            "flow/hidden_z_rms": self._rms_stat(z),
+            "flow/cond_rms": self._rms_stat(cond),
+            "flow/time_rms": self._rms_stat(y - cond),
+            "flow/y_rms": self._rms_stat(y),
+            "flow/pred_velocity_rms": self._rms_stat(pred),
+        }
+        return pred
 
     def sample(self, z, num_steps=50, temperature=1.0, sample_method=None):
         sample_method = (sample_method or self.sample_method or "euler").lower()
@@ -894,6 +916,11 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             output.per_modality_loss = {
                 "text_loss": text_loss.detach() if isinstance(text_loss, torch.Tensor) else torch.tensor(text_loss or 0.0, device=hidden_states.device),
                 "image_loss": image_loss.detach() if isinstance(image_loss, torch.Tensor) else torch.tensor(image_loss or 0.0, device=hidden_states.device),
+            }
+            output.flow_debug_stats = {
+                key: value.detach()
+                for key, value in self.flow_head.last_forward_stats.items()
+                if isinstance(value, torch.Tensor)
             }
         return output
         

@@ -42,19 +42,30 @@ model:
     pretrained_image_flow_adapter: "output/selfless-flow-0.6B-imagenet-warmup-full/image_flow_adapter-final.pt"
 
 dataset:
-    class_name: "ImageNetFlowCacheDataset"
+    class_name: "CombinedImageNetTextFlowDataset"
     params:
-        cache_path: "public/datasets/imagenet_full/vae_latents_mar_kl16/flow_latents_all_fp16.pt"
-        manifest_jsonl: "public/datasets/imagenet_full/manifest.jsonl"
-        synset_mapping_path: "/inspire/dataset/imagenet/v1/LOC_synset_mapping.txt"
-        prompt_template: "a photo of {class_name}"
-        image_tokens_per_img: 256
-        image_latent_dim: 16
-        max_seq_length: 320
-        pad_to_length: 320
-        val_ratio: 0.001
+        text_batch_ratio: 0.4
+        val_text_batches: 20
+        image:
+            cache_path: "public/datasets/imagenet_full/vae_latents_mar_kl16/flow_latents_all_fp16.pt"
+            manifest_jsonl: "public/datasets/imagenet_full/manifest.jsonl"
+            synset_mapping_path: "/inspire/dataset/imagenet/v1/LOC_synset_mapping.txt"
+            prompt_templates_path: "configs/selfless/imagenet_prompt_templates.yaml"
+            image_tokens_per_img: 256
+            image_latent_dim: 16
+            max_seq_length: 1024
+            pad_to_multiple_of: 64
+            val_ratio: 0.001
+        text:
+            tokenized_path: "public/.cache/huggingface/datasets/fwb-arrow-eos"
+            max_seq_length: 1024
+            rows_per_shard: 48804
+            pad_to_multiple_of: 64
+            sigma_mode: "ar"
+            val_ratio: 0.001
+            max_val_samples: 1280
     preprocessing:
-        max_seq_length: 320
+        max_seq_length: 1024
 
 optimizer:
     name: adamw
@@ -79,8 +90,8 @@ lr_scheduler:
         min_lr_scale: 0.05
 
 training:
-    batch_size: 64
-    total_batch_size: 512
+    batch_size: 16
+    total_batch_size: 256
     mixed_precision: "bf16"
     enable_tf32: true
     seed: 42

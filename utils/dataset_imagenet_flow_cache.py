@@ -16,10 +16,12 @@ kept as context for image tokens but is ignored by the CE loss.
 """
 
 import json
+import re
 from functools import partial
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
+from omegaconf import OmegaConf
 import torch
 from torch.utils.data import DataLoader, Dataset, Subset
 
@@ -37,6 +39,8 @@ class ImageNetFlowCacheDataset(Dataset):
         image_latent_dim: int = 16,
         manifest_jsonl: Optional[str] = None,
         prompt_template: str = "",
+        prompt_templates: Optional[List[str]] = None,
+        prompt_templates_path: Optional[str] = None,
         synset_mapping_path: Optional[str] = None,
         max_seq_length: Optional[int] = None,
         max_samples: int = -1,
@@ -69,6 +73,12 @@ class ImageNetFlowCacheDataset(Dataset):
         self.image_tokens_per_img = int(image_tokens_per_img)
         self.image_latent_dim = int(image_latent_dim)
         self.prompt_template = prompt_template or ""
+        self.prompt_template_groups, self.fallback_templates, self.global_contexts = self._load_prompt_template_groups(
+            prompt_template=prompt_template,
+            prompt_templates=prompt_templates,
+            prompt_templates_path=prompt_templates_path,
+        )
+        self.sequence_templates = self._all_sequence_templates()
         self.max_seq_length = int(max_seq_length) if max_seq_length else None
         self.seed = int(seed)
         self.epoch = 0
@@ -76,7 +86,7 @@ class ImageNetFlowCacheDataset(Dataset):
         self.synset_names = self._load_synset_names(synset_mapping_path)
         self.prompt_cache = self._build_prompt_cache()
         self.sequence_cache = self._build_sequence_cache()
-        self.fixed_length = 1 + self.image_tokens_per_img + 2 if not self.prompt_template else None
+        self.fixed_length = 1 + self.image_tokens_per_img + 2 if not self.sequence_templates else None
         if self.fixed_length is not None:
             self.fixed_input_ids = torch.tensor(
                 [self.boi_id] + [self.mask_id] * self.image_tokens_per_img + [self.eoi_id, self.eos_id],
@@ -93,8 +103,118 @@ class ImageNetFlowCacheDataset(Dataset):
                 dtype=torch.long,
             )
 
+    def _normalize_templates(
+        self,
+        templates: Sequence[str],
+        source: str,
+    ) -> List[str]:
+        normalized = [str(t).strip() for t in templates if str(t).strip()]
+        for template in normalized:
+            if "{image}" not in template:
+                raise ValueError(
+                    f"ImageNetFlowCacheDataset prompt template from {source} must contain '{{image}}': {template!r}"
+                )
+        return normalized
+
+    def _normalize_contexts(self, contexts: Sequence[str], source: str) -> List[str]:
+        normalized = [str(t).strip() for t in contexts if str(t).strip()]
+        for context in normalized:
+            if "{image}" in context:
+                raise ValueError(
+                    f"ImageNetFlowCacheDataset prompt context from {source} must not contain '{{image}}': {context!r}"
+                )
+        return normalized
+
+    def _attach_context(self, template: str, context: str) -> str:
+        if not context:
+            return template
+        prefix, suffix = self._split_rendered_template(template)
+        if len(prefix) >= len(suffix):
+            prefix = f"{prefix} {context}".strip()
+        else:
+            suffix = f"{context} {suffix}".strip()
+        return f"{prefix} {{image}} {suffix}".strip()
+
+    def _expand_templates_with_contexts(self, templates: List[str], contexts: List[str]) -> List[str]:
+        if not contexts:
+            return templates
+        expanded = []
+        for template in templates:
+            for context in contexts:
+                expanded.append(self._attach_context(template, context))
+        return self._dedupe_templates(expanded)
+
+    def _dedupe_templates(self, templates: Sequence[str]) -> List[str]:
+        seen = set()
+        unique_templates = []
+        for template in templates:
+            if template in seen:
+                continue
+            seen.add(template)
+            unique_templates.append(template)
+        return unique_templates
+
+    def _load_prompt_template_groups(
+        self,
+        prompt_template: str,
+        prompt_templates: Optional[List[str]],
+        prompt_templates_path: Optional[str],
+    ) -> Tuple[List[Dict[str, object]], List[str], List[str]]:
+        groups: List[Dict[str, object]] = []
+        fallback_templates: List[str] = []
+        global_contexts: List[str] = []
+
+        if prompt_templates_path:
+            path = Path(prompt_templates_path)
+            if not path.exists():
+                raise FileNotFoundError(path)
+            cfg = OmegaConf.to_container(OmegaConf.load(path), resolve=True)
+            global_contexts = self._normalize_contexts(
+                cfg.get("global_contexts", []),
+                str(path),
+            )
+            fallback_templates = self._normalize_templates(
+                cfg.get("fallback_templates", []),
+                str(path),
+            )
+            for group in cfg.get("groups", []):
+                templates = self._normalize_templates(group.get("templates", []), f"{path}:{group.get('name', '')}")
+                if not templates:
+                    continue
+                groups.append(
+                    {
+                        "name": str(group.get("name", "")),
+                        "keywords": [str(k).lower() for k in group.get("keywords", [])],
+                        "synsets": [str(s) for s in group.get("synsets", [])],
+                        "synset_ranges": [
+                            (str(r[0]), str(r[1])) for r in group.get("synset_ranges", [])
+                        ],
+                        "templates": templates,
+                    }
+                )
+
+        if prompt_templates:
+            fallback_templates = self._normalize_templates(prompt_templates, "dataset.params.prompt_templates")
+        elif prompt_template:
+            fallback_templates = self._normalize_templates(
+                [f"{prompt_template.strip()} {{image}}"],
+                "dataset.params.prompt_template",
+            )
+
+        fallback_templates = self._expand_templates_with_contexts(fallback_templates, global_contexts)
+        for group in groups:
+            group["templates"] = self._expand_templates_with_contexts(group["templates"], global_contexts)
+
+        return groups, fallback_templates, global_contexts
+
+    def _all_sequence_templates(self) -> List[str]:
+        templates = list(self.fallback_templates)
+        for group in self.prompt_template_groups:
+            templates.extend(group["templates"])
+        return self._dedupe_templates(templates)
+
     def _load_synsets(self, manifest_jsonl: Optional[str]) -> Dict[int, str]:
-        if not manifest_jsonl or not self.prompt_template:
+        if not manifest_jsonl or not self.sequence_templates:
             return {}
         path = Path(manifest_jsonl)
         if not path.exists():
@@ -126,28 +246,99 @@ class ImageNetFlowCacheDataset(Dataset):
                 names[synset] = (class_name, class_names or class_name)
         return names
 
-    def _render_prompt(self, img_id: int, synset: str) -> str:
+    def _template_pool_for_synset(self, synset: str) -> List[str]:
+        group = self._template_group_for_synset(synset)
+        if group is not None:
+            return group["templates"]
+        return self.fallback_templates
+
+    def prompt_group_for_synset(self, synset: str) -> str:
+        group = self._template_group_for_synset(synset)
+        return str(group["name"]) if group is not None else "fallback"
+
+    def _template_group_for_synset(self, synset: str) -> Optional[Dict[str, object]]:
         class_name, class_names = self.synset_names.get(synset, (synset, synset))
-        return self.prompt_template.format(
+        haystack = f"{synset} {class_name} {class_names}".lower()
+        synset_num = self._synset_number(synset)
+
+        for group in self.prompt_template_groups:
+            if synset in group["synsets"]:
+                return group
+
+        for group in self.prompt_template_groups:
+            if self._is_catchall_group(group):
+                continue
+            for start, end in group["synset_ranges"]:
+                start_num = self._synset_number(start)
+                end_num = self._synset_number(end)
+                if start_num is not None and end_num is not None and synset_num is not None:
+                    if start_num <= synset_num <= end_num:
+                        return group
+
+        for group in self.prompt_template_groups:
+            if self._is_catchall_group(group):
+                continue
+            if any(self._keyword_matches(haystack, keyword) for keyword in group["keywords"]):
+                return group
+
+        for group in self.prompt_template_groups:
+            if not self._is_catchall_group(group):
+                continue
+            for start, end in group["synset_ranges"]:
+                start_num = self._synset_number(start)
+                end_num = self._synset_number(end)
+                if start_num is not None and end_num is not None and synset_num is not None:
+                    if start_num <= synset_num <= end_num:
+                        return group
+
+        for group in self.prompt_template_groups:
+            if not self._is_catchall_group(group):
+                continue
+            if any(self._keyword_matches(haystack, keyword) for keyword in group["keywords"]):
+                return group
+
+        return None
+
+    def _is_catchall_group(self, group: Dict[str, object]) -> bool:
+        return str(group["name"]).startswith("other_")
+
+    def _keyword_matches(self, haystack: str, keyword: str) -> bool:
+        haystack_norm = f" {re.sub(r'[^a-z0-9]+', ' ', haystack.lower()).strip()} "
+        keyword_norm = re.sub(r"[^a-z0-9]+", " ", keyword.lower()).strip()
+        return bool(keyword_norm) and f" {keyword_norm} " in haystack_norm
+
+    def _synset_number(self, synset: str) -> Optional[int]:
+        if len(synset) < 2 or not synset[1:].isdigit():
+            return None
+        return int(synset[1:])
+
+    def _render_template(self, template: str, img_id: int, synset: str) -> str:
+        class_name, class_names = self.synset_names.get(synset, (synset, synset))
+        return template.format(
             img_id=int(img_id),
             synset=synset,
             class_name=class_name,
             class_names=class_names,
+            image="{image}",
         )
 
     def _build_prompt_cache(self) -> Dict[str, torch.Tensor]:
-        if not self.prompt_template:
+        if not self.sequence_templates:
             return {}
 
         prompt_cache: Dict[str, torch.Tensor] = {}
         if self.synsets:
             unique_synsets = sorted(set(self.synsets.values()))
             for synset in unique_synsets:
-                text = self._render_prompt(0, synset)
-                prompt_cache[text] = torch.tensor(
-                    self.tokenizer.encode(text, add_special_tokens=False),
-                    dtype=torch.long,
-                )
+                for template in self._template_pool_for_synset(synset):
+                    rendered = self._render_template(template, 0, synset)
+                    for text in rendered.split("{image}"):
+                        text = text.strip()
+                        if text and text not in prompt_cache:
+                            prompt_cache[text] = torch.tensor(
+                                self.tokenizer.encode(text, add_special_tokens=False),
+                                dtype=torch.long,
+                            )
         return prompt_cache
 
     def __len__(self) -> int:
@@ -156,71 +347,104 @@ class ImageNetFlowCacheDataset(Dataset):
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
 
-    def _prompt_ids(self, img_id: int) -> torch.Tensor:
-        if not self.prompt_template:
+    def _text_ids(self, text: str) -> torch.Tensor:
+        text = text.strip()
+        if not text:
             return torch.empty(0, dtype=torch.long)
-        synset = self.synsets.get(int(img_id), "")
-        text = self._render_prompt(int(img_id), synset)
         cached = self.prompt_cache.get(text)
         if cached is None:
             cached = torch.tensor(self.tokenizer.encode(text, add_special_tokens=False), dtype=torch.long)
             self.prompt_cache[text] = cached
         return cached
 
-    def _make_sequence_tensors(self, prompt_ids: torch.Tensor) -> Dict[str, torch.Tensor]:
-        prompt_len = int(prompt_ids.numel())
+    def _make_sequence_tensors(self, prefix_ids: torch.Tensor, suffix_ids: torch.Tensor) -> Dict[str, torch.Tensor]:
+        prefix_len = int(prefix_ids.numel())
+        suffix_len = int(suffix_ids.numel())
         input_ids = torch.cat(
             [
-                prompt_ids,
+                prefix_ids,
                 torch.tensor(
                     [self.boi_id]
                     + [self.mask_id] * self.image_tokens_per_img
-                    + [self.eoi_id, self.eos_id],
+                    + [self.eoi_id],
                     dtype=torch.long,
                 ),
+                suffix_ids,
+                torch.tensor([self.eos_id], dtype=torch.long),
             ]
         )
         token_types = torch.cat(
             [
-                torch.zeros(prompt_len, dtype=torch.uint8),
-                torch.tensor([2] + [1] * self.image_tokens_per_img + [2, 2], dtype=torch.uint8),
+                torch.zeros(prefix_len, dtype=torch.uint8),
+                torch.tensor([2] + [1] * self.image_tokens_per_img + [2], dtype=torch.uint8),
+                torch.zeros(suffix_len, dtype=torch.uint8),
+                torch.tensor([2], dtype=torch.uint8),
             ]
         )
         labels = torch.cat(
             [
-                prompt_ids,
+                prefix_ids,
                 torch.tensor(
                     [self.boi_id]
                     + [-100] * self.image_tokens_per_img
-                    + [-100, self.eos_id],
+                    + [-100],
                     dtype=torch.long,
                 ),
+                suffix_ids,
+                torch.tensor([self.eos_id], dtype=torch.long),
             ]
         )
         return {
             "input_ids": input_ids,
             "token_types": token_types,
             "labels": labels,
-            "prompt_len": torch.tensor(prompt_len, dtype=torch.long),
-            "image_start": torch.tensor(prompt_len + 1, dtype=torch.long),
+            "prompt_len": torch.tensor(prefix_len, dtype=torch.long),
+            "suffix_len": torch.tensor(suffix_len, dtype=torch.long),
+            "image_start": torch.tensor(prefix_len + 1, dtype=torch.long),
         }
 
     def _build_sequence_cache(self) -> Dict[str, Dict[str, torch.Tensor]]:
-        if not self.prompt_template:
+        if not self.sequence_templates:
             return {}
         sequence_cache: Dict[str, Dict[str, torch.Tensor]] = {}
-        for text, prompt_ids in self.prompt_cache.items():
-            sequence_cache[text] = self._make_sequence_tensors(prompt_ids)
+        if self.synsets:
+            for synset in sorted(set(self.synsets.values())):
+                for template in self._template_pool_for_synset(synset):
+                    rendered = self._render_template(template, 0, synset)
+                    prefix_text, suffix_text = self._split_rendered_template(rendered)
+                    sequence_cache[rendered] = self._make_sequence_tensors(
+                        self._text_ids(prefix_text),
+                        self._text_ids(suffix_text),
+                    )
         return sequence_cache
 
-    def _sequence_tensors(self, img_id: int) -> Dict[str, torch.Tensor]:
+    def _split_rendered_template(self, rendered: str) -> Tuple[str, str]:
+        parts = rendered.split("{image}")
+        if len(parts) != 2:
+            raise ValueError(f"Rendered prompt template must contain exactly one '{{image}}': {rendered!r}")
+        return parts[0].strip(), parts[1].strip()
+
+    def _template_for_sample(self, idx: int, synset: str) -> str:
+        templates = self._template_pool_for_synset(synset)
+        if not templates:
+            raise ValueError(
+                "No prompt templates available. Provide dataset.params.prompt_templates, "
+                "dataset.params.prompt_template, or dataset.params.prompt_templates_path."
+            )
+        template_idx = (idx * 1103515245 + self.epoch * 1_000_003 + self.seed) % len(templates)
+        return templates[template_idx]
+
+    def _sequence_tensors(self, img_id: int, template: str) -> Dict[str, torch.Tensor]:
         synset = self.synsets.get(int(img_id), "")
-        text = self._render_prompt(int(img_id), synset)
-        cached = self.sequence_cache.get(text)
+        rendered = self._render_template(template, int(img_id), synset)
+        cached = self.sequence_cache.get(rendered)
         if cached is None:
-            prompt_ids = self._prompt_ids(img_id)
-            cached = self._make_sequence_tensors(prompt_ids)
-            self.sequence_cache[text] = cached
+            prefix_text, suffix_text = self._split_rendered_template(rendered)
+            cached = self._make_sequence_tensors(
+                self._text_ids(prefix_text),
+                self._text_ids(suffix_text),
+            )
+            self.sequence_cache[rendered] = cached
         return cached
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
@@ -231,11 +455,13 @@ class ImageNetFlowCacheDataset(Dataset):
                 "labels": self.fixed_labels,
                 "image_latents": self.latents[idx],
                 "prompt_len": torch.tensor(0, dtype=torch.long),
+                "suffix_len": torch.tensor(0, dtype=torch.long),
                 "image_start": torch.tensor(1, dtype=torch.long),
-            }
+        }
 
         img_id = int(self.img_ids[idx].item())
-        sequence = self._sequence_tensors(img_id)
+        synset = self.synsets.get(int(img_id), "")
+        sequence = self._sequence_tensors(img_id, self._template_for_sample(idx, synset))
         length = int(sequence["input_ids"].numel())
         if self.max_seq_length is not None and length > self.max_seq_length:
             raise ValueError(
@@ -249,6 +475,7 @@ class ImageNetFlowCacheDataset(Dataset):
             "labels": sequence["labels"],
             "image_latents": self.latents[idx],
             "prompt_len": sequence["prompt_len"],
+            "suffix_len": sequence["suffix_len"],
             "image_start": sequence["image_start"],
         }
 
@@ -315,9 +542,11 @@ def collate_imagenet_flow_cache(
     for i, item in enumerate(batch):
         length = item["input_ids"].shape[0]
         prompt_len = int(item["prompt_len"].item())
+        suffix_len = int(item["suffix_len"].item())
         image_start = int(item["image_start"].item())
         eoi_pos = image_start + image_tokens
-        eos_pos = eoi_pos + 1
+        suffix_start = eoi_pos + 1
+        eos_pos = length - 1
 
         input_ids[i, :length] = item["input_ids"]
         token_types[i, :length] = item["token_types"]
@@ -329,7 +558,10 @@ def collate_imagenet_flow_cache(
         sigma[i, prompt_len] = prompt_len
         sigma[i, eoi_pos] = prompt_len + 1
         sigma[i, image_start:eoi_pos] = prompt_len + 2 + order[i]
-        sigma[i, eos_pos] = prompt_len + image_tokens + 2
+        suffix_sigma_start = prompt_len + image_tokens + 2
+        if suffix_len:
+            sigma[i, suffix_start:eos_pos] = suffix_sigma_start + torch.arange(suffix_len, dtype=torch.long)
+        sigma[i, eos_pos] = suffix_sigma_start + suffix_len
 
     valid_tokens = (token_types != 3).sum()
     image_tokens = (token_types == 1).sum()
@@ -360,6 +592,8 @@ def build_imagenet_flow_cache_dataloaders(config, tokenizer):
         image_latent_dim=params.get("image_latent_dim", config.model.image_latent_dim),
         manifest_jsonl=params.get("manifest_jsonl", None),
         prompt_template=params.get("prompt_template", ""),
+        prompt_templates=params.get("prompt_templates", None),
+        prompt_templates_path=params.get("prompt_templates_path", None),
         synset_mapping_path=params.get("synset_mapping_path", None),
         max_seq_length=params.get("max_seq_length", config.dataset.preprocessing.max_seq_length),
         max_samples=params.get("max_samples", -1),

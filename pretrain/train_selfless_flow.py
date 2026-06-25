@@ -144,6 +144,8 @@ def _save_image_flow_adapter(model, config, accelerator, global_step):
 
 def _unwrap_omnicorpus_dataset(dataset):
     ds = dataset
+    if hasattr(ds, "set_epoch"):
+        return ds
     while hasattr(ds, "dataset"):
         if hasattr(ds, "set_epoch") or hasattr(ds, "_packs") or ds.__class__.__name__ == "OmniCorpusPackedDataset":
             return ds
@@ -319,7 +321,12 @@ def main():
     ds = _unwrap_omnicorpus_dataset(train_dataloader.dataset)
     _is_multimodal_ds = hasattr(ds, 'set_epoch')
 
-    model, optimizer, train_dataloader, val_dataloader, lr_scheduler = accelerator.prepare(model, optimizer, train_dataloader, val_dataloader, lr_scheduler)
+    if hasattr(train_dataloader, "prepare_with_accelerator"):
+        model, optimizer, lr_scheduler = accelerator.prepare(model, optimizer, lr_scheduler)
+        train_dataloader = train_dataloader.prepare_with_accelerator(accelerator)
+        val_dataloader = val_dataloader.prepare_with_accelerator(accelerator)
+    else:
+        model, optimizer, train_dataloader, val_dataloader, lr_scheduler = accelerator.prepare(model, optimizer, train_dataloader, val_dataloader, lr_scheduler)
 
     ##################################
     #       MODEL RESUME         #
@@ -395,6 +402,10 @@ def main():
     acc_loss = torch.tensor(0.0, device=accelerator.device)
     acc_text_loss = torch.tensor(0.0, device=accelerator.device)
     acc_image_loss = torch.tensor(0.0, device=accelerator.device)
+    acc_text_batches = torch.tensor(0.0, device=accelerator.device)
+    acc_image_batches = torch.tensor(0.0, device=accelerator.device)
+    acc_flow_stats = {}
+    acc_flow_stat_batches = torch.tensor(0.0, device=accelerator.device)
 
     epoch = 0
     while global_step < config.training.max_train_steps:
@@ -414,16 +425,20 @@ def main():
         t_1 = 0.0
 
         if is_multimodal:
-            input_ids = batch["input_ids"].contiguous()  # [B, L] — no shift for selfless
-            token_types = batch["token_types"]  # [B, L]
-            sigma = batch["sigma"]  # [B, L], pre-computed by dataloader
-            labels = batch["labels"]  # [B, L], pre-computed by dataloader
+            input_ids = batch["input_ids"].contiguous().to(accelerator.device)  # [B, L] — no shift for selfless
+            token_types = batch["token_types"].to(accelerator.device)  # [B, L]
+            sigma = batch["sigma"].to(accelerator.device)  # [B, L], pre-computed by dataloader
+            labels = batch["labels"].to(accelerator.device)  # [B, L], pre-computed by dataloader
             image_latents = batch.get("image_latents", None)
+            if image_latents is not None:
+                image_latents = image_latents.to(accelerator.device)
             pack_stats = batch.get("pack_stats", None)
+            if pack_stats is not None:
+                pack_stats = pack_stats.to(accelerator.device)
             B, L = input_ids.shape
 
             selfless_attention_mask = get_selfless_mask(
-                sigma=sigma.to(accelerator.device), seq_len=L, device=accelerator.device
+                sigma=sigma, seq_len=L, device=accelerator.device
             )
 
             if global_step == 0 and accelerator.is_main_process and not hasattr(main, '_logged_first_batch'):
@@ -485,8 +500,21 @@ def main():
             if per_mod is not None:
                 t = per_mod["text_loss"]
                 i = per_mod["image_loss"]
-                acc_text_loss += t.detach() if isinstance(t, torch.Tensor) else 0.0
-                acc_image_loss += i.detach() if isinstance(i, torch.Tensor) else 0.0
+                has_text = (((token_types == 0) | (token_types == 2)) & (labels != -100)).any()
+                has_image = (token_types == 1).any()
+                if has_text:
+                    acc_text_loss += t.detach() if isinstance(t, torch.Tensor) else 0.0
+                    acc_text_batches += 1
+                if has_image:
+                    acc_image_loss += i.detach() if isinstance(i, torch.Tensor) else 0.0
+                    acc_image_batches += 1
+                    flow_stats = getattr(model_output, "flow_debug_stats", None)
+                    if flow_stats:
+                        for key, value in flow_stats.items():
+                            acc_flow_stats[key] = acc_flow_stats.get(
+                                key, torch.tensor(0.0, device=accelerator.device)
+                            ) + value.detach().to(accelerator.device)
+                        acc_flow_stat_batches += 1
             acc_loss += loss.detach()
 
             accelerator.backward(loss)
@@ -541,14 +569,27 @@ def main():
 
                 # Per-modality loss (accumulated across all micro-batches)
                 if is_multimodal:
-                    avg_text_loss = acc_text_loss / grad_accum
+                    avg_text_loss = acc_text_loss / acc_text_batches.clamp_min(1.0)
                     global_text_loss = accelerator.reduce(avg_text_loss, reduction="mean")
                     logs["train/loss_text"] = global_text_loss.item()
                     logs["train/ppl_text"] = math.exp(min(global_text_loss.item(), 100))
 
-                    avg_image_loss = acc_image_loss / grad_accum
+                    avg_image_loss = acc_image_loss / acc_image_batches.clamp_min(1.0)
                     global_image_loss = accelerator.reduce(avg_image_loss, reduction="mean")
                     logs["train/loss_image_flow"] = global_image_loss.item()
+                    if acc_flow_stats:
+                        flow_stat_count = acc_flow_stat_batches.clamp_min(1.0)
+                        global_flow_stats = {}
+                        for key, value in acc_flow_stats.items():
+                            stat = accelerator.reduce(value / flow_stat_count, reduction="mean")
+                            global_flow_stats[key] = stat.item()
+                            logs[f"train/{key}"] = stat.item()
+                        cond_rms = global_flow_stats.get("flow/cond_rms", 0.0)
+                        time_rms = global_flow_stats.get("flow/time_rms", 0.0)
+                        pred_rms = global_flow_stats.get("flow/pred_velocity_rms", 0.0)
+                        target_v_rms = global_flow_stats.get("flow/velocity_target_rms", 0.0)
+                        logs["train/flow/cond_time_rms_ratio"] = cond_rms / max(time_rms, 1e-8)
+                        logs["train/flow/pred_target_velocity_rms_ratio"] = pred_rms / max(target_v_rms, 1e-8)
 
                 accelerator.log(logs, step=global_step)
 
@@ -560,6 +601,15 @@ def main():
                     if is_multimodal:
                         msg += f" | Text: {global_text_loss.item():0.4f}"
                         msg += f" | Image: {global_image_loss.item():0.4f}"
+                        if acc_flow_stats:
+                            msg += (
+                                f" | FlowCond: {global_flow_stats.get('flow/cond_rms', 0.0):0.3f}"
+                                f" | FlowTime: {global_flow_stats.get('flow/time_rms', 0.0):0.3f}"
+                                f" | C/T: {logs.get('train/flow/cond_time_rms_ratio', 0.0):0.2f}"
+                                f" | FlowPred: {global_flow_stats.get('flow/pred_velocity_rms', 0.0):0.3f}"
+                                f" | FlowTargetV: {global_flow_stats.get('flow/velocity_target_rms', 0.0):0.3f}"
+                                f" | P/V: {logs.get('train/flow/pred_target_velocity_rms_ratio', 0.0):0.2f}"
+                            )
                     msg += (
                         f" | LR: {lr_scheduler.get_last_lr()[0]:0.6f} | "
                         f"Sec/Iter: {batch_time_m.val:0.4f}"
@@ -591,6 +641,10 @@ def main():
             acc_loss.zero_()
             acc_text_loss.zero_()
             acc_image_loss.zero_()
+            acc_text_batches.zero_()
+            acc_image_batches.zero_()
+            acc_flow_stats.clear()
+            acc_flow_stat_batches.zero_()
             if global_step >= config.training.max_train_steps:
                 break
 
@@ -860,6 +914,7 @@ def _validate_multimodal(model, val_dataloader, accelerator, global_step, config
     local_total_tokens = torch.tensor(0.0, device=accelerator.device)
     local_text_tokens = torch.tensor(0.0, device=accelerator.device)
     local_image_tokens = torch.tensor(0.0, device=accelerator.device)
+    saved_validation_images = False
 
     for batch in val_dataloader:
         input_ids = batch["input_ids"].contiguous().to(accelerator.device)
@@ -891,7 +946,7 @@ def _validate_multimodal(model, val_dataloader, accelerator, global_step, config
             image_latents=image_latents,
             calculate_likelihood=True,
         )
-        if local_text_tokens.item() == 0 and local_image_tokens.item() == 0:
+        if not saved_validation_images and image_latents is not None and image_mask.any():
             _save_validation_flow_images(
                 model=model,
                 output=output,
@@ -903,6 +958,7 @@ def _validate_multimodal(model, val_dataloader, accelerator, global_step, config
                 global_step=global_step,
                 config=config,
             )
+            saved_validation_images = True
         if hasattr(output, "per_modality_loss"):
             n_text = text_mask.sum().float()
             n_image = image_mask.sum().float()
