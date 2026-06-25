@@ -13,7 +13,8 @@ from torch.utils.data import DataLoader
 from torch import nn
 from transformers import Qwen3Config
 
-from models.modeling_model.modeling_selfless_flow import FlowMatchingHead, ImageLatentProjector, Qwen3ForCausalLM, Qwen3Model
+from models.modeling_model.mar_diffloss import DiffLoss
+from models.modeling_model.modeling_selfless_flow import ImageLatentProjector, Qwen3ForCausalLM, Qwen3Model
 from utils.dataset_combined_flow import CombinedBatchDataLoader, TextArrowDataset, collate_text_arrow
 from utils.dataset_imagenet_flow_cache import ImageNetFlowCacheDataset, collate_imagenet_flow_cache
 
@@ -66,19 +67,18 @@ class FakeFinalLayer:
         self.linear = FakeLinear()
 
 
-class FakeFlowHead:
+class FakeImageDiffusionHead:
     def __init__(self, latent_dim):
-        self.final_layer = FakeFinalLayer()
+        self.net = types.SimpleNamespace(final_layer=FakeFinalLayer())
         self.latent_dim = latent_dim
         self.sample_calls = []
 
-    def sample(self, z, num_steps, temperature, sample_method=None):
+    def sample(self, z, temperature=1.0, cfg=1.0):
         self.sample_calls.append(
             {
                 "z": z.detach().clone(),
-                "num_steps": num_steps,
                 "temperature": temperature,
-                "sample_method": sample_method,
+                "cfg": cfg,
             }
         )
         return torch.zeros(z.shape[0], self.latent_dim, device=z.device, dtype=z.dtype)
@@ -333,36 +333,23 @@ class SelflessFlowBehaviorTest(unittest.TestCase):
         self.assertTrue(all("image_latents" not in batch for batch in batches))
         self.assertTrue(all(torch.equal(batch["token_types"], torch.zeros_like(batch["token_types"])) for batch in batches))
 
-    def test_flow_head_scales_time_and_passes_condition_through(self):
-        head = FlowMatchingHead(
+    def test_mar_diffusion_head_outputs_epsilon_and_variance_channels(self):
+        head = DiffLoss(
             target_channels=4,
             z_channels=8,
-            width=8,
             depth=1,
-            time_scale=123.0,
+            width=8,
+            num_sampling_steps="2",
         )
-        captured = {}
+        target = torch.randn(3, 4)
+        z = torch.randn(3, 8)
+        t = torch.randint(0, head.train_diffusion.num_timesteps, (3,))
+        out = head.net(target, t, z)
+        loss = head(target, z)
 
-        def capture_time(_, args, __):
-            captured["time"] = args[0].detach().clone()
-
-        def capture_condition(_, args, __):
-            captured["condition"] = args[0].detach().clone()
-
-        time_hook = head.time_embed.register_forward_hook(capture_time)
-        cond_hook = head.cond_embed.register_forward_hook(capture_condition)
-        try:
-            x_t = torch.randn(3, 4)
-            t = torch.tensor([0.0, 0.5, 1.0])
-            z = torch.randn(3, 8) * 17.0 + 5.0
-            pred = head.predict_velocity(x_t, t, z)
-        finally:
-            time_hook.remove()
-            cond_hook.remove()
-
-        self.assertEqual(tuple(pred.shape), (3, 4))
-        self.assertTrue(torch.allclose(captured["time"], t * 123.0))
-        self.assertTrue(torch.allclose(captured["condition"], z))
+        self.assertEqual(tuple(out.shape), (3, 8))
+        self.assertEqual(loss.dim(), 0)
+        self.assertIn("diffusion/mse", head.last_forward_stats)
 
     def test_training_likelihood_uses_xt_all_mask_and_x0_real_content(self):
         config = tiny_qwen3_config()
@@ -432,7 +419,7 @@ class SelflessFlowBehaviorTest(unittest.TestCase):
         dummy = types.SimpleNamespace(
             config=types.SimpleNamespace(image_tokens_per_img=4),
             model=FakeInnerModel(hidden_size=hidden_size),
-            flow_head=FakeFlowHead(latent_dim=latent_dim),
+            image_diffusion_head=FakeImageDiffusionHead(latent_dim=latent_dim),
         )
 
         input_ids = torch.tensor([[10, 11, 7, 7, 7, 7, 12, 13]])
@@ -448,14 +435,14 @@ class SelflessFlowBehaviorTest(unittest.TestCase):
                 sigma=sigma,
                 spans=spans,
                 image_latent_dim=latent_dim,
-                flow_steps=3,
-                flow_temperature=0.5,
+                diffusion_temperature=0.5,
                 parallel_rate=1,
+                order_strategy="sigma",
             )
 
         self.assertEqual(tuple(generated.shape), (1, latent_dim, 2, 2))
         self.assertEqual(len(dummy.model.calls), 4)
-        self.assertEqual(len(dummy.flow_head.sample_calls), 4)
+        self.assertEqual(len(dummy.image_diffusion_head.sample_calls), 4)
 
         for call in dummy.model.calls:
             self.assertFalse(call["calculate_likelihood"])

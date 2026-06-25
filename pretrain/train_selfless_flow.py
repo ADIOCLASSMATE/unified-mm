@@ -44,16 +44,16 @@ def _special_token_ids(config):
     return ids
 
 
-def _apply_image_flow_warmup_freeze(model, config):
-    freeze_for_refine = config.training.get("freeze_backbone_for_image_flow_refine", False)
-    freeze_for_warmup = config.training.get("freeze_backbone_for_image_flow_warmup", False)
+def _apply_image_diffusion_warmup_freeze(model, config):
+    freeze_for_refine = config.training.get("freeze_backbone_for_image_diffusion_refine", False)
+    freeze_for_warmup = config.training.get("freeze_backbone_for_image_diffusion_warmup", False)
     if not (freeze_for_refine or freeze_for_warmup):
         return
 
     for param in model.parameters():
         param.requires_grad = False
 
-    for param in model.flow_head.parameters():
+    for param in model.image_diffusion_head.parameters():
         param.requires_grad = True
     for param in model.model.image_latent_proj.parameters():
         param.requires_grad = True
@@ -77,23 +77,41 @@ def _apply_image_flow_warmup_freeze(model, config):
     total = sum(p.numel() for p in model.parameters())
     stage_name = "refine" if freeze_for_refine else "warmup"
     logger.info(
-        f"Enabled frozen-Qwen image-flow {stage_name}: "
+        f"Enabled frozen-Qwen image-diffusion {stage_name}: "
         f"trainable={trainable:,}/{total:,} params; "
         f"special_token_ids={_special_token_ids(config)}"
     )
 
 
-def _load_image_flow_adapter(model, adapter_path, config):
+def _load_image_diffusion_adapter(model, adapter_path, config):
     if isinstance(adapter_path, str) and adapter_path.lower() in {"none", "null", "false", ""}:
         return
     if adapter_path is None:
         return
 
-    state = torch.load(adapter_path, map_location="cpu")
-    if "flow_head" in state:
-        missing, unexpected = model.flow_head.load_state_dict(state["flow_head"], strict=False)
+    adapter_path = Path(adapter_path)
+    if adapter_path.suffix == ".safetensors":
+        from safetensors import safe_open
+
+        head_state = {}
+        with safe_open(str(adapter_path), framework="pt", device="cpu") as f:
+            for key in f.keys():
+                if key.startswith("diffloss."):
+                    head_state[key[len("diffloss."):]] = f.get_tensor(key)
+                elif key.startswith("image_diffusion_head."):
+                    head_state[key[len("image_diffusion_head."):]] = f.get_tensor(key)
+        missing, unexpected = model.image_diffusion_head.load_state_dict(head_state, strict=False)
         logger.info(
-            f"Loaded adapter flow_head from {adapter_path}: "
+            f"Loaded MAR image_diffusion_head from {adapter_path}: "
+            f"keys={len(head_state)}, missing={missing}, unexpected={unexpected}"
+        )
+        return
+
+    state = torch.load(adapter_path, map_location="cpu")
+    if "image_diffusion_head" in state:
+        missing, unexpected = model.image_diffusion_head.load_state_dict(state["image_diffusion_head"], strict=False)
+        logger.info(
+            f"Loaded adapter image_diffusion_head from {adapter_path}: "
             f"missing={missing}, unexpected={unexpected}"
         )
     if "image_latent_proj" in state:
@@ -119,8 +137,8 @@ def _load_image_flow_adapter(model, adapter_path, config):
         logger.info(f"Loaded adapter special token embeddings from {adapter_path}")
 
 
-def _save_image_flow_adapter(model, config, accelerator, global_step):
-    if not config.training.get("save_image_flow_adapter", False):
+def _save_image_diffusion_adapter(model, config, accelerator, global_step):
+    if not config.training.get("save_image_diffusion_adapter", False):
         return
     if not accelerator.is_main_process:
         return
@@ -129,7 +147,7 @@ def _save_image_flow_adapter(model, config, accelerator, global_step):
     token_ids = _special_token_ids(config)
     embed = unwrapped.model.embed_tokens.weight.detach().cpu()
     state = {
-        "flow_head": {k: v.detach().cpu() for k, v in unwrapped.flow_head.state_dict().items()},
+        "image_diffusion_head": {k: v.detach().cpu() for k, v in unwrapped.image_diffusion_head.state_dict().items()},
         "image_latent_proj": {
             k: v.detach().cpu()
             for k, v in unwrapped.model.image_latent_proj.state_dict().items()
@@ -140,9 +158,9 @@ def _save_image_flow_adapter(model, config, accelerator, global_step):
             for name, token_id in token_ids.items()
         },
     }
-    path = Path(config.experiment.output_dir) / f"image_flow_adapter-{global_step}.pt"
+    path = Path(config.experiment.output_dir) / f"image_diffusion_adapter-{global_step}.pt"
     torch.save(state, path)
-    logger.info(f"Saved image-flow adapter to {path}")
+    logger.info(f"Saved image-diffusion adapter to {path}")
 
 
 def _unwrap_omnicorpus_dataset(dataset):
@@ -226,8 +244,8 @@ def main():
     logger.info("Loading tokenizer and model")
     model, tokenizer = load_model_tokenizer(config=config, logger=logger)
 
-    _load_image_flow_adapter(model, config.model.get("pretrained_image_flow_adapter", None), config)
-    _apply_image_flow_warmup_freeze(model, config)
+    _load_image_diffusion_adapter(model, config.model.get("pretrained_image_diffusion_adapter", None), config)
+    _apply_image_diffusion_warmup_freeze(model, config)
 
     if config.training.get("use_gradient_checkpointing", False):
         model.gradient_checkpointing_enable()
@@ -240,12 +258,12 @@ def main():
     ##################################
     optimizer_config = config.optimizer.params
 
-    # Use lower LR for pretrained backbone and higher LR for newly initialized
-    # continuous-image modules. Keep norms/embeddings/biases out of weight decay.
+    # Use lower LR for pretrained backbone and higher LR for continuous-image
+    # modules. Match MAR by keeping the diffusion MLP out of weight decay.
     base_lr = float(optimizer_config.learning_rate)
     backbone_lr = float(optimizer_config.get("backbone_learning_rate", base_lr))
-    flow_lr = float(optimizer_config.get("flow_learning_rate", base_lr))
-    projector_lr = float(optimizer_config.get("projector_learning_rate", flow_lr))
+    diffusion_lr = float(optimizer_config.get("diffusion_learning_rate", base_lr))
+    projector_lr = float(optimizer_config.get("projector_learning_rate", diffusion_lr))
     special_token_lr = float(optimizer_config.get("special_token_learning_rate", projector_lr))
     no_decay = [
         "bias",
@@ -259,8 +277,8 @@ def main():
     ]
 
     def lr_for_param(name):
-        if name.startswith("flow_head."):
-            return flow_lr
+        if name.startswith("image_diffusion_head."):
+            return diffusion_lr
         if "image_latent_proj" in name:
             return projector_lr
         if "embed_tokens.weight" in name:
@@ -271,7 +289,7 @@ def main():
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        weight_decay = 0.0 if any(nd in name for nd in no_decay) else optimizer_config.weight_decay
+        weight_decay = 0.0 if name.startswith("image_diffusion_head.") or any(nd in name for nd in no_decay) else optimizer_config.weight_decay
         key = (lr_for_param(name), weight_decay)
         grouped.setdefault(key, []).append(param)
 
@@ -281,7 +299,7 @@ def main():
     ]
     logger.info(
         "Optimizer LRs: "
-        f"backbone={backbone_lr:g}, image_latent_proj={projector_lr:g}, flow_head={flow_lr:g}; "
+        f"backbone={backbone_lr:g}, image_latent_proj={projector_lr:g}, image_diffusion_head={diffusion_lr:g}; "
         f"special_tokens={special_token_lr:g}; "
         f"weight_decay={optimizer_config.weight_decay:g}"
     )
@@ -407,8 +425,8 @@ def main():
     acc_image_loss = torch.tensor(0.0, device=accelerator.device)
     acc_text_batches = torch.tensor(0.0, device=accelerator.device)
     acc_image_batches = torch.tensor(0.0, device=accelerator.device)
-    acc_flow_stats = {}
-    acc_flow_stat_batches = torch.tensor(0.0, device=accelerator.device)
+    acc_diffusion_stats = {}
+    acc_diffusion_stat_batches = torch.tensor(0.0, device=accelerator.device)
 
     epoch = 0
     while global_step < config.training.max_train_steps:
@@ -511,13 +529,13 @@ def main():
                 if has_image:
                     acc_image_loss += i.detach() if isinstance(i, torch.Tensor) else 0.0
                     acc_image_batches += 1
-                    flow_stats = getattr(model_output, "flow_debug_stats", None)
-                    if flow_stats:
-                        for key, value in flow_stats.items():
-                            acc_flow_stats[key] = acc_flow_stats.get(
+                    diffusion_stats = getattr(model_output, "diffusion_debug_stats", None)
+                    if diffusion_stats:
+                        for key, value in diffusion_stats.items():
+                            acc_diffusion_stats[key] = acc_diffusion_stats.get(
                                 key, torch.tensor(0.0, device=accelerator.device)
                             ) + value.detach().to(accelerator.device)
-                        acc_flow_stat_batches += 1
+                        acc_diffusion_stat_batches += 1
             acc_loss += loss.detach()
 
             accelerator.backward(loss)
@@ -579,20 +597,14 @@ def main():
 
                     avg_image_loss = acc_image_loss / acc_image_batches.clamp_min(1.0)
                     global_image_loss = accelerator.reduce(avg_image_loss, reduction="mean")
-                    logs["train/loss_image_flow"] = global_image_loss.item()
-                    if acc_flow_stats:
-                        flow_stat_count = acc_flow_stat_batches.clamp_min(1.0)
-                        global_flow_stats = {}
-                        for key, value in acc_flow_stats.items():
-                            stat = accelerator.reduce(value / flow_stat_count, reduction="mean")
-                            global_flow_stats[key] = stat.item()
+                    logs["train/loss_image_diffusion"] = global_image_loss.item()
+                    if acc_diffusion_stats:
+                        diffusion_stat_count = acc_diffusion_stat_batches.clamp_min(1.0)
+                        global_diffusion_stats = {}
+                        for key, value in acc_diffusion_stats.items():
+                            stat = accelerator.reduce(value / diffusion_stat_count, reduction="mean")
+                            global_diffusion_stats[key] = stat.item()
                             logs[f"train/{key}"] = stat.item()
-                        cond_rms = global_flow_stats.get("flow/cond_rms", 0.0)
-                        time_rms = global_flow_stats.get("flow/time_rms", 0.0)
-                        pred_rms = global_flow_stats.get("flow/pred_velocity_rms", 0.0)
-                        target_v_rms = global_flow_stats.get("flow/velocity_target_rms", 0.0)
-                        logs["train/flow/cond_time_rms_ratio"] = cond_rms / max(time_rms, 1e-8)
-                        logs["train/flow/pred_target_velocity_rms_ratio"] = pred_rms / max(target_v_rms, 1e-8)
 
                 accelerator.log(logs, step=global_step)
 
@@ -604,14 +616,10 @@ def main():
                     if is_multimodal:
                         msg += f" | Text: {global_text_loss.item():0.4f}"
                         msg += f" | Image: {global_image_loss.item():0.4f}"
-                        if acc_flow_stats:
+                        if acc_diffusion_stats:
                             msg += (
-                                f" | FlowCond: {global_flow_stats.get('flow/cond_rms', 0.0):0.3f}"
-                                f" | FlowTime: {global_flow_stats.get('flow/time_rms', 0.0):0.3f}"
-                                f" | C/T: {logs.get('train/flow/cond_time_rms_ratio', 0.0):0.2f}"
-                                f" | FlowPred: {global_flow_stats.get('flow/pred_velocity_rms', 0.0):0.3f}"
-                                f" | FlowTargetV: {global_flow_stats.get('flow/velocity_target_rms', 0.0):0.3f}"
-                                f" | P/V: {logs.get('train/flow/pred_target_velocity_rms_ratio', 0.0):0.2f}"
+                                f" | DiffMSE: {global_diffusion_stats.get('diffusion/mse', 0.0):0.4f}"
+                                f" | DiffVB: {global_diffusion_stats.get('diffusion/vb', 0.0):0.4f}"
                             )
                     msg += (
                         f" | LR: {lr_scheduler.get_last_lr()[0]:0.6f} | "
@@ -625,7 +633,7 @@ def main():
             # Checkpointing
             if global_step % config.experiment.save_every == 0:
                 save_checkpoint(model, config, accelerator, global_step)
-                _save_image_flow_adapter(model, config, accelerator, global_step)
+                _save_image_diffusion_adapter(model, config, accelerator, global_step)
             
             if global_step % config.experiment.save_hfmodel_every == 0:
                 save_hf_model(model, tokenizer, config, accelerator, global_step)
@@ -646,14 +654,14 @@ def main():
             acc_image_loss.zero_()
             acc_text_batches.zero_()
             acc_image_batches.zero_()
-            acc_flow_stats.clear()
-            acc_flow_stat_batches.zero_()
+            acc_diffusion_stats.clear()
+            acc_diffusion_stat_batches.zero_()
             if global_step >= config.training.max_train_steps:
                 break
 
     accelerator.wait_for_everyone()
     save_hf_model(model, tokenizer, config, accelerator, "final")
-    _save_image_flow_adapter(model, config, accelerator, "final")
+    _save_image_diffusion_adapter(model, config, accelerator, "final")
     accelerator.end_training()
 
 
@@ -824,7 +832,7 @@ def _log_wandb_validation_images(accelerator, image_paths: dict[str, Path], glob
 
 
 @torch.no_grad()
-def _save_validation_flow_images(
+def _save_validation_diffusion_images(
     model,
     output,
     input_ids,
@@ -848,12 +856,12 @@ def _save_validation_flow_images(
     spans = _image_spans(token_types, image_tokens_per_img)
 
     gather_context = nullcontext()
-    flow_head_params = list(unwrapped.flow_head.parameters())
-    if any(hasattr(param, "ds_id") for param in flow_head_params):
+    diffusion_head_params = list(unwrapped.image_diffusion_head.parameters())
+    if any(hasattr(param, "ds_id") for param in diffusion_head_params):
         try:
             import deepspeed
             gather_context = deepspeed.zero.GatheredParameters(
-                flow_head_params,
+                diffusion_head_params,
                 modifier_rank=0,
             )
         except Exception:
@@ -871,12 +879,8 @@ def _save_validation_flow_images(
             return
 
         sample_count = min(int(config.experiment.get("validation_image_samples", 4)), len(spans))
-        flow_steps = int(config.experiment.get("validation_flow_steps", 50))
-        flow_temperature = float(config.experiment.get("validation_flow_temperature", 1.0))
-        flow_sample_method = config.experiment.get(
-            "validation_flow_sample_method",
-            config.model.get("flow_sample_method", None),
-        )
+        diffusion_temperature = float(config.experiment.get("validation_diffusion_temperature", 1.0))
+        diffusion_cfg = float(config.experiment.get("validation_diffusion_cfg", 1.0))
         scaling_factor = float(config.experiment.get("validation_vae_scaling_factor", 0.2325))
 
         side = int(image_tokens_per_img ** 0.5)
@@ -890,11 +894,10 @@ def _save_validation_flow_images(
         selected_spans = spans[:sample_count]
         for b, start, end in selected_spans:
             z = hidden_states[b, start:end].to(device=accelerator.device)
-            pred = unwrapped.flow_head.sample(
+            pred = unwrapped.image_diffusion_head.sample(
                 z,
-                num_steps=flow_steps,
-                temperature=flow_temperature,
-                sample_method=flow_sample_method,
+                temperature=diffusion_temperature,
+                cfg=diffusion_cfg,
             )
             target = image_latents[b, start:end].to(device=accelerator.device, dtype=pred.dtype)
             pred_latents.append(pred.view(side, side, -1).permute(2, 0, 1))
@@ -905,8 +908,6 @@ def _save_validation_flow_images(
             default_strategies = [
                 "hidden_norm",
                 "latent_proj_cosine",
-                "flow_self_consistency",
-                "solver_consistency",
                 "spatial_halton",
             ]
             strategies = config.experiment.get("validation_single_stream_order_strategies", None)
@@ -922,9 +923,8 @@ def _save_validation_flow_images(
                     sigma=sigma,
                     spans=selected_spans,
                     image_latent_dim=image_latents.shape[-1],
-                    flow_steps=flow_steps,
-                    flow_temperature=flow_temperature,
-                    flow_sample_method=flow_sample_method,
+                    diffusion_temperature=diffusion_temperature,
+                    diffusion_cfg=diffusion_cfg,
                     parallel_rate=int(config.experiment.get("validation_single_stream_parallel_rate", 32)),
                     order_strategy=str(order_strategy),
                     return_trace=True,
@@ -941,7 +941,7 @@ def _save_validation_flow_images(
 
         from torchvision.utils import make_grid, save_image
 
-        image_dir = Path(config.experiment.output_dir) / "validation_flow_images"
+        image_dir = Path(config.experiment.output_dir) / "validation_diffusion_images"
         image_dir.mkdir(parents=True, exist_ok=True)
         wandb_images = {}
         pred_img = (decoded_pred + 1.0) / 2.0
@@ -950,17 +950,17 @@ def _save_validation_flow_images(
         target_path = image_dir / f"step-{global_step:08d}-target.png"
         save_image(pred_img, pred_path)
         save_image(target_img, target_path)
-        wandb_images["val/flow_teacher_pred"] = pred_path
-        wandb_images["val/flow_target"] = target_path
+        wandb_images["val/diffusion_teacher_pred"] = pred_path
+        wandb_images["val/diffusion_target"] = target_path
         grid = make_grid(torch.stack([target_img, pred_img], dim=1).flatten(0, 1), nrow=2)
         target_pred_path = image_dir / f"step-{global_step:08d}-target_pred_grid.png"
         save_image(grid, target_pred_path)
         wandb_images["val/target_teacher_grid"] = target_pred_path
 
         logs = {
-            "val/flow_teacher_latent_mse": F.mse_loss(raw_pred_latents.float(), raw_target_latents.float()).item(),
-            "val/flow_teacher_latent_rms": raw_pred_latents.float().pow(2).mean().sqrt().item(),
-            "val/flow_target_latent_rms": raw_target_latents.float().pow(2).mean().sqrt().item(),
+            "val/diffusion_teacher_latent_mse": F.mse_loss(raw_pred_latents.float(), raw_target_latents.float()).item(),
+            "val/diffusion_teacher_latent_rms": raw_pred_latents.float().pow(2).mean().sqrt().item(),
+            "val/diffusion_target_latent_rms": raw_target_latents.float().pow(2).mean().sqrt().item(),
         }
         if single_stream_results:
             comparison_tiles = []
@@ -1035,7 +1035,7 @@ def _save_validation_flow_images(
                 logger.info(f"Validation single-stream strategies: {', '.join(comparison_names)}")
         accelerator.log(logs, step=global_step)
         _log_wandb_validation_images(accelerator, wandb_images, global_step)
-        logger.info(f"Saved validation flow images to {image_dir}")
+        logger.info(f"Saved validation diffusion images to {image_dir}")
 
 
 @torch.no_grad()
@@ -1079,7 +1079,7 @@ def _validate_multimodal(model, val_dataloader, accelerator, global_step, config
             calculate_likelihood=True,
         )
         if not saved_validation_images and image_latents is not None and image_mask.any():
-            _save_validation_flow_images(
+            _save_validation_diffusion_images(
                 model=model,
                 output=output,
                 input_ids=input_ids,
@@ -1141,15 +1141,15 @@ def _validate_multimodal(model, val_dataloader, accelerator, global_step, config
         logs["val/ppl_text"] = math.exp(avg_text) if avg_text < 100 else float("inf")
     if global_image_tokens.item() > 0:
         avg_image = (global_weighted_image / global_image_tokens).item()
-        logs["val/loss_image_flow"] = avg_image
+        logs["val/loss_image_diffusion"] = avg_image
 
     if accelerator.is_main_process:
         accelerator.log(logs, step=global_step)
         msg = f"[Validation] Step {global_step + 1} | Loss: {avg_loss:.4f} (PPL: {ppl:.2f})"
         if "val/loss_text" in logs:
             msg += f" | Text: {logs['val/loss_text']:.4f}"
-        if "val/loss_image_flow" in logs:
-            msg += f" | ImageFlow: {logs['val/loss_image_flow']:.4f}"
+        if "val/loss_image_diffusion" in logs:
+            msg += f" | ImageDiffusion: {logs['val/loss_image_diffusion']:.4f}"
         logger.info(msg)
 
     return avg_loss, ppl

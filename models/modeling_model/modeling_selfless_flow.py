@@ -47,193 +47,12 @@ from transformers.utils.deprecation import deprecate_kwarg
 from transformers.utils.generic import maybe_autocast, merge_with_config_defaults
 from torch.nn.attention.flex_attention import flex_attention, BlockMask, create_block_mask, and_masks
 from flash_attn.ops.triton.layer_norm import rms_norm_fn as flash_rms_norm
+from .mar_diffloss import DiffLoss
 try:
     from liger_kernel.ops.swiglu import LigerSiLUMulFunction  # noqa: F401
     liger_kernel_is_available = True
 except ImportError:
     liger_kernel_is_available = False
-
-
-def modulate(x, shift, scale):
-    return x * (1 + scale) + shift
-
-
-class FlowTimestepEmbedder(nn.Module):
-    def __init__(self, hidden_size, frequency_embedding_size=256):
-        super().__init__()
-        self.frequency_embedding_size = frequency_embedding_size
-        self.mlp = nn.Sequential(
-            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
-            nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size, bias=True),
-        )
-
-    @staticmethod
-    def timestep_embedding(t, dim, max_period=10000):
-        half = dim // 2
-        freqs = torch.exp(
-            -torch.log(torch.tensor(max_period, device=t.device, dtype=torch.float32))
-            * torch.arange(0, half, dtype=torch.float32, device=t.device)
-            / half
-        )
-        args = t[:, None].float() * freqs[None]
-        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-        if dim % 2:
-            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
-        return embedding
-
-    def forward(self, t):
-        emb = self.timestep_embedding(t, self.frequency_embedding_size)
-        return self.mlp(emb.to(dtype=self.mlp[0].weight.dtype))
-
-
-class FlowResBlock(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.in_ln = nn.LayerNorm(channels, eps=1e-6)
-        self.mlp = nn.Sequential(
-            nn.Linear(channels, channels, bias=True),
-            nn.SiLU(),
-            nn.Linear(channels, channels, bias=True),
-        )
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(channels, 3 * channels, bias=True),
-        )
-
-    def forward(self, x, y):
-        shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(y).chunk(3, dim=-1)
-        h = modulate(self.in_ln(x), shift_mlp, scale_mlp)
-        h = self.mlp(h)
-        return x + gate_mlp * h
-
-
-class FlowFinalLayer(nn.Module):
-    def __init__(self, model_channels, out_channels):
-        super().__init__()
-        self.norm_final = nn.LayerNorm(model_channels, elementwise_affine=False, eps=1e-6)
-        self.linear = nn.Linear(model_channels, out_channels, bias=True)
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(model_channels, 2 * model_channels, bias=True),
-        )
-
-    def forward(self, x, c):
-        shift, scale = self.adaLN_modulation(c).chunk(2, dim=-1)
-        x = modulate(self.norm_final(x), shift, scale)
-        return self.linear(x)
-
-
-class FlowMatchingHead(nn.Module):
-    def __init__(
-        self,
-        target_channels,
-        z_channels,
-        width=1024,
-        depth=3,
-        time_scale=1000.0,
-        sample_method="heun",
-    ):
-        super().__init__()
-        self.target_channels = target_channels
-        self.time_scale = float(time_scale)
-        self.sample_method = sample_method
-        self.time_embed = FlowTimestepEmbedder(width)
-        self.cond_embed = nn.Linear(z_channels, width)
-        self.input_proj = nn.Linear(target_channels, width)
-        self.res_blocks = nn.ModuleList([FlowResBlock(width) for _ in range(depth)])
-        self.final_layer = FlowFinalLayer(width, target_channels)
-        self.last_forward_stats = {}
-        self.initialize_weights()
-
-    @staticmethod
-    def _rms_stat(x):
-        return x.detach().float().pow(2).mean().sqrt()
-
-    def initialize_weights(self):
-        def _basic_init(module):
-            if isinstance(module, nn.Linear):
-                torch.nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0)
-        self.apply(_basic_init)
-        nn.init.normal_(self.time_embed.mlp[0].weight, std=0.02)
-        nn.init.normal_(self.time_embed.mlp[2].weight, std=0.02)
-        for block in self.res_blocks:
-            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
-            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
-        nn.init.constant_(self.final_layer.linear.weight, 0)
-        nn.init.constant_(self.final_layer.linear.bias, 0)
-
-    def forward(self, target, z, mask=None):
-        target = target.float()
-        noise = torch.randn_like(target)
-        t = torch.rand(target.shape[0], device=target.device, dtype=target.dtype)
-        x_t = (1.0 - t[:, None]) * noise + t[:, None] * target
-        velocity = target - noise
-
-        pred = self.predict_velocity(x_t, t, z)
-        loss = (pred - velocity).pow(2).mean(dim=-1)
-        self.last_forward_stats.update(
-            {
-                "flow/target_rms": self._rms_stat(target),
-                "flow/noise_rms": self._rms_stat(noise),
-                "flow/velocity_target_rms": self._rms_stat(velocity),
-                "flow/mse": loss.detach().float().mean(),
-            }
-        )
-        if mask is not None:
-            mask = mask.to(loss.dtype)
-            return (loss * mask).sum() / mask.sum().clamp_min(1.0)
-        return loss.mean()
-
-    def predict_velocity(self, x_t, t, z):
-        model_dtype = self.input_proj.weight.dtype
-        z = z.to(dtype=self.cond_embed.weight.dtype)
-        x = self.input_proj(x_t.to(dtype=model_dtype))
-        scaled_t = t.float() * self.time_scale
-        cond = self.cond_embed(z).to(dtype=model_dtype)
-        y = self.time_embed(scaled_t).to(dtype=model_dtype) + cond
-        for block in self.res_blocks:
-            x = block(x, y)
-        pred = self.final_layer(x, y).float()
-        self.last_forward_stats = {
-            "flow/input_xt_rms": self._rms_stat(x_t),
-            "flow/hidden_z_rms": self._rms_stat(z),
-            "flow/cond_rms": self._rms_stat(cond),
-            "flow/time_rms": self._rms_stat(y - cond),
-            "flow/y_rms": self._rms_stat(y),
-            "flow/pred_velocity_rms": self._rms_stat(pred),
-        }
-        return pred
-
-    def sample(self, z, num_steps=50, temperature=1.0, sample_method=None, x_init=None):
-        sample_method = (sample_method or self.sample_method or "euler").lower()
-        if x_init is None:
-            x = torch.randn(z.shape[0], self.target_channels, device=z.device, dtype=z.dtype) * temperature
-        else:
-            x = x_init.to(device=z.device, dtype=z.dtype).clone()
-        dt = 1.0 / float(num_steps)
-        for step in range(num_steps):
-            t = torch.full((z.shape[0],), step / float(num_steps), device=z.device, dtype=torch.float32)
-            v = self.predict_velocity(x, t, z).to(dtype=x.dtype)
-            if sample_method == "heun":
-                x_euler = x + dt * v
-                next_t = torch.full(
-                    (z.shape[0],),
-                    (step + 1) / float(num_steps),
-                    device=z.device,
-                    dtype=torch.float32,
-                )
-                next_v = self.predict_velocity(x_euler, next_t, z).to(dtype=x.dtype)
-                x = x + 0.5 * dt * (v + next_v)
-            elif sample_method == "euler":
-                x = x + dt * v
-            else:
-                raise ValueError(f"Unsupported flow sample_method: {sample_method}")
-        return x
     
 
 class ImageLatentProjector(nn.Module):
@@ -784,15 +603,16 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         self.unified_head = False
         self.lambda_image = getattr(config, "lambda_image", 0.5)
         self.lambda_text = getattr(config, "lambda_text", 1.0)
+        self.image_diffusion_batch_mul = int(getattr(config, "image_diffusion_batch_mul", 1))
 
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.flow_head = FlowMatchingHead(
+        self.image_diffusion_head = DiffLoss(
             target_channels=self.image_latent_dim,
             z_channels=config.hidden_size,
-            width=getattr(config, "flow_width", config.hidden_size),
-            depth=getattr(config, "flow_depth", 3),
-            time_scale=getattr(config, "flow_time_scale", 1000.0),
-            sample_method=getattr(config, "flow_sample_method", "heun"),
+            width=getattr(config, "image_diffusion_width", 1280),
+            depth=getattr(config, "image_diffusion_depth", 8),
+            num_sampling_steps=str(getattr(config, "image_diffusion_num_sampling_steps", "100")),
+            grad_checkpointing=getattr(config, "image_diffusion_grad_checkpointing", False),
         )
 
         # Initialize weights and apply final processing
@@ -884,21 +704,23 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
 
                 if image_flat_mask.any():
                     if image_latents is None:
-                        raise ValueError("image_latents must be provided for continuous image flow loss.")
+                        raise ValueError("image_latents must be provided for continuous image diffusion loss.")
                     if image_latents.shape[-1] != self.image_latent_dim:
                         raise ValueError(
                             f"image_latents last dimension ({image_latents.shape[-1]}) must match "
                             f"config.image_latent_dim ({self.image_latent_dim})."
                         )
                     flat_image_latents = image_latents.to(hidden_states.device).view(-1, self.image_latent_dim)
-                    image_loss = self.flow_head(
-                        target=flat_image_latents[image_flat_mask],
-                        z=flat_hidden[image_flat_mask],
-                    )
+                    image_targets = flat_image_latents[image_flat_mask]
+                    image_conditions = flat_hidden[image_flat_mask]
+                    if self.image_diffusion_batch_mul > 1:
+                        image_targets = image_targets.repeat(self.image_diffusion_batch_mul, 1)
+                        image_conditions = image_conditions.repeat(self.image_diffusion_batch_mul, 1)
+                    image_loss = self.image_diffusion_head(target=image_targets, z=image_conditions)
                 else:
                     dummy_target = torch.zeros(1, self.image_latent_dim, device=hidden_states.device)
                     dummy_hidden = flat_hidden[:1]
-                    image_loss = self.flow_head(dummy_target, dummy_hidden) * 0.0
+                    image_loss = self.image_diffusion_head(dummy_target, dummy_hidden) * 0.0
 
                 loss = self.lambda_text * text_loss + self.lambda_image * image_loss
             else:
@@ -920,9 +742,9 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 "text_loss": text_loss.detach() if isinstance(text_loss, torch.Tensor) else torch.tensor(text_loss or 0.0, device=hidden_states.device),
                 "image_loss": image_loss.detach() if isinstance(image_loss, torch.Tensor) else torch.tensor(image_loss or 0.0, device=hidden_states.device),
             }
-            output.flow_debug_stats = {
+            output.diffusion_debug_stats = {
                 key: value.detach()
-                for key, value in self.flow_head.last_forward_stats.items()
+                for key, value in self.image_diffusion_head.last_forward_stats.items()
                 if isinstance(value, torch.Tensor)
             }
         return output
@@ -939,9 +761,8 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         sigma: torch.Tensor,
         spans: list[tuple[int, int, int]],
         image_latent_dim: int | None = None,
-        flow_steps: int = 50,
-        flow_temperature: float = 1.0,
-        flow_sample_method: str | None = None,
+        diffusion_temperature: float = 1.0,
+        diffusion_cfg: float = 1.0,
         parallel_rate: int = 32,
         order_strategy: str = "condition_norm",
         return_trace: bool = False,
@@ -965,7 +786,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             selected_input_ids.shape[1],
             image_latent_dim,
             device=device,
-            dtype=self.flow_head.final_layer.linear.weight.dtype,
+            dtype=self.image_diffusion_head.net.final_layer.linear.weight.dtype,
         )
 
         original_orders = []
@@ -1066,7 +887,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             "spatial_uniform": _spatial_uniform_order(),
             "uniform": _spatial_uniform_order(),
         }
-        latent_level_strategies = {"latent_proj_cosine", "flow_self_consistency", "solver_consistency"}
+        latent_level_strategies = {"latent_proj_cosine"}
 
         while not filled.all():
             attention_mask = get_selfless_mask(
@@ -1109,61 +930,15 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 all_local_positions = torch.cat(all_local_positions)
                 z = hidden[all_sample_indices, all_seq_positions]
 
-                if order_strategy == "solver_consistency":
-                    noise = torch.randn(
-                        z.shape[0],
-                        self.flow_head.target_channels,
-                        device=device,
-                        dtype=z.dtype,
-                    ) * flow_temperature
-                    candidate_pred = self.flow_head.sample(
-                        z,
-                        num_steps=flow_steps,
-                        temperature=flow_temperature,
-                        sample_method=flow_sample_method,
-                        x_init=noise,
-                    ).to(work_latents.dtype)
-                    fast_steps = max(4, int(flow_steps) // 2)
-                    default_method = str(flow_sample_method or self.flow_head.sample_method or "euler").lower()
-                    fast_method = "euler" if default_method == "heun" else default_method
-                    fast_pred = self.flow_head.sample(
-                        z,
-                        num_steps=fast_steps,
-                        temperature=flow_temperature,
-                        sample_method=fast_method,
-                        x_init=noise,
-                    ).to(work_latents.dtype)
-                    all_scores = -(candidate_pred.float() - fast_pred.float()).pow(2).mean(dim=-1).sqrt()
-                elif order_strategy == "flow_self_consistency":
-                    noise = torch.randn(
-                        z.shape[0],
-                        self.flow_head.target_channels,
-                        device=device,
-                        dtype=z.dtype,
-                    ) * flow_temperature
-                    candidate_pred = self.flow_head.sample(
-                        z,
-                        num_steps=flow_steps,
-                        temperature=flow_temperature,
-                        sample_method=flow_sample_method,
-                        x_init=noise,
-                    ).to(work_latents.dtype)
-                    t_mid = torch.full((z.shape[0],), 0.5, device=device, dtype=torch.float32)
-                    x_mid = 0.5 * noise.to(candidate_pred.dtype) + 0.5 * candidate_pred
-                    target_velocity = candidate_pred.float() - noise.float()
-                    pred_velocity = self.flow_head.predict_velocity(x_mid, t_mid, z).float()
-                    all_scores = -(pred_velocity - target_velocity).pow(2).mean(dim=-1)
-                else:
-                    candidate_pred = self.flow_head.sample(
-                        z,
-                        num_steps=flow_steps,
-                        temperature=flow_temperature,
-                        sample_method=flow_sample_method,
-                    ).to(work_latents.dtype)
-                    projected = self.model.image_latent_proj(
-                        candidate_pred.to(dtype=self.model.image_latent_proj.weight_dtype)
-                    )
-                    all_scores = F.cosine_similarity(projected.float(), z.float(), dim=-1)
+                candidate_pred = self.image_diffusion_head.sample(
+                    z,
+                    temperature=diffusion_temperature,
+                    cfg=diffusion_cfg,
+                ).to(work_latents.dtype)
+                projected = self.model.image_latent_proj(
+                    candidate_pred.to(dtype=self.model.image_latent_proj.weight_dtype)
+                )
+                all_scores = F.cosine_similarity(projected.float(), z.float(), dim=-1)
 
                 cursor = 0
                 for sample_idx, count in enumerate(candidate_counts):
@@ -1208,8 +983,8 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                     else:
                         raise ValueError(
                             f"Unknown single-stream order_strategy={order_strategy!r}; "
-                            "expected one of: hidden_norm, latent_proj_cosine, flow_self_consistency, "
-                            "solver_consistency, spatial_halton, spatial_uniform, sigma, causal_sigma, random."
+                            "expected one of: hidden_norm, latent_proj_cosine, spatial_halton, "
+                            "spatial_uniform, sigma, causal_sigma, random."
                         )
 
                     fill_local_positions.append((sample_idx, positions, scores, None))
@@ -1227,11 +1002,10 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 seq_positions = torch.cat(seq_positions)
 
                 z = hidden[sample_indices, seq_positions]
-                pred = self.flow_head.sample(
+                pred = self.image_diffusion_head.sample(
                     z,
-                    num_steps=flow_steps,
-                    temperature=flow_temperature,
-                    sample_method=flow_sample_method,
+                    temperature=diffusion_temperature,
+                    cfg=diffusion_cfg,
                 ).to(work_latents.dtype)
 
             cursor = 0
@@ -1278,7 +1052,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         return generated
 
     def _image_logits_from_hidden(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError("Continuous image flow model does not expose VQ image logits.")
+        raise NotImplementedError("Continuous image diffusion model does not expose VQ image logits.")
 
     def _sample_from_logits(self, logits: torch.Tensor, temperature: float) -> tuple[torch.Tensor, torch.Tensor]:
         if temperature < 1e-6:

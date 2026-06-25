@@ -1,5 +1,5 @@
 experiment:
-    project: "selfless-flow-0.6B-text-2048-ft"
+    project: "selfless-diffusion-0.6B-text-2048-ft"
     name: "text-selfless-2048-ft"
     wandb_project: "unified-mm"
     output_dir: "output"
@@ -14,7 +14,7 @@ experiment:
     resume_from_checkpoint: none
 
 model:
-    model_path: "output/selfless-flow-0.6B-imagenet-unified-full/hf_model-15000"
+    model_path: "output/selfless-diffusion-0.6B-imagenet-unified-full/hf_model-15000"
     attention_pattern: "ar"
     loss_attention_pattern: "likelihood"
     mask_id: -1
@@ -25,10 +25,10 @@ model:
     image_tokens_per_img: 256
     image_latent_dim: 16
     image_projector_width: 2048
-    flow_depth: 3
-    flow_width: 1024
-    flow_time_scale: 1000.0
-    flow_sample_method: "heun"
+    image_diffusion_depth: 8
+    image_diffusion_width: 1280
+    image_diffusion_num_sampling_steps: "100"
+    image_diffusion_batch_mul: 4
 
 dataset:
     class_name: "TextArrowDataset"

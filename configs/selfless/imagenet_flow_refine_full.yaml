@@ -1,6 +1,6 @@
 experiment:
-    project: "selfless-flow-0.6B-imagenet-refine-full"
-    name: "imagenet-flow-refine-full"
+    project: "selfless-diffusion-0.6B-imagenet-refine-full"
+    name: "imagenet-diffusion-refine-full"
     wandb_project: "unified-mm"
     output_dir: "output"
     save_every: 1000
@@ -13,9 +13,8 @@ experiment:
     val_every: 1000
     validation_image_every: 1000
     validation_image_samples: 4
-    validation_flow_steps: 50
-    validation_flow_temperature: 1.0
-    validation_flow_sample_method: "heun"
+    validation_diffusion_temperature: 1.0
+    validation_diffusion_cfg: 1.0
     validation_single_stream_images: true
     validation_single_stream_parallel_rate: 1
     validation_single_stream_order_strategy: "sigma"
@@ -25,8 +24,6 @@ experiment:
         - "random"
         - "hidden_norm"
         - "latent_proj_cosine"
-        - "flow_self_consistency"
-        - "solver_consistency"
         - "spatial_halton"
     validation_mar_root: "/inspire/hdd/global_user/wanjiaxin-253108030048/code/mar"
     validation_vae_path: "public/vae/mar-kl16/kl16.ckpt"
@@ -34,7 +31,7 @@ experiment:
     resume_from_checkpoint: none
 
 model:
-    model_path: "output/selfless-flow-0.6B-imagenet-unified-full/hf_model-final"
+    model_path: "output/selfless-diffusion-0.6B-imagenet-unified-full/hf_model-final"
     attention_pattern: "ar"
     loss_attention_pattern: "likelihood"
     mask_id: -1
@@ -45,11 +42,11 @@ model:
     image_tokens_per_img: 256
     image_latent_dim: 16
     image_projector_width: 2048
-    flow_depth: 3
-    flow_width: 1024
-    flow_time_scale: 1000.0
-    flow_sample_method: "heun"
-    pretrained_image_flow_adapter: none
+    image_diffusion_depth: 8
+    image_diffusion_width: 1280
+    image_diffusion_num_sampling_steps: "100"
+    image_diffusion_batch_mul: 4
+    pretrained_image_diffusion_adapter: "../mar/pretrained_models/mar/mar_large_hf/mar-large.safetensors"
 
 dataset:
     class_name: "ImageNetFlowCacheDataset"
@@ -72,7 +69,7 @@ optimizer:
         learning_rate: 1.0e-4
         backbone_learning_rate: 0.0
         projector_learning_rate: 1.0e-4
-        flow_learning_rate: 2.0e-4
+        diffusion_learning_rate: 2.0e-4
         special_token_learning_rate: 1.0e-5
         scale_lr: false
         beta1: 0.9
@@ -102,5 +99,5 @@ training:
     use_gradient_checkpointing: false
     step_scheduler_with_optimizer: false
     from_scratch: false
-    freeze_backbone_for_image_flow_refine: true
-    save_image_flow_adapter: true
+    freeze_backbone_for_image_diffusion_refine: true
+    save_image_diffusion_adapter: true

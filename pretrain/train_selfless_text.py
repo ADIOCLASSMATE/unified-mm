@@ -53,7 +53,7 @@ def _set_epoch_on_loader(loader, epoch: int) -> None:
 
 def _freeze_unused_image_modules(model, logger=None) -> None:
     frozen = []
-    for module_name in ("flow_head",):
+    for module_name in ("image_diffusion_head",):
         module = getattr(model, module_name, None)
         if module is None:
             continue
