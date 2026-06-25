@@ -209,9 +209,12 @@ class FlowMatchingHead(nn.Module):
         }
         return pred
 
-    def sample(self, z, num_steps=50, temperature=1.0, sample_method=None):
+    def sample(self, z, num_steps=50, temperature=1.0, sample_method=None, x_init=None):
         sample_method = (sample_method or self.sample_method or "euler").lower()
-        x = torch.randn(z.shape[0], self.target_channels, device=z.device, dtype=z.dtype) * temperature
+        if x_init is None:
+            x = torch.randn(z.shape[0], self.target_channels, device=z.device, dtype=z.dtype) * temperature
+        else:
+            x = x_init.to(device=z.device, dtype=z.dtype).clone()
         dt = 1.0 / float(num_steps)
         for step in range(num_steps):
             t = torch.full((z.shape[0],), step / float(num_steps), device=z.device, dtype=torch.float32)
@@ -940,18 +943,23 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         flow_temperature: float = 1.0,
         flow_sample_method: str | None = None,
         parallel_rate: int = 32,
-    ) -> torch.Tensor | None:
+        order_strategy: str = "condition_norm",
+        return_trace: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor | None, dict[str, torch.Tensor | str]] | None:
         from utils.utils import get_selfless_mask
 
         if not spans:
-            return None
+            return (None, {}) if return_trace else None
 
         device = input_ids.device
         image_latent_dim = image_latent_dim or self.image_latent_dim
         image_tokens_per_img = int(getattr(self.config, "image_tokens_per_img", 256))
+        side = int(image_tokens_per_img ** 0.5)
+        if side * side != image_tokens_per_img:
+            raise ValueError(f"image_tokens_per_img={image_tokens_per_img} is not square")
         selected_input_ids = torch.stack([input_ids[b] for b, _, _ in spans]).to(device=device)
         selected_token_types = torch.stack([token_types[b] for b, _, _ in spans]).to(device=device)
-        selected_sigma = torch.stack([sigma[b] for b, _, _ in spans]).to(device=device)
+        selected_sigma = torch.stack([sigma[b] for b, _, _ in spans]).to(device=device, dtype=torch.float32)
         work_latents = torch.zeros(
             selected_input_ids.shape[0],
             selected_input_ids.shape[1],
@@ -964,7 +972,43 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         local_spans = []
         for out_idx, (batch_idx, start, end) in enumerate(spans):
             local_spans.append((out_idx, start, end))
-            original_orders.append(torch.argsort(sigma[batch_idx, start:end].to(device=device)))
+            original_orders.append(torch.argsort(sigma[batch_idx, start:end].to(device=device, dtype=torch.float32)))
+
+        def _halton(index: int, base: int) -> float:
+            value = 0.0
+            scale = 1.0 / float(base)
+            while index > 0:
+                value += (index % base) * scale
+                index //= base
+                scale /= float(base)
+            return value
+
+        def _halton_order() -> torch.Tensor:
+            seen = set()
+            order = []
+            idx = 1
+            while len(order) < image_tokens_per_img and idx < image_tokens_per_img * 32:
+                row = min(side - 1, int(_halton(idx, 2) * side))
+                col = min(side - 1, int(_halton(idx, 3) * side))
+                flat = row * side + col
+                if flat not in seen:
+                    seen.add(flat)
+                    order.append(flat)
+                idx += 1
+            if len(order) < image_tokens_per_img:
+                order.extend([flat for flat in range(image_tokens_per_img) if flat not in seen])
+            return torch.tensor(order, device=device, dtype=torch.long)
+
+        def _spatial_uniform_order() -> torch.Tensor:
+            yy, xx = torch.meshgrid(
+                torch.arange(side, device=device),
+                torch.arange(side, device=device),
+                indexing="ij",
+            )
+            center = (side - 1) / 2.0
+            ring = torch.maximum((yy.float() - center).abs(), (xx.float() - center).abs())
+            checker = (yy % 2) * 2 + (xx % 2)
+            return torch.argsort((ring * 4.0 + checker.float()).flatten())
 
         filled = torch.zeros(
             len(spans),
@@ -979,9 +1023,50 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             device=device,
             dtype=work_latents.dtype,
         )
+        generation_order = torch.zeros(
+            len(spans),
+            image_tokens_per_img,
+            device=device,
+            dtype=torch.long,
+        )
+        generation_step = torch.zeros_like(generation_order)
+        generation_score = torch.zeros(
+            len(spans),
+            image_tokens_per_img,
+            device=device,
+            dtype=torch.float32,
+        )
 
         current_sigma = selected_sigma.clone()
+        next_image_order = torch.zeros(len(spans), device=device, dtype=torch.float32)
         k = max(1, int(parallel_rate))
+        order_strategy = str(order_strategy or "condition_norm").lower()
+        replay_original_sigma = order_strategy in {"sigma", "sigma_replay"}
+        if not replay_original_sigma:
+            for sample_idx, start, end in local_spans:
+                original_image_sigma = selected_sigma[sample_idx, start:end]
+                start_order = float(original_image_sigma.min().item())
+                visible_context = (
+                    (selected_token_types[sample_idx] != 1)
+                    & (selected_token_types[sample_idx] != 3)
+                    & (selected_sigma[sample_idx] < start_order)
+                )
+                if visible_context.any():
+                    start_order = max(
+                        start_order,
+                        float(selected_sigma[sample_idx, visible_context].max().item() + 1.0),
+                    )
+                next_image_order[sample_idx] = start_order
+                current_sigma[sample_idx, start:end] = start_order + image_tokens_per_img
+        fill_counter = torch.ones(len(spans), device=device, dtype=torch.long)
+        step_idx = 1
+        fixed_orders = {
+            "spatial_halton": _halton_order(),
+            "halton": _halton_order(),
+            "spatial_uniform": _spatial_uniform_order(),
+            "uniform": _spatial_uniform_order(),
+        }
+        latent_level_strategies = {"latent_proj_cosine", "flow_self_consistency", "solver_consistency"}
 
         while not filled.all():
             attention_mask = get_selfless_mask(
@@ -1002,46 +1087,195 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             ).last_hidden_state
 
             fill_local_positions = []
-            for sample_idx, start, _ in local_spans:
-                order = original_orders[sample_idx]
-                remaining_order = order[~filled[sample_idx, order]]
-                if remaining_order.numel() == 0:
-                    continue
-                fill_local_positions.append((sample_idx, remaining_order[:k]))
+            if order_strategy in latent_level_strategies:
+                all_sample_indices = []
+                all_seq_positions = []
+                all_local_positions = []
+                candidate_counts = []
+                for sample_idx, start, _ in local_spans:
+                    remaining = (~filled[sample_idx]).nonzero(as_tuple=True)[0]
+                    candidate_counts.append(int(remaining.numel()))
+                    if remaining.numel() == 0:
+                        continue
+                    all_sample_indices.append(torch.full_like(remaining, sample_idx))
+                    all_seq_positions.append(start + remaining)
+                    all_local_positions.append(remaining)
+
+                if not all_sample_indices:
+                    break
+
+                all_sample_indices = torch.cat(all_sample_indices)
+                all_seq_positions = torch.cat(all_seq_positions)
+                all_local_positions = torch.cat(all_local_positions)
+                z = hidden[all_sample_indices, all_seq_positions]
+
+                if order_strategy == "solver_consistency":
+                    noise = torch.randn(
+                        z.shape[0],
+                        self.flow_head.target_channels,
+                        device=device,
+                        dtype=z.dtype,
+                    ) * flow_temperature
+                    candidate_pred = self.flow_head.sample(
+                        z,
+                        num_steps=flow_steps,
+                        temperature=flow_temperature,
+                        sample_method=flow_sample_method,
+                        x_init=noise,
+                    ).to(work_latents.dtype)
+                    fast_steps = max(4, int(flow_steps) // 2)
+                    default_method = str(flow_sample_method or self.flow_head.sample_method or "euler").lower()
+                    fast_method = "euler" if default_method == "heun" else default_method
+                    fast_pred = self.flow_head.sample(
+                        z,
+                        num_steps=fast_steps,
+                        temperature=flow_temperature,
+                        sample_method=fast_method,
+                        x_init=noise,
+                    ).to(work_latents.dtype)
+                    all_scores = -(candidate_pred.float() - fast_pred.float()).pow(2).mean(dim=-1).sqrt()
+                elif order_strategy == "flow_self_consistency":
+                    noise = torch.randn(
+                        z.shape[0],
+                        self.flow_head.target_channels,
+                        device=device,
+                        dtype=z.dtype,
+                    ) * flow_temperature
+                    candidate_pred = self.flow_head.sample(
+                        z,
+                        num_steps=flow_steps,
+                        temperature=flow_temperature,
+                        sample_method=flow_sample_method,
+                        x_init=noise,
+                    ).to(work_latents.dtype)
+                    t_mid = torch.full((z.shape[0],), 0.5, device=device, dtype=torch.float32)
+                    x_mid = 0.5 * noise.to(candidate_pred.dtype) + 0.5 * candidate_pred
+                    target_velocity = candidate_pred.float() - noise.float()
+                    pred_velocity = self.flow_head.predict_velocity(x_mid, t_mid, z).float()
+                    all_scores = -(pred_velocity - target_velocity).pow(2).mean(dim=-1)
+                else:
+                    candidate_pred = self.flow_head.sample(
+                        z,
+                        num_steps=flow_steps,
+                        temperature=flow_temperature,
+                        sample_method=flow_sample_method,
+                    ).to(work_latents.dtype)
+                    projected = self.model.image_latent_proj(
+                        candidate_pred.to(dtype=self.model.image_latent_proj.weight_dtype)
+                    )
+                    all_scores = F.cosine_similarity(projected.float(), z.float(), dim=-1)
+
+                cursor = 0
+                for sample_idx, count in enumerate(candidate_counts):
+                    if count == 0:
+                        continue
+                    local_positions = all_local_positions[cursor : cursor + count]
+                    local_scores = all_scores[cursor : cursor + count]
+                    local_pred = candidate_pred[cursor : cursor + count]
+                    fill_count = min(k, count)
+                    scores, chosen = torch.topk(local_scores, k=fill_count, dim=-1)
+                    positions = local_positions[chosen]
+                    chunks = local_pred[chosen]
+                    fill_local_positions.append((sample_idx, positions, scores, chunks))
+                    cursor += count
+            else:
+                for sample_idx, start, _ in local_spans:
+                    remaining_mask = ~filled[sample_idx]
+                    remaining_count = int(remaining_mask.sum().item())
+                    if remaining_count == 0:
+                        continue
+                    fill_count = min(k, remaining_count)
+
+                    if order_strategy in {"sigma", "sigma_replay", "causal_sigma"}:
+                        order = original_orders[sample_idx]
+                        positions = order[~filled[sample_idx, order]][:fill_count]
+                        scores = -sigma[spans[sample_idx][0], spans[sample_idx][1] : spans[sample_idx][2]].to(
+                            device=device, dtype=torch.float32
+                        )[positions]
+                    elif order_strategy == "random":
+                        remaining = remaining_mask.nonzero(as_tuple=True)[0]
+                        positions = remaining[torch.randperm(remaining.numel(), device=device)[:fill_count]]
+                        scores = torch.ones(fill_count, device=device, dtype=torch.float32)
+                    elif order_strategy in fixed_orders:
+                        order = fixed_orders[order_strategy]
+                        positions = order[~filled[sample_idx, order]][:fill_count]
+                        scores = torch.arange(fill_count, 0, -1, device=device, dtype=torch.float32)
+                    elif order_strategy in {"condition_norm", "hidden_norm", "confidence"}:
+                        span_hidden = hidden[sample_idx, start : start + image_tokens_per_img]
+                        all_scores = span_hidden.detach().float().pow(2).mean(dim=-1).sqrt()
+                        all_scores = all_scores.masked_fill(~remaining_mask, -torch.inf)
+                        scores, positions = torch.topk(all_scores, k=fill_count, dim=-1)
+                    else:
+                        raise ValueError(
+                            f"Unknown single-stream order_strategy={order_strategy!r}; "
+                            "expected one of: hidden_norm, latent_proj_cosine, flow_self_consistency, "
+                            "solver_consistency, spatial_halton, spatial_uniform, sigma, causal_sigma, random."
+                        )
+
+                    fill_local_positions.append((sample_idx, positions, scores, None))
 
             if not fill_local_positions:
                 break
 
-            sample_indices = []
-            seq_positions = []
-            for sample_idx, positions in fill_local_positions:
-                sample_indices.append(torch.full_like(positions, sample_idx))
-                seq_positions.append(local_spans[sample_idx][1] + positions)
-            sample_indices = torch.cat(sample_indices)
-            seq_positions = torch.cat(seq_positions)
+            if order_strategy not in latent_level_strategies:
+                sample_indices = []
+                seq_positions = []
+                for sample_idx, positions, _, _ in fill_local_positions:
+                    sample_indices.append(torch.full_like(positions, sample_idx))
+                    seq_positions.append(local_spans[sample_idx][1] + positions)
+                sample_indices = torch.cat(sample_indices)
+                seq_positions = torch.cat(seq_positions)
 
-            z = hidden[sample_indices, seq_positions]
-            pred = self.flow_head.sample(
-                z,
-                num_steps=flow_steps,
-                temperature=flow_temperature,
-                sample_method=flow_sample_method,
-            ).to(work_latents.dtype)
+                z = hidden[sample_indices, seq_positions]
+                pred = self.flow_head.sample(
+                    z,
+                    num_steps=flow_steps,
+                    temperature=flow_temperature,
+                    sample_method=flow_sample_method,
+                ).to(work_latents.dtype)
 
             cursor = 0
-            for sample_idx, local_positions in fill_local_positions:
+            for sample_idx, local_positions, local_scores, local_chunks in fill_local_positions:
                 count = local_positions.numel()
-                chunk = pred[cursor:cursor + count]
+                if local_chunks is None:
+                    chunk = pred[cursor:cursor + count]
+                    cursor += count
+                else:
+                    chunk = local_chunks
                 start = local_spans[sample_idx][1]
                 work_latents[sample_idx, start + local_positions] = chunk
                 generated[sample_idx, local_positions] = chunk
                 filled[sample_idx, local_positions] = True
-                cursor += count
+                if not replay_original_sigma:
+                    new_sigma = next_image_order[sample_idx] + torch.arange(
+                        count,
+                        device=device,
+                        dtype=current_sigma.dtype,
+                    )
+                    current_sigma[sample_idx, start + local_positions] = new_sigma
+                    next_image_order[sample_idx] += float(count)
+                start_count = int(fill_counter[sample_idx].item())
+                generation_order[sample_idx, local_positions] = torch.arange(
+                    start_count,
+                    start_count + count,
+                    device=device,
+                    dtype=generation_order.dtype,
+                )
+                generation_step[sample_idx, local_positions] = step_idx
+                generation_score[sample_idx, local_positions] = local_scores.to(generation_score.dtype)
+                fill_counter[sample_idx] += count
+            step_idx += 1
 
-        side = int(image_tokens_per_img ** 0.5)
-        if side * side != image_tokens_per_img:
-            raise ValueError(f"image_tokens_per_img={image_tokens_per_img} is not square")
-        return generated.view(len(spans), side, side, image_latent_dim).permute(0, 3, 1, 2)
+        generated = generated.view(len(spans), side, side, image_latent_dim).permute(0, 3, 1, 2)
+        if return_trace:
+            trace = {
+                "order_strategy": order_strategy,
+                "generation_order": generation_order.view(len(spans), side, side),
+                "generation_step": generation_step.view(len(spans), side, side),
+                "generation_score": generation_score.view(len(spans), side, side),
+            }
+            return generated, trace
+        return generated
 
     def _image_logits_from_hidden(self, hidden_states: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError("Continuous image flow model does not expose VQ image logits.")

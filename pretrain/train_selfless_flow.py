@@ -45,7 +45,9 @@ def _special_token_ids(config):
 
 
 def _apply_image_flow_warmup_freeze(model, config):
-    if not config.training.get("freeze_backbone_for_image_flow_warmup", False):
+    freeze_for_refine = config.training.get("freeze_backbone_for_image_flow_refine", False)
+    freeze_for_warmup = config.training.get("freeze_backbone_for_image_flow_warmup", False)
+    if not (freeze_for_refine or freeze_for_warmup):
         return
 
     for param in model.parameters():
@@ -73,8 +75,9 @@ def _apply_image_flow_warmup_freeze(model, config):
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
+    stage_name = "refine" if freeze_for_refine else "warmup"
     logger.info(
-        "Enabled frozen-Qwen image-flow warmup: "
+        f"Enabled frozen-Qwen image-flow {stage_name}: "
         f"trainable={trainable:,}/{total:,} params; "
         f"special_token_ids={_special_token_ids(config)}"
     )
@@ -787,6 +790,39 @@ def _image_spans(token_types: torch.Tensor, image_tokens_per_img: int):
     return spans
 
 
+def _heatmap_images(values: torch.Tensor) -> torch.Tensor:
+    values = values.detach().float().cpu()
+    valid = values > 0
+    if valid.any():
+        min_val = values[valid].min()
+        max_val = values[valid].max()
+        values = (values - min_val) / (max_val - min_val).clamp_min(1e-6)
+    else:
+        values = torch.zeros_like(values)
+    values = values.clamp(0, 1)
+    red = values
+    green = 1.0 - (values - 0.5).abs() * 2.0
+    blue = 1.0 - values
+    heatmap = torch.stack([red, green.clamp(0, 1), blue], dim=1)
+    heatmap = heatmap * valid.unsqueeze(1).float()
+    return heatmap
+
+
+def _log_wandb_validation_images(accelerator, image_paths: dict[str, Path], global_step: int) -> None:
+    if not image_paths:
+        return
+    try:
+        import wandb
+    except Exception:
+        return
+    logs = {}
+    for key, path in image_paths.items():
+        if path.exists():
+            logs[key] = wandb.Image(str(path), caption=path.name)
+    if logs:
+        accelerator.log(logs, step=global_step)
+
+
 @torch.no_grad()
 def _save_validation_flow_images(
     model,
@@ -864,45 +900,141 @@ def _save_validation_flow_images(
             pred_latents.append(pred.view(side, side, -1).permute(2, 0, 1))
             target_latents.append(target.view(side, side, -1).permute(2, 0, 1))
 
-        single_stream_latents = None
+        single_stream_results = {}
         if config.experiment.get("validation_single_stream_images", True):
-            single_stream_latents = unwrapped.sample_image_latents_single_stream(
-                input_ids=input_ids,
-                token_types=token_types,
-                sigma=sigma,
-                spans=selected_spans,
-                image_latent_dim=image_latents.shape[-1],
-                flow_steps=flow_steps,
-                flow_temperature=flow_temperature,
-                flow_sample_method=flow_sample_method,
-                parallel_rate=int(config.experiment.get("validation_single_stream_parallel_rate", 32)),
-            )
+            default_strategies = [
+                "hidden_norm",
+                "latent_proj_cosine",
+                "flow_self_consistency",
+                "solver_consistency",
+                "spatial_halton",
+            ]
+            strategies = config.experiment.get("validation_single_stream_order_strategies", None)
+            if strategies is None:
+                legacy_strategy = config.experiment.get("validation_single_stream_order_strategy", None)
+                strategies = [legacy_strategy] if legacy_strategy else default_strategies
+            if isinstance(strategies, str):
+                strategies = [item.strip() for item in strategies.split(",") if item.strip()]
+            for order_strategy in strategies:
+                single_stream_result = unwrapped.sample_image_latents_single_stream(
+                    input_ids=input_ids,
+                    token_types=token_types,
+                    sigma=sigma,
+                    spans=selected_spans,
+                    image_latent_dim=image_latents.shape[-1],
+                    flow_steps=flow_steps,
+                    flow_temperature=flow_temperature,
+                    flow_sample_method=flow_sample_method,
+                    parallel_rate=int(config.experiment.get("validation_single_stream_parallel_rate", 32)),
+                    order_strategy=str(order_strategy),
+                    return_trace=True,
+                )
+                single_stream_latents, single_stream_trace = single_stream_result
+                if single_stream_latents is not None:
+                    single_stream_results[str(order_strategy)] = (single_stream_latents, single_stream_trace)
 
-        pred_latents = torch.stack(pred_latents).to(dtype=next(vae.parameters()).dtype) / scaling_factor
-        target_latents = torch.stack(target_latents).to(dtype=next(vae.parameters()).dtype) / scaling_factor
-        decoded_pred = vae.decode(pred_latents).float().clamp(-1, 1)
-        decoded_target = vae.decode(target_latents).float().clamp(-1, 1)
-        decoded_single_stream = None
-        if single_stream_latents is not None:
-            single_stream_latents = single_stream_latents.to(dtype=next(vae.parameters()).dtype) / scaling_factor
-            decoded_single_stream = vae.decode(single_stream_latents).float().clamp(-1, 1)
+        raw_pred_latents = torch.stack(pred_latents)
+        raw_target_latents = torch.stack(target_latents)
+        vae_dtype = next(vae.parameters()).dtype
+        decoded_pred = vae.decode(raw_pred_latents.to(dtype=vae_dtype) / scaling_factor).float().clamp(-1, 1)
+        decoded_target = vae.decode(raw_target_latents.to(dtype=vae_dtype) / scaling_factor).float().clamp(-1, 1)
 
         from torchvision.utils import make_grid, save_image
 
         image_dir = Path(config.experiment.output_dir) / "validation_flow_images"
         image_dir.mkdir(parents=True, exist_ok=True)
+        wandb_images = {}
         pred_img = (decoded_pred + 1.0) / 2.0
         target_img = (decoded_target + 1.0) / 2.0
-        save_image(pred_img, image_dir / f"step-{global_step:08d}-pred.png")
-        save_image(target_img, image_dir / f"step-{global_step:08d}-target.png")
+        pred_path = image_dir / f"step-{global_step:08d}-pred.png"
+        target_path = image_dir / f"step-{global_step:08d}-target.png"
+        save_image(pred_img, pred_path)
+        save_image(target_img, target_path)
+        wandb_images["val/flow_teacher_pred"] = pred_path
+        wandb_images["val/flow_target"] = target_path
         grid = make_grid(torch.stack([target_img, pred_img], dim=1).flatten(0, 1), nrow=2)
-        save_image(grid, image_dir / f"step-{global_step:08d}-target_pred_grid.png")
-        if decoded_single_stream is not None:
-            single_stream_img = (decoded_single_stream + 1.0) / 2.0
-            save_image(single_stream_img, image_dir / f"step-{global_step:08d}-single_stream_pred.png")
-            comparison = torch.stack([target_img, pred_img, single_stream_img], dim=1).flatten(0, 1)
-            comparison_grid = make_grid(comparison, nrow=3)
-            save_image(comparison_grid, image_dir / f"step-{global_step:08d}-target_teacher_single_grid.png")
+        target_pred_path = image_dir / f"step-{global_step:08d}-target_pred_grid.png"
+        save_image(grid, target_pred_path)
+        wandb_images["val/target_teacher_grid"] = target_pred_path
+
+        logs = {
+            "val/flow_teacher_latent_mse": F.mse_loss(raw_pred_latents.float(), raw_target_latents.float()).item(),
+            "val/flow_teacher_latent_rms": raw_pred_latents.float().pow(2).mean().sqrt().item(),
+            "val/flow_target_latent_rms": raw_target_latents.float().pow(2).mean().sqrt().item(),
+        }
+        if single_stream_results:
+            comparison_tiles = []
+            comparison_names = []
+            for order_strategy, (single_stream_latents, single_stream_trace) in single_stream_results.items():
+                decoded_single_stream = vae.decode(
+                    single_stream_latents.to(dtype=vae_dtype) / scaling_factor
+                ).float().clamp(-1, 1)
+                strategy_tag = str(order_strategy).replace("/", "_")
+                log_prefix = f"val/single_stream/{strategy_tag}"
+
+                logs.update(
+                    {
+                        f"{log_prefix}/latent_mse_to_target": F.mse_loss(
+                            single_stream_latents.float(), raw_target_latents.float()
+                        ).item(),
+                        f"{log_prefix}/latent_mse_to_teacher": F.mse_loss(
+                            single_stream_latents.float(), raw_pred_latents.float()
+                        ).item(),
+                        f"{log_prefix}/latent_rms": single_stream_latents.float().pow(2).mean().sqrt().item(),
+                    }
+                )
+
+                single_stream_img = (decoded_single_stream + 1.0) / 2.0
+                single_stream_path = image_dir / f"step-{global_step:08d}-single_stream_pred_{strategy_tag}.png"
+                save_image(single_stream_img, single_stream_path)
+                wandb_images[f"{log_prefix}/pred"] = single_stream_path
+
+                comparison = torch.stack([target_img, pred_img, single_stream_img], dim=1).flatten(0, 1)
+                comparison_grid = make_grid(comparison, nrow=3)
+                comparison_path = image_dir / f"step-{global_step:08d}-target_teacher_single_{strategy_tag}.png"
+                save_image(comparison_grid, comparison_path)
+                wandb_images[f"{log_prefix}/target_teacher_single_grid"] = comparison_path
+
+                comparison_tiles.append(single_stream_img)
+                comparison_names.append(strategy_tag)
+
+                if single_stream_trace:
+                    trace_strategy = single_stream_trace.get("order_strategy", strategy_tag)
+                    order_map = single_stream_trace.get("generation_order", None)
+                    step_map = single_stream_trace.get("generation_step", None)
+                    score_map = single_stream_trace.get("generation_score", None)
+                    if isinstance(order_map, torch.Tensor):
+                        order_grid = make_grid(_heatmap_images(order_map), nrow=sample_count)
+                        order_path = image_dir / f"step-{global_step:08d}-single_stream_order_{trace_strategy}.png"
+                        save_image(order_grid, order_path)
+                        wandb_images[f"{log_prefix}/generation_order"] = order_path
+                        logs[f"{log_prefix}/generation_order_max"] = order_map.float().max().item()
+                    if isinstance(step_map, torch.Tensor):
+                        step_grid = make_grid(_heatmap_images(step_map), nrow=sample_count)
+                        step_path = image_dir / f"step-{global_step:08d}-single_stream_steps_{trace_strategy}.png"
+                        save_image(step_grid, step_path)
+                        wandb_images[f"{log_prefix}/generation_steps"] = step_path
+                        logs[f"{log_prefix}/generation_step_max"] = step_map.float().max().item()
+                    if isinstance(score_map, torch.Tensor):
+                        score_grid = make_grid(_heatmap_images(score_map), nrow=sample_count)
+                        score_path = image_dir / f"step-{global_step:08d}-single_stream_scores_{trace_strategy}.png"
+                        save_image(score_grid, score_path)
+                        wandb_images[f"{log_prefix}/generation_scores"] = score_path
+                        valid_scores = score_map[score_map != 0].float()
+                        if valid_scores.numel() > 0:
+                            score_mean = valid_scores.mean().item()
+                            score_std = valid_scores.std(unbiased=False).item()
+                            logs[f"{log_prefix}/generation_score_mean"] = score_mean
+                            logs[f"{log_prefix}/generation_score_std"] = score_std
+
+            if comparison_tiles:
+                all_single_grid = make_grid(torch.cat(comparison_tiles, dim=0), nrow=sample_count)
+                all_single_path = image_dir / f"step-{global_step:08d}-single_stream_all_strategies.png"
+                save_image(all_single_grid, all_single_path)
+                wandb_images["val/single_stream/all_strategy_preds"] = all_single_path
+                logger.info(f"Validation single-stream strategies: {', '.join(comparison_names)}")
+        accelerator.log(logs, step=global_step)
+        _log_wandb_validation_images(accelerator, wandb_images, global_step)
         logger.info(f"Saved validation flow images to {image_dir}")
 
 

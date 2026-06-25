@@ -1,6 +1,6 @@
 experiment:
-    project: "selfless-flow-0.6B-imagenet-flowhead16k"
-    name: "imagenet-flow-500c-flowhead16k"
+    project: "selfless-flow-0.6B-imagenet-refine-full"
+    name: "imagenet-flow-refine-full"
     wandb_project: "unified-mm"
     output_dir: "output"
     save_every: 1000
@@ -8,10 +8,10 @@ experiment:
     generate_every: 10000
     log_every: 10
     log_grad_norm_every: 100
-    checkpoints_total_limit: 200
-    save_hfmodel_every: 5000
-    val_every: 500
-    validation_image_every: 500
+    checkpoints_total_limit: 100
+    save_hfmodel_every: 10000
+    val_every: 1000
+    validation_image_every: 1000
     validation_image_samples: 4
     validation_flow_steps: 50
     validation_flow_temperature: 1.0
@@ -34,12 +34,12 @@ experiment:
     resume_from_checkpoint: none
 
 model:
-    model_path: "public/models/Qwen/Qwen3-0.6B-Base"
+    model_path: "output/selfless-flow-0.6B-imagenet-unified-full/hf_model-final"
     attention_pattern: "ar"
     loss_attention_pattern: "likelihood"
     mask_id: -1
     use_flex_attention: true
-    lambda_text: 0.2
+    lambda_text: 0.0
     lambda_image: 1.0
     continuous_image_latents: true
     image_tokens_per_img: 256
@@ -52,28 +52,28 @@ model:
     pretrained_image_flow_adapter: none
 
 dataset:
-    class_name: "ImageNetLatentPackedDataset"
+    class_name: "ImageNetFlowCacheDataset"
     params:
-        docs_jsonl: "public/datasets/imagenet_prompt_500c_all/docs/train.jsonl"
-        latent_dir: "public/datasets/imagenet_prompt_500c_all/vae_latents_mar_kl16"
-        max_seq_length: 2048
+        cache_path: "public/datasets/imagenet_full/vae_latents_mar_kl16/flow_latents_all_fp16.pt"
+        manifest_jsonl: "public/datasets/imagenet_full/manifest.jsonl"
+        synset_mapping_path: "/inspire/dataset/imagenet/v1/LOC_synset_mapping.txt"
+        prompt_templates_path: "configs/selfless/imagenet_prompt_templates.yaml"
         image_tokens_per_img: 256
         image_latent_dim: 16
-        latent_key: "latent"
-        pack_strategy: "best_fit_decreasing"
-        pad_to_max_length: true
-        log_pack_stats: true
+        max_seq_length: 1024
+        pad_to_multiple_of: 64
         val_ratio: 0.001
     preprocessing:
-        max_seq_length: 2048
+        max_seq_length: 1024
 
 optimizer:
     name: adamw
     params:
         learning_rate: 1.0e-4
-        backbone_learning_rate: 5.0e-6
+        backbone_learning_rate: 0.0
         projector_learning_rate: 1.0e-4
-        flow_learning_rate: 1.0e-4
+        flow_learning_rate: 2.0e-4
+        special_token_learning_rate: 1.0e-5
         scale_lr: false
         beta1: 0.9
         beta2: 0.95
@@ -85,20 +85,22 @@ lr_scheduler:
     params:
         learning_rate: ${optimizer.params.learning_rate}
         warmup_steps: 1000
-        decay_steps: 20000
-        min_lr_scale: 0.05
+        decay_steps: 50000
+        min_lr_scale: 0.1
 
 training:
-    batch_size: 8
-    total_batch_size: 256
+    batch_size: 64
+    total_batch_size: 512
     mixed_precision: "bf16"
     enable_tf32: true
     seed: 42
     dataloader_workers: 4
-    max_train_steps: 30000
+    max_train_steps: 300000
     max_grad_norm: 1.0
     ar_ratio: -1.0
     mc_samples: 16
     use_gradient_checkpointing: false
     step_scheduler_with_optimizer: false
     from_scratch: false
+    freeze_backbone_for_image_flow_refine: true
+    save_image_flow_adapter: true

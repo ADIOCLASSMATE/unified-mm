@@ -18,6 +18,16 @@ experiment:
     validation_flow_sample_method: "heun"
     validation_single_stream_images: true
     validation_single_stream_parallel_rate: 1
+    validation_single_stream_order_strategy: "sigma"
+    validation_single_stream_order_strategies:
+        - "sigma"
+        - "causal_sigma"
+        - "random"
+        - "hidden_norm"
+        - "latent_proj_cosine"
+        - "flow_self_consistency"
+        - "solver_consistency"
+        - "spatial_halton"
     validation_mar_root: "/inspire/hdd/global_user/wanjiaxin-253108030048/code/mar"
     validation_vae_path: "public/vae/mar-kl16/kl16.ckpt"
     validation_vae_scaling_factor: 0.2325
