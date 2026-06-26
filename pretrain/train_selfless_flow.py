@@ -58,7 +58,7 @@ def _apply_image_diffusion_warmup_freeze(model, config):
 
     for param in model.image_diffusion_head.parameters():
         param.requires_grad = True
-    for param in model.model.image_latent_proj.parameters():
+    for param in model.image_token_embedder.parameters():
         param.requires_grad = True
     if hasattr(model.model, "image_condition_null"):
         model.model.image_condition_null.requires_grad = True
@@ -100,7 +100,7 @@ def _load_image_diffusion_adapter(model, adapter_path, config):
 
         head_state = {}
         projector_state = {}
-        projector_target = model.model.image_latent_proj.state_dict()
+        projector_target = model.image_token_embedder.state_dict()
         projector_skipped = {}
         mar_mask_token = None
 
@@ -124,7 +124,7 @@ def _load_image_diffusion_adapter(model, adapter_path, config):
                     _maybe_add_projector_key(key, f.get_tensor(key))
                 elif key == "encoder_pos_embed_learned":
                     pos = f.get_tensor(key).squeeze(0)
-                    _maybe_add_projector_key("image_pos_embed.weight", pos[-model.model.image_latent_proj.image_tokens_per_img:])
+                    _maybe_add_projector_key("image_pos_embed.weight", pos[-model.image_token_embedder.image_tokens_per_img:])
                 elif key == "diffusion_pos_embed_learned":
                     _maybe_add_projector_key("diffusion_pos_embed.weight", f.get_tensor(key).squeeze(0))
                 elif key == "mask_token":
@@ -135,15 +135,15 @@ def _load_image_diffusion_adapter(model, adapter_path, config):
             f"keys={len(head_state)}, missing={missing}, unexpected={unexpected}"
         )
         if projector_state:
-            missing, unexpected = model.model.image_latent_proj.load_state_dict(projector_state, strict=False)
+            missing, unexpected = model.image_token_embedder.load_state_dict(projector_state, strict=False)
             logger.info(
-                f"Loaded MAR image_latent_proj from {adapter_path}: "
+                f"Loaded MAR image_token_embedder from {adapter_path}: "
                 f"keys={len(projector_state)}, missing={missing}, unexpected={unexpected}, "
                 f"skipped={projector_skipped}"
             )
         else:
             logger.warning(
-                f"No MAR image_latent_proj keys were loaded from {adapter_path}; skipped={projector_skipped}"
+                f"No MAR image_token_embedder keys were loaded from {adapter_path}; skipped={projector_skipped}"
             )
         image_mask_token_id = config.model.get("image_mask_token_id", None)
         if mar_mask_token is not None and image_mask_token_id is not None:
@@ -170,12 +170,12 @@ def _load_image_diffusion_adapter(model, adapter_path, config):
             f"Loaded adapter image_diffusion_head from {adapter_path}: "
             f"missing={missing}, unexpected={unexpected}"
         )
-    if "image_latent_proj" in state:
-        missing, unexpected = model.model.image_latent_proj.load_state_dict(
-            state["image_latent_proj"], strict=False
+    if "image_token_embedder" in state:
+        missing, unexpected = model.image_token_embedder.load_state_dict(
+            state["image_token_embedder"], strict=False
         )
         logger.info(
-            f"Loaded adapter image_latent_proj from {adapter_path}: "
+            f"Loaded adapter image_token_embedder from {adapter_path}: "
             f"missing={missing}, unexpected={unexpected}"
         )
     if "image_condition_null" in state and hasattr(model.model, "image_condition_null"):
@@ -213,9 +213,9 @@ def _save_image_diffusion_adapter(model, config, accelerator, global_step):
     embed = unwrapped.model.embed_tokens.weight.detach().cpu()
     state = {
         "image_diffusion_head": {k: v.detach().cpu() for k, v in unwrapped.image_diffusion_head.state_dict().items()},
-        "image_latent_proj": {
+        "image_token_embedder": {
             k: v.detach().cpu()
-            for k, v in unwrapped.model.image_latent_proj.state_dict().items()
+            for k, v in unwrapped.image_token_embedder.state_dict().items()
         },
         "image_condition_null": unwrapped.model.image_condition_null.detach().cpu().clone(),
         "special_token_ids": token_ids,
@@ -345,7 +345,7 @@ def main():
     def lr_for_param(name):
         if name.startswith("image_diffusion_head."):
             return diffusion_lr
-        if "image_latent_proj" in name:
+        if "image_token_embedder" in name:
             return projector_lr
         if "image_condition_null" in name:
             return projector_lr
@@ -367,7 +367,7 @@ def main():
     ]
     logger.info(
         "Optimizer LRs: "
-        f"backbone={backbone_lr:g}, image_latent_proj={projector_lr:g}, image_diffusion_head={diffusion_lr:g}; "
+        f"backbone={backbone_lr:g}, image_token_embedder={projector_lr:g}, image_diffusion_head={diffusion_lr:g}; "
         f"special_tokens={special_token_lr:g}; "
         f"weight_decay={optimizer_config.weight_decay:g}"
     )

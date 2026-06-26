@@ -15,6 +15,10 @@ experiment:
     validation_image_samples: 4
     validation_diffusion_temperature: 1.0
     validation_diffusion_cfg: 1.0
+    validation_diffusion_clip_denoised: true
+    validation_denoise_timestep: 500
+    validation_vae_dtype: "fp32"
+    validation_save_debug_images: false
     validation_single_stream_images: true
     validation_single_stream_parallel_rate: 1
     validation_single_stream_order_strategy: "sigma"
@@ -46,6 +50,9 @@ model:
     image_diffusion_width: 1280
     image_diffusion_num_sampling_steps: "100"
     image_diffusion_batch_mul: 4
+    image_diffusion_condition_norm: "rms"
+    image_diffusion_condition_norm_eps: 1.0e-6
+    image_condition_drop_prob: 0.1
     pretrained_image_diffusion_adapter: "../mar/pretrained_models/mar/mar_large_hf/mar-large.safetensors"
 
 dataset:

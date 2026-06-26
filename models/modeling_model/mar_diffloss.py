@@ -29,6 +29,12 @@ class DiffLoss(nn.Module):
         return x.detach().float().pow(2).mean().sqrt()
 
     def forward(self, target, z, mask=None):
+        model_dtype = self.net.input_proj.weight.dtype
+        model_device = self.net.input_proj.weight.device
+        target = target.to(device=model_device, dtype=model_dtype)
+        z = z.to(device=model_device, dtype=model_dtype)
+        if mask is not None:
+            mask = mask.to(device=model_device, dtype=target.dtype)
         t = torch.randint(0, self.train_diffusion.num_timesteps, (target.shape[0],), device=target.device)
         model_kwargs = dict(c=z)
         loss_dict = self.train_diffusion.training_losses(self.net, target, t, model_kwargs)
@@ -44,9 +50,16 @@ class DiffLoss(nn.Module):
             loss = (loss * mask).sum() / mask.sum()
         return loss.mean()
 
-    def sample(self, z, temperature=1.0, cfg=1.0):
+    def sample(self, z, temperature=1.0, cfg=1.0, clip_denoised=False):
         # diffusion loss sampling
+        model_dtype = self.net.input_proj.weight.dtype
+        model_device = self.net.input_proj.weight.device
+        z = z.to(device=model_device, dtype=model_dtype)
         if not cfg == 1.0:
+            if z.shape[0] % 2 != 0:
+                raise ValueError(
+                    f"cfg != 1.0 requires paired conditional/unconditional conditions; got batch {z.shape[0]}"
+                )
             noise = torch.randn(z.shape[0] // 2, self.in_channels, device=z.device, dtype=z.dtype)
             noise = torch.cat([noise, noise], dim=0)
             model_kwargs = dict(c=z, cfg_scale=cfg)
@@ -57,7 +70,7 @@ class DiffLoss(nn.Module):
             sample_fn = self.net.forward
 
         sampled_token_latent = self.gen_diffusion.p_sample_loop(
-            sample_fn, noise.shape, noise, clip_denoised=False, model_kwargs=model_kwargs, progress=False,
+            sample_fn, noise.shape, noise, clip_denoised=clip_denoised, model_kwargs=model_kwargs, progress=False,
             temperature=temperature
         )
 
@@ -104,6 +117,7 @@ class TimestepEmbedder(nn.Module):
 
     def forward(self, t):
         t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+        t_freq = t_freq.to(device=self.mlp[0].weight.device, dtype=self.mlp[0].weight.dtype)
         t_emb = self.mlp(t_freq)
         return t_emb
 
@@ -234,6 +248,9 @@ class SimpleMLPAdaLN(nn.Module):
         :param c: conditioning from AR transformer.
         :return: an [N x C] Tensor of outputs.
         """
+        model_dtype = self.input_proj.weight.dtype
+        x = x.to(device=self.input_proj.weight.device, dtype=model_dtype)
+        c = c.to(device=x.device, dtype=model_dtype)
         x = self.input_proj(x)
         t = self.time_embed(t)
         c = self.cond_embed(c)

@@ -76,7 +76,7 @@ def load_adapter(model, adapter_path: str):
     if path.suffix == ".safetensors":
         head_state = {}
         projector_state = {}
-        projector_target = model.model.image_latent_proj.state_dict()
+        projector_target = model.image_token_embedder.state_dict()
         projector_skipped = {}
         mar_mask_token = None
 
@@ -102,7 +102,7 @@ def load_adapter(model, adapter_path: str):
                     pos = f.get_tensor(key).squeeze(0)
                     maybe_add_projector_key(
                         "image_pos_embed.weight",
-                        pos[-model.model.image_latent_proj.image_tokens_per_img:],
+                        pos[-model.image_token_embedder.image_tokens_per_img:],
                     )
                 elif key == "diffusion_pos_embed_learned":
                     maybe_add_projector_key("diffusion_pos_embed.weight", f.get_tensor(key).squeeze(0))
@@ -114,13 +114,13 @@ def load_adapter(model, adapter_path: str):
             "image_diffusion_head_keys": len(head_state),
             "missing": list(missing),
             "unexpected": list(unexpected),
-            "image_latent_proj_keys": len(projector_state),
-            "image_latent_proj_skipped": projector_skipped,
+            "image_token_embedder_keys": len(projector_state),
+            "image_token_embedder_skipped": projector_skipped,
         }
         if projector_state:
-            missing, unexpected = model.model.image_latent_proj.load_state_dict(projector_state, strict=False)
-            report["image_latent_proj_missing"] = list(missing)
-            report["image_latent_proj_unexpected"] = list(unexpected)
+            missing, unexpected = model.image_token_embedder.load_state_dict(projector_state, strict=False)
+            report["image_token_embedder_missing"] = list(missing)
+            report["image_token_embedder_unexpected"] = list(unexpected)
         image_mask_token_id = getattr(model.config, "image_mask_token_id", None)
         if mar_mask_token is not None and image_mask_token_id is not None:
             with torch.no_grad():
@@ -138,10 +138,10 @@ def load_adapter(model, adapter_path: str):
         missing, unexpected = model.image_diffusion_head.load_state_dict(state["image_diffusion_head"], strict=False)
         report["image_diffusion_head_missing"] = list(missing)
         report["image_diffusion_head_unexpected"] = list(unexpected)
-    if "image_latent_proj" in state:
-        missing, unexpected = model.model.image_latent_proj.load_state_dict(state["image_latent_proj"], strict=False)
-        report["image_latent_proj_missing"] = list(missing)
-        report["image_latent_proj_unexpected"] = list(unexpected)
+    if "image_token_embedder" in state:
+        missing, unexpected = model.image_token_embedder.load_state_dict(state["image_token_embedder"], strict=False)
+        report["image_token_embedder_missing"] = list(missing)
+        report["image_token_embedder_unexpected"] = list(unexpected)
     if "image_condition_null" in state and hasattr(model.model, "image_condition_null"):
         with torch.no_grad():
             model.model.image_condition_null.copy_(

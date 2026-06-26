@@ -14,7 +14,7 @@ from torch import nn
 from transformers import Qwen3Config
 
 from models.modeling_model.mar_diffloss import DiffLoss
-from models.modeling_model.modeling_selfless_flow import ImageLatentProjector, Qwen3ForCausalLM, Qwen3Model
+from models.modeling_model.modeling_selfless_flow import ImageTokenEmbedder, Qwen3ForCausalLM, Qwen3Model
 from utils.dataset_combined_flow import CombinedBatchDataLoader, TextArrowDataset, collate_text_arrow
 from utils.dataset_imagenet_flow_cache import ImageNetFlowCacheDataset, collate_imagenet_flow_cache
 
@@ -126,6 +126,37 @@ class FakeInnerModel:
         )
         hidden.fill_(2.0 if image_condition_drop else 1.0)
         return types.SimpleNamespace(last_hidden_state=hidden)
+
+
+class FakeTextBackbone:
+    def __init__(self, token_plan):
+        self.token_plan = list(token_plan)
+        self.calls = []
+
+    def __call__(self, **kwargs):
+        self.calls.append(kwargs)
+        input_ids = kwargs["X0_input_ids"]
+        token_idx = min(len(self.calls) - 1, len(self.token_plan) - 1)
+        hidden = torch.zeros(
+            input_ids.shape[0],
+            input_ids.shape[1],
+            1,
+            device=input_ids.device,
+            dtype=torch.float32,
+        )
+        hidden[:, -1, 0] = float(self.token_plan[token_idx])
+        return types.SimpleNamespace(last_hidden_state=hidden)
+
+
+class FakeTextHead:
+    def __init__(self, vocab_size):
+        self.vocab_size = vocab_size
+
+    def __call__(self, hidden):
+        token_id = int(hidden[0, 0].item())
+        logits = torch.full((hidden.shape[0], self.vocab_size), -1000.0, device=hidden.device)
+        logits[:, token_id] = 1000.0
+        return logits
 
 
 class SelflessFlowBehaviorTest(unittest.TestCase):
@@ -283,8 +314,8 @@ class SelflessFlowBehaviorTest(unittest.TestCase):
             tokenizer.encode("cat", add_special_tokens=False)[0],
         )
 
-    def test_image_latent_projector_handles_bfloat16_weights(self):
-        projector = ImageLatentProjector(latent_dim=4, hidden_size=8, projector_width=16, image_tokens_per_img=4).to(dtype=torch.bfloat16)
+    def test_image_token_embedder_handles_bfloat16_weights(self):
+        projector = ImageTokenEmbedder(latent_dim=4, hidden_size=8, projector_width=16, image_tokens_per_img=4).to(dtype=torch.bfloat16)
         latents = torch.randn(5, 4, dtype=torch.float32)
         positions = torch.tensor([0, 1, 2, 3, 0])
         out = projector(latents, positions)
@@ -381,26 +412,64 @@ class SelflessFlowBehaviorTest(unittest.TestCase):
         expected_xt = model.embed_tokens(
             torch.full_like(input_ids, config.mask_token_id)
         )
-        image_positions = model._image_local_positions(token_types)
+        image_positions = model.image_local_positions(token_types)
         image_mask = token_types == 1
         image_mask_embedding = model._image_mask_embedding(
             input_ids.device,
-            model.image_latent_proj.weight_dtype,
+            model.image_token_embedder.weight_dtype,
         )
-        expected_xt[image_mask] = model.image_latent_proj.embed_mask(
+        expected_xt[image_mask] = model.image_token_embedder.embed_mask(
             image_positions[image_mask],
             image_mask_embedding,
         )
         self.assertTrue(torch.allclose(call["xt"], expected_xt))
 
         expected_x0 = model.embed_tokens(input_ids.masked_fill(image_mask, config.image_mask_token_id))
-        expected_x0[image_mask] = model.image_latent_proj(
+        expected_x0[image_mask] = model.image_token_embedder(
             image_latents[image_mask],
             image_positions[image_mask],
         )
         self.assertTrue(torch.allclose(call["x0"], expected_x0))
 
         self.assertTrue(torch.allclose(output.last_hidden_state, expected_xt))
+
+    def test_image_token_ids_do_not_leak_into_backbone_embeddings(self):
+        config = tiny_qwen3_config()
+        model = Qwen3Model(config)
+        capture = CaptureLayer()
+        model.layers = nn.ModuleList([capture])
+        model.norm = nn.Identity()
+        model.train()
+
+        token_types = torch.tensor([[0, 1, 1, 2]])
+        image_latents = torch.arange(16, dtype=torch.float32).view(1, 4, 4)
+        attention_mask = object()
+
+        first_ids = torch.tensor([[1, 2, 3, 4]])
+        second_ids = torch.tensor([[1, 20, 21, 4]])
+
+        model(
+            X0_input_ids=first_ids,
+            attention_mask=attention_mask,
+            token_types=token_types,
+            image_latents=image_latents,
+            calculate_likelihood=True,
+        )
+        first_call = capture.calls[-1]
+
+        model(
+            X0_input_ids=second_ids,
+            attention_mask=attention_mask,
+            token_types=token_types,
+            image_latents=image_latents,
+            calculate_likelihood=True,
+        )
+        second_call = capture.calls[-1]
+
+        self.assertIs(first_call["attention_mask"], attention_mask)
+        self.assertIs(second_call["attention_mask"], attention_mask)
+        self.assertTrue(torch.allclose(first_call["x0"], second_call["x0"]))
+        self.assertTrue(torch.allclose(first_call["xt"], second_call["xt"]))
 
     def test_single_stream_unfilled_image_tokens_use_same_mask_embedding(self):
         config = tiny_qwen3_config()
@@ -427,19 +496,19 @@ class SelflessFlowBehaviorTest(unittest.TestCase):
         call = capture.calls[-1]
         self.assertIsNone(call["xt"])
 
-        image_positions = model._image_local_positions(token_types)
+        image_positions = model.image_local_positions(token_types)
         image_mask = token_types == 1
         image_mask_embedding = model._image_mask_embedding(
             input_ids.device,
-            model.image_latent_proj.weight_dtype,
+            model.image_token_embedder.weight_dtype,
         )
         expected_x0 = model.embed_tokens(input_ids.masked_fill(image_mask, config.image_mask_token_id))
-        expected_x0[image_mask] = model.image_latent_proj.embed_mask(
+        expected_x0[image_mask] = model.image_token_embedder.embed_mask(
             image_positions[image_mask],
             image_mask_embedding,
         )
         visible_image = image_mask & image_latent_mask
-        expected_x0[visible_image] = model.image_latent_proj(
+        expected_x0[visible_image] = model.image_token_embedder(
             image_latents[visible_image],
             image_positions[visible_image],
         )
@@ -473,19 +542,19 @@ class SelflessFlowBehaviorTest(unittest.TestCase):
         )
 
         call = capture.calls[-1]
-        image_positions = model._image_local_positions(token_types)
+        image_positions = model.image_local_positions(token_types)
         image_mask = token_types == 1
         image_mask_embedding = model._image_mask_embedding(
             input_ids.device,
-            model.image_latent_proj.weight_dtype,
+            model.image_token_embedder.weight_dtype,
         )
         expected_x0 = model.embed_tokens(input_ids.masked_fill(image_mask, config.image_mask_token_id))
-        expected_x0[image_mask] = model.image_latent_proj.embed_mask(
+        expected_x0[image_mask] = model.image_token_embedder.embed_mask(
             image_positions[image_mask],
             image_mask_embedding,
         )
         visible_image = image_mask & image_latent_mask
-        expected_x0[visible_image] = model.image_latent_proj(
+        expected_x0[visible_image] = model.image_token_embedder(
             image_latents[visible_image],
             image_positions[visible_image],
         )
@@ -599,6 +668,39 @@ class SelflessFlowBehaviorTest(unittest.TestCase):
             self.assertEqual(tuple(sample_call["z"].shape), (2, hidden_size))
             self.assertTrue(torch.all(sample_call["z"][0] == 1.0))
             self.assertTrue(torch.all(sample_call["z"][1] == 2.0))
+
+    def test_text_generate_is_single_stream_and_has_no_discrete_image_branch(self):
+        dummy = types.SimpleNamespace(
+            device=torch.device("cpu"),
+            config=types.SimpleNamespace(mask_token_id=7, eos_token_id=9),
+            model=FakeTextBackbone(token_plan=[5, 9]),
+            lm_head=FakeTextHead(vocab_size=32),
+            unified_head=False,
+        )
+        dummy._sample_from_logits = types.MethodType(Qwen3ForCausalLM._sample_from_logits, dummy)
+
+        with patch("utils.utils.get_selfless_mask", side_effect=lambda sigma, seq_len, device: sigma.detach().clone()):
+            seq, token_types, image_tokens, image_steps = Qwen3ForCausalLM._generate_one(
+                dummy,
+                prompt_ids=torch.tensor([1, 2]),
+                gen_length=4,
+                prompt_task="ar",
+                block_size=1,
+                temperature=0.0,
+                ratio=None,
+                parallel_rate=None,
+                decode_strategy="confidence",
+            )
+
+        self.assertEqual(seq.tolist(), [1, 2, 5, 9])
+        self.assertEqual(token_types.tolist(), [0, 0, 0, 0])
+        self.assertEqual(image_tokens, 0)
+        self.assertEqual(image_steps, 0)
+        self.assertEqual(len(dummy.model.calls), 2)
+        for call in dummy.model.calls:
+            self.assertFalse(call["calculate_likelihood"])
+            self.assertNotIn("image_latents", call)
+            self.assertNotIn("image_latent_mask", call)
 
 
 if __name__ == "__main__":

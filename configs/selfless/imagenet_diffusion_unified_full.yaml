@@ -1,6 +1,6 @@
 experiment:
-    project: "selfless-diffusion-0.6B-imagenet-warmup-full"
-    name: "imagenet-diffusion-warmup-full"
+    project: "selfless-diffusion-0.6B-imagenet-unified-full"
+    name: "imagenet-diffusion-unified-full"
     wandb_project: "unified-mm"
     output_dir: "output"
     save_every: 1000
@@ -9,12 +9,16 @@ experiment:
     log_every: 10
     log_grad_norm_every: 100
     checkpoints_total_limit: 200
-    save_hfmodel_every: 10000
+    save_hfmodel_every: 5000
     val_every: 1000
     validation_image_every: 1000
     validation_image_samples: 4
     validation_diffusion_temperature: 1.0
     validation_diffusion_cfg: 1.0
+    validation_diffusion_clip_denoised: true
+    validation_denoise_timestep: 500
+    validation_vae_dtype: "fp32"
+    validation_save_debug_images: false
     validation_single_stream_images: true
     validation_single_stream_parallel_rate: 1
     validation_single_stream_order_strategy: "sigma"
@@ -36,7 +40,7 @@ model:
     loss_attention_pattern: "likelihood"
     mask_id: -1
     use_flex_attention: true
-    lambda_text: 0.0
+    lambda_text: 0.2
     lambda_image: 1.0
     continuous_image_latents: true
     image_tokens_per_img: 256
@@ -46,27 +50,44 @@ model:
     image_diffusion_width: 1280
     image_diffusion_num_sampling_steps: "100"
     image_diffusion_batch_mul: 4
+    image_diffusion_condition_norm: "rms"
+    image_diffusion_condition_norm_eps: 1.0e-6
+    image_condition_drop_prob: 0.1
     pretrained_image_diffusion_adapter: "../mar/pretrained_models/mar/mar_large_hf/mar-large.safetensors"
 
 dataset:
-    class_name: "ImageNetFlowCacheDataset"
+    class_name: "CombinedImageNetTextFlowDataset"
     params:
-        cache_path: "public/datasets/imagenet_full/vae_latents_mar_kl16/flow_latents_all_fp16.pt"
-        manifest_jsonl: "public/datasets/imagenet_full/manifest.jsonl"
-        prompt_template: ""
-        image_tokens_per_img: 256
-        image_latent_dim: 16
-        val_ratio: 0.001
+        text_batch_ratio: 0.4
+        val_text_batches: 20
+        image:
+            cache_path: "public/datasets/imagenet_full/vae_latents_mar_kl16/flow_latents_all_fp16.pt"
+            manifest_jsonl: "public/datasets/imagenet_full/manifest.jsonl"
+            synset_mapping_path: "/inspire/dataset/imagenet/v1/LOC_synset_mapping.txt"
+            prompt_templates_path: "configs/selfless/imagenet_prompt_templates.yaml"
+            image_tokens_per_img: 256
+            image_latent_dim: 16
+            max_seq_length: 1024
+            pad_to_multiple_of: 64
+            val_ratio: 0.001
+        text:
+            tokenized_path: "public/.cache/huggingface/datasets/fwb-arrow-eos"
+            max_seq_length: 1024
+            rows_per_shard: 48804
+            pad_to_multiple_of: 64
+            sigma_mode: "ar"
+            val_ratio: 0.001
+            max_val_samples: 1280
     preprocessing:
-        max_seq_length: 320
+        max_seq_length: 1024
 
 optimizer:
     name: adamw
     params:
         learning_rate: 1.0e-4
-        backbone_learning_rate: 0.0
-        projector_learning_rate: 3.0e-4
-        diffusion_learning_rate: 3.0e-4
+        backbone_learning_rate: 5.0e-6
+        projector_learning_rate: 1.0e-4
+        diffusion_learning_rate: 1.0e-4
         special_token_learning_rate: 1.0e-4
         scale_lr: false
         beta1: 0.9
@@ -79,12 +100,12 @@ lr_scheduler:
     params:
         learning_rate: ${optimizer.params.learning_rate}
         warmup_steps: 1000
-        decay_steps: 30000
+        decay_steps: 50000
         min_lr_scale: 0.05
 
 training:
-    batch_size: 128
-    total_batch_size: 512
+    batch_size: 16
+    total_batch_size: 256
     mixed_precision: "bf16"
     enable_tf32: true
     seed: 42
@@ -96,5 +117,5 @@ training:
     use_gradient_checkpointing: false
     step_scheduler_with_optimizer: false
     from_scratch: false
-    freeze_backbone_for_image_diffusion_warmup: true
-    save_image_diffusion_adapter: true
+    freeze_backbone_for_image_diffusion_warmup: false
+    save_image_diffusion_adapter: false

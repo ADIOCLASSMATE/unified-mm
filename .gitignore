@@ -2,7 +2,7 @@
 .sii
 .claude
 .venv
-output
+output*
 public
 __pycache__
 *.log

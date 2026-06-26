@@ -61,11 +61,11 @@ def _freeze_unused_image_modules(model, logger=None) -> None:
             param.requires_grad_(False)
         frozen.append(module_name)
 
-    image_latent_proj = getattr(getattr(model, "model", None), "image_latent_proj", None)
-    if image_latent_proj is not None:
-        for param in image_latent_proj.parameters():
+    image_token_embedder = getattr(model, "image_token_embedder", None)
+    if image_token_embedder is not None:
+        for param in image_token_embedder.parameters():
             param.requires_grad_(False)
-        frozen.append("model.image_latent_proj")
+        frozen.append("image_token_embedder")
 
     if logger is not None and frozen:
         logger.info(f"Frozen unused image modules for text-only tuning: {', '.join(frozen)}")
