@@ -1,4 +1,5 @@
 import os
+import copy
 import random
 import re
 import sys
@@ -103,6 +104,7 @@ def _load_image_diffusion_adapter(model, adapter_path, config):
         projector_target = model.image_token_embedder.state_dict()
         projector_skipped = {}
         mar_mask_token = None
+        mar_fake_latent = None
 
         def _maybe_add_projector_key(name, value):
             if name not in projector_target:
@@ -129,6 +131,8 @@ def _load_image_diffusion_adapter(model, adapter_path, config):
                     _maybe_add_projector_key("diffusion_pos_embed.weight", f.get_tensor(key).squeeze(0))
                 elif key == "mask_token":
                     mar_mask_token = f.get_tensor(key).reshape(-1)
+                elif key == "fake_latent":
+                    mar_fake_latent = f.get_tensor(key).reshape(-1)
         missing, unexpected = model.image_diffusion_head.load_state_dict(head_state, strict=False)
         logger.info(
             f"Loaded MAR image_diffusion_head from {adapter_path}: "
@@ -161,6 +165,17 @@ def _load_image_diffusion_adapter(model, adapter_path, config):
                     logger.info(
                         f"Loaded MAR mask_token into image_mask_token_id={int(image_mask_token_id)}"
                     )
+        if mar_fake_latent is not None and hasattr(model.model, "image_condition_null"):
+            with torch.no_grad():
+                null = model.model.image_condition_null
+                if mar_fake_latent.numel() != null.numel():
+                    logger.warning(
+                        f"Skipping MAR fake_latent load: shape={tuple(mar_fake_latent.shape)} "
+                        f"does not match image_condition_null shape={tuple(null.shape)}"
+                    )
+                else:
+                    null.copy_(mar_fake_latent.to(device=null.device, dtype=null.dtype))
+                    logger.info("Loaded MAR fake_latent into image_condition_null")
         return
 
     state = torch.load(adapter_path, map_location="cpu")
@@ -227,6 +242,104 @@ def _save_image_diffusion_adapter(model, config, accelerator, global_step):
     path = Path(config.experiment.output_dir) / f"image_diffusion_adapter-{global_step}.pt"
     torch.save(state, path)
     logger.info(f"Saved image-diffusion adapter to {path}")
+
+
+def _ema_enabled(config) -> bool:
+    return bool(config.training.get("use_ema", False))
+
+
+def _ema_decay(config) -> float:
+    decay = float(config.training.get("ema_decay", 0.9999))
+    if not 0.0 <= decay < 1.0:
+        raise ValueError(f"ema_decay must be in [0, 1), got {decay}")
+    return decay
+
+
+def _create_ema_model(model, config):
+    if not _ema_enabled(config):
+        return None
+    ema_model = copy.deepcopy(model)
+    ema_model.eval()
+    for param in ema_model.parameters():
+        param.requires_grad_(False)
+    return ema_model
+
+
+@torch.no_grad()
+def _sync_ema_model(ema_model, model, accelerator) -> None:
+    source_state = accelerator.unwrap_model(model).state_dict()
+    ema_state = ema_model.state_dict()
+    if set(source_state.keys()) != set(ema_state.keys()):
+        missing = sorted(set(ema_state.keys()) - set(source_state.keys()))
+        unexpected = sorted(set(source_state.keys()) - set(ema_state.keys()))
+        raise RuntimeError(f"EMA state mismatch: missing={missing}, unexpected={unexpected}")
+
+    for name, ema_value in ema_state.items():
+        source_value = source_state[name].detach().to(
+            device=ema_value.device,
+            dtype=ema_value.dtype,
+            non_blocking=True,
+        )
+        ema_value.copy_(source_value)
+
+
+@torch.no_grad()
+def _update_ema_model(ema_model, model, accelerator, decay: float) -> None:
+    source_state = accelerator.unwrap_model(model).state_dict()
+    ema_state = ema_model.state_dict()
+    for name, ema_value in ema_state.items():
+        source_value = source_state[name].detach().to(
+            device=ema_value.device,
+            dtype=ema_value.dtype,
+            non_blocking=True,
+        )
+        if torch.is_floating_point(ema_value):
+            ema_value.mul_(decay).add_(source_value, alpha=1.0 - decay)
+        else:
+            ema_value.copy_(source_value)
+
+
+def _ema_state_path(config, global_step) -> Path:
+    output_dir = Path(config.experiment.output_dir)
+    if isinstance(global_step, int):
+        return output_dir / f"checkpoint-{global_step}" / "ema_state.pt"
+    return output_dir / f"ema_state-{global_step}.pt"
+
+
+def _save_ema_state(ema_model, config, accelerator, global_step) -> None:
+    if ema_model is None or not accelerator.is_main_process:
+        return
+    path = _ema_state_path(config, global_step)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    state = {
+        "global_step": global_step,
+        "decay": _ema_decay(config),
+        "state_dict": {k: v.detach().cpu() for k, v in ema_model.state_dict().items()},
+    }
+    torch.save(state, path)
+    logger.info(f"Saved EMA state to {path}")
+
+
+def _load_ema_state_if_available(ema_model, checkpoint_dir: Path) -> bool:
+    path = Path(checkpoint_dir) / "ema_state.pt"
+    if not path.exists():
+        return False
+    state = torch.load(path, map_location="cpu")
+    state_dict = state.get("state_dict", state)
+    ema_model.load_state_dict(state_dict, strict=True)
+    logger.info(f"Loaded EMA state from {path}")
+    return True
+
+
+def _save_ema_hf_model(ema_model, tokenizer, config, accelerator, global_step) -> None:
+    if ema_model is None or not bool(config.training.get("ema_save_hf_model", True)):
+        return
+    if not accelerator.is_main_process:
+        return
+    save_path = Path(config.experiment.output_dir) / f"hf_model-{global_step}-ema"
+    ema_model.save_pretrained(save_path, safe_serialization=True)
+    tokenizer.save_pretrained(save_path)
+    logger.info(f"Saved EMA HF model to {save_path}")
 
 
 def _unwrap_omnicorpus_dataset(dataset):
@@ -316,6 +429,22 @@ def main():
     if config.training.get("use_gradient_checkpointing", False):
         model.gradient_checkpointing_enable()
         logger.info("Gradient checkpointing enabled")
+
+    ema_model = _create_ema_model(model, config)
+    ema_decay_value = _ema_decay(config) if ema_model is not None else None
+    ema_update_after_step = int(config.training.get("ema_update_after_step", 0))
+    if ema_model is not None:
+        logger.info(
+            "EMA enabled: "
+            f"decay={ema_decay_value:g}, update_after_step={ema_update_after_step}, "
+            f"validate={bool(config.training.get('ema_validate', True))}, "
+            f"save_adapter={bool(config.training.get('ema_save_adapter', True))}, "
+            f"save_hf_model={bool(config.training.get('ema_save_hf_model', True))}"
+        )
+        if accelerator.distributed_type == DistributedType.DEEPSPEED:
+            logger.warning(
+                "EMA keeps an unsharded shadow model. This may require extra memory with DeepSpeed."
+            )
 
     selfless_sampler = SelflessSampler(mask_token_id=model.config.mask_token_id, config=config)
     
@@ -416,6 +545,8 @@ def main():
         val_dataloader = val_dataloader.prepare_with_accelerator(accelerator)
     else:
         model, optimizer, train_dataloader, val_dataloader, lr_scheduler = accelerator.prepare(model, optimizer, train_dataloader, val_dataloader, lr_scheduler)
+    if ema_model is not None:
+        ema_model.to(accelerator.device)
 
     ##################################
     #       MODEL RESUME         #
@@ -453,6 +584,14 @@ def main():
         global_step = 0
         resume_step = 0
 
+    if ema_model is not None:
+        if resume_checkpoint_dir and _load_ema_state_if_available(ema_model, resume_checkpoint_dir):
+            ema_model.to(accelerator.device)
+        else:
+            _sync_ema_model(ema_model, model, accelerator)
+            logger.info("Initialized EMA weights from the current training model.")
+        ema_model.eval()
+
     ##################################
     #             Training           #
     ##################################
@@ -483,6 +622,8 @@ def main():
         train_dataloader = accelerator.skip_first_batches(train_dataloader, batches_to_skip)
 
     model.train()
+    if ema_model is not None:
+        ema_model.eval()
 
     train_iter = iter(train_dataloader)
 
@@ -615,6 +756,8 @@ def main():
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
+                if ema_model is not None and (global_step + 1) >= ema_update_after_step:
+                    _update_ema_model(ema_model, model, accelerator, ema_decay_value)
 
                 # 记录梯度范数 (可选)
                 if (global_step + 1) % config.experiment.log_grad_norm_every == 0 and accelerator.is_main_process:
@@ -648,6 +791,8 @@ def main():
                     "samples/sec/gpu": samples_per_second_per_gpu,
                     "batch_time": batch_time_m.val,
                 }
+                if ema_model is not None:
+                    logs["ema/decay"] = ema_decay_value
                 if is_multimodal and pack_stats is not None:
                     valid_tokens, image_tokens, padding_tokens, packed_len = pack_stats.tolist()
                     logs["pack/valid_tokens"] = valid_tokens
@@ -701,20 +846,34 @@ def main():
             # Checkpointing
             if global_step % config.experiment.save_every == 0:
                 save_checkpoint(model, config, accelerator, global_step)
-                _save_image_diffusion_adapter(model, config, accelerator, global_step)
+                _save_ema_state(ema_model, config, accelerator, global_step)
+                adapter_model = (
+                    ema_model
+                    if ema_model is not None and bool(config.training.get("ema_save_adapter", True))
+                    else model
+                )
+                _save_image_diffusion_adapter(adapter_model, config, accelerator, global_step)
             
             if global_step % config.experiment.save_hfmodel_every == 0:
                 save_hf_model(model, tokenizer, config, accelerator, global_step)
+                _save_ema_hf_model(ema_model, tokenizer, config, accelerator, global_step)
                 
             # Validation
             if global_step % config.experiment.val_every == 0:
-                validate(model, val_dataloader, selfless_sampler, accelerator, global_step, config)
+                eval_model = (
+                    ema_model
+                    if ema_model is not None and bool(config.training.get("ema_validate", True))
+                    else model
+                )
+                validate(eval_model, val_dataloader, selfless_sampler, accelerator, global_step, config)
                 # if accelerator.is_main_process:
                 #     pre_text, label_text = get_text(logits_pred=logits_pred[0], label_ids=label_ids[0], tokenizer=tokenizer)
                 #     accelerator.print(f"pre_text: {pre_text}")
                 #     accelerator.print(f"label_text: {label_text}")
                 
                 model.train()
+                if ema_model is not None:
+                    ema_model.eval()
 
             # Reset per-step accumulators for the next optimizer step
             acc_loss.zero_()
@@ -729,7 +888,14 @@ def main():
 
     accelerator.wait_for_everyone()
     save_hf_model(model, tokenizer, config, accelerator, "final")
-    _save_image_diffusion_adapter(model, config, accelerator, "final")
+    _save_ema_hf_model(ema_model, tokenizer, config, accelerator, "final")
+    _save_ema_state(ema_model, config, accelerator, "final")
+    adapter_model = (
+        ema_model
+        if ema_model is not None and bool(config.training.get("ema_save_adapter", True))
+        else model
+    )
+    _save_image_diffusion_adapter(adapter_model, config, accelerator, "final")
     accelerator.end_training()
 
 
@@ -950,7 +1116,8 @@ def _save_validation_diffusion_images(
         sample_count = min(int(config.experiment.get("validation_image_samples", 4)), len(spans))
         diffusion_temperature = float(config.experiment.get("validation_diffusion_temperature", 1.0))
         diffusion_cfg = float(config.experiment.get("validation_diffusion_cfg", 1.0))
-        diffusion_clip_denoised = bool(config.experiment.get("validation_diffusion_clip_denoised", True))
+        diffusion_cfg_schedule = str(config.experiment.get("validation_diffusion_cfg_schedule", "linear"))
+        diffusion_clip_denoised = bool(config.experiment.get("validation_diffusion_clip_denoised", False))
         denoise_timestep = int(config.experiment.get("validation_denoise_timestep", 500))
         scaling_factor = float(config.experiment.get("validation_vae_scaling_factor", 0.2325))
 
@@ -1047,6 +1214,7 @@ def _save_validation_diffusion_images(
                     image_latent_dim=image_latents.shape[-1],
                     diffusion_temperature=diffusion_temperature,
                     diffusion_cfg=diffusion_cfg,
+                    diffusion_cfg_schedule=diffusion_cfg_schedule,
                     diffusion_clip_denoised=diffusion_clip_denoised,
                     parallel_rate=int(config.experiment.get("validation_single_stream_parallel_rate", 1)),
                     order_strategy=str(order_strategy),

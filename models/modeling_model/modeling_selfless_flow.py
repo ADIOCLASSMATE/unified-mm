@@ -261,6 +261,25 @@ def _image_diffusion_condition_norm_config(obj) -> tuple[str, float]:
     return str(norm_mode).lower(), float(eps)
 
 
+def _scheduled_diffusion_cfg(
+    cfg: float,
+    schedule: str | None,
+    progress: float,
+) -> float:
+    cfg = float(cfg)
+    if cfg == 1.0:
+        return 1.0
+    schedule = str(schedule or "constant").lower()
+    if schedule in {"constant", "none", "off", ""}:
+        return cfg
+    progress = max(0.0, min(1.0, float(progress)))
+    if schedule == "linear":
+        return 1.0 + (cfg - 1.0) * progress
+    raise ValueError(
+        f"Unknown diffusion_cfg_schedule={schedule!r}; expected constant or linear."
+    )
+
+
 def compute_image_local_positions(
     token_types: torch.Tensor,
     image_tokens_per_img: int,
@@ -575,8 +594,10 @@ class Qwen3Model(Qwen3PreTrainedModel):
             getattr(config, "image_projector_width", None),
             getattr(config, "image_tokens_per_img", 256),
         )
+        # Null text/global condition for image CFG. Image latents and structural
+        # delimiters remain visible; only natural-language condition tokens drop.
         self.image_condition_null = nn.Parameter(torch.empty(config.hidden_size))
-        nn.init.normal_(self.image_condition_null, std=0.02)
+        nn.init.zeros_(self.image_condition_null)
         self.layers = nn.ModuleList(
             [Qwen3DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
@@ -710,7 +731,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
         token_types: torch.Tensor,
         force_drop: bool = False,
     ) -> torch.Tensor:
-        condition_token_mask = (token_types != 1) & (token_types != 3)
+        condition_token_mask = token_types == 0
         if not condition_token_mask.any():
             return inputs_embeds
 
@@ -1059,8 +1080,11 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         sigma: torch.Tensor,
         spans: list[tuple[int, int, int]],
         image_latent_dim: int | None = None,
+        initial_image_latents: torch.Tensor | None = None,
+        initial_image_latent_mask: torch.Tensor | None = None,
         diffusion_temperature: float = 1.0,
         diffusion_cfg: float = 1.0,
+        diffusion_cfg_schedule: str = "linear",
         diffusion_clip_denoised: bool = False,
         parallel_rate: int = 32,
         order_strategy: str = "condition_norm",
@@ -1087,6 +1111,31 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             device=device,
             dtype=self.image_diffusion_head.net.final_layer.linear.weight.dtype,
         )
+        base_image_latent_mask = torch.zeros_like(selected_token_types, dtype=torch.bool)
+        if initial_image_latents is not None:
+            if initial_image_latents.shape[:2] != input_ids.shape:
+                raise ValueError(
+                    "initial_image_latents must have shape [batch, seq_len, latent_dim], "
+                    f"got {tuple(initial_image_latents.shape)} for input_ids={tuple(input_ids.shape)}"
+                )
+            if initial_image_latents.shape[-1] != image_latent_dim:
+                raise ValueError(
+                    f"initial_image_latents last dimension ({initial_image_latents.shape[-1]}) "
+                    f"must match image_latent_dim ({image_latent_dim})."
+                )
+            selected_initial_latents = torch.stack(
+                [initial_image_latents[b] for b, _, _ in spans]
+            ).to(device=device, dtype=work_latents.dtype)
+            work_latents.copy_(selected_initial_latents)
+        if initial_image_latent_mask is not None:
+            if initial_image_latent_mask.shape != input_ids.shape:
+                raise ValueError(
+                    "initial_image_latent_mask must have shape [batch, seq_len], "
+                    f"got {tuple(initial_image_latent_mask.shape)} for input_ids={tuple(input_ids.shape)}"
+                )
+            base_image_latent_mask = torch.stack(
+                [initial_image_latent_mask[b] for b, _, _ in spans]
+            ).to(device=device, dtype=torch.bool)
 
         original_orders = []
         local_spans = []
@@ -1200,12 +1249,26 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         use_diffusion_cfg = diffusion_cfg != 1.0
 
         while not filled.all():
+            remaining_per_sample = (~filled).sum(dim=1)
+            planned_fill = torch.minimum(
+                remaining_per_sample,
+                torch.full_like(remaining_per_sample, k),
+            ).sum()
+            progress_after_step = (
+                float(filled.sum().item() + planned_fill.item())
+                / float(max(1, filled.numel()))
+            )
+            cfg_iter = _scheduled_diffusion_cfg(
+                diffusion_cfg,
+                diffusion_cfg_schedule,
+                progress_after_step,
+            )
             attention_mask = get_selfless_mask(
                 sigma=current_sigma,
                 seq_len=selected_input_ids.shape[1],
                 device=device,
             )
-            image_latent_mask = torch.zeros_like(selected_token_types, dtype=torch.bool)
+            image_latent_mask = base_image_latent_mask.clone()
             for sample_idx, start, _ in local_spans:
                 image_latent_mask[sample_idx, start : start + image_tokens_per_img] = filled[sample_idx]
             hidden = self.model(
@@ -1265,7 +1328,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                     z,
                     z_uncond=z_uncond,
                     temperature=diffusion_temperature,
-                    cfg=diffusion_cfg,
+                    cfg=cfg_iter,
                     clip_denoised=diffusion_clip_denoised,
                 ).to(work_latents.dtype)
                 projected = self.image_token_embedder(
@@ -1353,7 +1416,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                     z,
                     z_uncond=z_uncond,
                     temperature=diffusion_temperature,
-                    cfg=diffusion_cfg,
+                    cfg=cfg_iter,
                     clip_denoised=diffusion_clip_denoised,
                 ).to(work_latents.dtype)
 
@@ -1393,6 +1456,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         if return_trace:
             trace = {
                 "order_strategy": order_strategy,
+                "diffusion_cfg_schedule": str(diffusion_cfg_schedule),
                 "generation_order": generation_order.view(len(spans), side, side),
                 "generation_step": generation_step.view(len(spans), side, side),
                 "generation_score": generation_score.view(len(spans), side, side),
@@ -1421,14 +1485,45 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         ratio,
         parallel_rate,
         decode_strategy: str,
-    ) -> tuple[torch.Tensor, torch.Tensor, int, int]:
+        diffusion_temperature: float = 1.0,
+        diffusion_cfg: float = 1.0,
+        diffusion_cfg_schedule: str = "linear",
+        diffusion_clip_denoised: bool = False,
+        image_parallel_rate: int | None = None,
+        image_order_strategy: str | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         from utils.utils import get_selfless_mask
 
         device = self.device
         eos_token_id = getattr(self.config, "eos_token_id", None)
+        boi_token_id = getattr(self.config, "boi_token_id", None)
+        eoi_token_id = getattr(self.config, "eoi_token_id", None)
+        image_mask_token_id = getattr(self.config, "image_mask_token_id", None)
+        image_tokens_per_img = int(getattr(self.config, "image_tokens_per_img", 256))
+        image_latent_dim = int(getattr(self, "image_latent_dim", getattr(self.config, "image_latent_dim", 4)))
+        side = int(image_tokens_per_img ** 0.5)
+        if side * side != image_tokens_per_img:
+            raise ValueError(f"image_tokens_per_img={image_tokens_per_img} is not square")
+
+        latent_dtype = torch.float32
+        diffusion_head = getattr(self, "image_diffusion_head", None)
+        if diffusion_head is not None:
+            try:
+                latent_dtype = diffusion_head.net.final_layer.linear.weight.dtype
+            except AttributeError:
+                latent_dtype = torch.float32
 
         seq = prompt_ids.to(device=device, dtype=torch.long).flatten().clone()
         token_types = torch.zeros_like(seq, dtype=torch.uint8)
+        image_latents = torch.zeros(
+            seq.shape[0],
+            image_latent_dim,
+            device=device,
+            dtype=latent_dtype,
+        )
+        image_latent_mask = torch.zeros(seq.shape[0], device=device, dtype=torch.bool)
+        generated_images = []
+        generated_spans = []
         sigma = torch.empty(seq.shape[0], dtype=torch.float32, device=device)
         if prompt_task == "ar":
             sigma[:] = torch.arange(seq.shape[0], device=device, dtype=sigma.dtype)
@@ -1443,28 +1538,130 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             start = float(sigma.max().item() + 1.0) if sigma.numel() > 0 else 0.0
             return torch.arange(start, start + n, device=device, dtype=sigma.dtype)
 
-        while generated_text_tokens < gen_length:
-            seq = torch.cat([seq, torch.tensor([self.config.mask_token_id], device=device, dtype=torch.long)])
-            token_types = torch.cat([token_types, torch.tensor([0], device=device, dtype=torch.uint8)])
-            sigma = torch.cat([sigma, next_sigma_values(1)])
-            L = seq.shape[0]
-            attention_mask = get_selfless_mask(sigma=sigma.unsqueeze(0), seq_len=L, device=device)
-            hidden = self.model(
-                X0_input_ids=seq.unsqueeze(0),
-                attention_mask=attention_mask,
+        def append_tokens(token_ids: torch.Tensor, types: torch.Tensor):
+            nonlocal seq, token_types, sigma, image_latents, image_latent_mask
+            token_ids = token_ids.to(device=device, dtype=torch.long).flatten()
+            types = types.to(device=device, dtype=torch.uint8).flatten()
+            if token_ids.shape != types.shape:
+                raise ValueError("token_ids and token types must have the same shape.")
+            n = int(token_ids.numel())
+            if n == 0:
+                return
+            seq = torch.cat([seq, token_ids])
+            token_types = torch.cat([token_types, types])
+            sigma = torch.cat([sigma, next_sigma_values(n)])
+            image_latents = torch.cat(
+                [
+                    image_latents,
+                    torch.zeros(n, image_latent_dim, device=device, dtype=image_latents.dtype),
+                ],
+                dim=0,
+            )
+            image_latent_mask = torch.cat(
+                [
+                    image_latent_mask,
+                    torch.zeros(n, device=device, dtype=torch.bool),
+                ]
+            )
+
+        def model_kwargs_for_current_seq():
+            kwargs = {
+                "X0_input_ids": seq.unsqueeze(0),
+                "attention_mask": get_selfless_mask(
+                    sigma=sigma.unsqueeze(0),
+                    seq_len=seq.shape[0],
+                    device=device,
+                ),
+                "token_types": token_types.unsqueeze(0),
+                "calculate_likelihood": False,
+            }
+            if (token_types == 1).any():
+                kwargs["image_latents"] = image_latents.unsqueeze(0)
+                kwargs["image_latent_mask"] = image_latent_mask.unsqueeze(0)
+            return kwargs
+
+        def sample_current_image_span(image_start: int, image_end: int):
+            if eoi_token_id is None or image_mask_token_id is None:
+                raise ValueError(
+                    "Image generation requires config.eoi_token_id and config.image_mask_token_id."
+                )
+            generated = self.sample_image_latents_single_stream(
+                input_ids=seq.unsqueeze(0),
                 token_types=token_types.unsqueeze(0),
-                calculate_likelihood=False,
-            ).last_hidden_state[0, -1]
+                sigma=sigma.unsqueeze(0),
+                spans=[(0, image_start, image_end)],
+                image_latent_dim=image_latent_dim,
+                initial_image_latents=image_latents.unsqueeze(0),
+                initial_image_latent_mask=image_latent_mask.unsqueeze(0),
+                diffusion_temperature=diffusion_temperature,
+                diffusion_cfg=diffusion_cfg,
+                diffusion_cfg_schedule=diffusion_cfg_schedule,
+                diffusion_clip_denoised=diffusion_clip_denoised,
+                parallel_rate=image_parallel_rate if image_parallel_rate is not None else 32,
+                order_strategy=image_order_strategy or decode_strategy,
+            )
+            if generated is None:
+                return
+            image_chw = generated[0].to(device=device, dtype=image_latents.dtype)
+            flat_image = image_chw.permute(1, 2, 0).reshape(image_tokens_per_img, image_latent_dim)
+            image_latents[image_start:image_end] = flat_image
+            image_latent_mask[image_start:image_end] = True
+            generated_images.append(image_chw)
+            generated_spans.append((image_start, image_end))
+
+        while generated_text_tokens < gen_length:
+            append_tokens(
+                torch.tensor([self.config.mask_token_id], device=device),
+                torch.tensor([0], device=device, dtype=torch.uint8),
+            )
+            hidden = self.model(**model_kwargs_for_current_seq()).last_hidden_state[0, -1]
             text_logits = self.lm_head(hidden.unsqueeze(0))
             next_token, _ = self._sample_from_logits(text_logits, temperature)
             next_token = next_token.item()
             seq[-1] = next_token
             generated_text_tokens += 1
 
+            if boi_token_id is not None and next_token == int(boi_token_id):
+                if eoi_token_id is None or image_mask_token_id is None:
+                    raise ValueError(
+                        "Generated BOI but config.eoi_token_id or config.image_mask_token_id is missing."
+                    )
+                token_types[-1] = 2
+                image_start = int(seq.shape[0])
+                append_tokens(
+                    torch.full(
+                        (image_tokens_per_img,),
+                        int(image_mask_token_id),
+                        device=device,
+                        dtype=torch.long,
+                    ),
+                    torch.ones(image_tokens_per_img, device=device, dtype=torch.uint8),
+                )
+                image_end = int(seq.shape[0])
+                append_tokens(
+                    torch.tensor([int(eoi_token_id)], device=device, dtype=torch.long),
+                    torch.tensor([2], device=device, dtype=torch.uint8),
+                )
+                sample_current_image_span(image_start, image_end)
+                continue
+
             if eos_token_id is not None and next_token == eos_token_id:
                 break
 
-        return seq, token_types, 0, 0
+        if generated_images:
+            generated_image_latents = torch.stack(generated_images, dim=0)
+            image_spans = torch.tensor(generated_spans, device=device, dtype=torch.long)
+        else:
+            generated_image_latents = torch.zeros(
+                0,
+                image_latent_dim,
+                side,
+                side,
+                device=device,
+                dtype=image_latents.dtype,
+            )
+            image_spans = torch.empty(0, 2, device=device, dtype=torch.long)
+        return seq, token_types, image_latents, generated_image_latents, image_spans
 
     @torch.no_grad()
     def generate(self, prompt_ids, gen_length, num_response=1, prompt_task='ar', block_size=4, temperature=1.0, ratio=None, parallel_rate=None, decode_strategy='confidence', **kwargs):
@@ -1478,8 +1675,17 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
 
         seqs = []
         type_seqs = []
+        aligned_image_latents = []
+        generated_image_latents = []
+        image_spans = []
+        diffusion_temperature = float(kwargs.pop("diffusion_temperature", 1.0))
+        diffusion_cfg = float(kwargs.pop("diffusion_cfg", 1.0))
+        diffusion_cfg_schedule = str(kwargs.pop("diffusion_cfg_schedule", "linear"))
+        diffusion_clip_denoised = bool(kwargs.pop("diffusion_clip_denoised", False))
+        image_parallel_rate = kwargs.pop("image_parallel_rate", parallel_rate)
+        image_order_strategy = kwargs.pop("image_order_strategy", decode_strategy)
         for i in range(num_response):
-            seq, token_types, image_tokens, image_steps = self._generate_one(
+            seq, token_types, image_latents, image_chw, spans = self._generate_one(
                 prompt_ids=base_prompts[i],
                 gen_length=gen_length,
                 prompt_task=prompt_task,
@@ -1488,9 +1694,18 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 ratio=ratio,
                 parallel_rate=parallel_rate,
                 decode_strategy=decode_strategy,
+                diffusion_temperature=diffusion_temperature,
+                diffusion_cfg=diffusion_cfg,
+                diffusion_cfg_schedule=diffusion_cfg_schedule,
+                diffusion_clip_denoised=diffusion_clip_denoised,
+                image_parallel_rate=image_parallel_rate,
+                image_order_strategy=image_order_strategy,
             )
             seqs.append(seq)
             type_seqs.append(token_types)
+            aligned_image_latents.append(image_latents)
+            generated_image_latents.append(image_chw)
+            image_spans.append(spans)
 
         max_len = max(seq.shape[0] for seq in seqs)
         pad_id = getattr(self.config, "eos_token_id", None)
@@ -1499,16 +1714,56 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         output = torch.full((num_response, max_len), pad_id, device=self.device, dtype=torch.long)
         raw_output = torch.full((num_response, max_len), pad_id, device=self.device, dtype=torch.long)
         output_token_types = torch.full((num_response, max_len), 3, device=self.device, dtype=torch.uint8)
+        image_latent_dim = int(getattr(self, "image_latent_dim", getattr(self.config, "image_latent_dim", 4)))
+        latent_dtype = aligned_image_latents[0].dtype if aligned_image_latents else torch.float32
+        output_image_latents = torch.zeros(
+            num_response,
+            max_len,
+            image_latent_dim,
+            device=self.device,
+            dtype=latent_dtype,
+        )
         for i, seq in enumerate(seqs):
             token_types = type_seqs[i]
             raw_output[i, :seq.shape[0]] = seq
             output_token_types[i, :token_types.shape[0]] = token_types
             output[i, :seq.shape[0]] = seq
+            output_image_latents[i, :aligned_image_latents[i].shape[0]] = aligned_image_latents[i]
+
+        max_images = max((images.shape[0] for images in generated_image_latents), default=0)
+        image_tokens_per_img = int(getattr(self.config, "image_tokens_per_img", 256))
+        side = int(image_tokens_per_img ** 0.5)
+        generated_image_output = torch.zeros(
+            num_response,
+            max_images,
+            image_latent_dim,
+            side,
+            side,
+            device=self.device,
+            dtype=latent_dtype,
+        )
+        output_image_spans = torch.full(
+            (num_response, max_images, 2),
+            -1,
+            device=self.device,
+            dtype=torch.long,
+        )
+        image_counts = torch.zeros(num_response, device=self.device, dtype=torch.long)
+        for i, images in enumerate(generated_image_latents):
+            count = int(images.shape[0])
+            image_counts[i] = count
+            if count:
+                generated_image_output[i, :count] = images
+                output_image_spans[i, :count] = image_spans[i]
 
         return {
             'seq': output,
             'raw_seq': raw_output,
             'token_types': output_token_types,
+            'image_latents': output_image_latents,
+            'generated_image_latents': generated_image_output,
+            'image_spans': output_image_spans,
+            'image_counts': image_counts,
             'parallel_rate': 0.0,
         }
         

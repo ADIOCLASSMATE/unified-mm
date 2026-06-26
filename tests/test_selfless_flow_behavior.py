@@ -515,7 +515,7 @@ class SelflessFlowBehaviorTest(unittest.TestCase):
         self.assertTrue(torch.allclose(call["x0"], expected_x0))
         self.assertTrue(torch.allclose(call["x0"][:, 2], expected_x0[:, 2]))
 
-    def test_forced_image_condition_drop_replaces_text_and_special_only(self):
+    def test_forced_image_condition_drop_replaces_text_only_and_keeps_special(self):
         config = tiny_qwen3_config()
         model = Qwen3Model(config)
         capture = CaptureLayer()
@@ -559,7 +559,6 @@ class SelflessFlowBehaviorTest(unittest.TestCase):
             image_positions[visible_image],
         )
         expected_x0[:, 0] = model.image_condition_null
-        expected_x0[:, 3] = model.image_condition_null
         self.assertTrue(torch.allclose(call["x0"], expected_x0))
 
     def test_image_diffusion_cfg_requires_paired_unconditional_condition(self):
@@ -663,8 +662,9 @@ class SelflessFlowBehaviorTest(unittest.TestCase):
         for cond_call, uncond_call in zip(dummy.model.calls[0::2], dummy.model.calls[1::2]):
             self.assertFalse(cond_call["image_condition_drop"])
             self.assertTrue(uncond_call["image_condition_drop"])
-        for sample_call in dummy.image_diffusion_head.sample_calls:
-            self.assertEqual(sample_call["cfg"], 2.0)
+        expected_cfg = [1.25, 1.5, 1.75, 2.0]
+        for sample_call, cfg in zip(dummy.image_diffusion_head.sample_calls, expected_cfg):
+            self.assertAlmostEqual(sample_call["cfg"], cfg)
             self.assertEqual(tuple(sample_call["z"].shape), (2, hidden_size))
             self.assertTrue(torch.all(sample_call["z"][0] == 1.0))
             self.assertTrue(torch.all(sample_call["z"][1] == 2.0))
@@ -672,7 +672,13 @@ class SelflessFlowBehaviorTest(unittest.TestCase):
     def test_text_generate_is_single_stream_and_has_no_discrete_image_branch(self):
         dummy = types.SimpleNamespace(
             device=torch.device("cpu"),
-            config=types.SimpleNamespace(mask_token_id=7, eos_token_id=9),
+            config=types.SimpleNamespace(
+                mask_token_id=7,
+                eos_token_id=9,
+                image_tokens_per_img=4,
+                image_latent_dim=4,
+            ),
+            image_latent_dim=4,
             model=FakeTextBackbone(token_plan=[5, 9]),
             lm_head=FakeTextHead(vocab_size=32),
             unified_head=False,
@@ -680,7 +686,7 @@ class SelflessFlowBehaviorTest(unittest.TestCase):
         dummy._sample_from_logits = types.MethodType(Qwen3ForCausalLM._sample_from_logits, dummy)
 
         with patch("utils.utils.get_selfless_mask", side_effect=lambda sigma, seq_len, device: sigma.detach().clone()):
-            seq, token_types, image_tokens, image_steps = Qwen3ForCausalLM._generate_one(
+            seq, token_types, image_latents, generated_images, image_spans = Qwen3ForCausalLM._generate_one(
                 dummy,
                 prompt_ids=torch.tensor([1, 2]),
                 gen_length=4,
@@ -694,13 +700,89 @@ class SelflessFlowBehaviorTest(unittest.TestCase):
 
         self.assertEqual(seq.tolist(), [1, 2, 5, 9])
         self.assertEqual(token_types.tolist(), [0, 0, 0, 0])
-        self.assertEqual(image_tokens, 0)
-        self.assertEqual(image_steps, 0)
+        self.assertEqual(tuple(image_latents.shape), (4, 4))
+        self.assertEqual(tuple(generated_images.shape), (0, 4, 2, 2))
+        self.assertEqual(tuple(image_spans.shape), (0, 2))
         self.assertEqual(len(dummy.model.calls), 2)
         for call in dummy.model.calls:
             self.assertFalse(call["calculate_likelihood"])
             self.assertNotIn("image_latents", call)
             self.assertNotIn("image_latent_mask", call)
+
+    def test_generate_one_expands_boi_into_image_span_and_continues_text(self):
+        dummy = types.SimpleNamespace(
+            device=torch.device("cpu"),
+            config=types.SimpleNamespace(
+                mask_token_id=7,
+                image_mask_token_id=8,
+                eos_token_id=9,
+                boi_token_id=11,
+                eoi_token_id=12,
+                image_tokens_per_img=4,
+                image_latent_dim=4,
+            ),
+            image_latent_dim=4,
+            model=FakeTextBackbone(token_plan=[11, 5, 9]),
+            lm_head=FakeTextHead(vocab_size=32),
+        )
+        dummy._sample_from_logits = types.MethodType(Qwen3ForCausalLM._sample_from_logits, dummy)
+
+        sampler_calls = []
+
+        def fake_sampler(self, **kwargs):
+            sampler_calls.append(
+                {
+                    "input_ids": kwargs["input_ids"].detach().clone(),
+                    "token_types": kwargs["token_types"].detach().clone(),
+                    "sigma": kwargs["sigma"].detach().clone(),
+                    "spans": list(kwargs["spans"]),
+                    "initial_image_latent_mask": kwargs["initial_image_latent_mask"].detach().clone(),
+                    "diffusion_cfg_schedule": kwargs["diffusion_cfg_schedule"],
+                    "parallel_rate": kwargs["parallel_rate"],
+                    "order_strategy": kwargs["order_strategy"],
+                }
+            )
+            return torch.arange(16, dtype=torch.float32).view(1, 4, 2, 2)
+
+        dummy.sample_image_latents_single_stream = types.MethodType(fake_sampler, dummy)
+
+        with patch("utils.utils.get_selfless_mask", side_effect=lambda sigma, seq_len, device: sigma.detach().clone()):
+            seq, token_types, image_latents, generated_images, image_spans = Qwen3ForCausalLM._generate_one(
+                dummy,
+                prompt_ids=torch.tensor([1, 2]),
+                gen_length=3,
+                prompt_task="ar",
+                block_size=1,
+                temperature=0.0,
+                ratio=None,
+                parallel_rate=None,
+                decode_strategy="confidence",
+                diffusion_cfg_schedule="constant",
+                image_parallel_rate=2,
+            )
+
+        self.assertEqual(seq.tolist(), [1, 2, 11, 8, 8, 8, 8, 12, 5, 9])
+        self.assertEqual(token_types.tolist(), [0, 0, 2, 1, 1, 1, 1, 2, 0, 0])
+        self.assertEqual(image_spans.tolist(), [[3, 7]])
+        self.assertEqual(tuple(generated_images.shape), (1, 4, 2, 2))
+        expected_flat = torch.arange(16, dtype=torch.float32).view(4, 2, 2).permute(1, 2, 0).reshape(4, 4)
+        self.assertTrue(torch.equal(image_latents[3:7], expected_flat))
+
+        self.assertEqual(len(sampler_calls), 1)
+        call = sampler_calls[0]
+        self.assertEqual(call["spans"], [(0, 3, 7)])
+        self.assertEqual(call["input_ids"].tolist(), [[1, 2, 11, 8, 8, 8, 8, 12]])
+        self.assertEqual(call["token_types"].tolist(), [[0, 0, 2, 1, 1, 1, 1, 2]])
+        self.assertEqual(call["sigma"].tolist(), [[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]])
+        self.assertFalse(call["initial_image_latent_mask"].any())
+        self.assertEqual(call["diffusion_cfg_schedule"], "constant")
+        self.assertEqual(call["parallel_rate"], 2)
+        self.assertEqual(call["order_strategy"], "confidence")
+
+        self.assertEqual(len(dummy.model.calls), 3)
+        after_image_call = dummy.model.calls[1]
+        self.assertTrue(torch.equal(after_image_call["image_latent_mask"][0, 3:7], torch.ones(4, dtype=torch.bool)))
+        self.assertTrue(torch.equal(after_image_call["image_latents"][0, 3:7], expected_flat))
 
 
 if __name__ == "__main__":

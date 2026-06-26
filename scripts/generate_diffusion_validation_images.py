@@ -36,6 +36,7 @@ def parse_args():
     parser.add_argument("--sampling_steps", default="100")
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--cfg", type=float, default=1.0)
+    parser.add_argument("--cfg_schedule", choices=["constant", "linear"], default="linear")
     parser.add_argument("--denoise_timestep", type=int, default=500)
     parser.add_argument("--full_clip", action="store_true", help="Save full diffusion sample with clip_denoised=True.")
     parser.add_argument("--full_no_clip", action="store_true", help="Save full diffusion sample with clip_denoised=False.")
@@ -79,6 +80,7 @@ def load_adapter(model, adapter_path: str):
         projector_target = model.image_token_embedder.state_dict()
         projector_skipped = {}
         mar_mask_token = None
+        mar_fake_latent = None
 
         def maybe_add_projector_key(name, value):
             if name not in projector_target:
@@ -108,6 +110,8 @@ def load_adapter(model, adapter_path: str):
                     maybe_add_projector_key("diffusion_pos_embed.weight", f.get_tensor(key).squeeze(0))
                 elif key == "mask_token":
                     mar_mask_token = f.get_tensor(key).reshape(-1)
+                elif key == "fake_latent":
+                    mar_fake_latent = f.get_tensor(key).reshape(-1)
         missing, unexpected = model.image_diffusion_head.load_state_dict(head_state, strict=False)
         report = {
             "adapter": str(path),
@@ -130,6 +134,17 @@ def load_adapter(model, adapter_path: str):
                     report["loaded_mar_mask_token_id"] = int(image_mask_token_id)
                 else:
                     report["skipped_mar_mask_token_shape"] = [int(mar_mask_token.numel()), int(embed.shape[1])]
+        if mar_fake_latent is not None and hasattr(model.model, "image_condition_null"):
+            with torch.no_grad():
+                null = model.model.image_condition_null
+                if mar_fake_latent.numel() == null.numel():
+                    null.copy_(mar_fake_latent.to(device=null.device, dtype=null.dtype))
+                    report["loaded_mar_fake_latent_as_image_condition_null"] = True
+                else:
+                    report["skipped_mar_fake_latent_shape"] = [
+                        int(mar_fake_latent.numel()),
+                        int(null.numel()),
+                    ]
         return report
 
     state = torch.load(path, map_location="cpu")
@@ -254,6 +269,7 @@ def main():
         "sampling_steps": str(args.sampling_steps),
         "temperature": args.temperature,
         "cfg": args.cfg,
+        "cfg_schedule": args.cfg_schedule,
         "denoise_timestep": args.denoise_timestep,
         "loss": float(output.loss.detach().float().item()),
         "diffusion_stats": {
@@ -379,6 +395,7 @@ def main():
                     image_latent_dim=image_latents.shape[-1],
                     diffusion_temperature=args.temperature,
                     diffusion_cfg=args.cfg,
+                    diffusion_cfg_schedule=args.cfg_schedule,
                     diffusion_clip_denoised=args.single_stream_clip,
                     parallel_rate=args.parallel_rate,
                     order_strategy=strategy,

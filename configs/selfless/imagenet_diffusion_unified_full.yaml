@@ -1,6 +1,6 @@
 experiment:
     project: "selfless-diffusion-0.6B-imagenet-unified-full"
-    name: "imagenet-diffusion-unified-full"
+    name: "imagenet-diffusion-unified-from-textft"
     wandb_project: "unified-mm"
     output_dir: "output"
     save_every: 1000
@@ -8,39 +8,36 @@ experiment:
     generate_every: 10000
     log_every: 10
     log_grad_norm_every: 100
-    checkpoints_total_limit: 200
-    save_hfmodel_every: 5000
+    checkpoints_total_limit: 20
+    save_hfmodel_every: 10000
     val_every: 1000
     validation_image_every: 1000
-    validation_image_samples: 4
+    validation_image_samples: 2
     validation_diffusion_temperature: 1.0
-    validation_diffusion_cfg: 1.0
-    validation_diffusion_clip_denoised: true
+    validation_diffusion_cfg: 1.5
+    validation_diffusion_cfg_schedule: "linear"
+    validation_diffusion_clip_denoised: false
     validation_denoise_timestep: 500
     validation_vae_dtype: "fp32"
     validation_save_debug_images: false
     validation_single_stream_images: true
-    validation_single_stream_parallel_rate: 1
+    validation_single_stream_parallel_rate: 16
     validation_single_stream_order_strategy: "sigma"
     validation_single_stream_order_strategies:
         - "sigma"
-        - "causal_sigma"
-        - "random"
-        - "hidden_norm"
         - "latent_proj_cosine"
-        - "spatial_halton"
     validation_mar_root: "/inspire/hdd/global_user/wanjiaxin-253108030048/code/mar"
     validation_vae_path: "public/vae/mar-kl16/kl16.ckpt"
     validation_vae_scaling_factor: 0.2325
     resume_from_checkpoint: none
 
 model:
-    model_path: "public/models/Qwen/Qwen3-0.6B-Base"
+    model_path: "output/selfless-diffusion-0.6B-text2048-finewebedu-adapt/hf_model-final"
     attention_pattern: "ar"
     loss_attention_pattern: "likelihood"
     mask_id: -1
     use_flex_attention: true
-    lambda_text: 0.2
+    lambda_text: 0.5
     lambda_image: 1.0
     continuous_image_latents: true
     image_tokens_per_img: 256
@@ -58,8 +55,8 @@ model:
 dataset:
     class_name: "CombinedImageNetTextFlowDataset"
     params:
-        text_batch_ratio: 0.4
-        val_text_batches: 20
+        text_batch_ratio: 0.25
+        val_text_batches: 8
         image:
             cache_path: "public/datasets/imagenet_full/vae_latents_mar_kl16/flow_latents_all_fp16.pt"
             manifest_jsonl: "public/datasets/imagenet_full/manifest.jsonl"
@@ -88,7 +85,7 @@ optimizer:
         backbone_learning_rate: 5.0e-6
         projector_learning_rate: 1.0e-4
         diffusion_learning_rate: 1.0e-4
-        special_token_learning_rate: 1.0e-4
+        special_token_learning_rate: 5.0e-6
         scale_lr: false
         beta1: 0.9
         beta2: 0.95
@@ -118,4 +115,10 @@ training:
     step_scheduler_with_optimizer: false
     from_scratch: false
     freeze_backbone_for_image_diffusion_warmup: false
+    use_ema: true
+    ema_decay: 0.9999
+    ema_update_after_step: 0
+    ema_validate: true
+    ema_save_adapter: false
+    ema_save_hf_model: true
     save_image_diffusion_adapter: false

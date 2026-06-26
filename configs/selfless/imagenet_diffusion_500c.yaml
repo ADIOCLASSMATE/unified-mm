@@ -15,7 +15,8 @@ experiment:
     validation_image_samples: 4
     validation_diffusion_temperature: 1.0
     validation_diffusion_cfg: 1.0
-    validation_diffusion_clip_denoised: true
+    validation_diffusion_cfg_schedule: "linear"
+    validation_diffusion_clip_denoised: false
     validation_denoise_timestep: 500
     validation_vae_dtype: "fp32"
     validation_save_debug_images: false
@@ -106,3 +107,9 @@ training:
     use_gradient_checkpointing: false
     step_scheduler_with_optimizer: false
     from_scratch: false
+    use_ema: true
+    ema_decay: 0.9999
+    ema_update_after_step: 0
+    ema_validate: true
+    ema_save_adapter: true
+    ema_save_hf_model: true
