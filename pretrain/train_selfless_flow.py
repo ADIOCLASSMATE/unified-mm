@@ -41,6 +41,9 @@ def _special_token_ids(config):
         "boi": int(config.model.boi_token_id),
         "eoi": int(config.model.eoi_token_id),
     }
+    image_mask_token_id = config.model.get("image_mask_token_id", None)
+    if image_mask_token_id is not None:
+        ids["image_mask"] = int(image_mask_token_id)
     return ids
 
 
@@ -57,6 +60,8 @@ def _apply_image_diffusion_warmup_freeze(model, config):
         param.requires_grad = True
     for param in model.model.image_latent_proj.parameters():
         param.requires_grad = True
+    if hasattr(model.model, "image_condition_null"):
+        model.model.image_condition_null.requires_grad = True
 
     embed_weight = model.model.embed_tokens.weight
     embed_weight.requires_grad = True
@@ -94,17 +99,68 @@ def _load_image_diffusion_adapter(model, adapter_path, config):
         from safetensors import safe_open
 
         head_state = {}
+        projector_state = {}
+        projector_target = model.model.image_latent_proj.state_dict()
+        projector_skipped = {}
+        mar_mask_token = None
+
+        def _maybe_add_projector_key(name, value):
+            if name not in projector_target:
+                projector_skipped[name] = (tuple(value.shape), None)
+                return
+            target_shape = tuple(projector_target[name].shape)
+            if tuple(value.shape) != target_shape:
+                projector_skipped[name] = (tuple(value.shape), target_shape)
+                return
+            projector_state[name] = value
+
         with safe_open(str(adapter_path), framework="pt", device="cpu") as f:
             for key in f.keys():
                 if key.startswith("diffloss."):
                     head_state[key[len("diffloss."):]] = f.get_tensor(key)
                 elif key.startswith("image_diffusion_head."):
                     head_state[key[len("image_diffusion_head."):]] = f.get_tensor(key)
+                elif key in {"z_proj.weight", "z_proj.bias", "z_proj_ln.weight", "z_proj_ln.bias"}:
+                    _maybe_add_projector_key(key, f.get_tensor(key))
+                elif key == "encoder_pos_embed_learned":
+                    pos = f.get_tensor(key).squeeze(0)
+                    _maybe_add_projector_key("image_pos_embed.weight", pos[-model.model.image_latent_proj.image_tokens_per_img:])
+                elif key == "diffusion_pos_embed_learned":
+                    _maybe_add_projector_key("diffusion_pos_embed.weight", f.get_tensor(key).squeeze(0))
+                elif key == "mask_token":
+                    mar_mask_token = f.get_tensor(key).reshape(-1)
         missing, unexpected = model.image_diffusion_head.load_state_dict(head_state, strict=False)
         logger.info(
             f"Loaded MAR image_diffusion_head from {adapter_path}: "
             f"keys={len(head_state)}, missing={missing}, unexpected={unexpected}"
         )
+        if projector_state:
+            missing, unexpected = model.model.image_latent_proj.load_state_dict(projector_state, strict=False)
+            logger.info(
+                f"Loaded MAR image_latent_proj from {adapter_path}: "
+                f"keys={len(projector_state)}, missing={missing}, unexpected={unexpected}, "
+                f"skipped={projector_skipped}"
+            )
+        else:
+            logger.warning(
+                f"No MAR image_latent_proj keys were loaded from {adapter_path}; skipped={projector_skipped}"
+            )
+        image_mask_token_id = config.model.get("image_mask_token_id", None)
+        if mar_mask_token is not None and image_mask_token_id is not None:
+            with torch.no_grad():
+                embed = model.model.embed_tokens.weight
+                if mar_mask_token.numel() != embed.shape[1]:
+                    logger.warning(
+                        f"Skipping MAR mask_token load: shape={tuple(mar_mask_token.shape)} "
+                        f"does not match embedding dim={embed.shape[1]}"
+                    )
+                else:
+                    embed[int(image_mask_token_id)].copy_(
+                        mar_mask_token.to(device=embed.device, dtype=embed.dtype)
+                    )
+                    logger.info(
+                        f"Loaded MAR mask_token into image_mask_token_id={int(image_mask_token_id)}"
+                    )
         return
 
     state = torch.load(adapter_path, map_location="cpu")
@@ -122,6 +178,15 @@ def _load_image_diffusion_adapter(model, adapter_path, config):
             f"Loaded adapter image_latent_proj from {adapter_path}: "
             f"missing={missing}, unexpected={unexpected}"
         )
+    if "image_condition_null" in state and hasattr(model.model, "image_condition_null"):
+        with torch.no_grad():
+            model.model.image_condition_null.copy_(
+                state["image_condition_null"].to(
+                    device=model.model.image_condition_null.device,
+                    dtype=model.model.image_condition_null.dtype,
+                )
+            )
+        logger.info(f"Loaded adapter image_condition_null from {adapter_path}")
     if "special_token_embeddings" in state:
         token_ids = _special_token_ids(config)
         with torch.no_grad():
@@ -152,6 +217,7 @@ def _save_image_diffusion_adapter(model, config, accelerator, global_step):
             k: v.detach().cpu()
             for k, v in unwrapped.model.image_latent_proj.state_dict().items()
         },
+        "image_condition_null": unwrapped.model.image_condition_null.detach().cpu().clone(),
         "special_token_ids": token_ids,
         "special_token_embeddings": {
             name: embed[token_id].clone()
@@ -280,6 +346,8 @@ def main():
         if name.startswith("image_diffusion_head."):
             return diffusion_lr
         if "image_latent_proj" in name:
+            return projector_lr
+        if "image_condition_null" in name:
             return projector_lr
         if "embed_tokens.weight" in name:
             return special_token_lr
@@ -772,7 +840,8 @@ def _load_mar_vae(config, accelerator):
     AutoencoderKL = mar_vae.AutoencoderKL
 
     vae = AutoencoderKL(embed_dim=16, ch_mult=(1, 1, 2, 2, 4), ckpt_path=str(vae_path))
-    dtype = torch.float16 if accelerator.device.type == "cuda" else torch.float32
+    vae_dtype_name = str(config.experiment.get("validation_vae_dtype", "fp32")).lower()
+    dtype = torch.float16 if vae_dtype_name in {"fp16", "float16", "half"} and accelerator.device.type == "cuda" else torch.float32
     vae = vae.to(device=accelerator.device, dtype=dtype).eval()
     for param in vae.parameters():
         param.requires_grad_(False)
@@ -881,6 +950,8 @@ def _save_validation_diffusion_images(
         sample_count = min(int(config.experiment.get("validation_image_samples", 4)), len(spans))
         diffusion_temperature = float(config.experiment.get("validation_diffusion_temperature", 1.0))
         diffusion_cfg = float(config.experiment.get("validation_diffusion_cfg", 1.0))
+        diffusion_clip_denoised = bool(config.experiment.get("validation_diffusion_clip_denoised", True))
+        denoise_timestep = int(config.experiment.get("validation_denoise_timestep", 500))
         scaling_factor = float(config.experiment.get("validation_vae_scaling_factor", 0.2325))
 
         side = int(image_tokens_per_img ** 0.5)
@@ -889,18 +960,69 @@ def _save_validation_diffusion_images(
             return
 
         hidden_states = output.last_hidden_state
+        uncond_hidden_states = None
+        if diffusion_cfg != 1.0:
+            attention_mask = get_selfless_mask(
+                sigma=sigma,
+                seq_len=input_ids.shape[1],
+                device=accelerator.device,
+            )
+            uncond_output = unwrapped(
+                X0_input_ids=input_ids,
+                attention_mask=attention_mask,
+                token_types=token_types,
+                image_latents=image_latents,
+                image_condition_drop=True,
+                calculate_likelihood=True,
+                return_logits=False,
+            )
+            uncond_hidden_states = uncond_output.last_hidden_state
         pred_latents = []
+        denoise_latents = []
         target_latents = []
         selected_spans = spans[:sample_count]
         for b, start, end in selected_spans:
-            z = hidden_states[b, start:end].to(device=accelerator.device)
-            pred = unwrapped.image_diffusion_head.sample(
+            local_positions = torch.arange(
+                end - start,
+                device=accelerator.device,
+                dtype=torch.long,
+            )
+            z = unwrapped._prepare_image_diffusion_condition(
+                hidden_states[b, start:end].to(device=accelerator.device),
+                local_positions,
+            )
+            z_uncond = None
+            if uncond_hidden_states is not None:
+                z_uncond = unwrapped._prepare_image_diffusion_condition(
+                    uncond_hidden_states[b, start:end].to(device=accelerator.device),
+                    local_positions,
+                )
+            pred = unwrapped.sample_image_diffusion_with_cfg(
                 z,
+                z_uncond=z_uncond,
                 temperature=diffusion_temperature,
                 cfg=diffusion_cfg,
+                clip_denoised=diffusion_clip_denoised,
             )
             target = image_latents[b, start:end].to(device=accelerator.device, dtype=pred.dtype)
+            t = torch.full(
+                (target.shape[0],),
+                max(0, min(denoise_timestep, unwrapped.image_diffusion_head.train_diffusion.num_timesteps - 1)),
+                device=target.device,
+                dtype=torch.long,
+            )
+            noise = torch.randn_like(target)
+            noisy_target = unwrapped.image_diffusion_head.train_diffusion.q_sample(target, t, noise=noise)
+            denoise_out = unwrapped.image_diffusion_head.train_diffusion.p_mean_variance(
+                unwrapped.image_diffusion_head.net,
+                noisy_target,
+                t,
+                clip_denoised=False,
+                model_kwargs={"c": z},
+            )
+            denoise = denoise_out["pred_xstart"].to(dtype=pred.dtype)
             pred_latents.append(pred.view(side, side, -1).permute(2, 0, 1))
+            denoise_latents.append(denoise.view(side, side, -1).permute(2, 0, 1))
             target_latents.append(target.view(side, side, -1).permute(2, 0, 1))
 
         single_stream_results = {}
@@ -925,7 +1047,8 @@ def _save_validation_diffusion_images(
                     image_latent_dim=image_latents.shape[-1],
                     diffusion_temperature=diffusion_temperature,
                     diffusion_cfg=diffusion_cfg,
-                    parallel_rate=int(config.experiment.get("validation_single_stream_parallel_rate", 32)),
+                    diffusion_clip_denoised=diffusion_clip_denoised,
+                    parallel_rate=int(config.experiment.get("validation_single_stream_parallel_rate", 1)),
                     order_strategy=str(order_strategy),
                     return_trace=True,
                 )
@@ -934,9 +1057,11 @@ def _save_validation_diffusion_images(
                     single_stream_results[str(order_strategy)] = (single_stream_latents, single_stream_trace)
 
         raw_pred_latents = torch.stack(pred_latents)
+        raw_denoise_latents = torch.stack(denoise_latents)
         raw_target_latents = torch.stack(target_latents)
         vae_dtype = next(vae.parameters()).dtype
         decoded_pred = vae.decode(raw_pred_latents.to(dtype=vae_dtype) / scaling_factor).float().clamp(-1, 1)
+        decoded_denoise = vae.decode(raw_denoise_latents.to(dtype=vae_dtype) / scaling_factor).float().clamp(-1, 1)
         decoded_target = vae.decode(raw_target_latents.to(dtype=vae_dtype) / scaling_factor).float().clamp(-1, 1)
 
         from torchvision.utils import make_grid, save_image
@@ -944,22 +1069,26 @@ def _save_validation_diffusion_images(
         image_dir = Path(config.experiment.output_dir) / "validation_diffusion_images"
         image_dir.mkdir(parents=True, exist_ok=True)
         wandb_images = {}
+        save_debug_images = bool(config.experiment.get("validation_save_debug_images", False))
         pred_img = (decoded_pred + 1.0) / 2.0
+        denoise_img = (decoded_denoise + 1.0) / 2.0
         target_img = (decoded_target + 1.0) / 2.0
-        pred_path = image_dir / f"step-{global_step:08d}-pred.png"
-        target_path = image_dir / f"step-{global_step:08d}-target.png"
-        save_image(pred_img, pred_path)
-        save_image(target_img, target_path)
-        wandb_images["val/diffusion_teacher_pred"] = pred_path
-        wandb_images["val/diffusion_target"] = target_path
-        grid = make_grid(torch.stack([target_img, pred_img], dim=1).flatten(0, 1), nrow=2)
-        target_pred_path = image_dir / f"step-{global_step:08d}-target_pred_grid.png"
-        save_image(grid, target_pred_path)
-        wandb_images["val/target_teacher_grid"] = target_pred_path
+        if save_debug_images:
+            pred_path = image_dir / f"step-{global_step:08d}-full_sample.png"
+            denoise_path = image_dir / f"step-{global_step:08d}-denoise_x0_t{denoise_timestep}.png"
+            target_path = image_dir / f"step-{global_step:08d}-target.png"
+            save_image(pred_img, pred_path)
+            save_image(denoise_img, denoise_path)
+            save_image(target_img, target_path)
+            wandb_images["val/debug/full_sample"] = pred_path
+            wandb_images["val/debug/denoise_x0"] = denoise_path
+            wandb_images["val/debug/target"] = target_path
 
         logs = {
-            "val/diffusion_teacher_latent_mse": F.mse_loss(raw_pred_latents.float(), raw_target_latents.float()).item(),
-            "val/diffusion_teacher_latent_rms": raw_pred_latents.float().pow(2).mean().sqrt().item(),
+            "val/diffusion_full_sample_latent_mse": F.mse_loss(raw_pred_latents.float(), raw_target_latents.float()).item(),
+            "val/diffusion_full_sample_latent_rms": raw_pred_latents.float().pow(2).mean().sqrt().item(),
+            "val/diffusion_denoise_x0_latent_mse": F.mse_loss(raw_denoise_latents.float(), raw_target_latents.float()).item(),
+            "val/diffusion_denoise_x0_latent_rms": raw_denoise_latents.float().pow(2).mean().sqrt().item(),
             "val/diffusion_target_latent_rms": raw_target_latents.float().pow(2).mean().sqrt().item(),
         }
         if single_stream_results:
@@ -985,15 +1114,16 @@ def _save_validation_diffusion_images(
                 )
 
                 single_stream_img = (decoded_single_stream + 1.0) / 2.0
-                single_stream_path = image_dir / f"step-{global_step:08d}-single_stream_pred_{strategy_tag}.png"
-                save_image(single_stream_img, single_stream_path)
-                wandb_images[f"{log_prefix}/pred"] = single_stream_path
+                if save_debug_images:
+                    single_stream_path = image_dir / f"step-{global_step:08d}-single_stream_pred_{strategy_tag}.png"
+                    save_image(single_stream_img, single_stream_path)
+                    wandb_images[f"{log_prefix}/debug/pred"] = single_stream_path
 
-                comparison = torch.stack([target_img, pred_img, single_stream_img], dim=1).flatten(0, 1)
-                comparison_grid = make_grid(comparison, nrow=3)
-                comparison_path = image_dir / f"step-{global_step:08d}-target_teacher_single_{strategy_tag}.png"
+                comparison = torch.stack([target_img, single_stream_img], dim=1).flatten(0, 1)
+                comparison_grid = make_grid(comparison, nrow=2)
+                comparison_path = image_dir / f"step-{global_step:08d}-strategy_{strategy_tag}.png"
                 save_image(comparison_grid, comparison_path)
-                wandb_images[f"{log_prefix}/target_teacher_single_grid"] = comparison_path
+                wandb_images[f"{log_prefix}/target_strategy_grid"] = comparison_path
 
                 comparison_tiles.append(single_stream_img)
                 comparison_names.append(strategy_tag)
@@ -1004,35 +1134,45 @@ def _save_validation_diffusion_images(
                     step_map = single_stream_trace.get("generation_step", None)
                     score_map = single_stream_trace.get("generation_score", None)
                     if isinstance(order_map, torch.Tensor):
-                        order_grid = make_grid(_heatmap_images(order_map), nrow=sample_count)
-                        order_path = image_dir / f"step-{global_step:08d}-single_stream_order_{trace_strategy}.png"
-                        save_image(order_grid, order_path)
-                        wandb_images[f"{log_prefix}/generation_order"] = order_path
                         logs[f"{log_prefix}/generation_order_max"] = order_map.float().max().item()
+                        if save_debug_images:
+                            order_grid = make_grid(_heatmap_images(order_map), nrow=sample_count)
+                            order_path = image_dir / f"step-{global_step:08d}-single_stream_order_{trace_strategy}.png"
+                            save_image(order_grid, order_path)
+                            wandb_images[f"{log_prefix}/debug/generation_order"] = order_path
                     if isinstance(step_map, torch.Tensor):
-                        step_grid = make_grid(_heatmap_images(step_map), nrow=sample_count)
-                        step_path = image_dir / f"step-{global_step:08d}-single_stream_steps_{trace_strategy}.png"
-                        save_image(step_grid, step_path)
-                        wandb_images[f"{log_prefix}/generation_steps"] = step_path
                         logs[f"{log_prefix}/generation_step_max"] = step_map.float().max().item()
+                        if save_debug_images:
+                            step_grid = make_grid(_heatmap_images(step_map), nrow=sample_count)
+                            step_path = image_dir / f"step-{global_step:08d}-single_stream_steps_{trace_strategy}.png"
+                            save_image(step_grid, step_path)
+                            wandb_images[f"{log_prefix}/debug/generation_steps"] = step_path
                     if isinstance(score_map, torch.Tensor):
-                        score_grid = make_grid(_heatmap_images(score_map), nrow=sample_count)
-                        score_path = image_dir / f"step-{global_step:08d}-single_stream_scores_{trace_strategy}.png"
-                        save_image(score_grid, score_path)
-                        wandb_images[f"{log_prefix}/generation_scores"] = score_path
                         valid_scores = score_map[score_map != 0].float()
                         if valid_scores.numel() > 0:
                             score_mean = valid_scores.mean().item()
                             score_std = valid_scores.std(unbiased=False).item()
                             logs[f"{log_prefix}/generation_score_mean"] = score_mean
                             logs[f"{log_prefix}/generation_score_std"] = score_std
+                        if save_debug_images:
+                            score_grid = make_grid(_heatmap_images(score_map), nrow=sample_count)
+                            score_path = image_dir / f"step-{global_step:08d}-single_stream_scores_{trace_strategy}.png"
+                            save_image(score_grid, score_path)
+                            wandb_images[f"{log_prefix}/debug/generation_scores"] = score_path
 
-            if comparison_tiles:
-                all_single_grid = make_grid(torch.cat(comparison_tiles, dim=0), nrow=sample_count)
-                all_single_path = image_dir / f"step-{global_step:08d}-single_stream_all_strategies.png"
-                save_image(all_single_grid, all_single_path)
-                wandb_images["val/single_stream/all_strategy_preds"] = all_single_path
-                logger.info(f"Validation single-stream strategies: {', '.join(comparison_names)}")
+        else:
+            comparison_tiles = []
+            comparison_names = []
+
+        overview_tiles = [target_img, denoise_img, pred_img] + comparison_tiles
+        overview_grid = make_grid(torch.stack(overview_tiles, dim=1).flatten(0, 1), nrow=len(overview_tiles))
+        overview_path = image_dir / f"step-{global_step:08d}-overview.png"
+        save_image(overview_grid, overview_path)
+        wandb_images["val/overview_target_denoise_fullsample"] = overview_path
+        logger.info(
+            "Validation overview columns: target, denoise_x0, full_sample"
+            + (f", {', '.join(comparison_names)}" if comparison_names else "")
+        )
         accelerator.log(logs, step=global_step)
         _log_wandb_validation_images(accelerator, wandb_images, global_step)
         logger.info(f"Saved validation diffusion images to {image_dir}")

@@ -30,6 +30,7 @@ def tiny_qwen3_config():
         max_position_embeddings=32,
     )
     config.mask_token_id = 7
+    config.image_mask_token_id = 8
     config.image_latent_dim = 4
     config.image_tokens_per_img = 4
     return config
@@ -73,12 +74,13 @@ class FakeImageDiffusionHead:
         self.latent_dim = latent_dim
         self.sample_calls = []
 
-    def sample(self, z, temperature=1.0, cfg=1.0):
+    def sample(self, z, temperature=1.0, cfg=1.0, clip_denoised=False):
         self.sample_calls.append(
             {
                 "z": z.detach().clone(),
                 "temperature": temperature,
                 "cfg": cfg,
+                "clip_denoised": clip_denoised,
             }
         )
         return torch.zeros(z.shape[0], self.latent_dim, device=z.device, dtype=z.dtype)
@@ -103,6 +105,7 @@ class FakeInnerModel:
         self.calls = []
 
     def __call__(self, **kwargs):
+        image_condition_drop = bool(kwargs.get("image_condition_drop", False))
         self.calls.append(
             {
                 "calculate_likelihood": kwargs["calculate_likelihood"],
@@ -110,6 +113,7 @@ class FakeInnerModel:
                 "image_latent_mask": kwargs["image_latent_mask"].detach().clone(),
                 "image_latents": kwargs["image_latents"].detach().clone(),
                 "token_types": kwargs["token_types"].detach().clone(),
+                "image_condition_drop": image_condition_drop,
             }
         )
         input_ids = kwargs["X0_input_ids"]
@@ -120,6 +124,7 @@ class FakeInnerModel:
             device=input_ids.device,
             dtype=kwargs["image_latents"].dtype,
         )
+        hidden.fill_(2.0 if image_condition_drop else 1.0)
         return types.SimpleNamespace(last_hidden_state=hidden)
 
 
@@ -279,9 +284,10 @@ class SelflessFlowBehaviorTest(unittest.TestCase):
         )
 
     def test_image_latent_projector_handles_bfloat16_weights(self):
-        projector = ImageLatentProjector(latent_dim=4, hidden_size=8, projector_width=16).to(dtype=torch.bfloat16)
+        projector = ImageLatentProjector(latent_dim=4, hidden_size=8, projector_width=16, image_tokens_per_img=4).to(dtype=torch.bfloat16)
         latents = torch.randn(5, 4, dtype=torch.float32)
-        out = projector(latents)
+        positions = torch.tensor([0, 1, 2, 3, 0])
+        out = projector(latents, positions)
         self.assertEqual(tuple(out.shape), (5, 8))
         self.assertEqual(out.dtype, torch.bfloat16)
 
@@ -372,16 +378,29 @@ class SelflessFlowBehaviorTest(unittest.TestCase):
         )
 
         call = capture.calls[-1]
-        mask_embeds = model.embed_tokens(
+        expected_xt = model.embed_tokens(
             torch.full_like(input_ids, config.mask_token_id)
         )
-        self.assertTrue(torch.allclose(call["xt"], mask_embeds))
+        image_positions = model._image_local_positions(token_types)
+        image_mask = token_types == 1
+        image_mask_embedding = model._image_mask_embedding(
+            input_ids.device,
+            model.image_latent_proj.weight_dtype,
+        )
+        expected_xt[image_mask] = model.image_latent_proj.embed_mask(
+            image_positions[image_mask],
+            image_mask_embedding,
+        )
+        self.assertTrue(torch.allclose(call["xt"], expected_xt))
 
-        expected_x0 = model.embed_tokens(input_ids)
-        expected_x0[:, 1:3] = model.image_latent_proj(image_latents[:, 1:3])
+        expected_x0 = model.embed_tokens(input_ids.masked_fill(image_mask, config.image_mask_token_id))
+        expected_x0[image_mask] = model.image_latent_proj(
+            image_latents[image_mask],
+            image_positions[image_mask],
+        )
         self.assertTrue(torch.allclose(call["x0"], expected_x0))
 
-        self.assertTrue(torch.allclose(output.last_hidden_state, mask_embeds))
+        self.assertTrue(torch.allclose(output.last_hidden_state, expected_xt))
 
     def test_single_stream_unfilled_image_tokens_use_same_mask_embedding(self):
         config = tiny_qwen3_config()
@@ -408,10 +427,95 @@ class SelflessFlowBehaviorTest(unittest.TestCase):
         call = capture.calls[-1]
         self.assertIsNone(call["xt"])
 
-        expected_x0 = model.embed_tokens(input_ids.masked_fill(token_types == 1, config.mask_token_id))
-        expected_x0[:, 1] = model.image_latent_proj(image_latents[:, 1])
+        image_positions = model._image_local_positions(token_types)
+        image_mask = token_types == 1
+        image_mask_embedding = model._image_mask_embedding(
+            input_ids.device,
+            model.image_latent_proj.weight_dtype,
+        )
+        expected_x0 = model.embed_tokens(input_ids.masked_fill(image_mask, config.image_mask_token_id))
+        expected_x0[image_mask] = model.image_latent_proj.embed_mask(
+            image_positions[image_mask],
+            image_mask_embedding,
+        )
+        visible_image = image_mask & image_latent_mask
+        expected_x0[visible_image] = model.image_latent_proj(
+            image_latents[visible_image],
+            image_positions[visible_image],
+        )
         self.assertTrue(torch.allclose(call["x0"], expected_x0))
-        self.assertTrue(torch.allclose(call["x0"][:, 2], model.embed_tokens(torch.tensor([config.mask_token_id]))))
+        self.assertTrue(torch.allclose(call["x0"][:, 2], expected_x0[:, 2]))
+
+    def test_forced_image_condition_drop_replaces_text_and_special_only(self):
+        config = tiny_qwen3_config()
+        model = Qwen3Model(config)
+        capture = CaptureLayer()
+        model.layers = nn.ModuleList([capture])
+        model.norm = nn.Identity()
+        model.eval()
+
+        with torch.no_grad():
+            model.image_condition_null.fill_(3.0)
+
+        input_ids = torch.tensor([[1, 2, 3, 4, 5]])
+        token_types = torch.tensor([[0, 1, 1, 2, 3]])
+        image_latents = torch.arange(20, dtype=torch.float32).view(1, 5, 4)
+        image_latent_mask = torch.tensor([[False, True, False, False, False]])
+
+        model(
+            X0_input_ids=input_ids,
+            attention_mask=object(),
+            token_types=token_types,
+            image_latents=image_latents,
+            image_latent_mask=image_latent_mask,
+            image_condition_drop=True,
+            calculate_likelihood=False,
+        )
+
+        call = capture.calls[-1]
+        image_positions = model._image_local_positions(token_types)
+        image_mask = token_types == 1
+        image_mask_embedding = model._image_mask_embedding(
+            input_ids.device,
+            model.image_latent_proj.weight_dtype,
+        )
+        expected_x0 = model.embed_tokens(input_ids.masked_fill(image_mask, config.image_mask_token_id))
+        expected_x0[image_mask] = model.image_latent_proj.embed_mask(
+            image_positions[image_mask],
+            image_mask_embedding,
+        )
+        visible_image = image_mask & image_latent_mask
+        expected_x0[visible_image] = model.image_latent_proj(
+            image_latents[visible_image],
+            image_positions[visible_image],
+        )
+        expected_x0[:, 0] = model.image_condition_null
+        expected_x0[:, 3] = model.image_condition_null
+        self.assertTrue(torch.allclose(call["x0"], expected_x0))
+
+    def test_image_diffusion_cfg_requires_paired_unconditional_condition(self):
+        latent_dim = 4
+        head = FakeImageDiffusionHead(latent_dim=latent_dim)
+        dummy = types.SimpleNamespace(image_diffusion_head=head)
+        z = torch.ones(3, latent_dim)
+        z_uncond = torch.full_like(z, 2.0)
+
+        out = Qwen3ForCausalLM.sample_image_diffusion_with_cfg(
+            dummy,
+            z,
+            z_uncond=z_uncond,
+            temperature=0.7,
+            cfg=3.0,
+            clip_denoised=True,
+        )
+
+        self.assertEqual(tuple(out.shape), (3, latent_dim))
+        call = head.sample_calls[-1]
+        self.assertEqual(call["cfg"], 3.0)
+        self.assertEqual(call["temperature"], 0.7)
+        self.assertTrue(call["clip_denoised"])
+        self.assertTrue(torch.equal(call["z"][:3], z))
+        self.assertTrue(torch.equal(call["z"][3:], z_uncond))
 
     def test_single_stream_helper_uses_single_stream_masks_and_original_sigma(self):
         latent_dim = 4
@@ -456,6 +560,45 @@ class SelflessFlowBehaviorTest(unittest.TestCase):
         ]
         for call, expected in zip(dummy.model.calls, expected_masks):
             self.assertEqual(call["image_latent_mask"][0, 2:6].tolist(), expected)
+
+    def test_single_stream_cfg_uses_cond_and_uncond_hidden_pairs(self):
+        latent_dim = 4
+        hidden_size = 8
+        dummy = types.SimpleNamespace(
+            config=types.SimpleNamespace(image_tokens_per_img=4),
+            model=FakeInnerModel(hidden_size=hidden_size),
+            image_diffusion_head=FakeImageDiffusionHead(latent_dim=latent_dim),
+        )
+
+        input_ids = torch.tensor([[10, 11, 7, 7, 7, 7, 12, 13]])
+        token_types = torch.tensor([[0, 2, 1, 1, 1, 1, 2, 2]])
+        sigma = torch.tensor([[0, 1, 4, 5, 3, 6, 2, 7]])
+        spans = [(0, 2, 6)]
+
+        with patch("utils.utils.get_selfless_mask", side_effect=lambda sigma, seq_len, device: sigma.detach().clone()):
+            generated = Qwen3ForCausalLM.sample_image_latents_single_stream(
+                dummy,
+                input_ids=input_ids,
+                token_types=token_types,
+                sigma=sigma,
+                spans=spans,
+                image_latent_dim=latent_dim,
+                diffusion_cfg=2.0,
+                parallel_rate=1,
+                order_strategy="sigma",
+            )
+
+        self.assertEqual(tuple(generated.shape), (1, latent_dim, 2, 2))
+        self.assertEqual(len(dummy.model.calls), 8)
+        self.assertEqual(len(dummy.image_diffusion_head.sample_calls), 4)
+        for cond_call, uncond_call in zip(dummy.model.calls[0::2], dummy.model.calls[1::2]):
+            self.assertFalse(cond_call["image_condition_drop"])
+            self.assertTrue(uncond_call["image_condition_drop"])
+        for sample_call in dummy.image_diffusion_head.sample_calls:
+            self.assertEqual(sample_call["cfg"], 2.0)
+            self.assertEqual(tuple(sample_call["z"].shape), (2, hidden_size))
+            self.assertTrue(torch.all(sample_call["z"][0] == 1.0))
+            self.assertTrue(torch.all(sample_call["z"][1] == 2.0))
 
 
 if __name__ == "__main__":

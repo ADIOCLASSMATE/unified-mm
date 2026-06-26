@@ -110,12 +110,19 @@ def load_model_tokenizer(config: OmegaConf, logger=None):
     # Register BOI/EOI tokens for multimodal (begin/end of image)
     boi_token = "<|boi|>"
     eoi_token = "<|eoi|>"
+    image_mask_token = "<|img_mask|>"
 
-    if boi_token not in tokenizer.get_vocab():
-        tokenizer.add_tokens([boi_token, eoi_token], special_tokens=True)
+    tokens_to_add = [
+        token
+        for token in (boi_token, eoi_token, image_mask_token)
+        if token not in tokenizer.get_vocab()
+    ]
+    if tokens_to_add:
+        tokenizer.add_tokens(tokens_to_add, special_tokens=True)
 
     config.model.boi_token_id = tokenizer.convert_tokens_to_ids(boi_token)
     config.model.eoi_token_id = tokenizer.convert_tokens_to_ids(eoi_token)
+    config.model.image_mask_token_id = tokenizer.convert_tokens_to_ids(image_mask_token)
 
     # image_offset: where image codebook indices start in the unified input_ids space.
     # Keep the configured value so dual-head and unified-head ablations can share
@@ -126,7 +133,8 @@ def load_model_tokenizer(config: OmegaConf, logger=None):
     if logger is not None:
         logger.info('special tokens : \n', tokenizer.special_tokens_map)
         logger.info(f'BOI token id: {config.model.boi_token_id}, '
-                    f'EOI token id: {config.model.eoi_token_id}')
+                    f'EOI token id: {config.model.eoi_token_id}, '
+                    f'IMG_MASK token id: {config.model.image_mask_token_id}')
     
     
     project = config.experiment.project
@@ -172,11 +180,12 @@ def load_model_tokenizer(config: OmegaConf, logger=None):
     
     multimodal_config_keys = (
         "image_vocab_size", "image_offset", "lambda_image", "lambda_text",
-        "boi_token_id", "eoi_token_id", "unified_head", "image_tokens_per_img",
+        "boi_token_id", "eoi_token_id", "image_mask_token_id", "unified_head", "image_tokens_per_img",
         "image_latent_dim", "continuous_image_latents", "image_diffusion_width",
         "image_diffusion_depth", "image_diffusion_num_sampling_steps",
         "image_diffusion_batch_mul", "image_diffusion_grad_checkpointing",
-        "image_projector_width",
+        "image_diffusion_condition_norm", "image_diffusion_condition_norm_eps",
+        "image_condition_drop_prob", "image_projector_width",
     )
 
     if config.training.from_scratch:
@@ -225,7 +234,11 @@ def load_model_tokenizer(config: OmegaConf, logger=None):
             trust_remote_code=True
         )
 
-        if "flow" in project.lower():
+        if (
+            "flow" in project.lower()
+            or "diffusion" in project.lower()
+            or config.model.get("continuous_image_latents", False)
+        ):
             if len(tokenizer) > model.config.vocab_size:
                 model.resize_token_embeddings(len(tokenizer))
         # Unified head: expand embeddings + lm_head to include image vocab
@@ -284,6 +297,22 @@ def load_model_tokenizer(config: OmegaConf, logger=None):
                     model.config.im_end_token_id = im_end_ids[0]
             except:
                 model.config.im_end_token_id = None
+
+    if len(tokenizer) > model.config.vocab_size:
+        model.resize_token_embeddings(len(tokenizer))
+
+    image_mask_token_id = getattr(model.config, "image_mask_token_id", None)
+    if image_mask_token_id is not None:
+        with torch.no_grad():
+            embed = model.model.embed_tokens.weight
+            mask_token_id = int(model.config.mask_token_id)
+            image_mask_token_id = int(image_mask_token_id)
+            if (
+                0 <= mask_token_id < embed.shape[0]
+                and 0 <= image_mask_token_id < embed.shape[0]
+                and mask_token_id != image_mask_token_id
+            ):
+                embed[image_mask_token_id].copy_(embed[mask_token_id])
     
     # 启用 Gradient Checkpointing
     if config.training.get("use_gradient_checkpointing", True):

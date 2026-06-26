@@ -56,26 +56,66 @@ except ImportError:
     
 
 class ImageLatentProjector(nn.Module):
-    def __init__(self, latent_dim, hidden_size, projector_width=None):
+    def __init__(self, latent_dim, hidden_size, projector_width=None, image_tokens_per_img=256):
         super().__init__()
-        projector_width = int(projector_width or hidden_size * 2)
-        self.in_norm = nn.LayerNorm(latent_dim, eps=1e-6)
-        self.fc1 = nn.Linear(latent_dim, projector_width, bias=True)
-        self.act = nn.GELU()
-        self.fc2 = nn.Linear(projector_width, hidden_size, bias=True)
-        self.out_norm = nn.LayerNorm(hidden_size, eps=1e-6)
+        self.latent_dim = int(latent_dim)
+        self.hidden_size = int(hidden_size)
+        self.image_tokens_per_img = int(image_tokens_per_img)
+        self.z_proj = nn.Linear(self.latent_dim, self.hidden_size, bias=True)
+        self.z_proj_ln = nn.LayerNorm(self.hidden_size, eps=1e-6)
+        self.image_pos_embed = nn.Embedding(self.image_tokens_per_img, self.hidden_size)
+        self.diffusion_pos_embed = nn.Embedding(self.image_tokens_per_img, self.hidden_size)
+        self._reset_mar_slots()
+
+    def _reset_mar_slots(self):
+        nn.init.zeros_(self.z_proj.weight)
+        nn.init.zeros_(self.z_proj.bias)
+        nn.init.ones_(self.z_proj_ln.weight)
+        nn.init.zeros_(self.z_proj_ln.bias)
+        nn.init.zeros_(self.image_pos_embed.weight)
+        nn.init.zeros_(self.diffusion_pos_embed.weight)
 
     @property
     def weight_dtype(self):
-        return self.fc1.weight.dtype
+        return self.z_proj.weight.dtype
 
-    def forward(self, latents):
-        x = latents.to(dtype=self.in_norm.weight.dtype)
-        x = self.in_norm(x).to(dtype=self.fc1.weight.dtype)
-        x = self.fc1(x)
-        x = self.act(x)
-        x = self.fc2(x)
-        return self.out_norm(x)
+    def _positions(self, local_positions, device):
+        if local_positions is None:
+            return None
+        local_positions = local_positions.to(device=device, dtype=torch.long)
+        if local_positions.numel() > 0:
+            if int(local_positions.min().item()) < 0 or int(local_positions.max().item()) >= self.image_tokens_per_img:
+                raise ValueError(
+                    f"image local positions must be in [0, {self.image_tokens_per_img}), "
+                    f"got min={int(local_positions.min().item())}, max={int(local_positions.max().item())}"
+                )
+        return local_positions
+
+    def embed_latents(self, latents, local_positions=None):
+        x = latents.to(dtype=self.z_proj.weight.dtype)
+        x = self.z_proj(x)
+        local_positions = self._positions(local_positions, x.device)
+        if local_positions is not None:
+            x = x + self.image_pos_embed(local_positions).to(dtype=x.dtype)
+        return self.z_proj_ln(x)
+
+    def embed_mask(self, local_positions, mask_embedding):
+        local_positions = self._positions(local_positions, mask_embedding.device)
+        if local_positions is None:
+            raise ValueError("local_positions must be provided when embedding image mask tokens.")
+        x = mask_embedding.to(dtype=self.z_proj.weight.dtype)
+        x = x.expand(local_positions.shape + (x.shape[-1],))
+        x = x + self.image_pos_embed(local_positions).to(dtype=x.dtype)
+        return self.z_proj_ln(x)
+
+    def add_diffusion_pos(self, z, local_positions=None):
+        local_positions = self._positions(local_positions, z.device)
+        if local_positions is None:
+            return z
+        return z + self.diffusion_pos_embed(local_positions).to(dtype=z.dtype)
+
+    def forward(self, latents, local_positions=None):
+        return self.embed_latents(latents, local_positions=local_positions)
 
 
 def _compute_default_rope_parameters(config: Qwen3Config, device=None):
@@ -183,6 +223,42 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
         return hidden_states
     hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+
+def _normalize_image_diffusion_condition(
+    z: torch.Tensor,
+    norm_mode: str = "none",
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    norm_mode = str(norm_mode or "none").lower()
+    if norm_mode in {"none", "false", "off", ""}:
+        return z
+    z_float = z.float()
+    if norm_mode in {"rms", "rmsnorm"}:
+        rms = z_float.pow(2).mean(dim=-1, keepdim=True).sqrt()
+        return (z_float / rms.clamp_min(float(eps))).to(z.dtype)
+    if norm_mode in {"layernorm", "layer_norm", "ln"}:
+        return F.layer_norm(z_float, (z.shape[-1],)).to(z.dtype)
+    raise ValueError(
+        f"Unknown image_diffusion_condition_norm={norm_mode!r}; "
+        "expected rms, layer_norm, or none."
+    )
+
+
+def _image_diffusion_condition_norm_config(obj) -> tuple[str, float]:
+    config = getattr(obj, "config", None)
+    norm_mode = getattr(obj, "image_diffusion_condition_norm", None)
+    if norm_mode is None and config is not None:
+        norm_mode = getattr(config, "image_diffusion_condition_norm", None)
+    if norm_mode is None:
+        norm_mode = "none"
+
+    eps = getattr(obj, "image_diffusion_condition_norm_eps", None)
+    if eps is None and config is not None:
+        eps = getattr(config, "image_diffusion_condition_norm_eps", None)
+    if eps is None:
+        eps = 1e-6
+    return str(norm_mode).lower(), float(eps)
 
 
 @torch.compile(fullgraph=True, mode="max-autotune-no-cudagraphs")
@@ -450,12 +526,16 @@ class Qwen3Model(Qwen3PreTrainedModel):
         self.vocab_size = config.vocab_size
 
         self.image_latent_dim = getattr(config, "image_latent_dim", 4)
+        self.image_condition_drop_prob = float(getattr(config, "image_condition_drop_prob", 0.0))
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.image_latent_proj = ImageLatentProjector(
             self.image_latent_dim,
             config.hidden_size,
             getattr(config, "image_projector_width", None),
+            getattr(config, "image_tokens_per_img", 256),
         )
+        self.image_condition_null = nn.Parameter(torch.empty(config.hidden_size))
+        nn.init.normal_(self.image_condition_null, std=0.02)
         self.layers = nn.ModuleList(
             [Qwen3DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
@@ -466,12 +546,95 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
         # Initialize weights and apply final processing
         self.post_init()
+        self.image_latent_proj._reset_mar_slots()
 
     def get_input_embeddings(self):
         return self.embed_tokens
 
     def set_input_embeddings(self, new_embeddings):
         self.embed_tokens = new_embeddings
+
+    def _image_mask_token_id(self) -> int:
+        return int(getattr(self.config, "image_mask_token_id", self.config.mask_token_id))
+
+    def _image_mask_embedding(self, device, dtype):
+        token_id = self._image_mask_token_id()
+        if token_id < 0 or token_id >= self.embed_tokens.num_embeddings:
+            raise ValueError(
+                f"image_mask_token_id={token_id} is outside embedding vocab size "
+                f"{self.embed_tokens.num_embeddings}."
+            )
+        token = torch.tensor([token_id], device=device, dtype=torch.long)
+        return self.embed_tokens(token)[0].to(dtype=dtype)
+
+    def _image_local_positions(self, token_types: torch.Tensor) -> torch.Tensor:
+        is_image = token_types == 1
+        local_positions = torch.full(
+            token_types.shape,
+            -1,
+            device=token_types.device,
+            dtype=torch.long,
+        )
+        if not is_image.any():
+            return local_positions
+
+        for batch_idx in range(is_image.shape[0]):
+            positions = is_image[batch_idx].nonzero(as_tuple=True)[0]
+            if positions.numel() == 0:
+                continue
+            gaps = (positions[1:] != positions[:-1] + 1).nonzero(as_tuple=True)[0] + 1
+            boundaries = torch.cat(
+                [
+                    torch.zeros(1, device=positions.device, dtype=torch.long),
+                    gaps,
+                    torch.full((1,), positions.numel(), device=positions.device, dtype=torch.long),
+                ]
+            )
+            for start_idx, end_idx in zip(boundaries[:-1].tolist(), boundaries[1:].tolist()):
+                span = positions[start_idx:end_idx]
+                span_len = span.numel()
+                if span_len > self.image_latent_proj.image_tokens_per_img:
+                    raise ValueError(
+                        f"image span length {span_len} exceeds image_tokens_per_img="
+                        f"{self.image_latent_proj.image_tokens_per_img}"
+                    )
+                local_positions[batch_idx, span] = torch.arange(
+                    span_len,
+                    device=token_types.device,
+                    dtype=torch.long,
+                )
+        return local_positions
+
+    def _apply_image_condition_drop(
+        self,
+        inputs_embeds: torch.Tensor,
+        token_types: torch.Tensor,
+        force_drop: bool = False,
+    ) -> torch.Tensor:
+        condition_token_mask = (token_types != 1) & (token_types != 3)
+        if not condition_token_mask.any():
+            return inputs_embeds
+
+        if force_drop:
+            drop_mask = condition_token_mask
+        else:
+            drop_prob = self.image_condition_drop_prob
+            if not (self.training and drop_prob > 0.0):
+                return inputs_embeds
+            has_image = (token_types == 1).any(dim=1)
+            drop_rows = torch.rand(
+                token_types.shape[0],
+                device=token_types.device,
+            ) < drop_prob
+            drop_rows = drop_rows & has_image
+            if not drop_rows.any():
+                return inputs_embeds
+            drop_mask = condition_token_mask & drop_rows[:, None]
+
+        dropped = inputs_embeds.clone()
+        null = self.image_condition_null.to(device=dropped.device, dtype=dropped.dtype)
+        dropped[drop_mask] = null
+        return dropped
 
     # @check_model_inputs
     @auto_docstring
@@ -509,8 +672,10 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 token_types = token_types.to(X0_input_ids.device)
                 image_latents = kwargs.get("image_latents", None)
                 image_latent_mask = kwargs.get("image_latent_mask", None)
+                image_condition_drop = bool(kwargs.get("image_condition_drop", False))
                 is_image = token_types == 1
-                safe_input_ids = X0_input_ids.masked_fill(is_image, self.config.mask_token_id)
+                image_local_positions = self._image_local_positions(token_types)
+                safe_input_ids = X0_input_ids.masked_fill(is_image, self._image_mask_token_id())
                 X0_inputs_embeds = self.embed_tokens(safe_input_ids)
                 if is_image.any():
                     if image_latents is None:
@@ -525,8 +690,21 @@ class Qwen3Model(Qwen3PreTrainedModel):
                     if image_latent_mask is not None:
                         image_latent_mask = image_latent_mask.to(device=X0_input_ids.device, dtype=torch.bool)
                         use_image_latent = is_image & image_latent_mask
+                    use_image_mask = is_image & ~use_image_latent
+                    image_mask_embedding = self._image_mask_embedding(
+                        device=X0_input_ids.device,
+                        dtype=self.image_latent_proj.weight_dtype,
+                    )
+                    if use_image_mask.any():
+                        X0_inputs_embeds[use_image_mask] = self.image_latent_proj.embed_mask(
+                            image_local_positions[use_image_mask],
+                            image_mask_embedding,
+                        )
                     if use_image_latent.any():
-                        X0_inputs_embeds[use_image_latent] = self.image_latent_proj(image_latents[use_image_latent])
+                        X0_inputs_embeds[use_image_latent] = self.image_latent_proj(
+                            image_latents[use_image_latent],
+                            image_local_positions[use_image_latent],
+                        )
                 elif self.training:
                     dummy_latent = torch.zeros(
                         1,
@@ -535,12 +713,30 @@ class Qwen3Model(Qwen3PreTrainedModel):
                         dtype=self.image_latent_proj.weight_dtype,
                     )
                     X0_inputs_embeds = X0_inputs_embeds + self.image_latent_proj(dummy_latent).sum() * 0.0
+                X0_inputs_embeds = self._apply_image_condition_drop(
+                    X0_inputs_embeds,
+                    token_types,
+                    force_drop=image_condition_drop,
+                )
 
         if self.training or calculate_likelihood:
             if self.XT_input_ids is None or self.XT_input_ids.shape != X0_input_ids.shape:
                 self.XT_input_ids = torch.full_like(X0_input_ids, self.config.mask_token_id)
-            # XT stream: mask tokens use text embedding (XT always gets [MASK] embeddings)
             XT_inputs_embeds = self.embed_tokens(self.XT_input_ids)
+            token_types = kwargs.get("token_types", None)
+            if token_types is not None:
+                token_types = token_types.to(X0_input_ids.device)
+                is_image = token_types == 1
+                if is_image.any():
+                    image_local_positions = self._image_local_positions(token_types)
+                    image_mask_embedding = self._image_mask_embedding(
+                        device=X0_input_ids.device,
+                        dtype=self.image_latent_proj.weight_dtype,
+                    )
+                    XT_inputs_embeds[is_image] = self.image_latent_proj.embed_mask(
+                        image_local_positions[is_image],
+                        image_mask_embedding,
+                    )
         else:
             self.XT_input_ids = None
             XT_inputs_embeds = None
@@ -604,6 +800,13 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         self.lambda_image = getattr(config, "lambda_image", 0.5)
         self.lambda_text = getattr(config, "lambda_text", 1.0)
         self.image_diffusion_batch_mul = int(getattr(config, "image_diffusion_batch_mul", 1))
+        self.image_diffusion_condition_norm = str(
+            getattr(config, "image_diffusion_condition_norm", "rms")
+        ).lower()
+        self.image_diffusion_condition_norm_eps = float(
+            getattr(config, "image_diffusion_condition_norm_eps", 1e-6)
+        )
+        self.image_condition_drop_prob = float(getattr(config, "image_condition_drop_prob", 0.0))
 
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.image_diffusion_head = DiffLoss(
@@ -617,6 +820,49 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
 
         # Initialize weights and apply final processing
         self.post_init()
+        self.model.image_latent_proj._reset_mar_slots()
+
+    def _prepare_image_diffusion_condition(
+        self,
+        z: torch.Tensor,
+        image_local_positions: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if image_local_positions is not None:
+            z = self.model.image_latent_proj.add_diffusion_pos(z, image_local_positions)
+        return _normalize_image_diffusion_condition(
+            z,
+            self.image_diffusion_condition_norm,
+            self.image_diffusion_condition_norm_eps,
+        )
+
+    def sample_image_diffusion_with_cfg(
+        self,
+        z: torch.Tensor,
+        z_uncond: torch.Tensor | None = None,
+        temperature: float = 1.0,
+        cfg: float = 1.0,
+        clip_denoised: bool = False,
+    ) -> torch.Tensor:
+        if cfg == 1.0:
+            return self.image_diffusion_head.sample(
+                z,
+                temperature=temperature,
+                cfg=1.0,
+                clip_denoised=clip_denoised,
+            )
+        if z_uncond is None:
+            raise ValueError("cfg != 1.0 requires z_uncond; pass paired conditional/unconditional conditions.")
+        if z.shape != z_uncond.shape:
+            raise ValueError(f"z and z_uncond must have the same shape, got {tuple(z.shape)} vs {tuple(z_uncond.shape)}")
+        paired = torch.cat([z, z_uncond], dim=0)
+        sampled = self.image_diffusion_head.sample(
+            paired,
+            temperature=temperature,
+            cfg=cfg,
+            clip_denoised=clip_denoised,
+        )
+        sampled, _ = sampled.chunk(2, dim=0)
+        return sampled
 
     def tie_weights(self, missing_keys: set[str] | None = None, recompute_mapping: bool = True):
         # Delegate standard tie (lm_head ↔ embed_tokens) to parent
@@ -660,6 +906,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 Whether to calculate the likelihood of the input sequence. If `True`, the model will compute the likelihood using the XT stream, which is necessary for training. If `False`, the model will only compute the hidden states for the X0 stream, which can be used for efficient decoding. Note that when `calculate_likelihood` is `True`, the model will return the likelihood loss in the `loss` field of the output, and the `logits` field will contain the logits from the XT stream.
         ```"""
         calculate_likelihood = calculate_likelihood or labels is not None
+        return_logits = bool(kwargs.pop("return_logits", True))
         outputs: BaseModelOutputWithPast = self.model(
             X0_input_ids=X0_input_ids,
             attention_mask=attention_mask,
@@ -678,7 +925,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
 
         token_types = kwargs.get("token_types", None)
         logits = None
-        if not (labels is not None and token_types is not None):
+        if return_logits and not (labels is not None and token_types is not None):
             logits = self.lm_head(hidden_states[:, slice_indices, :])
 
         loss = None
@@ -690,6 +937,8 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
 
                 flat_hidden = hidden_states.view(-1, hidden_states.size(-1))
                 flat_labels = labels.view(-1)
+                image_local_positions = self.model._image_local_positions(token_types)
+                flat_image_positions = image_local_positions.view(-1)
 
                 text_flat_mask = text_mask.view(-1)
                 image_flat_mask = image_mask.view(-1)
@@ -712,14 +961,17 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                         )
                     flat_image_latents = image_latents.to(hidden_states.device).view(-1, self.image_latent_dim)
                     image_targets = flat_image_latents[image_flat_mask]
-                    image_conditions = flat_hidden[image_flat_mask]
+                    image_conditions = self._prepare_image_diffusion_condition(
+                        flat_hidden[image_flat_mask],
+                        flat_image_positions[image_flat_mask],
+                    )
                     if self.image_diffusion_batch_mul > 1:
                         image_targets = image_targets.repeat(self.image_diffusion_batch_mul, 1)
                         image_conditions = image_conditions.repeat(self.image_diffusion_batch_mul, 1)
                     image_loss = self.image_diffusion_head(target=image_targets, z=image_conditions)
                 else:
                     dummy_target = torch.zeros(1, self.image_latent_dim, device=hidden_states.device)
-                    dummy_hidden = flat_hidden[:1]
+                    dummy_hidden = self._prepare_image_diffusion_condition(flat_hidden[:1])
                     image_loss = self.image_diffusion_head(dummy_target, dummy_hidden) * 0.0
 
                 loss = self.lambda_text * text_loss + self.lambda_image * image_loss
@@ -763,6 +1015,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         image_latent_dim: int | None = None,
         diffusion_temperature: float = 1.0,
         diffusion_cfg: float = 1.0,
+        diffusion_clip_denoised: bool = False,
         parallel_rate: int = 32,
         order_strategy: str = "condition_norm",
         return_trace: bool = False,
@@ -862,7 +1115,17 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         next_image_order = torch.zeros(len(spans), device=device, dtype=torch.float32)
         k = max(1, int(parallel_rate))
         order_strategy = str(order_strategy or "condition_norm").lower()
+        condition_norm_mode, condition_norm_eps = _image_diffusion_condition_norm_config(self)
         replay_original_sigma = order_strategy in {"sigma", "sigma_replay"}
+        def _condition(hidden_values: torch.Tensor, local_positions: torch.Tensor) -> torch.Tensor:
+            if hasattr(self, "_prepare_image_diffusion_condition"):
+                return self._prepare_image_diffusion_condition(hidden_values, local_positions)
+            return _normalize_image_diffusion_condition(
+                hidden_values,
+                condition_norm_mode,
+                condition_norm_eps,
+            )
+
         if not replay_original_sigma:
             for sample_idx, start, end in local_spans:
                 original_image_sigma = selected_sigma[sample_idx, start:end]
@@ -888,6 +1151,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             "uniform": _spatial_uniform_order(),
         }
         latent_level_strategies = {"latent_proj_cosine"}
+        use_diffusion_cfg = diffusion_cfg != 1.0
 
         while not filled.all():
             attention_mask = get_selfless_mask(
@@ -906,6 +1170,17 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 image_latent_mask=image_latent_mask,
                 calculate_likelihood=False,
             ).last_hidden_state
+            uncond_hidden = None
+            if use_diffusion_cfg:
+                uncond_hidden = self.model(
+                    X0_input_ids=selected_input_ids,
+                    attention_mask=attention_mask,
+                    token_types=selected_token_types,
+                    image_latents=work_latents,
+                    image_latent_mask=image_latent_mask,
+                    image_condition_drop=True,
+                    calculate_likelihood=False,
+                ).last_hidden_state
 
             fill_local_positions = []
             if order_strategy in latent_level_strategies:
@@ -928,15 +1203,28 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 all_sample_indices = torch.cat(all_sample_indices)
                 all_seq_positions = torch.cat(all_seq_positions)
                 all_local_positions = torch.cat(all_local_positions)
-                z = hidden[all_sample_indices, all_seq_positions]
+                z = _condition(
+                    hidden[all_sample_indices, all_seq_positions],
+                    all_local_positions,
+                )
+                z_uncond = None
+                if use_diffusion_cfg:
+                    z_uncond = _condition(
+                        uncond_hidden[all_sample_indices, all_seq_positions],
+                        all_local_positions,
+                    )
 
-                candidate_pred = self.image_diffusion_head.sample(
+                candidate_pred = Qwen3ForCausalLM.sample_image_diffusion_with_cfg(
+                    self,
                     z,
+                    z_uncond=z_uncond,
                     temperature=diffusion_temperature,
                     cfg=diffusion_cfg,
+                    clip_denoised=diffusion_clip_denoised,
                 ).to(work_latents.dtype)
                 projected = self.model.image_latent_proj(
-                    candidate_pred.to(dtype=self.model.image_latent_proj.weight_dtype)
+                    candidate_pred.to(dtype=self.model.image_latent_proj.weight_dtype),
+                    all_local_positions,
                 )
                 all_scores = F.cosine_similarity(projected.float(), z.float(), dim=-1)
 
@@ -995,17 +1283,32 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             if order_strategy not in latent_level_strategies:
                 sample_indices = []
                 seq_positions = []
+                local_positions_for_condition = []
                 for sample_idx, positions, _, _ in fill_local_positions:
                     sample_indices.append(torch.full_like(positions, sample_idx))
                     seq_positions.append(local_spans[sample_idx][1] + positions)
+                    local_positions_for_condition.append(positions)
                 sample_indices = torch.cat(sample_indices)
                 seq_positions = torch.cat(seq_positions)
+                local_positions_for_condition = torch.cat(local_positions_for_condition)
 
-                z = hidden[sample_indices, seq_positions]
-                pred = self.image_diffusion_head.sample(
+                z = _condition(
+                    hidden[sample_indices, seq_positions],
+                    local_positions_for_condition,
+                )
+                z_uncond = None
+                if use_diffusion_cfg:
+                    z_uncond = _condition(
+                        uncond_hidden[sample_indices, seq_positions],
+                        local_positions_for_condition,
+                    )
+                pred = Qwen3ForCausalLM.sample_image_diffusion_with_cfg(
+                    self,
                     z,
+                    z_uncond=z_uncond,
                     temperature=diffusion_temperature,
                     cfg=diffusion_cfg,
+                    clip_denoised=diffusion_clip_denoised,
                 ).to(work_latents.dtype)
 
             cursor = 0
@@ -1110,6 +1413,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         boi_token_id = getattr(self.config, "boi_token_id", None)
         eoi_token_id = getattr(self.config, "eoi_token_id", None)
         eos_token_id = getattr(self.config, "eos_token_id", None)
+        image_mask_token_id = int(getattr(self.config, "image_mask_token_id", self.config.mask_token_id))
         if boi_token_id is None or eoi_token_id is None:
             raise ValueError("boi_token_id and eoi_token_id must be set for multimodal generation.")
 
@@ -1158,7 +1462,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 continue
 
             image_masks = torch.full(
-                (image_tokens_per_img,), self.config.mask_token_id, device=device, dtype=torch.long
+                (image_tokens_per_img,), image_mask_token_id, device=device, dtype=torch.long
             )
             eoi = torch.tensor([eoi_token_id], device=device, dtype=torch.long)
             seq = torch.cat([seq, image_masks, eoi])
@@ -1179,7 +1483,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             image_start = seq.shape[0] - image_tokens_per_img - 1
             image_end = seq.shape[0] - 1
             next_image_order = float(eoi_sigma.item() + 1.0)
-            while seq[image_start:image_end].eq(self.config.mask_token_id).any():
+            while seq[image_start:image_end].eq(image_mask_token_id).any():
                 L = seq.shape[0]
                 attention_mask = get_selfless_mask(sigma=sigma.unsqueeze(0), seq_len=L, device=device)
                 hidden = self.model(
@@ -1188,7 +1492,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                     token_types=token_types.unsqueeze(0),
                     calculate_likelihood=True,
                 ).last_hidden_state[0]
-                valid_mask = seq[image_start:image_end].eq(self.config.mask_token_id)
+                valid_mask = seq[image_start:image_end].eq(image_mask_token_id)
                 image_hidden = hidden[image_start:image_end]
                 image_logits = self._image_logits_from_hidden(image_hidden)
                 next_image_tokens, conf = self._sample_from_logits(image_logits, temperature)
