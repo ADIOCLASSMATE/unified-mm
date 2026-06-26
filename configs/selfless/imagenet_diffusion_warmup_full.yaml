@@ -105,9 +105,9 @@ training:
     from_scratch: false
     freeze_backbone_for_image_diffusion_warmup: true
     use_ema: true
-    ema_decay: 0.9995
+    ema_decay: 0.999
     ema_update_after_step: 0
-    ema_validate: true
+    ema_validate: false
     ema_save_adapter: true
     ema_save_hf_model: true
     save_image_diffusion_adapter: true
