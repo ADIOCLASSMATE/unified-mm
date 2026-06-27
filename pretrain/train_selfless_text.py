@@ -166,10 +166,15 @@ def main():
     if accelerator.is_main_process:
         log_config = {k: v for k, v in flatten_omega_conf(config, resolve=True)}
         log_config.pop("experiment.resume_from_checkpoint", None)
+        wandb_init_kwargs = {
+            "name": config.experiment.name,
+            "resume": "allow",
+            "mode": os.environ.get("WANDB_MODE", "online"),
+        }
         accelerator.init_trackers(
             config.experiment.wandb_project,
             config=log_config,
-            init_kwargs={"wandb": {"name": config.experiment.name}},
+            init_kwargs={"wandb": wandb_init_kwargs},
         )
 
     if config.training.seed is not None:

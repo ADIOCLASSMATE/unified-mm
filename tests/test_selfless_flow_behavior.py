@@ -370,6 +370,39 @@ class SelflessFlowBehaviorTest(unittest.TestCase):
         self.assertTrue(all("image_latents" not in batch for batch in batches))
         self.assertTrue(all(torch.equal(batch["token_types"], torch.zeros_like(batch["token_types"])) for batch in batches))
 
+    def test_combined_loader_accumulation_schedule_is_deterministic(self):
+        image_batch = {
+            "input_ids": torch.ones(2, 6, dtype=torch.long),
+            "token_types": torch.ones(2, 6, dtype=torch.uint8),
+            "sigma": torch.zeros(2, 6, dtype=torch.long),
+            "labels": torch.full((2, 6), -100, dtype=torch.long),
+            "image_latents": torch.zeros(2, 6, 4),
+        }
+        text_batch = {
+            "input_ids": torch.ones(2, 8, dtype=torch.long) * 2,
+            "token_types": torch.zeros(2, 8, dtype=torch.uint8),
+            "sigma": torch.arange(8).unsqueeze(0).expand(2, 8),
+            "labels": torch.ones(2, 8, dtype=torch.long) * 2,
+        }
+        image_loader = DataLoader([image_batch] * 8, batch_size=None)
+        text_loader = DataLoader([text_batch] * 2, batch_size=None)
+        combined = CombinedBatchDataLoader(
+            image_loader=image_loader,
+            text_loader=text_loader,
+            text_batch_ratio=0.25,
+            seed=1,
+            mode="train",
+            batch_schedule="accumulation",
+            accumulation_steps=4,
+            text_batches_per_accumulation=1,
+        )
+
+        sources = [batch["batch_source"] for batch in combined]
+        self.assertEqual(
+            sources,
+            ["image", "image", "image", "text", "image", "image", "image", "text"],
+        )
+
     def test_mar_diffusion_head_outputs_epsilon_and_variance_channels(self):
         head = DiffLoss(
             target_channels=4,
@@ -628,6 +661,51 @@ class SelflessFlowBehaviorTest(unittest.TestCase):
         ]
         for call, expected in zip(dummy.model.calls, expected_masks):
             self.assertEqual(call["image_latent_mask"][0, 2:6].tolist(), expected)
+
+    def test_single_stream_treats_initial_image_latent_mask_as_already_filled(self):
+        latent_dim = 4
+        hidden_size = 8
+        dummy = types.SimpleNamespace(
+            config=types.SimpleNamespace(image_tokens_per_img=4),
+            model=FakeInnerModel(hidden_size=hidden_size),
+            image_diffusion_head=FakeImageDiffusionHead(latent_dim=latent_dim),
+        )
+
+        input_ids = torch.tensor([[10, 11, 7, 7, 7, 7, 12, 13]])
+        token_types = torch.tensor([[0, 2, 1, 1, 1, 1, 2, 2]])
+        sigma = torch.tensor([[0, 1, 4, 5, 3, 6, 2, 7]])
+        spans = [(0, 2, 6)]
+        initial_latents = torch.zeros(1, 8, latent_dim)
+        initial_latents[0, 2] = torch.tensor([1.0, 2.0, 3.0, 4.0])
+        initial_latents[0, 4] = torch.tensor([5.0, 6.0, 7.0, 8.0])
+        initial_mask = torch.zeros(1, 8, dtype=torch.bool)
+        initial_mask[0, [2, 4]] = True
+
+        with patch("utils.utils.get_selfless_mask", side_effect=lambda sigma, seq_len, device: sigma.detach().clone()):
+            generated = Qwen3ForCausalLM.sample_image_latents_single_stream(
+                dummy,
+                input_ids=input_ids,
+                token_types=token_types,
+                sigma=sigma,
+                spans=spans,
+                image_latent_dim=latent_dim,
+                initial_image_latents=initial_latents,
+                initial_image_latent_mask=initial_mask,
+                diffusion_temperature=0.5,
+                parallel_rate=1,
+                order_strategy="sigma",
+            )
+
+        self.assertEqual(tuple(generated.shape), (1, latent_dim, 2, 2))
+        self.assertEqual(len(dummy.model.calls), 2)
+        self.assertEqual(len(dummy.image_diffusion_head.sample_calls), 2)
+        self.assertTrue(torch.equal(generated[0, :, 0, 0], initial_latents[0, 2]))
+        self.assertTrue(torch.equal(generated[0, :, 1, 0], initial_latents[0, 4]))
+
+        first_call = dummy.model.calls[0]
+        self.assertEqual(first_call["image_latent_mask"][0, 2:6].tolist(), [True, False, True, False])
+        self.assertTrue(torch.equal(first_call["image_latents"][0, 2], initial_latents[0, 2]))
+        self.assertTrue(torch.equal(first_call["image_latents"][0, 4], initial_latents[0, 4]))
 
     def test_single_stream_cfg_uses_cond_and_uncond_hidden_pairs(self):
         latent_dim = 4

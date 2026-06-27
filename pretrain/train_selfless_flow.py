@@ -407,10 +407,15 @@ def main():
         log_config = {k: v for k, v in flatten_omega_conf(config, resolve=True)}
         log_config.pop("experiment.resume_from_checkpoint", None)
 
+        wandb_init_kwargs = {
+            "name": config.experiment.name,
+            "resume": "allow",
+            "mode": os.environ.get("WANDB_MODE", "online"),
+        }
         accelerator.init_trackers(
             config.experiment.wandb_project,
             config=log_config,
-            init_kwargs={"wandb": {"name": config.experiment.name}},
+            init_kwargs={"wandb": wandb_init_kwargs},
         )
 
     # Set training seed
@@ -1118,7 +1123,29 @@ def _save_validation_diffusion_images(
         diffusion_cfg = float(config.experiment.get("validation_diffusion_cfg", 1.0))
         diffusion_cfg_schedule = str(config.experiment.get("validation_diffusion_cfg_schedule", "linear"))
         diffusion_clip_denoised = bool(config.experiment.get("validation_diffusion_clip_denoised", False))
-        denoise_timestep = int(config.experiment.get("validation_denoise_timestep", 500))
+        train_diffusion = unwrapped.image_diffusion_head.train_diffusion
+        max_denoise_timestep = train_diffusion.num_timesteps - 1
+        denoise_timestep = max(
+            0,
+            min(int(config.experiment.get("validation_denoise_timestep", 500)), max_denoise_timestep),
+        )
+        extra_denoise_config = config.experiment.get("validation_extra_denoise_timesteps", [999])
+        if extra_denoise_config is None:
+            extra_denoise_values = []
+        elif isinstance(extra_denoise_config, str):
+            extra_denoise_values = [item.strip() for item in extra_denoise_config.split(",") if item.strip()]
+        elif isinstance(extra_denoise_config, (int, float)):
+            extra_denoise_values = [extra_denoise_config]
+        else:
+            extra_denoise_values = list(extra_denoise_config)
+        extra_denoise_timesteps = []
+        seen_denoise_timesteps = {denoise_timestep}
+        for value in extra_denoise_values:
+            timestep = max(0, min(int(value), max_denoise_timestep))
+            if timestep in seen_denoise_timesteps:
+                continue
+            seen_denoise_timesteps.add(timestep)
+            extra_denoise_timesteps.append(timestep)
         scaling_factor = float(config.experiment.get("validation_vae_scaling_factor", 0.2325))
 
         side = int(image_tokens_per_img ** 0.5)
@@ -1146,6 +1173,8 @@ def _save_validation_diffusion_images(
             uncond_hidden_states = uncond_output.last_hidden_state
         pred_latents = []
         denoise_latents = []
+        extra_denoise_latents = {timestep: [] for timestep in extra_denoise_timesteps}
+        extra_denoise_eps_mse = {timestep: [] for timestep in extra_denoise_timesteps}
         target_latents = []
         selected_spans = spans[:sample_count]
         for b, start, end in selected_spans:
@@ -1174,13 +1203,13 @@ def _save_validation_diffusion_images(
             target = image_latents[b, start:end].to(device=accelerator.device, dtype=pred.dtype)
             t = torch.full(
                 (target.shape[0],),
-                max(0, min(denoise_timestep, unwrapped.image_diffusion_head.train_diffusion.num_timesteps - 1)),
+                denoise_timestep,
                 device=target.device,
                 dtype=torch.long,
             )
             noise = torch.randn_like(target)
-            noisy_target = unwrapped.image_diffusion_head.train_diffusion.q_sample(target, t, noise=noise)
-            denoise_out = unwrapped.image_diffusion_head.train_diffusion.p_mean_variance(
+            noisy_target = train_diffusion.q_sample(target, t, noise=noise)
+            denoise_out = train_diffusion.p_mean_variance(
                 unwrapped.image_diffusion_head.net,
                 noisy_target,
                 t,
@@ -1188,6 +1217,29 @@ def _save_validation_diffusion_images(
                 model_kwargs={"c": z},
             )
             denoise = denoise_out["pred_xstart"].to(dtype=pred.dtype)
+            for extra_timestep in extra_denoise_timesteps:
+                extra_t = torch.full(
+                    (target.shape[0],),
+                    extra_timestep,
+                    device=target.device,
+                    dtype=torch.long,
+                )
+                extra_noise = torch.randn_like(target)
+                extra_noisy_target = train_diffusion.q_sample(target, extra_t, noise=extra_noise)
+                extra_model_output = unwrapped.image_diffusion_head.net(extra_noisy_target, extra_t, c=z)
+                extra_eps_pred = extra_model_output[:, : target.shape[-1]]
+                extra_denoise_out = train_diffusion.p_mean_variance(
+                    unwrapped.image_diffusion_head.net,
+                    extra_noisy_target,
+                    extra_t,
+                    clip_denoised=False,
+                    model_kwargs={"c": z},
+                )
+                extra_denoise = extra_denoise_out["pred_xstart"].to(dtype=pred.dtype)
+                extra_denoise_latents[extra_timestep].append(extra_denoise.view(side, side, -1).permute(2, 0, 1))
+                extra_denoise_eps_mse[extra_timestep].append(
+                    F.mse_loss(extra_eps_pred.float(), extra_noise.float()).detach().float()
+                )
             pred_latents.append(pred.view(side, side, -1).permute(2, 0, 1))
             denoise_latents.append(denoise.view(side, side, -1).permute(2, 0, 1))
             target_latents.append(target.view(side, side, -1).permute(2, 0, 1))
@@ -1226,10 +1278,19 @@ def _save_validation_diffusion_images(
 
         raw_pred_latents = torch.stack(pred_latents)
         raw_denoise_latents = torch.stack(denoise_latents)
+        raw_extra_denoise_latents = {
+            timestep: torch.stack(latents)
+            for timestep, latents in extra_denoise_latents.items()
+            if latents
+        }
         raw_target_latents = torch.stack(target_latents)
         vae_dtype = next(vae.parameters()).dtype
         decoded_pred = vae.decode(raw_pred_latents.to(dtype=vae_dtype) / scaling_factor).float().clamp(-1, 1)
         decoded_denoise = vae.decode(raw_denoise_latents.to(dtype=vae_dtype) / scaling_factor).float().clamp(-1, 1)
+        decoded_extra_denoise = {
+            timestep: vae.decode(latents.to(dtype=vae_dtype) / scaling_factor).float().clamp(-1, 1)
+            for timestep, latents in raw_extra_denoise_latents.items()
+        }
         decoded_target = vae.decode(raw_target_latents.to(dtype=vae_dtype) / scaling_factor).float().clamp(-1, 1)
 
         from torchvision.utils import make_grid, save_image
@@ -1240,6 +1301,10 @@ def _save_validation_diffusion_images(
         save_debug_images = bool(config.experiment.get("validation_save_debug_images", False))
         pred_img = (decoded_pred + 1.0) / 2.0
         denoise_img = (decoded_denoise + 1.0) / 2.0
+        extra_denoise_imgs = {
+            timestep: (decoded + 1.0) / 2.0
+            for timestep, decoded in decoded_extra_denoise.items()
+        }
         target_img = (decoded_target + 1.0) / 2.0
         if save_debug_images:
             pred_path = image_dir / f"step-{global_step:08d}-full_sample.png"
@@ -1251,14 +1316,39 @@ def _save_validation_diffusion_images(
             wandb_images["val/debug/full_sample"] = pred_path
             wandb_images["val/debug/denoise_x0"] = denoise_path
             wandb_images["val/debug/target"] = target_path
+            for timestep, extra_img in extra_denoise_imgs.items():
+                extra_path = image_dir / f"step-{global_step:08d}-denoise_x0_t{timestep}.png"
+                save_image(extra_img, extra_path)
+                wandb_images[f"val/debug/denoise_x0_t{timestep}"] = extra_path
 
+        target_rms = raw_target_latents.float().pow(2).mean().sqrt().item()
         logs = {
             "val/diffusion_full_sample_latent_mse": F.mse_loss(raw_pred_latents.float(), raw_target_latents.float()).item(),
             "val/diffusion_full_sample_latent_rms": raw_pred_latents.float().pow(2).mean().sqrt().item(),
             "val/diffusion_denoise_x0_latent_mse": F.mse_loss(raw_denoise_latents.float(), raw_target_latents.float()).item(),
             "val/diffusion_denoise_x0_latent_rms": raw_denoise_latents.float().pow(2).mean().sqrt().item(),
-            "val/diffusion_target_latent_rms": raw_target_latents.float().pow(2).mean().sqrt().item(),
+            "val/diffusion_target_latent_rms": target_rms,
         }
+        for timestep, extra_latents in raw_extra_denoise_latents.items():
+            tag = f"t{timestep}"
+            extra_rms = extra_latents.float().pow(2).mean().sqrt().item()
+            logs.update(
+                {
+                    f"val/diffusion_denoise_x0_{tag}_latent_mse": F.mse_loss(
+                        extra_latents.float(), raw_target_latents.float()
+                    ).item(),
+                    f"val/diffusion_denoise_x0_{tag}_latent_rms": extra_rms,
+                    f"val/diffusion_denoise_x0_{tag}_rms_ratio_to_target": extra_rms / max(target_rms, 1.0e-12),
+                    f"val/diffusion_denoise_x0_{tag}_abs_p99": torch.quantile(
+                        extra_latents.float().abs().flatten(),
+                        torch.tensor(0.99, device=extra_latents.device),
+                    ).item(),
+                }
+            )
+            if extra_denoise_eps_mse.get(timestep):
+                logs[f"val/diffusion_denoise_x0_{tag}_eps_mse"] = (
+                    torch.stack(extra_denoise_eps_mse[timestep]).mean().item()
+                )
         if single_stream_results:
             comparison_tiles = []
             comparison_names = []
@@ -1332,13 +1422,18 @@ def _save_validation_diffusion_images(
             comparison_tiles = []
             comparison_names = []
 
-        overview_tiles = [target_img, denoise_img, pred_img] + comparison_tiles
+        overview_tiles = [target_img, denoise_img] + list(extra_denoise_imgs.values()) + [pred_img] + comparison_tiles
         overview_grid = make_grid(torch.stack(overview_tiles, dim=1).flatten(0, 1), nrow=len(overview_tiles))
         overview_path = image_dir / f"step-{global_step:08d}-overview.png"
         save_image(overview_grid, overview_path)
         wandb_images["val/overview_target_denoise_fullsample"] = overview_path
+        denoise_column_names = [f"denoise_x0_t{denoise_timestep}"] + [
+            f"denoise_x0_t{timestep}" for timestep in extra_denoise_imgs
+        ]
         logger.info(
-            "Validation overview columns: target, denoise_x0, full_sample"
+            "Validation overview columns: target, "
+            + ", ".join(denoise_column_names)
+            + ", full_sample"
             + (f", {', '.join(comparison_names)}" if comparison_names else "")
         )
         accelerator.log(logs, step=global_step)

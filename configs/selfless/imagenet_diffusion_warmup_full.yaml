@@ -18,6 +18,7 @@ experiment:
     validation_diffusion_cfg_schedule: "linear"
     validation_diffusion_clip_denoised: false
     validation_denoise_timestep: 500
+    validation_extra_denoise_timesteps: [999]
     validation_vae_dtype: "fp32"
     validation_save_debug_images: false
     validation_single_stream_images: true
@@ -25,7 +26,7 @@ experiment:
     validation_single_stream_order_strategy: "sigma"
     validation_single_stream_order_strategies:
         - "sigma"
-        - "latent_proj_cosine"
+        - "spatial_halton"
     validation_mar_root: "/inspire/hdd/global_user/wanjiaxin-253108030048/code/mar"
     validation_vae_path: "public/vae/mar-kl16/kl16.ckpt"
     validation_vae_scaling_factor: 0.2325

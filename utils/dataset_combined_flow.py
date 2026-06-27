@@ -1,5 +1,6 @@
 import bisect
 import glob
+import os
 import random
 from functools import partial
 from pathlib import Path
@@ -177,6 +178,9 @@ class CombinedBatchDataLoader:
         seed: int = 42,
         mode: str = "train",
         max_text_batches: Optional[int] = None,
+        batch_schedule: str = "random",
+        accumulation_steps: Optional[int] = None,
+        text_batches_per_accumulation: Optional[int] = None,
     ):
         self.image_loader = image_loader
         self.text_loader = text_loader
@@ -186,6 +190,22 @@ class CombinedBatchDataLoader:
         self.epoch = 0
         self.max_text_batches = max_text_batches
         self.dataset = self
+        self.batch_schedule = str(batch_schedule or "random").lower()
+        if self.batch_schedule not in {"random", "accumulation"}:
+            raise ValueError(f"Unsupported batch_schedule={batch_schedule!r}; use 'random' or 'accumulation'.")
+        self.accumulation_steps = int(accumulation_steps or 0)
+        if text_batches_per_accumulation is None:
+            text_batches_per_accumulation = round(self.text_batch_ratio * self.accumulation_steps)
+            if self.text_batch_ratio > 0.0 and text_batches_per_accumulation == 0:
+                text_batches_per_accumulation = 1
+        self.text_batches_per_accumulation = int(text_batches_per_accumulation)
+        if self.batch_schedule == "accumulation":
+            if self.accumulation_steps <= 0:
+                raise ValueError("batch_schedule='accumulation' requires accumulation_steps > 0.")
+            self.text_batches_per_accumulation = max(
+                0,
+                min(self.text_batches_per_accumulation, self.accumulation_steps),
+            )
 
     def __len__(self) -> int:
         if self.mode == "train":
@@ -202,6 +222,14 @@ class CombinedBatchDataLoader:
             iterator = iter(loader)
             return next(iterator), iterator
 
+    def _use_text_batch(self, step: int, rng: random.Random) -> bool:
+        if self.batch_schedule == "accumulation":
+            if self.text_batches_per_accumulation <= 0:
+                return False
+            position = step % self.accumulation_steps
+            return position >= self.accumulation_steps - self.text_batches_per_accumulation
+        return rng.random() < self.text_batch_ratio
+
     def __iter__(self):
         image_iter = iter(self.image_loader)
         text_iter = iter(self.text_loader)
@@ -209,7 +237,7 @@ class CombinedBatchDataLoader:
         total = len(self)
 
         for step in range(total):
-            use_text = rng.random() < self.text_batch_ratio
+            use_text = self._use_text_batch(step, rng)
             if self.mode != "train":
                 use_text = step >= len(self.image_loader)
             if use_text:
@@ -251,6 +279,9 @@ class CombinedBatchDataLoader:
             seed=self.seed,
             mode=self.mode,
             max_text_batches=self.max_text_batches,
+            batch_schedule=self.batch_schedule,
+            accumulation_steps=self.accumulation_steps,
+            text_batches_per_accumulation=self.text_batches_per_accumulation,
         )
         prepared.epoch = self.epoch
         return prepared
@@ -315,6 +346,13 @@ def _build_text_loaders(config, tokenizer):
     return build_text_arrow_dataloaders(config, tokenizer)
 
 
+def _infer_accumulation_steps(config) -> int:
+    world_size = max(1, int(os.environ.get("WORLD_SIZE", "1")))
+    total_batch_size = int(config.training.total_batch_size)
+    batch_size = int(config.training.batch_size)
+    return max(1, (total_batch_size // batch_size) // world_size)
+
+
 def build_combined_flow_dataloaders(config, tokenizer):
     params = config.dataset.params
     image_config = OmegaConf.create(OmegaConf.to_container(config, resolve=False))
@@ -323,12 +361,22 @@ def build_combined_flow_dataloaders(config, tokenizer):
     text_train_loader, text_val_loader = _build_text_loaders(config, tokenizer)
 
     text_batch_ratio = float(params.get("text_batch_ratio", 0.4))
+    batch_schedule = str(params.get("batch_schedule", "random"))
+    accumulation_steps = params.get("accumulation_steps", None)
+    if accumulation_steps is None or str(accumulation_steps).lower() == "auto":
+        accumulation_steps = _infer_accumulation_steps(config)
+    text_batches_per_accumulation = params.get("text_batches_per_accumulation", None)
+    if text_batches_per_accumulation is not None and str(text_batches_per_accumulation).lower() == "auto":
+        text_batches_per_accumulation = None
     train_loader = CombinedBatchDataLoader(
         image_loader=image_train_loader,
         text_loader=text_train_loader,
         text_batch_ratio=text_batch_ratio,
         seed=config.training.seed,
         mode="train",
+        batch_schedule=batch_schedule,
+        accumulation_steps=accumulation_steps,
+        text_batches_per_accumulation=text_batches_per_accumulation,
     )
 
     val_text_batches = int(params.get("val_text_batches", 20))
@@ -339,5 +387,6 @@ def build_combined_flow_dataloaders(config, tokenizer):
         seed=config.training.seed,
         mode="val",
         max_text_batches=val_text_batches,
+        batch_schedule="random",
     )
     return train_loader, val_loader

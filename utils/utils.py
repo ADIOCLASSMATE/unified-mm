@@ -117,6 +117,7 @@ def load_model_tokenizer(config: OmegaConf, logger=None):
         for token in (boi_token, eoi_token, image_mask_token)
         if token not in tokenizer.get_vocab()
     ]
+    added_image_mask_token = image_mask_token in tokens_to_add
     if tokens_to_add:
         tokenizer.add_tokens(tokens_to_add, special_tokens=True)
 
@@ -302,7 +303,7 @@ def load_model_tokenizer(config: OmegaConf, logger=None):
         model.resize_token_embeddings(len(tokenizer))
 
     image_mask_token_id = getattr(model.config, "image_mask_token_id", None)
-    if image_mask_token_id is not None:
+    if image_mask_token_id is not None and added_image_mask_token:
         with torch.no_grad():
             embed = model.model.embed_tokens.weight
             mask_token_id = int(model.config.mask_token_id)
@@ -313,6 +314,11 @@ def load_model_tokenizer(config: OmegaConf, logger=None):
                 and mask_token_id != image_mask_token_id
             ):
                 embed[image_mask_token_id].copy_(embed[mask_token_id])
+                if logger is not None:
+                    logger.info(
+                        f"Initialized newly added image mask token id={image_mask_token_id} "
+                        f"from text mask token id={mask_token_id}"
+                    )
     
     # 启用 Gradient Checkpointing
     if config.training.get("use_gradient_checkpointing", True):

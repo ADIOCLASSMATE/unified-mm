@@ -2,6 +2,7 @@
 import argparse
 import importlib.util
 import json
+import math
 from pathlib import Path
 
 import torch
@@ -23,6 +24,11 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Manual validation image generation for MAR DiffLoss adapters.")
     parser.add_argument("--config", default="configs/selfless/imagenet_diffusion_warmup_full.yaml")
     parser.add_argument(
+        "--model_path_override",
+        default="",
+        help="Optionally override config.model.model_path before loading the model.",
+    )
+    parser.add_argument(
         "--adapter",
         default="output/selfless-diffusion-0.6B-imagenet-warmup-from-textft/image_diffusion_adapter-12000.pt",
         help="Warmup adapter .pt, MAR .safetensors, or 'none' to use randomly initialized current head.",
@@ -42,6 +48,19 @@ def parse_args():
     parser.add_argument("--full_no_clip", action="store_true", help="Save full diffusion sample with clip_denoised=False.")
     parser.add_argument("--single_stream", action="store_true", help="Also run single-stream iterative generation.")
     parser.add_argument("--single_stream_clip", action="store_true", help="Use clip_denoised=True for single-stream.")
+    parser.add_argument(
+        "--oracle_reveal_ratios",
+        default="",
+        help=(
+            "Comma-separated fractions of image tokens to seed with ground-truth latents before "
+            "single-stream generation, e.g. '0.2,0.5'."
+        ),
+    )
+    parser.add_argument(
+        "--oracle_reveal_order",
+        default="same",
+        help="Order for oracle seeding: same, sigma, random, spatial_halton, spatial_uniform, or prefix.",
+    )
     parser.add_argument("--parallel_rate", type=int, default=1)
     parser.add_argument(
         "--strategies",
@@ -63,6 +82,124 @@ def tensor_stats(x):
         "mean": float(x.mean().item()),
         "std": float(x.std(unbiased=False).item()),
         "rms": float(x.pow(2).mean().sqrt().item()),
+    }
+
+
+def parse_float_list(value: str) -> list[float]:
+    if not value:
+        return []
+    ratios = []
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        ratio = float(item)
+        if ratio < 0.0 or ratio > 1.0:
+            raise ValueError(f"oracle reveal ratios must be in [0, 1], got {ratio}")
+        ratios.append(ratio)
+    return ratios
+
+
+def _halton(index: int, base: int) -> float:
+    value = 0.0
+    scale = 1.0 / float(base)
+    while index > 0:
+        value += (index % base) * scale
+        index //= base
+        scale /= float(base)
+    return value
+
+
+def _halton_order(side: int, device) -> torch.Tensor:
+    seen = set()
+    order = []
+    idx = 1
+    image_tokens = side * side
+    while len(order) < image_tokens and idx < image_tokens * 32:
+        row = min(side - 1, int(_halton(idx, 2) * side))
+        col = min(side - 1, int(_halton(idx, 3) * side))
+        flat = row * side + col
+        if flat not in seen:
+            seen.add(flat)
+            order.append(flat)
+        idx += 1
+    if len(order) < image_tokens:
+        order.extend([flat for flat in range(image_tokens) if flat not in seen])
+    return torch.tensor(order, device=device, dtype=torch.long)
+
+
+def _spatial_uniform_order(side: int, device) -> torch.Tensor:
+    yy, xx = torch.meshgrid(
+        torch.arange(side, device=device),
+        torch.arange(side, device=device),
+        indexing="ij",
+    )
+    center = (side - 1) / 2.0
+    ring = torch.maximum((yy.float() - center).abs(), (xx.float() - center).abs())
+    checker = (yy % 2) * 2 + (xx % 2)
+    return torch.argsort((ring * 4.0 + checker.float()).flatten())
+
+
+def _oracle_order(
+    strategy: str,
+    sigma_row: torch.Tensor,
+    start: int,
+    end: int,
+    side: int,
+    seed: int,
+    sample_idx: int,
+) -> torch.Tensor:
+    strategy = str(strategy or "sigma").lower()
+    image_tokens = end - start
+    device = sigma_row.device
+    if strategy in {"sigma", "sigma_replay", "causal_sigma"}:
+        return torch.argsort(sigma_row[start:end].to(device=device, dtype=torch.float32))
+    if strategy == "random":
+        generator = torch.Generator(device=device)
+        generator.manual_seed(int(seed) + 1009 * int(sample_idx))
+        return torch.randperm(image_tokens, device=device, generator=generator)
+    if strategy in {"spatial_halton", "halton"}:
+        return _halton_order(side, device)
+    if strategy in {"spatial_uniform", "uniform"}:
+        return _spatial_uniform_order(side, device)
+    if strategy in {"prefix", "raster", "row_major"}:
+        return torch.arange(image_tokens, device=device, dtype=torch.long)
+    return torch.argsort(sigma_row[start:end].to(device=device, dtype=torch.float32))
+
+
+def build_oracle_initial_mask(
+    token_types: torch.Tensor,
+    sigma: torch.Tensor,
+    spans: list[tuple[int, int, int]],
+    image_tokens: int,
+    ratio: float,
+    generation_strategy: str,
+    reveal_order: str,
+    seed: int,
+) -> torch.Tensor:
+    mask = torch.zeros_like(token_types, dtype=torch.bool)
+    reveal_count = max(0, min(image_tokens, int(math.floor(float(ratio) * image_tokens))))
+    if reveal_count == 0:
+        return mask
+    side = int(image_tokens ** 0.5)
+    order_strategy = generation_strategy if str(reveal_order).lower() == "same" else reveal_order
+    for sample_idx, (batch_idx, start, end) in enumerate(spans):
+        order = _oracle_order(order_strategy, sigma[batch_idx], start, end, side, seed, sample_idx)
+        mask[batch_idx, start + order[:reveal_count]] = True
+    return mask
+
+
+def masked_mse_and_rms(pred: torch.Tensor, target: torch.Tensor, mask_hw: torch.Tensor) -> dict:
+    pred = pred.float()
+    target = target.float()
+    mask = mask_hw.to(device=pred.device, dtype=torch.bool).unsqueeze(1)
+    denom = mask.sum().item() * pred.shape[1]
+    if denom <= 0:
+        return {"latent_mse": None, "latent_rms": None}
+    mask_f = mask.to(dtype=pred.dtype)
+    return {
+        "latent_mse": float((((pred - target) ** 2) * mask_f).sum().item() / denom),
+        "latent_rms": float(((pred.pow(2) * mask_f).sum().item() / denom) ** 0.5),
     }
 
 
@@ -199,12 +336,15 @@ def decode_latents(vae, latents, scaling_factor):
 def main():
     args = parse_args()
     progress = not args.no_progress
+    oracle_reveal_ratios = parse_float_list(args.oracle_reveal_ratios)
     torch.manual_seed(args.seed)
     device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     config = OmegaConf.load(args.config)
+    if args.model_path_override:
+        config.model.model_path = args.model_path_override
     config.training.batch_size = args.batch_size
     config.training.dataloader_workers = 0
     config.model.image_diffusion_num_sampling_steps = str(args.sampling_steps)
@@ -266,11 +406,14 @@ def main():
     metrics = {
         "adapter": adapter_report,
         "config": args.config,
+        "model_path": str(config.model.model_path),
         "sampling_steps": str(args.sampling_steps),
         "temperature": args.temperature,
         "cfg": args.cfg,
         "cfg_schedule": args.cfg_schedule,
         "denoise_timestep": args.denoise_timestep,
+        "oracle_reveal_ratios": oracle_reveal_ratios,
+        "oracle_reveal_order": args.oracle_reveal_order,
         "loss": float(output.loss.detach().float().item()),
         "diffusion_stats": {
             key: float(value.detach().float().item())
@@ -364,7 +507,8 @@ def main():
 
             metrics["samples"].append(sample_metrics)
 
-    target_img = decode_latents(vae, torch.stack(target_latents).float(), scaling_factor)
+    target_chw = torch.stack(target_latents).float()
+    target_img = decode_latents(vae, target_chw, scaling_factor)
     denoise_img = decode_latents(vae, torch.stack(denoise_latents).float(), scaling_factor)
     overview_columns = [("target", target_img), (f"denoise_x0_t{args.denoise_timestep}", denoise_img)]
 
@@ -407,11 +551,65 @@ def main():
             overview_columns.append((f"strategy_{tag}", single_img))
             metrics[f"single_stream_{tag}"] = {
                 "latent_rms": float(single_latents.float().pow(2).mean().sqrt().item()),
-                "latent_mse_to_target": float(
-                    F.mse_loss(single_latents.float(), torch.stack(target_latents).float()).item()
-                ),
+                "latent_mse_to_target": float(F.mse_loss(single_latents.float(), target_chw).item()),
                 "generation_step_max": float(trace["generation_step"].float().max().item()) if trace else None,
             }
+
+            for ratio in oracle_reveal_ratios:
+                oracle_mask = build_oracle_initial_mask(
+                    token_types=token_types,
+                    sigma=sigma,
+                    spans=spans,
+                    image_tokens=image_tokens,
+                    ratio=ratio,
+                    generation_strategy=strategy,
+                    reveal_order=args.oracle_reveal_order,
+                    seed=args.seed,
+                )
+                with torch.no_grad():
+                    oracle_latents, oracle_trace = model.sample_image_latents_single_stream(
+                        input_ids=input_ids,
+                        token_types=token_types,
+                        sigma=sigma,
+                        spans=spans,
+                        image_latent_dim=image_latents.shape[-1],
+                        initial_image_latents=image_latents,
+                        initial_image_latent_mask=oracle_mask,
+                        diffusion_temperature=args.temperature,
+                        diffusion_cfg=args.cfg,
+                        diffusion_cfg_schedule=args.cfg_schedule,
+                        diffusion_clip_denoised=args.single_stream_clip,
+                        parallel_rate=args.parallel_rate,
+                        order_strategy=strategy,
+                        return_trace=True,
+                    )
+                oracle_grid = torch.stack(
+                    [
+                        oracle_mask[batch_idx, start:end].view(side, side)
+                        for batch_idx, start, end in spans
+                    ]
+                )
+                remaining_grid = ~oracle_grid
+                oracle_img = decode_latents(vae, oracle_latents.float(), scaling_factor)
+                ratio_tag = str(ratio).replace(".", "p")
+                save_image(
+                    make_grid(torch.stack([target_img, oracle_img], dim=1).flatten(0, 1), nrow=2),
+                    out_dir / f"strategy_{tag}_oracle_{ratio_tag}.png",
+                )
+                overview_columns.append((f"strategy_{tag}_oracle_{ratio_tag}", oracle_img))
+                metrics[f"single_stream_{tag}_oracle_{ratio_tag}"] = {
+                    "oracle_reveal_ratio": float(ratio),
+                    "oracle_revealed_tokens_per_image": int(oracle_grid[0].sum().item()) if oracle_grid.numel() else 0,
+                    "latent_rms": float(oracle_latents.float().pow(2).mean().sqrt().item()),
+                    "latent_mse_to_target": float(F.mse_loss(oracle_latents.float(), target_chw).item()),
+                    "remaining": masked_mse_and_rms(oracle_latents, target_chw, remaining_grid),
+                    "known": masked_mse_and_rms(oracle_latents, target_chw, oracle_grid),
+                    "baseline_remaining": masked_mse_and_rms(single_latents, target_chw, remaining_grid),
+                    "baseline_known": masked_mse_and_rms(single_latents, target_chw, oracle_grid),
+                    "generation_step_max": (
+                        float(oracle_trace["generation_step"].float().max().item()) if oracle_trace else None
+                    ),
+                }
 
     if args.save_individual:
         save_image(target_img, out_dir / "target.png")

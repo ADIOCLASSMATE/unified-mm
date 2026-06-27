@@ -1133,6 +1133,10 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                     "initial_image_latent_mask must have shape [batch, seq_len], "
                     f"got {tuple(initial_image_latent_mask.shape)} for input_ids={tuple(input_ids.shape)}"
                 )
+            if initial_image_latents is None and initial_image_latent_mask.any():
+                raise ValueError(
+                    "initial_image_latents must be provided when initial_image_latent_mask has true entries."
+                )
             base_image_latent_mask = torch.stack(
                 [initial_image_latent_mask[b] for b, _, _ in spans]
             ).to(device=device, dtype=torch.bool)
@@ -1205,6 +1209,14 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             device=device,
             dtype=torch.float32,
         )
+        for sample_idx, start, _ in local_spans:
+            initial_filled = base_image_latent_mask[sample_idx, start : start + image_tokens_per_img]
+            if initial_filled.any():
+                filled[sample_idx] = initial_filled
+                generated[sample_idx, initial_filled] = work_latents[
+                    sample_idx,
+                    start : start + image_tokens_per_img,
+                ][initial_filled]
 
         current_sigma = selected_sigma.clone()
         next_image_order = torch.zeros(len(spans), device=device, dtype=torch.float32)
