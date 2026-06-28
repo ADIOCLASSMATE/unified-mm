@@ -365,6 +365,37 @@ class SelflessFlowBehaviorTest(unittest.TestCase):
             tokenizer.encode("cat", add_special_tokens=False)[0],
         )
 
+    def test_imagenet_flow_cache_can_disable_all_text_labels_for_stage0(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            latents = torch.arange(8, dtype=torch.float16).view(1, 4, 2)
+            torch.save({"latents": latents, "img_ids": torch.tensor([1])}, root / "latents.pt")
+            (root / "manifest.jsonl").write_text('{"img_id": 1, "synset": "n00000001"}\n')
+            (root / "mapping.txt").write_text("n00000001 test class\n")
+
+            tokenizer = FakeTokenizer()
+            dataset = ImageNetFlowCacheDataset(
+                cache_path=str(root / "latents.pt"),
+                tokenizer=tokenizer,
+                boi_token_id=11,
+                eoi_token_id=12,
+                mask_token_id=13,
+                eos_token_id=14,
+                image_tokens_per_img=4,
+                image_latent_dim=2,
+                manifest_jsonl=str(root / "manifest.jsonl"),
+                prompt_templates=["{class_name} {image}"],
+                synset_mapping_path=str(root / "mapping.txt"),
+                max_seq_length=16,
+                label_text=False,
+            )
+
+            batch = collate_imagenet_flow_cache([dataset[0]], pad_to_length=16)
+
+        text_tokens = batch["input_ids"][0, batch["token_types"][0] == 0].tolist()
+        self.assertEqual(text_tokens, tokenizer.encode("test class", add_special_tokens=False))
+        self.assertTrue(torch.equal(batch["labels"], torch.full_like(batch["labels"], -100)))
+
     def test_imagenet_latent_hflip_augmentation_is_train_only(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

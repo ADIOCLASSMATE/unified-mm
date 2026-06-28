@@ -1,0 +1,120 @@
+experiment:
+    project: "selfless-flow-stage0-imagenet10c"
+    name: "stage0-10c-classcond-pure-flow"
+    wandb_project: "unified-mm"
+    output_dir: "output"
+    save_every: 2000
+    eval_every: 100
+    generate_every: 10000
+    log_every: 10
+    log_grad_norm_every: 200
+    checkpoints_total_limit: 20
+    save_hfmodel_every: 10000
+    val_every: 1000
+    validation_image_every: 1000
+    validation_image_samples: 2
+    validation_flow_temperature: 1.0
+    validation_flow_cfg: 1.0
+    validation_flow_cfg_schedule: "linear"
+    validation_flow_solver: "heun"
+    validation_flow_probe_times: [0.25, 0.5, 0.75, 0.95]
+    validation_vae_dtype: "fp32"
+    validation_save_debug_images: false
+    validation_single_stream_images: true
+    validation_single_stream_parallel_rate: 1
+    validation_single_stream_order_strategy: "sigma"
+    validation_single_stream_order_strategies:
+        - "sigma"
+        - "spatial_halton"
+    validation_mar_root: "/inspire/hdd/global_user/wanjiaxin-253108030048/code/mar"
+    validation_vae_path: "public/vae/mar-kl16/kl16.ckpt"
+    validation_vae_scaling_factor: 0.2325
+    resume_from_checkpoint: none
+
+model:
+    model_path: "public/models/Qwen/Qwen3-0.6B-Base"
+    attention_pattern: "ar"
+    loss_attention_pattern: "likelihood"
+    mask_id: -1
+    use_flex_attention: true
+    lambda_text: 0.0
+    lambda_image: 1.0
+    continuous_image_latents: true
+    image_tokens_per_img: 256
+    image_latent_dim: 16
+    image_projector_width: 2048
+    image_generation_head_type: "flow"
+    image_flow_depth: 8
+    image_flow_width: 1280
+    image_flow_num_sampling_steps: "100"
+    image_flow_batch_mul: 4
+    image_flow_condition_norm: "rms"
+    image_flow_condition_norm_eps: 1.0e-6
+    image_flow_time_scale: 1000.0
+    image_flow_time_sampling: "logit_normal"
+    image_flow_logit_mean: 0.0
+    image_flow_logit_std: 1.0
+    image_flow_time_eps: 1.0e-5
+    image_flow_time_uniform_mix: 0.1
+    image_flow_solver: "heun"
+    image_uncond_prob: 0.0
+    pretrained_image_flow_adapter: "../mar/pretrained_models/mar/mar_large_hf/mar-large.safetensors"
+
+dataset:
+    class_name: "ImageNetFlowCacheDataset"
+    params:
+        cache_path: "public/datasets/imagenet_stage0_10c/vae_latents_mar_kl16/flow_latents_10c_fp16.pt"
+        manifest_jsonl: "public/datasets/imagenet_stage0_10c/manifest.jsonl"
+        synset_mapping_path: "/inspire/dataset/imagenet/v1/LOC_synset_mapping.txt"
+        prompt_templates:
+            - "{class_name} {image}"
+        label_text: false
+        image_tokens_per_img: 256
+        image_latent_dim: 16
+        max_seq_length: 320
+        pad_to_length: 320
+        pad_to_multiple_of: 64
+        val_ratio: 0.02
+        latent_hflip_prob: 0.0
+    preprocessing:
+        max_seq_length: 320
+
+optimizer:
+    name: adamw
+    params:
+        learning_rate: 1.0e-4
+        backbone_learning_rate: 5.0e-5
+        projector_learning_rate: 1.0e-4
+        flow_learning_rate: 1.0e-4
+        special_token_learning_rate: 5.0e-5
+        scale_lr: false
+        beta1: 0.9
+        beta2: 0.95
+        weight_decay: 0.01
+        epsilon: 1e-8
+
+lr_scheduler:
+    scheduler: "wsd"
+    params:
+        learning_rate: ${optimizer.params.learning_rate}
+        warmup_steps: 500
+        decay_steps: 5000
+        min_lr_scale: 0.1
+
+training:
+    batch_size: 16
+    total_batch_size: 512
+    mixed_precision: "bf16"
+    enable_tf32: true
+    seed: 42
+    dataloader_workers: 8
+    max_train_steps: 50000
+    max_grad_norm: 1.0
+    ar_ratio: -1.0
+    mc_samples: 16
+    use_gradient_checkpointing: false
+    step_scheduler_with_optimizer: false
+    from_scratch: false
+    freeze_backbone_for_image_flow_warmup: false
+    use_ema: false
+    save_image_flow_adapter: true

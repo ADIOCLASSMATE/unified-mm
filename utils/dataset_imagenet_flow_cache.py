@@ -47,6 +47,7 @@ class ImageNetFlowCacheDataset(Dataset):
         max_samples: int = -1,
         seed: int = 42,
         latent_hflip_prob: float = 0.0,
+        label_text: bool = True,
     ):
         self.cache_path = Path(cache_path)
         if not self.cache_path.exists():
@@ -84,6 +85,7 @@ class ImageNetFlowCacheDataset(Dataset):
         self.max_seq_length = int(max_seq_length) if max_seq_length else None
         self.seed = int(seed)
         self.epoch = 0
+        self.label_text = bool(label_text)
         self.latent_hflip_prob = float(latent_hflip_prob)
         if not 0.0 <= self.latent_hflip_prob <= 1.0:
             raise ValueError(f"latent_hflip_prob must be in [0, 1], got {latent_hflip_prob}")
@@ -100,6 +102,10 @@ class ImageNetFlowCacheDataset(Dataset):
         self.sequence_cache = self._build_sequence_cache()
         self.fixed_length = 1 + self.image_tokens_per_img + 2 if not self.sequence_templates else None
         if self.fixed_length is not None:
+            if self.label_text:
+                fixed_labels = [self.boi_id] + [-100] * self.image_tokens_per_img + [-100, self.eos_id]
+            else:
+                fixed_labels = [-100] * self.fixed_length
             self.fixed_input_ids = torch.tensor(
                 [self.boi_id] + [self.mask_id] * self.image_tokens_per_img + [self.eoi_id, self.eos_id],
                 dtype=torch.long,
@@ -109,9 +115,7 @@ class ImageNetFlowCacheDataset(Dataset):
                 dtype=torch.uint8,
             )
             self.fixed_labels = torch.tensor(
-                [self.boi_id]
-                + [-100] * self.image_tokens_per_img
-                + [-100, self.eos_id],
+                fixed_labels,
                 dtype=torch.long,
             )
 
@@ -406,19 +410,22 @@ class ImageNetFlowCacheDataset(Dataset):
                 torch.tensor([2], dtype=torch.uint8),
             ]
         )
-        labels = torch.cat(
-            [
-                prefix_ids,
-                torch.tensor(
-                    [self.boi_id]
-                    + [-100] * self.image_tokens_per_img
-                    + [-100],
-                    dtype=torch.long,
-                ),
-                suffix_ids,
-                torch.tensor([self.eos_id], dtype=torch.long),
-            ]
-        )
+        if self.label_text:
+            labels = torch.cat(
+                [
+                    prefix_ids,
+                    torch.tensor(
+                        [self.boi_id]
+                        + [-100] * self.image_tokens_per_img
+                        + [-100],
+                        dtype=torch.long,
+                    ),
+                    suffix_ids,
+                    torch.tensor([self.eos_id], dtype=torch.long),
+                ]
+            )
+        else:
+            labels = torch.full_like(input_ids, -100)
         return {
             "input_ids": input_ids,
             "token_types": token_types,
@@ -625,6 +632,7 @@ def build_imagenet_flow_cache_dataloaders(config, tokenizer):
         max_samples=params.get("max_samples", -1),
         seed=config.training.seed,
         latent_hflip_prob=params.get("latent_hflip_prob", 0.0),
+        label_text=params.get("label_text", True),
     )
 
     val_ratio = params.get("val_ratio", 0.001)
