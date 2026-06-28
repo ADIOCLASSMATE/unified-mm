@@ -47,7 +47,7 @@ from transformers.utils.deprecation import deprecate_kwarg
 from transformers.utils.generic import maybe_autocast, merge_with_config_defaults
 from torch.nn.attention.flex_attention import flex_attention, BlockMask, create_block_mask, and_masks
 from flash_attn.ops.triton.layer_norm import rms_norm_fn as flash_rms_norm
-from .mar_diffloss import DiffLoss
+from .mar_flowloss import FlowLoss
 try:
     from liger_kernel.ops.swiglu import LigerSiLUMulFunction  # noqa: F401
     liger_kernel_is_available = True
@@ -225,7 +225,7 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
-def _normalize_image_diffusion_condition(
+def _normalize_image_flow_condition(
     z: torch.Tensor,
     norm_mode: str = "none",
     eps: float = 1e-6,
@@ -240,28 +240,28 @@ def _normalize_image_diffusion_condition(
     if norm_mode in {"layernorm", "layer_norm", "ln"}:
         return F.layer_norm(z_float, (z.shape[-1],)).to(z.dtype)
     raise ValueError(
-        f"Unknown image_diffusion_condition_norm={norm_mode!r}; "
+        f"Unknown image_flow_condition_norm={norm_mode!r}; "
         "expected rms, layer_norm, or none."
     )
 
 
-def _image_diffusion_condition_norm_config(obj) -> tuple[str, float]:
+def _image_flow_condition_norm_config(obj) -> tuple[str, float]:
     config = getattr(obj, "config", None)
-    norm_mode = getattr(obj, "image_diffusion_condition_norm", None)
+    norm_mode = getattr(obj, "image_flow_condition_norm", None)
     if norm_mode is None and config is not None:
-        norm_mode = getattr(config, "image_diffusion_condition_norm", None)
+        norm_mode = getattr(config, "image_flow_condition_norm", None)
     if norm_mode is None:
         norm_mode = "none"
 
-    eps = getattr(obj, "image_diffusion_condition_norm_eps", None)
+    eps = getattr(obj, "image_flow_condition_norm_eps", None)
     if eps is None and config is not None:
-        eps = getattr(config, "image_diffusion_condition_norm_eps", None)
+        eps = getattr(config, "image_flow_condition_norm_eps", None)
     if eps is None:
         eps = 1e-6
     return str(norm_mode).lower(), float(eps)
 
 
-def _scheduled_diffusion_cfg(
+def _scheduled_flow_cfg(
     cfg: float,
     schedule: str | None,
     progress: float,
@@ -276,7 +276,7 @@ def _scheduled_diffusion_cfg(
     if schedule == "linear":
         return 1.0 + (cfg - 1.0) * progress
     raise ValueError(
-        f"Unknown diffusion_cfg_schedule={schedule!r}; expected constant or linear."
+        f"Unknown flow_cfg_schedule={schedule!r}; expected constant or linear."
     )
 
 
@@ -586,7 +586,6 @@ class Qwen3Model(Qwen3PreTrainedModel):
         self.vocab_size = config.vocab_size
 
         self.image_latent_dim = getattr(config, "image_latent_dim", 4)
-        self.image_condition_drop_prob = float(getattr(config, "image_condition_drop_prob", 0.0))
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.image_token_embedder = ImageTokenEmbedder(
             self.image_latent_dim,
@@ -594,10 +593,6 @@ class Qwen3Model(Qwen3PreTrainedModel):
             getattr(config, "image_projector_width", None),
             getattr(config, "image_tokens_per_img", 256),
         )
-        # Null text/global condition for image CFG. Image latents and structural
-        # delimiters remain visible; only natural-language condition tokens drop.
-        self.image_condition_null = nn.Parameter(torch.empty(config.hidden_size))
-        nn.init.zeros_(self.image_condition_null)
         self.layers = nn.ModuleList(
             [Qwen3DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
@@ -647,7 +642,6 @@ class Qwen3Model(Qwen3PreTrainedModel):
         token_types: torch.Tensor | None,
         image_latents: torch.Tensor | None,
         image_latent_mask: torch.Tensor | None,
-        image_condition_drop: bool,
     ) -> torch.Tensor:
         if token_types is None:
             return self.embed_tokens(input_ids)
@@ -680,12 +674,12 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 inputs_embeds[use_image_mask] = self.image_token_embedder.embed_mask(
                     image_local_positions[use_image_mask],
                     image_mask_embedding,
-                )
+                ).to(dtype=inputs_embeds.dtype)
             if use_image_latent.any():
                 inputs_embeds[use_image_latent] = self.image_token_embedder(
                     image_latents[use_image_latent],
                     image_local_positions[use_image_latent],
-                )
+                ).to(dtype=inputs_embeds.dtype)
         elif self.training:
             dummy_latent = torch.zeros(
                 1,
@@ -695,11 +689,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
             )
             inputs_embeds = inputs_embeds + self.image_token_embedder(dummy_latent).sum() * 0.0
 
-        return self._apply_image_condition_drop(
-            inputs_embeds,
-            token_types,
-            force_drop=image_condition_drop,
-        )
+        return inputs_embeds
 
     def _build_xt_inputs_embeds(
         self,
@@ -722,39 +712,8 @@ class Qwen3Model(Qwen3PreTrainedModel):
             inputs_embeds[is_image] = self.image_token_embedder.embed_mask(
                 image_local_positions[is_image],
                 image_mask_embedding,
-            )
+            ).to(dtype=inputs_embeds.dtype)
         return inputs_embeds
-
-    def _apply_image_condition_drop(
-        self,
-        inputs_embeds: torch.Tensor,
-        token_types: torch.Tensor,
-        force_drop: bool = False,
-    ) -> torch.Tensor:
-        condition_token_mask = token_types == 0
-        if not condition_token_mask.any():
-            return inputs_embeds
-
-        if force_drop:
-            drop_mask = condition_token_mask
-        else:
-            drop_prob = self.image_condition_drop_prob
-            if not (self.training and drop_prob > 0.0):
-                return inputs_embeds
-            has_image = (token_types == 1).any(dim=1)
-            drop_rows = torch.rand(
-                token_types.shape[0],
-                device=token_types.device,
-            ) < drop_prob
-            drop_rows = drop_rows & has_image
-            if not drop_rows.any():
-                return inputs_embeds
-            drop_mask = condition_token_mask & drop_rows[:, None]
-
-        dropped = inputs_embeds.clone()
-        null = self.image_condition_null.to(device=dropped.device, dtype=dropped.dtype)
-        dropped[drop_mask] = null
-        return dropped
 
     # @check_model_inputs
     @auto_docstring
@@ -790,7 +749,6 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 token_types=kwargs.get("token_types", None),
                 image_latents=kwargs.get("image_latents", None),
                 image_latent_mask=kwargs.get("image_latent_mask", None),
-                image_condition_drop=bool(kwargs.get("image_condition_drop", False)),
             )
 
         if self.training or calculate_likelihood:
@@ -859,23 +817,28 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         self.unified_head = False
         self.lambda_image = getattr(config, "lambda_image", 0.5)
         self.lambda_text = getattr(config, "lambda_text", 1.0)
-        self.image_diffusion_batch_mul = int(getattr(config, "image_diffusion_batch_mul", 1))
-        self.image_diffusion_condition_norm = str(
-            getattr(config, "image_diffusion_condition_norm", "rms")
+        self.image_flow_batch_mul = int(getattr(config, "image_flow_batch_mul", 1))
+        self.image_flow_condition_norm = str(
+            getattr(config, "image_flow_condition_norm", "rms")
         ).lower()
-        self.image_diffusion_condition_norm_eps = float(
-            getattr(config, "image_diffusion_condition_norm_eps", 1e-6)
+        self.image_flow_condition_norm_eps = float(
+            getattr(config, "image_flow_condition_norm_eps", 1e-6)
         )
-        self.image_condition_drop_prob = float(getattr(config, "image_condition_drop_prob", 0.0))
-
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.image_diffusion_head = DiffLoss(
+        self.image_flow_head = FlowLoss(
             target_channels=self.image_latent_dim,
             z_channels=config.hidden_size,
-            width=getattr(config, "image_diffusion_width", 1280),
-            depth=getattr(config, "image_diffusion_depth", 8),
-            num_sampling_steps=str(getattr(config, "image_diffusion_num_sampling_steps", "100")),
-            grad_checkpointing=getattr(config, "image_diffusion_grad_checkpointing", False),
+            width=getattr(config, "image_flow_width", 1280),
+            depth=getattr(config, "image_flow_depth", 8),
+            num_sampling_steps=str(getattr(config, "image_flow_num_sampling_steps", "50")),
+            grad_checkpointing=getattr(config, "image_flow_grad_checkpointing", False),
+            time_scale=getattr(config, "image_flow_time_scale", 1000.0),
+            time_sampling=getattr(config, "image_flow_time_sampling", "logit_normal"),
+            logit_mean=getattr(config, "image_flow_logit_mean", 0.0),
+            logit_std=getattr(config, "image_flow_logit_std", 1.0),
+            time_eps=getattr(config, "image_flow_time_eps", 1.0e-4),
+            uniform_mix=getattr(config, "image_flow_time_uniform_mix", 0.1),
+            solver=getattr(config, "image_flow_solver", "heun"),
         )
 
         # Initialize weights and apply final processing
@@ -889,47 +852,48 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
     def image_local_positions(self, token_types: torch.Tensor) -> torch.Tensor:
         return self.model.image_local_positions(token_types)
 
-    def _prepare_image_diffusion_condition(
+    def _prepare_image_flow_condition(
         self,
         z: torch.Tensor,
         image_local_positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if image_local_positions is not None:
             z = self.image_token_embedder.add_diffusion_pos(z, image_local_positions)
-        return _normalize_image_diffusion_condition(
+        return _normalize_image_flow_condition(
             z,
-            self.image_diffusion_condition_norm,
-            self.image_diffusion_condition_norm_eps,
+            self.image_flow_condition_norm,
+            self.image_flow_condition_norm_eps,
         )
 
-    def sample_image_diffusion_with_cfg(
+    def sample_image_flow_with_cfg(
         self,
         z: torch.Tensor,
         z_uncond: torch.Tensor | None = None,
         temperature: float = 1.0,
         cfg: float = 1.0,
-        clip_denoised: bool = False,
+        solver: str | None = None,
+        num_steps: int | None = None,
     ) -> torch.Tensor:
         if cfg == 1.0:
-            return self.image_diffusion_head.sample(
+            return self.image_flow_head.sample(
                 z,
                 temperature=temperature,
                 cfg=1.0,
-                clip_denoised=clip_denoised,
+                solver=solver,
+                num_steps=num_steps,
             )
         if z_uncond is None:
             raise ValueError("cfg != 1.0 requires z_uncond; pass paired conditional/unconditional conditions.")
         if z.shape != z_uncond.shape:
             raise ValueError(f"z and z_uncond must have the same shape, got {tuple(z.shape)} vs {tuple(z_uncond.shape)}")
         paired = torch.cat([z, z_uncond], dim=0)
-        sampled = self.image_diffusion_head.sample(
+        return self.image_flow_head.sample(
             paired,
             temperature=temperature,
             cfg=cfg,
-            clip_denoised=clip_denoised,
+            solver=solver,
+            num_steps=num_steps,
         )
-        sampled, _ = sampled.chunk(2, dim=0)
-        return sampled
 
     def tie_weights(self, missing_keys: set[str] | None = None, recompute_mapping: bool = True):
         # Delegate standard tie (lm_head ↔ embed_tokens) to parent
@@ -1020,7 +984,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
 
                 if image_flat_mask.any():
                     if image_latents is None:
-                        raise ValueError("image_latents must be provided for continuous image diffusion loss.")
+                        raise ValueError("image_latents must be provided for continuous image flow loss.")
                     if image_latents.shape[-1] != self.image_latent_dim:
                         raise ValueError(
                             f"image_latents last dimension ({image_latents.shape[-1]}) must match "
@@ -1028,18 +992,18 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                         )
                     flat_image_latents = image_latents.to(hidden_states.device).view(-1, self.image_latent_dim)
                     image_targets = flat_image_latents[image_flat_mask]
-                    image_conditions = self._prepare_image_diffusion_condition(
+                    image_conditions = self._prepare_image_flow_condition(
                         flat_hidden[image_flat_mask],
                         flat_image_positions[image_flat_mask],
                     )
-                    if self.image_diffusion_batch_mul > 1:
-                        image_targets = image_targets.repeat(self.image_diffusion_batch_mul, 1)
-                        image_conditions = image_conditions.repeat(self.image_diffusion_batch_mul, 1)
-                    image_loss = self.image_diffusion_head(target=image_targets, z=image_conditions)
+                    if self.image_flow_batch_mul > 1:
+                        image_targets = image_targets.repeat(self.image_flow_batch_mul, 1)
+                        image_conditions = image_conditions.repeat(self.image_flow_batch_mul, 1)
+                    image_loss = self.image_flow_head(target=image_targets, z=image_conditions)
                 else:
                     dummy_target = torch.zeros(1, self.image_latent_dim, device=hidden_states.device)
-                    dummy_hidden = self._prepare_image_diffusion_condition(flat_hidden[:1])
-                    image_loss = self.image_diffusion_head(dummy_target, dummy_hidden) * 0.0
+                    dummy_hidden = self._prepare_image_flow_condition(flat_hidden[:1])
+                    image_loss = self.image_flow_head(dummy_target, dummy_hidden) * 0.0
 
                 loss = self.lambda_text * text_loss + self.lambda_image * image_loss
             else:
@@ -1054,18 +1018,20 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
-        output.last_hidden_state = hidden_states
+        output["last_hidden_state"] = hidden_states
         # Attach per-modality losses for logging
         if token_types is not None and loss is not None:
-            output.per_modality_loss = {
+            per_modality_loss = {
                 "text_loss": text_loss.detach() if isinstance(text_loss, torch.Tensor) else torch.tensor(text_loss or 0.0, device=hidden_states.device),
                 "image_loss": image_loss.detach() if isinstance(image_loss, torch.Tensor) else torch.tensor(image_loss or 0.0, device=hidden_states.device),
             }
-            output.diffusion_debug_stats = {
+            flow_debug_stats = {
                 key: value.detach()
-                for key, value in self.image_diffusion_head.last_forward_stats.items()
+                for key, value in self.image_flow_head.last_forward_stats.items()
                 if isinstance(value, torch.Tensor)
             }
+            output["per_modality_loss"] = per_modality_loss
+            output["flow_debug_stats"] = flow_debug_stats
         return output
         
     @torch.compile(mode="max-autotune-no-cudagraphs")
@@ -1082,10 +1048,11 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         image_latent_dim: int | None = None,
         initial_image_latents: torch.Tensor | None = None,
         initial_image_latent_mask: torch.Tensor | None = None,
-        diffusion_temperature: float = 1.0,
-        diffusion_cfg: float = 1.0,
-        diffusion_cfg_schedule: str = "linear",
-        diffusion_clip_denoised: bool = False,
+        flow_temperature: float = 1.0,
+        flow_cfg: float = 1.0,
+        flow_cfg_schedule: str = "linear",
+        flow_solver: str | None = None,
+        flow_num_steps: int | None = None,
         parallel_rate: int = 32,
         order_strategy: str = "condition_norm",
         return_trace: bool = False,
@@ -1109,7 +1076,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             selected_input_ids.shape[1],
             image_latent_dim,
             device=device,
-            dtype=self.image_diffusion_head.net.final_layer.linear.weight.dtype,
+            dtype=self.image_flow_head.net.final_layer.linear.weight.dtype,
         )
         base_image_latent_mask = torch.zeros_like(selected_token_types, dtype=torch.bool)
         if initial_image_latents is not None:
@@ -1222,12 +1189,12 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         next_image_order = torch.zeros(len(spans), device=device, dtype=torch.float32)
         k = max(1, int(parallel_rate))
         order_strategy = str(order_strategy or "condition_norm").lower()
-        condition_norm_mode, condition_norm_eps = _image_diffusion_condition_norm_config(self)
+        condition_norm_mode, condition_norm_eps = _image_flow_condition_norm_config(self)
         replay_original_sigma = order_strategy in {"sigma", "sigma_replay"}
         def _condition(hidden_values: torch.Tensor, local_positions: torch.Tensor) -> torch.Tensor:
-            if hasattr(self, "_prepare_image_diffusion_condition"):
-                return self._prepare_image_diffusion_condition(hidden_values, local_positions)
-            return _normalize_image_diffusion_condition(
+            if hasattr(self, "_prepare_image_flow_condition"):
+                return self._prepare_image_flow_condition(hidden_values, local_positions)
+            return _normalize_image_flow_condition(
                 hidden_values,
                 condition_norm_mode,
                 condition_norm_eps,
@@ -1258,7 +1225,15 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             "uniform": _spatial_uniform_order(),
         }
         latent_level_strategies = {"latent_proj_cosine"}
-        use_diffusion_cfg = diffusion_cfg != 1.0
+        use_flow_cfg = flow_cfg != 1.0
+        boi_token_id = getattr(self.config, "boi_token_id", None)
+        if use_flow_cfg and boi_token_id is None:
+            raise ValueError("flow_cfg != 1.0 requires config.boi_token_id for image-uncond attention masks.")
+        image_uncond_rows = torch.ones(
+            selected_input_ids.shape[0],
+            device=device,
+            dtype=torch.bool,
+        ) if use_flow_cfg else None
 
         while not filled.all():
             remaining_per_sample = (~filled).sum(dim=1)
@@ -1270,9 +1245,9 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 float(filled.sum().item() + planned_fill.item())
                 / float(max(1, filled.numel()))
             )
-            cfg_iter = _scheduled_diffusion_cfg(
-                diffusion_cfg,
-                diffusion_cfg_schedule,
+            cfg_iter = _scheduled_flow_cfg(
+                flow_cfg,
+                flow_cfg_schedule,
                 progress_after_step,
             )
             attention_mask = get_selfless_mask(
@@ -1280,6 +1255,17 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 seq_len=selected_input_ids.shape[1],
                 device=device,
             )
+            uncond_attention_mask = None
+            if use_flow_cfg:
+                uncond_attention_mask = get_selfless_mask(
+                    sigma=current_sigma,
+                    seq_len=selected_input_ids.shape[1],
+                    device=device,
+                    input_ids=selected_input_ids,
+                    token_types=selected_token_types,
+                    boi_token_id=int(boi_token_id),
+                    image_uncond_rows=image_uncond_rows,
+                )
             image_latent_mask = base_image_latent_mask.clone()
             for sample_idx, start, _ in local_spans:
                 image_latent_mask[sample_idx, start : start + image_tokens_per_img] = filled[sample_idx]
@@ -1292,14 +1278,13 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 calculate_likelihood=False,
             ).last_hidden_state
             uncond_hidden = None
-            if use_diffusion_cfg:
+            if use_flow_cfg:
                 uncond_hidden = self.model(
                     X0_input_ids=selected_input_ids,
-                    attention_mask=attention_mask,
+                    attention_mask=uncond_attention_mask,
                     token_types=selected_token_types,
                     image_latents=work_latents,
                     image_latent_mask=image_latent_mask,
-                    image_condition_drop=True,
                     calculate_likelihood=False,
                 ).last_hidden_state
 
@@ -1329,19 +1314,20 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                     all_local_positions,
                 )
                 z_uncond = None
-                if use_diffusion_cfg:
+                if use_flow_cfg:
                     z_uncond = _condition(
                         uncond_hidden[all_sample_indices, all_seq_positions],
                         all_local_positions,
                     )
 
-                candidate_pred = Qwen3ForCausalLM.sample_image_diffusion_with_cfg(
+                candidate_pred = Qwen3ForCausalLM.sample_image_flow_with_cfg(
                     self,
                     z,
                     z_uncond=z_uncond,
-                    temperature=diffusion_temperature,
+                    temperature=flow_temperature,
                     cfg=cfg_iter,
-                    clip_denoised=diffusion_clip_denoised,
+                    solver=flow_solver,
+                    num_steps=flow_num_steps,
                 ).to(work_latents.dtype)
                 projected = self.image_token_embedder(
                     candidate_pred.to(dtype=self.image_token_embedder.weight_dtype),
@@ -1418,18 +1404,19 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                     local_positions_for_condition,
                 )
                 z_uncond = None
-                if use_diffusion_cfg:
+                if use_flow_cfg:
                     z_uncond = _condition(
                         uncond_hidden[sample_indices, seq_positions],
                         local_positions_for_condition,
                     )
-                pred = Qwen3ForCausalLM.sample_image_diffusion_with_cfg(
+                pred = Qwen3ForCausalLM.sample_image_flow_with_cfg(
                     self,
                     z,
                     z_uncond=z_uncond,
-                    temperature=diffusion_temperature,
+                    temperature=flow_temperature,
                     cfg=cfg_iter,
-                    clip_denoised=diffusion_clip_denoised,
+                    solver=flow_solver,
+                    num_steps=flow_num_steps,
                 ).to(work_latents.dtype)
 
             cursor = 0
@@ -1468,7 +1455,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         if return_trace:
             trace = {
                 "order_strategy": order_strategy,
-                "diffusion_cfg_schedule": str(diffusion_cfg_schedule),
+                "flow_cfg_schedule": str(flow_cfg_schedule),
                 "generation_order": generation_order.view(len(spans), side, side),
                 "generation_step": generation_step.view(len(spans), side, side),
                 "generation_score": generation_score.view(len(spans), side, side),
@@ -1497,10 +1484,11 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         ratio,
         parallel_rate,
         decode_strategy: str,
-        diffusion_temperature: float = 1.0,
-        diffusion_cfg: float = 1.0,
-        diffusion_cfg_schedule: str = "linear",
-        diffusion_clip_denoised: bool = False,
+        flow_temperature: float = 1.0,
+        flow_cfg: float = 1.0,
+        flow_cfg_schedule: str = "linear",
+        flow_solver: str | None = None,
+        flow_num_steps: int | None = None,
         image_parallel_rate: int | None = None,
         image_order_strategy: str | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1518,10 +1506,10 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             raise ValueError(f"image_tokens_per_img={image_tokens_per_img} is not square")
 
         latent_dtype = torch.float32
-        diffusion_head = getattr(self, "image_diffusion_head", None)
-        if diffusion_head is not None:
+        flow_head = getattr(self, "image_flow_head", None)
+        if flow_head is not None:
             try:
-                latent_dtype = diffusion_head.net.final_layer.linear.weight.dtype
+                latent_dtype = flow_head.net.final_layer.linear.weight.dtype
             except AttributeError:
                 latent_dtype = torch.float32
 
@@ -1605,10 +1593,11 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 image_latent_dim=image_latent_dim,
                 initial_image_latents=image_latents.unsqueeze(0),
                 initial_image_latent_mask=image_latent_mask.unsqueeze(0),
-                diffusion_temperature=diffusion_temperature,
-                diffusion_cfg=diffusion_cfg,
-                diffusion_cfg_schedule=diffusion_cfg_schedule,
-                diffusion_clip_denoised=diffusion_clip_denoised,
+                flow_temperature=flow_temperature,
+                flow_cfg=flow_cfg,
+                flow_cfg_schedule=flow_cfg_schedule,
+                flow_solver=flow_solver,
+                flow_num_steps=flow_num_steps,
                 parallel_rate=image_parallel_rate if image_parallel_rate is not None else 32,
                 order_strategy=image_order_strategy or decode_strategy,
             )
@@ -1690,10 +1679,11 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         aligned_image_latents = []
         generated_image_latents = []
         image_spans = []
-        diffusion_temperature = float(kwargs.pop("diffusion_temperature", 1.0))
-        diffusion_cfg = float(kwargs.pop("diffusion_cfg", 1.0))
-        diffusion_cfg_schedule = str(kwargs.pop("diffusion_cfg_schedule", "linear"))
-        diffusion_clip_denoised = bool(kwargs.pop("diffusion_clip_denoised", False))
+        flow_temperature = float(kwargs.pop("flow_temperature", 1.0))
+        flow_cfg = float(kwargs.pop("flow_cfg", 1.0))
+        flow_cfg_schedule = str(kwargs.pop("flow_cfg_schedule", "linear"))
+        flow_solver = kwargs.pop("flow_solver", None)
+        flow_num_steps = kwargs.pop("flow_num_steps", None)
         image_parallel_rate = kwargs.pop("image_parallel_rate", parallel_rate)
         image_order_strategy = kwargs.pop("image_order_strategy", decode_strategy)
         for i in range(num_response):
@@ -1706,10 +1696,11 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 ratio=ratio,
                 parallel_rate=parallel_rate,
                 decode_strategy=decode_strategy,
-                diffusion_temperature=diffusion_temperature,
-                diffusion_cfg=diffusion_cfg,
-                diffusion_cfg_schedule=diffusion_cfg_schedule,
-                diffusion_clip_denoised=diffusion_clip_denoised,
+                flow_temperature=flow_temperature,
+                flow_cfg=flow_cfg,
+                flow_cfg_schedule=flow_cfg_schedule,
+                flow_solver=flow_solver,
+                flow_num_steps=flow_num_steps,
                 image_parallel_rate=image_parallel_rate,
                 image_order_strategy=image_order_strategy,
             )

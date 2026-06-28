@@ -21,40 +21,39 @@ from utils.utils import get_selfless_mask, load_model_tokenizer
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Manual validation image generation for MAR DiffLoss adapters.")
+    parser = argparse.ArgumentParser(description="Manual validation image generation for image rectified-flow heads.")
     parser.add_argument("--config", default="configs/selfless/imagenet_diffusion_warmup_full.yaml")
-    parser.add_argument(
-        "--model_path_override",
-        default="",
-        help="Optionally override config.model.model_path before loading the model.",
-    )
+    parser.add_argument("--model_path_override", default="")
     parser.add_argument(
         "--adapter",
-        default="output/selfless-diffusion-0.6B-imagenet-warmup-from-textft/image_diffusion_adapter-12000.pt",
-        help="Warmup adapter .pt, MAR .safetensors, or 'none' to use randomly initialized current head.",
+        default="none",
+        help="Flow adapter, old diffusion adapter/checkpoint to migrate, MAR .safetensors, or 'none'.",
     )
-    parser.add_argument("--output_dir", default="output/manual_diffusion_validation")
+    parser.add_argument(
+        "--model_state",
+        default="",
+        help=(
+            "Optional full model state to load after initialization. Supports a DeepSpeed "
+            "mp_rank_00_model_states.pt file with a 'module' key or a plain state_dict."
+        ),
+    )
+    parser.add_argument("--output_dir", default="output/manual_flow_validation")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--samples", type=int, default=4)
     parser.add_argument("--split", choices=["val", "train"], default="val")
-    parser.add_argument("--sampling_steps", default="100")
+    parser.add_argument("--sampling_steps", default="50")
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--cfg", type=float, default=1.0)
     parser.add_argument("--cfg_schedule", choices=["constant", "linear"], default="linear")
-    parser.add_argument("--denoise_timestep", type=int, default=500)
-    parser.add_argument("--full_clip", action="store_true", help="Save full diffusion sample with clip_denoised=True.")
-    parser.add_argument("--full_no_clip", action="store_true", help="Save full diffusion sample with clip_denoised=False.")
-    parser.add_argument("--single_stream", action="store_true", help="Also run single-stream iterative generation.")
-    parser.add_argument("--single_stream_clip", action="store_true", help="Use clip_denoised=True for single-stream.")
+    parser.add_argument("--flow_solver", choices=["heun", "euler"], default="heun")
+    parser.add_argument("--probe_times", default="0.25,0.5,0.75,0.95")
+    parser.add_argument("--single_stream", action="store_true")
     parser.add_argument(
         "--oracle_reveal_ratios",
         default="",
-        help=(
-            "Comma-separated fractions of image tokens to seed with ground-truth latents before "
-            "single-stream generation, e.g. '0.2,0.5'."
-        ),
+        help="Comma-separated fractions of image tokens seeded with ground-truth latents before single-stream generation.",
     )
     parser.add_argument(
         "--oracle_reveal_order",
@@ -62,14 +61,10 @@ def parse_args():
         help="Order for oracle seeding: same, sigma, random, spatial_halton, spatial_uniform, or prefix.",
     )
     parser.add_argument("--parallel_rate", type=int, default=1)
-    parser.add_argument(
-        "--strategies",
-        default="sigma,hidden_norm",
-        help="Comma-separated single-stream order strategies.",
-    )
+    parser.add_argument("--strategies", default="sigma,hidden_norm")
     parser.add_argument("--vae_dtype", choices=["fp32", "fp16"], default="fp32")
     parser.add_argument("--save_individual", action="store_true")
-    parser.add_argument("--no_progress", action="store_true", help="Disable tqdm progress bars.")
+    parser.add_argument("--no_progress", action="store_true")
     return parser.parse_args()
 
 
@@ -88,16 +83,16 @@ def tensor_stats(x):
 def parse_float_list(value: str) -> list[float]:
     if not value:
         return []
-    ratios = []
+    out = []
     for item in value.split(","):
         item = item.strip()
         if not item:
             continue
-        ratio = float(item)
-        if ratio < 0.0 or ratio > 1.0:
-            raise ValueError(f"oracle reveal ratios must be in [0, 1], got {ratio}")
-        ratios.append(ratio)
-    return ratios
+        value_float = float(item)
+        if value_float < 0.0 or value_float > 1.0:
+            raise ValueError(f"values must be in [0, 1], got {value_float}")
+        out.append(value_float)
+    return out
 
 
 def _halton(index: int, base: int) -> float:
@@ -140,15 +135,7 @@ def _spatial_uniform_order(side: int, device) -> torch.Tensor:
     return torch.argsort((ring * 4.0 + checker.float()).flatten())
 
 
-def _oracle_order(
-    strategy: str,
-    sigma_row: torch.Tensor,
-    start: int,
-    end: int,
-    side: int,
-    seed: int,
-    sample_idx: int,
-) -> torch.Tensor:
+def _oracle_order(strategy: str, sigma_row: torch.Tensor, start: int, end: int, side: int, seed: int, sample_idx: int):
     strategy = str(strategy or "sigma").lower()
     image_tokens = end - start
     device = sigma_row.device
@@ -203,61 +190,69 @@ def masked_mse_and_rms(pred: torch.Tensor, target: torch.Tensor, mask_hw: torch.
     }
 
 
+def _migrate_head_state(model, head_state: dict[str, torch.Tensor]):
+    target = model.image_flow_head.state_dict()
+    load_state = {}
+    skipped = {}
+    for key, value in head_state.items():
+        if key not in target:
+            skipped[key] = [list(value.shape), None]
+            continue
+        target_shape = tuple(target[key].shape)
+        value_shape = tuple(value.shape)
+        if value_shape == target_shape:
+            load_state[key] = value
+        else:
+            skipped[key] = [list(value_shape), list(target_shape)]
+    missing, unexpected = model.image_flow_head.load_state_dict(load_state, strict=False)
+    return {
+        "loaded": len(load_state),
+        "missing": list(missing),
+        "unexpected": list(unexpected),
+        "skipped": skipped,
+    }
+
+
 def load_adapter(model, adapter_path: str):
     if adapter_path.lower() in {"none", "null", "false", ""}:
         return {"adapter": None}
 
     path = Path(adapter_path)
+    if path.is_dir():
+        path = path / "model.safetensors"
     if not path.exists():
         raise FileNotFoundError(path)
 
+    report = {"adapter": str(path)}
     if path.suffix == ".safetensors":
         head_state = {}
         projector_state = {}
         projector_target = model.image_token_embedder.state_dict()
-        projector_skipped = {}
         mar_mask_token = None
-        mar_fake_latent = None
 
         def maybe_add_projector_key(name, value):
-            if name not in projector_target:
-                projector_skipped[name] = (tuple(value.shape), None)
-                return
-            target_shape = tuple(projector_target[name].shape)
-            if tuple(value.shape) != target_shape:
-                projector_skipped[name] = (tuple(value.shape), target_shape)
-                return
-            projector_state[name] = value
+            if name in projector_target and tuple(value.shape) == tuple(projector_target[name].shape):
+                projector_state[name] = value
 
         with safe_open(str(path), framework="pt", device="cpu") as f:
             for key in f.keys():
                 if key.startswith("diffloss."):
                     head_state[key[len("diffloss."):]] = f.get_tensor(key)
-                elif key.startswith("image_diffusion_head."):
-                    head_state[key[len("image_diffusion_head."):]] = f.get_tensor(key)
+                elif key.startswith("image_flow_head."):
+                    head_state[key[len("image_flow_head."):]] = f.get_tensor(key)
+                elif key.startswith("model.image_token_embedder."):
+                    maybe_add_projector_key(key[len("model.image_token_embedder."):], f.get_tensor(key))
                 elif key in {"z_proj.weight", "z_proj.bias", "z_proj_ln.weight", "z_proj_ln.bias"}:
                     maybe_add_projector_key(key, f.get_tensor(key))
                 elif key == "encoder_pos_embed_learned":
                     pos = f.get_tensor(key).squeeze(0)
-                    maybe_add_projector_key(
-                        "image_pos_embed.weight",
-                        pos[-model.image_token_embedder.image_tokens_per_img:],
-                    )
+                    maybe_add_projector_key("image_pos_embed.weight", pos[-model.image_token_embedder.image_tokens_per_img:])
                 elif key == "diffusion_pos_embed_learned":
                     maybe_add_projector_key("diffusion_pos_embed.weight", f.get_tensor(key).squeeze(0))
                 elif key == "mask_token":
                     mar_mask_token = f.get_tensor(key).reshape(-1)
-                elif key == "fake_latent":
-                    mar_fake_latent = f.get_tensor(key).reshape(-1)
-        missing, unexpected = model.image_diffusion_head.load_state_dict(head_state, strict=False)
-        report = {
-            "adapter": str(path),
-            "image_diffusion_head_keys": len(head_state),
-            "missing": list(missing),
-            "unexpected": list(unexpected),
-            "image_token_embedder_keys": len(projector_state),
-            "image_token_embedder_skipped": projector_skipped,
-        }
+
+        report["image_flow_head"] = _migrate_head_state(model, head_state)
         if projector_state:
             missing, unexpected = model.image_token_embedder.load_state_dict(projector_state, strict=False)
             report["image_token_embedder_missing"] = list(missing)
@@ -269,40 +264,15 @@ def load_adapter(model, adapter_path: str):
                 if mar_mask_token.numel() == embed.shape[1]:
                     embed[int(image_mask_token_id)].copy_(mar_mask_token.to(device=embed.device, dtype=embed.dtype))
                     report["loaded_mar_mask_token_id"] = int(image_mask_token_id)
-                else:
-                    report["skipped_mar_mask_token_shape"] = [int(mar_mask_token.numel()), int(embed.shape[1])]
-        if mar_fake_latent is not None and hasattr(model.model, "image_condition_null"):
-            with torch.no_grad():
-                null = model.model.image_condition_null
-                if mar_fake_latent.numel() == null.numel():
-                    null.copy_(mar_fake_latent.to(device=null.device, dtype=null.dtype))
-                    report["loaded_mar_fake_latent_as_image_condition_null"] = True
-                else:
-                    report["skipped_mar_fake_latent_shape"] = [
-                        int(mar_fake_latent.numel()),
-                        int(null.numel()),
-                    ]
         return report
 
     state = torch.load(path, map_location="cpu")
-    report = {"adapter": str(path)}
-    if "image_diffusion_head" in state:
-        missing, unexpected = model.image_diffusion_head.load_state_dict(state["image_diffusion_head"], strict=False)
-        report["image_diffusion_head_missing"] = list(missing)
-        report["image_diffusion_head_unexpected"] = list(unexpected)
+    if "image_flow_head" in state:
+        report["image_flow_head"] = _migrate_head_state(model, state["image_flow_head"])
     if "image_token_embedder" in state:
         missing, unexpected = model.image_token_embedder.load_state_dict(state["image_token_embedder"], strict=False)
         report["image_token_embedder_missing"] = list(missing)
         report["image_token_embedder_unexpected"] = list(unexpected)
-    if "image_condition_null" in state and hasattr(model.model, "image_condition_null"):
-        with torch.no_grad():
-            model.model.image_condition_null.copy_(
-                state["image_condition_null"].to(
-                    device=model.model.image_condition_null.device,
-                    dtype=model.model.image_condition_null.dtype,
-                )
-            )
-        report["loaded_image_condition_null"] = True
     if "special_token_embeddings" in state and "special_token_ids" in state:
         with torch.no_grad():
             embed = model.model.embed_tokens.weight
@@ -311,6 +281,30 @@ def load_adapter(model, adapter_path: str):
                     embed[int(token_id)].copy_(state["special_token_embeddings"][name].to(dtype=embed.dtype))
         report["loaded_special_token_embeddings"] = sorted(state["special_token_embeddings"].keys())
     return report
+
+
+def load_model_state(model, model_state_path: str):
+    if not model_state_path:
+        return {"model_state": None}
+    path = Path(model_state_path)
+    if path.is_dir():
+        candidate = path / "pytorch_model" / "mp_rank_00_model_states.pt"
+        if candidate.exists():
+            path = candidate
+    if not path.exists():
+        raise FileNotFoundError(path)
+    state = torch.load(path, map_location="cpu")
+    if isinstance(state, dict) and "module" in state:
+        state_dict = state["module"]
+    else:
+        state_dict = state
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    return {
+        "model_state": str(path),
+        "keys": len(state_dict),
+        "missing": list(missing),
+        "unexpected": list(unexpected),
+    }
 
 
 def load_vae(config, device, dtype_name):
@@ -337,6 +331,7 @@ def main():
     args = parse_args()
     progress = not args.no_progress
     oracle_reveal_ratios = parse_float_list(args.oracle_reveal_ratios)
+    probe_times = parse_float_list(args.probe_times)
     torch.manual_seed(args.seed)
     device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
     out_dir = Path(args.output_dir)
@@ -347,12 +342,17 @@ def main():
         config.model.model_path = args.model_path_override
     config.training.batch_size = args.batch_size
     config.training.dataloader_workers = 0
-    config.model.image_diffusion_num_sampling_steps = str(args.sampling_steps)
+    config.model.image_flow_num_sampling_steps = str(args.sampling_steps)
 
     print("Loading model/tokenizer...")
     model, tokenizer = load_model_tokenizer(config)
     print(f"Loading adapter: {args.adapter}")
-    adapter_report = load_adapter(model, args.adapter)
+    adapter_report = load_adapter(
+        model,
+        args.adapter,
+    )
+    print(f"Loading model state: {args.model_state or 'none'}")
+    model_state_report = load_model_state(model, args.model_state)
     model = model.to(device).eval()
     print("Loading MAR VAE...")
     vae = load_vae(config, device, args.vae_dtype)
@@ -381,12 +381,25 @@ def main():
         )
         uncond_output = None
         if args.cfg != 1.0:
+            image_uncond_rows = torch.ones(
+                input_ids.shape[0],
+                device=device,
+                dtype=torch.bool,
+            )
+            uncond_attention_mask = get_selfless_mask(
+                sigma=sigma,
+                seq_len=input_ids.shape[1],
+                device=device,
+                input_ids=input_ids,
+                token_types=token_types,
+                boi_token_id=int(config.model.boi_token_id),
+                image_uncond_rows=image_uncond_rows,
+            )
             uncond_output = model(
                 X0_input_ids=input_ids,
-                attention_mask=attention_mask,
+                attention_mask=uncond_attention_mask,
                 token_types=token_types,
                 image_latents=image_latents,
-                image_condition_drop=True,
                 calculate_likelihood=True,
                 return_logits=False,
             )
@@ -405,129 +418,92 @@ def main():
     strategies = [item.strip() for item in args.strategies.split(",") if item.strip()]
     metrics = {
         "adapter": adapter_report,
+        "model_state": model_state_report,
         "config": args.config,
         "model_path": str(config.model.model_path),
         "sampling_steps": str(args.sampling_steps),
         "temperature": args.temperature,
         "cfg": args.cfg,
         "cfg_schedule": args.cfg_schedule,
-        "denoise_timestep": args.denoise_timestep,
+        "flow_solver": args.flow_solver,
+        "probe_times": probe_times,
         "oracle_reveal_ratios": oracle_reveal_ratios,
         "oracle_reveal_order": args.oracle_reveal_order,
         "loss": float(output.loss.detach().float().item()),
-        "diffusion_stats": {
+        "flow_stats": {
             key: float(value.detach().float().item())
-            for key, value in getattr(output, "diffusion_debug_stats", {}).items()
+            for key, value in getattr(output, "flow_debug_stats", {}).items()
         },
         "samples": [],
     }
 
     target_latents = []
-    denoise_latents = []
-    full_clip_latents = []
-    full_no_clip_latents = []
+    full_sample_latents = []
+    probe_x0_latents = {time_value: [] for time_value in probe_times}
 
-    sample_iter = tqdm(
-        list(enumerate(spans)),
-        desc="Denoise/full sampling",
-        dynamic_ncols=True,
-        disable=not progress,
-    )
+    sample_iter = tqdm(list(enumerate(spans)), desc="Flow sampling", dynamic_ncols=True, disable=not progress)
     with torch.no_grad():
         for sample_idx, (batch_idx, start, end) in sample_iter:
             local_positions = torch.arange(end - start, device=device, dtype=torch.long)
-            z = model._prepare_image_diffusion_condition(
-                output.last_hidden_state[batch_idx, start:end],
-                local_positions,
-            )
+            z = model._prepare_image_flow_condition(output.last_hidden_state[batch_idx, start:end], local_positions)
             z_uncond = None
             if uncond_output is not None:
-                z_uncond = model._prepare_image_diffusion_condition(
+                z_uncond = model._prepare_image_flow_condition(
                     uncond_output.last_hidden_state[batch_idx, start:end],
                     local_positions,
                 )
             target = image_latents[batch_idx, start:end].to(dtype=z.dtype)
-            sample_iter.set_postfix_str("denoise_x0", refresh=False)
-
-            timestep = max(0, min(args.denoise_timestep, model.image_diffusion_head.train_diffusion.num_timesteps - 1))
-            t = torch.full((target.shape[0],), timestep, device=device, dtype=torch.long)
-            torch.manual_seed(args.seed + 1000 + sample_idx)
-            noise = torch.randn_like(target)
-            noisy = model.image_diffusion_head.train_diffusion.q_sample(target, t, noise=noise)
-            denoise = model.image_diffusion_head.train_diffusion.p_mean_variance(
-                model.image_diffusion_head.net,
-                noisy,
-                t,
-                clip_denoised=False,
-                model_kwargs={"c": z},
-            )["pred_xstart"].to(dtype=target.dtype)
+            torch.manual_seed(args.seed + 2000 + sample_idx)
+            full_sample = model.sample_image_flow_with_cfg(
+                z,
+                z_uncond=z_uncond,
+                temperature=args.temperature,
+                cfg=args.cfg,
+                solver=args.flow_solver,
+            ).to(dtype=target.dtype)
 
             sample_metrics = {
                 "index": sample_idx,
                 "batch_index": batch_idx,
                 "target": tensor_stats(target),
-                "denoise_x0": tensor_stats(denoise),
-                "denoise_x0_mse_to_target": float(F.mse_loss(denoise.float(), target.float()).item()),
+                "full_sample": tensor_stats(full_sample),
+                "full_sample_mse_to_target": float(F.mse_loss(full_sample.float(), target.float()).item()),
+                "probes": {},
             }
+            for time_value in probe_times:
+                t = torch.full((target.shape[0],), time_value, device=device, dtype=torch.float32)
+                noise = torch.randn_like(target)
+                t_view = t.view(-1, 1).to(dtype=target.dtype)
+                x_t = (1.0 - t_view) * target + t_view * noise
+                v_target = noise - target
+                v_pred = model.image_flow_head.velocity(x_t, t, z).to(dtype=target.dtype)
+                x0_est = x_t - t_view * v_pred
+                sample_metrics["probes"][str(time_value)] = {
+                    "v_mse": float(F.mse_loss(v_pred.float(), v_target.float()).item()),
+                    "x0_est_mse": float(F.mse_loss(x0_est.float(), target.float()).item()),
+                    "x0_est": tensor_stats(x0_est),
+                }
+                probe_x0_latents[time_value].append(x0_est.view(side, side, -1).permute(2, 0, 1))
 
             target_latents.append(target.view(side, side, -1).permute(2, 0, 1))
-            denoise_latents.append(denoise.view(side, side, -1).permute(2, 0, 1))
-
-            if args.full_clip:
-                sample_iter.set_postfix_str("full_clip=True", refresh=False)
-                torch.manual_seed(args.seed + 2000 + sample_idx)
-                full_clip = model.sample_image_diffusion_with_cfg(
-                    z,
-                    z_uncond=z_uncond,
-                    temperature=args.temperature,
-                    cfg=args.cfg,
-                    clip_denoised=True,
-                ).to(dtype=target.dtype)
-                full_clip_latents.append(full_clip.view(side, side, -1).permute(2, 0, 1))
-                sample_metrics["full_sample_clip_true"] = tensor_stats(full_clip)
-                sample_metrics["full_sample_clip_true_mse_to_target"] = float(
-                    F.mse_loss(full_clip.float(), target.float()).item()
-                )
-
-            if args.full_no_clip:
-                sample_iter.set_postfix_str("full_clip=False", refresh=False)
-                torch.manual_seed(args.seed + 2000 + sample_idx)
-                full_no_clip = model.sample_image_diffusion_with_cfg(
-                    z,
-                    z_uncond=z_uncond,
-                    temperature=args.temperature,
-                    cfg=args.cfg,
-                    clip_denoised=False,
-                ).to(dtype=target.dtype)
-                full_no_clip_latents.append(full_no_clip.view(side, side, -1).permute(2, 0, 1))
-                sample_metrics["full_sample_clip_false"] = tensor_stats(full_no_clip)
-                sample_metrics["full_sample_clip_false_mse_to_target"] = float(
-                    F.mse_loss(full_no_clip.float(), target.float()).item()
-                )
-
+            full_sample_latents.append(full_sample.view(side, side, -1).permute(2, 0, 1))
             metrics["samples"].append(sample_metrics)
 
     target_chw = torch.stack(target_latents).float()
     target_img = decode_latents(vae, target_chw, scaling_factor)
-    denoise_img = decode_latents(vae, torch.stack(denoise_latents).float(), scaling_factor)
-    overview_columns = [("target", target_img), (f"denoise_x0_t{args.denoise_timestep}", denoise_img)]
-
-    if full_no_clip_latents:
-        full_no_clip_img = decode_latents(vae, torch.stack(full_no_clip_latents).float(), scaling_factor)
-        overview_columns.append(("full_clip_false", full_no_clip_img))
-        save_image(full_no_clip_img, out_dir / "full_sample_clip_false.png")
-    if full_clip_latents:
-        full_clip_img = decode_latents(vae, torch.stack(full_clip_latents).float(), scaling_factor)
-        overview_columns.append(("full_clip_true", full_clip_img))
-        save_image(full_clip_img, out_dir / "full_sample_clip_true.png")
+    full_sample_img = decode_latents(vae, torch.stack(full_sample_latents).float(), scaling_factor)
+    overview_columns = [("target", target_img)]
+    for time_value, latents in probe_x0_latents.items():
+        if latents:
+            probe_img = decode_latents(vae, torch.stack(latents).float(), scaling_factor)
+            tag = str(time_value).replace(".", "p")
+            overview_columns.append((f"flow_x0_est_{tag}", probe_img))
+            save_image(probe_img, out_dir / f"flow_x0_est_{tag}.png")
+    overview_columns.append(("full_sample", full_sample_img))
+    save_image(full_sample_img, out_dir / "full_sample.png")
 
     if args.single_stream and strategies:
-        strategy_iter = tqdm(
-            strategies,
-            desc="Single-stream strategies",
-            dynamic_ncols=True,
-            disable=not progress,
-        )
+        strategy_iter = tqdm(strategies, desc="Single-stream strategies", dynamic_ncols=True, disable=not progress)
         for strategy in strategy_iter:
             strategy_iter.set_postfix_str(strategy, refresh=False)
             with torch.no_grad():
@@ -537,10 +513,10 @@ def main():
                     sigma=sigma,
                     spans=spans,
                     image_latent_dim=image_latents.shape[-1],
-                    diffusion_temperature=args.temperature,
-                    diffusion_cfg=args.cfg,
-                    diffusion_cfg_schedule=args.cfg_schedule,
-                    diffusion_clip_denoised=args.single_stream_clip,
+                    flow_temperature=args.temperature,
+                    flow_cfg=args.cfg,
+                    flow_cfg_schedule=args.cfg_schedule,
+                    flow_solver=args.flow_solver,
                     parallel_rate=args.parallel_rate,
                     order_strategy=strategy,
                     return_trace=True,
@@ -575,19 +551,16 @@ def main():
                         image_latent_dim=image_latents.shape[-1],
                         initial_image_latents=image_latents,
                         initial_image_latent_mask=oracle_mask,
-                        diffusion_temperature=args.temperature,
-                        diffusion_cfg=args.cfg,
-                        diffusion_cfg_schedule=args.cfg_schedule,
-                        diffusion_clip_denoised=args.single_stream_clip,
+                        flow_temperature=args.temperature,
+                        flow_cfg=args.cfg,
+                        flow_cfg_schedule=args.cfg_schedule,
+                        flow_solver=args.flow_solver,
                         parallel_rate=args.parallel_rate,
                         order_strategy=strategy,
                         return_trace=True,
                     )
                 oracle_grid = torch.stack(
-                    [
-                        oracle_mask[batch_idx, start:end].view(side, side)
-                        for batch_idx, start, end in spans
-                    ]
+                    [oracle_mask[batch_idx, start:end].view(side, side) for batch_idx, start, end in spans]
                 )
                 remaining_grid = ~oracle_grid
                 oracle_img = decode_latents(vae, oracle_latents.float(), scaling_factor)
@@ -613,7 +586,6 @@ def main():
 
     if args.save_individual:
         save_image(target_img, out_dir / "target.png")
-        save_image(denoise_img, out_dir / f"denoise_x0_t{args.denoise_timestep}.png")
 
     grid = make_grid(torch.stack([img for _, img in overview_columns], dim=1).flatten(0, 1), nrow=len(overview_columns))
     overview_path = out_dir / "overview.png"
@@ -624,7 +596,7 @@ def main():
     metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     print(f"Saved overview: {overview_path}")
     print(f"Saved metrics: {metrics_path}")
-    print(json.dumps({k: metrics[k] for k in ["loss", "diffusion_stats", "overview_columns"]}, indent=2))
+    print(json.dumps({k: metrics[k] for k in ["loss", "flow_stats", "overview_columns"]}, indent=2))
 
 
 if __name__ == "__main__":

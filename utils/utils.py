@@ -182,11 +182,14 @@ def load_model_tokenizer(config: OmegaConf, logger=None):
     multimodal_config_keys = (
         "image_vocab_size", "image_offset", "lambda_image", "lambda_text",
         "boi_token_id", "eoi_token_id", "image_mask_token_id", "unified_head", "image_tokens_per_img",
-        "image_latent_dim", "continuous_image_latents", "image_diffusion_width",
-        "image_diffusion_depth", "image_diffusion_num_sampling_steps",
-        "image_diffusion_batch_mul", "image_diffusion_grad_checkpointing",
-        "image_diffusion_condition_norm", "image_diffusion_condition_norm_eps",
-        "image_condition_drop_prob", "image_projector_width",
+        "image_latent_dim", "continuous_image_latents",
+        "image_generation_head_type", "image_flow_width", "image_flow_depth",
+        "image_flow_num_sampling_steps", "image_flow_batch_mul",
+        "image_flow_grad_checkpointing", "image_flow_condition_norm",
+        "image_flow_condition_norm_eps", "image_flow_time_scale",
+        "image_flow_time_sampling", "image_flow_logit_mean", "image_flow_logit_std",
+        "image_flow_time_eps", "image_flow_time_uniform_mix", "image_flow_solver",
+        "image_uncond_prob", "image_projector_width",
     )
 
     if config.training.from_scratch:
@@ -574,7 +577,16 @@ def get_config_by_model_size(model_path: str, model_size_key: str):
 
     return config
 
-def get_selfless_mask(sigma: torch.Tensor, seq_len: int, device) -> BlockMask:
+def get_selfless_mask(
+    sigma: torch.Tensor,
+    seq_len: int,
+    device,
+    *,
+    input_ids: torch.Tensor | None = None,
+    token_types: torch.Tensor | None = None,
+    boi_token_id: int | None = None,
+    image_uncond_rows: torch.Tensor | None = None,
+) -> BlockMask:
     """
     Selfless Attention mask — removes the diagonal (self-attention) from both streams.
 
@@ -591,9 +603,32 @@ def get_selfless_mask(sigma: torch.Tensor, seq_len: int, device) -> BlockMask:
     """
 
     B = sigma.shape[0]
+    use_image_uncond = image_uncond_rows is not None
+    if use_image_uncond:
+        if input_ids is None or token_types is None or boi_token_id is None:
+            raise ValueError(
+                "input_ids, token_types, and boi_token_id are required when image_uncond_rows is provided."
+            )
+        input_ids = input_ids.to(device=device)
+        token_types = token_types.to(device=device)
+        image_uncond_rows = image_uncond_rows.to(device=device, dtype=torch.bool)
+        image_span_ids = torch.cumsum(
+            (input_ids == int(boi_token_id)).to(torch.long),
+            dim=1,
+        )
+
     def selfless_fn(b, h, q_idx, kv_idx):
         S_q = sigma[b, q_idx]
         S_kv = sigma[b, kv_idx]
-        return S_kv < S_q  # strict — no diagonal, no self-view
+        allowed = S_kv < S_q  # strict — no diagonal, no self-view
+        if not use_image_uncond:
+            return allowed
+
+        q_is_uncond_image = image_uncond_rows[b] & (token_types[b, q_idx] == 1)
+        kv_same_image_span = (
+            (token_types[b, kv_idx] == 1)
+            & (image_span_ids[b, kv_idx] == image_span_ids[b, q_idx])
+        )
+        return allowed & (~q_is_uncond_image | kv_same_image_span)
 
     return create_block_mask(selfless_fn, B=B, H=None, Q_LEN=seq_len, KV_LEN=seq_len, device=device)

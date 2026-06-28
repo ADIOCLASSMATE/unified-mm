@@ -1,161 +1,150 @@
 # Unified-MM Project Context
 
-This project studies **permutation-based selfless attention** for unified text-image pretraining. The current implementation is centered on **OpenGVLab/OmniCorpus-CC-210M** as the only multimodal pretraining dataset. Older COCO, FineWeb, and synthetic SII data paths are obsolete and have been removed.
+This project currently studies a **two-stream Qwen3 LLM with MAR-like image
+flow** for unified text-image modeling. Older documentation about
+OmniCorpus-only discrete image-token CE is obsolete for the active path.
 
 ## Research Thesis
 
-Autoregressive multimodal models force a single left-to-right order over text and image tokens. That is reasonable for language but a poor inductive bias for 2D visual tokens. This project uses one shared Transformer and one strict sigma-ordered attention rule:
+Standard causal LMs train hidden state `h_i` to predict token `x_{i+1}`. This
+one-token shift is inconvenient for a unified multimodal model because image
+generation wants a hidden condition aligned with the same spatial latent slot it
+will generate.
+
+The active model removes that tensor-level shift with two streams:
+
+- `X0`: content stream with real text tokens and visible image latent embeddings.
+- `XT`: query stream with mask embeddings, trained to predict the target at the
+  same sequence position.
+
+Both streams use one strict attention rule:
 
 ```text
-q attends to kv iff sigma[kv] > sigma[q]
+q attends to kv iff sigma[kv] < sigma[q]
 ```
 
-The contribution is not “no modality-specific components.” Text and image still need different vocabularies, embeddings, and output heads. The contribution is that the **core Transformer layers and attention rule are shared**, while modality-appropriate behavior is expressed through sigma schedules.
+The diagonal is excluded, so a token cannot see itself. With AR sigma values,
+text still gets causal information flow, but `labels == input_ids` at valid text
+positions. Image positions use the aligned `XT` hidden state as the condition
+for a MAR-like rectified-flow loss.
 
-## Current Data Direction
-
-The project is now **OmniCorpus-only**:
-
-```text
-OpenGVLab/OmniCorpus-CC-210M parquet
-  -> interleaved document JSONL + downloaded images
-  -> Open-MAGVIT2 image tokens
-  -> pre-tokenized Arrow shards
-  -> packed training batches
-```
-
-Training must not read OmniCorpus parquet, download images, tokenize text, or run MAGVIT2. All expensive work happens offline.
-
-## Sequence Format
-
-Every document is converted to:
-
-```text
-text [BOI] image_tokens [EOI] text [BOI] image_tokens [EOI] ... [EOS]
-```
-
-Hard invariants:
-
-- `token_types`: `0=text`, `1=image`, `2=special`, `3=padding`.
-- Every image span is exactly `BOI + 256 image tokens + EOI`.
-- Image tokens are Open-MAGVIT2 codes shifted by `image_offset`.
-- Image spans are never sliced or truncated.
-- Long documents are shortened by trimming text first, then dropping complete image blocks from the end.
-- `EOI` labels are `-100`.
-- Padding labels are `-100`.
-- `EOS` separates documents when multiple documents are packed together.
-
-## Current Architecture
+## Active Architecture
 
 Core model:
 
-- `models/modeling_model/modeling_selfless.py`
+- `models/modeling_model/modeling_selfless_flow.py`
 - Qwen3-based two-stream Transformer.
-- X0 stream receives real token embeddings and produces K/V.
-- XT stream receives mask embeddings and produces Q during training.
-- Inference uses X0 only.
+- `ImageTokenEmbedder` projects MAR KL16 latents into the hidden space.
+- `FlowLoss` predicts rectified-flow velocity for continuous image latents.
+- Text uses normal LM-head cross-entropy.
+- Image slots use flow MSE, not discrete image-token CE.
 
-Multimodal token handling:
+Key objective:
 
-- Text ids use the tokenizer vocabulary.
-- Image ids are `image_offset + image_code`.
-- Dual-head mode uses a text LM head and image LM head.
-- Loss is `text_loss + lambda_image * image_loss`.
+```text
+loss = lambda_text * text_ce + lambda_image * image_flow_mse
+```
 
-Data loading:
+Text-to-image generation works by letting image slots attend to prompt/context
+tokens, then sampling MAR KL16 latents from the flow head. Image-to-text works
+by letting later text positions attend image latent tokens through the same
+Transformer attention.
 
-- `utils/dataset_omnicorpus.py`
-- `OmniCorpusPackedDataset` loads Arrow shards by memory mapping.
-- It stores document lengths and pack indices, not all token lists.
-- `__getitem__` concatenates the indexed documents, validates image spans, assigns sigma/labels, and returns tensors.
-- `set_epoch()` shuffles pack order but keeps dataset length stable.
+## Current Data Direction
+
+Active image data uses cached MAR KL16 VAE latents:
+
+```text
+ImageNet image -> MAR KL16 VAE -> Tensor[256, 16]
+```
+
+Each training sample is represented as:
+
+```text
+optional text [BOI] 256 image latent slots [EOI] optional text [EOS]
+```
+
+Batch fields:
+
+- `input_ids`: text/special ids; image slots use `<|img_mask|>`.
+- `token_types`: `0=text`, `1=image`, `2=special`, `3=padding`.
+- `sigma`: strict attention order.
+- `labels`: text CE labels; image positions are `-100`.
+- `image_latents`: aligned continuous image targets.
 
 ## Active Configs And Commands
 
-Main config:
+Text selfless adaptation:
+
+```bash
+bash script/selfless/pretraining_text_selfless_2048.sh
+```
+
+Encode ImageNet into MAR KL16 latent cache:
+
+```bash
+bash script/selfless/encode_imagenet_full_mar_kl16.sh
+```
+
+Image-flow warmup:
+
+```bash
+bash script/selfless/pretraining_imagenet_diffusion_warmup_full.sh
+```
+
+Unified image/text training:
+
+```bash
+bash script/selfless/pretraining_imagenet_diffusion_unified_full.sh
+```
+
+Flow refinement:
+
+```bash
+bash script/selfless/pretraining_imagenet_diffusion_refine_full.sh
+```
+
+Main configs:
 
 ```text
-configs/selfless/omnicorpus.yaml
-```
-
-Launch training:
-
-```bash
-bash script/selfless/pretraining_omnicorpus.sh
-```
-
-Download OmniCorpus shards:
-
-```bash
-uv run python scripts/omnicorpus_download.py \
-  --max_shards 4 \
-  --local_dir public/datasets/omnicorpus/raw
-```
-
-Prepare interleaved documents and images:
-
-```bash
-uv run python scripts/omnicorpus_prepare_docs.py \
-  --parquet_glob 'public/datasets/omnicorpus/raw/data/**/*.parquet' \
-  --output_jsonl public/datasets/omnicorpus/docs/train.jsonl \
-  --image_dir public/datasets/omnicorpus/images
-```
-
-Encode images:
-
-```bash
-uv run python scripts/omnicorpus_encode_images.py \
-  --docs_jsonl public/datasets/omnicorpus/docs/train.jsonl \
-  --image_dir public/datasets/omnicorpus/images \
-  --output_dir public/datasets/omnicorpus/image_tokens_magvit2 \
-  --device cuda
-```
-
-Build Arrow shards:
-
-```bash
-uv run python scripts/omnicorpus_build_arrow.py \
-  --config configs/selfless/omnicorpus.yaml \
-  --docs_jsonl public/datasets/omnicorpus/docs/train.jsonl \
-  --image_token_dir public/datasets/omnicorpus/image_tokens_magvit2 \
-  --output_dir public/datasets/omnicorpus/arrow
-```
-
-Visualize dataloader:
-
-```bash
-uv run python scripts/viz_dataloader.py --config configs/selfless/omnicorpus.yaml
+configs/selfless/text_selfless_2048_ft.yaml
+configs/selfless/imagenet_diffusion_warmup_full.yaml
+configs/selfless/imagenet_diffusion_unified_full.yaml
+configs/selfless/imagenet_diffusion_refine_full.yaml
 ```
 
 ## Implementation Status
 
 Done:
 
-- Two-stream selfless attention.
-- Strict selfless attention mask.
-- Qwen3 model loading.
-- Open-MAGVIT2 wrapper.
-- Dual text/image embedding and LM head path.
-- Modality-aware loss.
-- OmniCorpus parquet-to-doc conversion.
-- OmniCorpus image download and MAGVIT2 encoding.
-- OmniCorpus Arrow builder.
-- OmniCorpus packed dataloader.
+- Two-stream strict selfless attention for Qwen3.
+- Shift-free text objective with same-position labels.
+- Continuous image latent embedding path.
+- MAR-like rectified-flow image loss.
+- MAR adapter migration for warmup.
+- ImageNet latent-cache dataset.
+- Combined image/text dataloader.
+- Single-stream image latent generation with multiple order strategies.
+- Validation image decoding and flow diagnostics.
 
 Still research/development work:
 
-- 2D image sigma schedules.
-- 2D RoPE for image tokens.
-- Show-o-style baseline.
-- Gradient conflict measurement.
-- Full-scale distributed preprocessing.
-- Multimodal evaluation suite.
+- Better multimodal data beyond ImageNet class-prompt conditioning.
+- Stronger understanding evaluation.
+- Generation-order ablations.
+- Text retention vs image learning balance.
+- More robust long-context/interleaved multimodal training.
 
 ## Engineering Notes
 
-- Keep preprocessing offline and resumable.
-- Do not reintroduce COCO/FineWeb/SII synthetic data into the main multimodal path.
-- Do not truncate image tokens.
-- Do not change `image_tokens_per_img=256` without updating all validation and model assumptions.
-- Any new dataset transform must preserve `BOI/EOI/EOS` boundaries.
-- Before claiming data changes are safe, run a small Arrow build and dataloader smoke test.
+- The active training loop is `pretrain/train_selfless_flow.py`.
+- The active model class is loaded when the project name contains `flow` or
+  `diffusion`.
+- Do not reintroduce shifted labels into the selfless flow path.
+- Do not treat image slots as discrete codebook CE targets in the active flow
+  configs.
+- Keep `image_tokens_per_img=256` and `image_latent_dim=16` aligned with MAR
+  KL16 assumptions unless all datasets, validation, and samplers are updated.
+- If changing image generation, check `sample_image_latents_single_stream()` and
+  `scripts/generate_diffusion_validation_images.py`.
+- If changing attention visibility, check `utils/utils.py:get_selfless_mask()`.

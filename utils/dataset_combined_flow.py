@@ -1,5 +1,6 @@
 import bisect
 import glob
+import math
 import os
 import random
 from functools import partial
@@ -138,12 +139,15 @@ class TextArrowDataset(Dataset):
 def collate_text_arrow(
     batch: List[Dict[str, torch.Tensor]],
     pad_token_id: int = 0,
+    pad_to_length: Optional[int] = None,
     pad_to_multiple_of: Optional[int] = None,
 ) -> Dict[str, torch.Tensor]:
     batch_max_len = max(item["input_ids"].shape[0] for item in batch)
-    max_len = batch_max_len
+    max_len = int(pad_to_length) if pad_to_length is not None else batch_max_len
     if pad_to_multiple_of and max_len % pad_to_multiple_of:
         max_len = ((max_len + pad_to_multiple_of - 1) // pad_to_multiple_of) * pad_to_multiple_of
+    if batch_max_len > max_len:
+        raise ValueError(f"Batch max length {batch_max_len} exceeds pad_to_length={max_len}")
 
     bsz = len(batch)
     input_ids = torch.full((bsz, max_len), int(pad_token_id), dtype=torch.long)
@@ -180,7 +184,7 @@ class CombinedBatchDataLoader:
         max_text_batches: Optional[int] = None,
         batch_schedule: str = "random",
         accumulation_steps: Optional[int] = None,
-        text_batches_per_accumulation: Optional[int] = None,
+        text_batches_per_accumulation: Optional[int | str] = None,
     ):
         self.image_loader = image_loader
         self.text_loader = text_loader
@@ -194,6 +198,14 @@ class CombinedBatchDataLoader:
         if self.batch_schedule not in {"random", "accumulation"}:
             raise ValueError(f"Unsupported batch_schedule={batch_schedule!r}; use 'random' or 'accumulation'.")
         self.accumulation_steps = int(accumulation_steps or 0)
+        self.use_ratio_accumulation_schedule = False
+        if isinstance(text_batches_per_accumulation, str):
+            schedule_value = text_batches_per_accumulation.lower()
+            if schedule_value in {"ratio", "balanced", "balanced_ratio"}:
+                self.use_ratio_accumulation_schedule = True
+                text_batches_per_accumulation = 0
+            else:
+                text_batches_per_accumulation = int(text_batches_per_accumulation)
         if text_batches_per_accumulation is None:
             text_batches_per_accumulation = round(self.text_batch_ratio * self.accumulation_steps)
             if self.text_batch_ratio > 0.0 and text_batches_per_accumulation == 0:
@@ -224,9 +236,21 @@ class CombinedBatchDataLoader:
 
     def _use_text_batch(self, step: int, rng: random.Random) -> bool:
         if self.batch_schedule == "accumulation":
+            position = step % self.accumulation_steps
+            if self.use_ratio_accumulation_schedule:
+                group = step // self.accumulation_steps
+                target = self.text_batch_ratio * self.accumulation_steps
+                current_total = math.floor((group + 1) * target + 1.0e-9)
+                previous_total = math.floor(group * target + 1.0e-9)
+                text_batches_this_accumulation = max(
+                    0,
+                    min(current_total - previous_total, self.accumulation_steps),
+                )
+                if text_batches_this_accumulation <= 0:
+                    return False
+                return position >= self.accumulation_steps - text_batches_this_accumulation
             if self.text_batches_per_accumulation <= 0:
                 return False
-            position = step % self.accumulation_steps
             return position >= self.accumulation_steps - self.text_batches_per_accumulation
         return rng.random() < self.text_batch_ratio
 
@@ -281,7 +305,9 @@ class CombinedBatchDataLoader:
             max_text_batches=self.max_text_batches,
             batch_schedule=self.batch_schedule,
             accumulation_steps=self.accumulation_steps,
-            text_batches_per_accumulation=self.text_batches_per_accumulation,
+            text_batches_per_accumulation=(
+                "ratio" if self.use_ratio_accumulation_schedule else self.text_batches_per_accumulation
+            ),
         )
         prepared.epoch = self.epoch
         return prepared
@@ -316,6 +342,7 @@ def build_text_arrow_dataloaders(config, tokenizer):
     collate_fn = partial(
         collate_text_arrow,
         pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+        pad_to_length=params.get("pad_to_length", None),
         pad_to_multiple_of=params.get("pad_to_multiple_of", 64),
     )
 
@@ -367,7 +394,7 @@ def build_combined_flow_dataloaders(config, tokenizer):
         accumulation_steps = _infer_accumulation_steps(config)
     text_batches_per_accumulation = params.get("text_batches_per_accumulation", None)
     if text_batches_per_accumulation is not None and str(text_batches_per_accumulation).lower() == "auto":
-        text_batches_per_accumulation = None
+        text_batches_per_accumulation = "ratio"
     train_loader = CombinedBatchDataLoader(
         image_loader=image_train_loader,
         text_loader=text_train_loader,

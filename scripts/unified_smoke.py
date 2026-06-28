@@ -23,9 +23,9 @@ from pretrain import train_selfless_flow as train_flow
 from pretrain.train_selfless_flow import (
     _create_ema_model,
     _load_ema_state_if_available,
-    _load_image_diffusion_adapter,
+    _load_image_flow_adapter,
     _save_ema_state,
-    _save_image_diffusion_adapter,
+    _save_image_flow_adapter,
     _sync_ema_model,
     _update_ema_model,
 )
@@ -93,13 +93,18 @@ def tiny_config() -> Qwen3Config:
     config.image_latent_dim = 4
     config.image_tokens_per_img = 4
     config.image_projector_width = 16
-    config.image_diffusion_width = 8
-    config.image_diffusion_depth = 1
-    config.image_diffusion_num_sampling_steps = "2"
-    config.image_diffusion_batch_mul = 1
-    config.image_diffusion_condition_norm = "rms"
-    config.image_diffusion_condition_norm_eps = 1e-6
-    config.image_condition_drop_prob = 0.0
+    config.image_flow_width = 8
+    config.image_flow_depth = 1
+    config.image_flow_num_sampling_steps = "2"
+    config.image_flow_batch_mul = 1
+    config.image_flow_condition_norm = "rms"
+    config.image_flow_condition_norm_eps = 1e-6
+    config.image_flow_time_scale = 1000.0
+    config.image_flow_time_sampling = "uniform"
+    config.image_flow_time_eps = 1e-4
+    config.image_flow_time_uniform_mix = 0.0
+    config.image_flow_solver = "heun"
+    config.image_uncond_prob = 0.0
     config.lambda_text = 0.1
     config.lambda_image = 1.0
     config.use_flex_attention = False
@@ -115,7 +120,7 @@ def smoke_train_config(output_dir: Path) -> OmegaConf:
                 "ema_decay": 0.5,
                 "ema_save_hf_model": False,
                 "ema_save_adapter": True,
-                "save_image_diffusion_adapter": True,
+                "save_image_flow_adapter": True,
             },
             "model": {
                 "mask_token_id": 7,
@@ -190,13 +195,13 @@ def run_validation(model, batch):
     if not torch.isfinite(loss):
         raise RuntimeError(f"validation loss is not finite: {loss.item()}")
 
-    z = model._prepare_image_diffusion_condition(
+    z = model._prepare_image_flow_condition(
         output.last_hidden_state[0, 2:6],
         torch.arange(4, device=device),
     )
-    sampled = model.sample_image_diffusion_with_cfg(z, temperature=1.0, cfg=1.0)
+    sampled = model.sample_image_flow_with_cfg(z, temperature=1.0, cfg=1.0)
     if tuple(sampled.shape) != (4, 4):
-        raise RuntimeError(f"unexpected diffusion sample shape: {tuple(sampled.shape)}")
+        raise RuntimeError(f"unexpected flow sample shape: {tuple(sampled.shape)}")
 
     single_stream, trace = model.sample_image_latents_single_stream(
         input_ids=batch["input_ids"],
@@ -204,16 +209,16 @@ def run_validation(model, batch):
         sigma=batch["sigma"],
         spans=[(0, 2, 6)],
         image_latent_dim=4,
-        diffusion_temperature=1.0,
-        diffusion_cfg=1.5,
-        diffusion_cfg_schedule="linear",
+        flow_temperature=1.0,
+        flow_cfg=1.5,
+        flow_cfg_schedule="linear",
         parallel_rate=2,
         order_strategy="sigma",
         return_trace=True,
     )
     if tuple(single_stream.shape) != (1, 4, 2, 2):
         raise RuntimeError(f"unexpected single-stream latent shape: {tuple(single_stream.shape)}")
-    if trace.get("diffusion_cfg_schedule") != "linear":
+    if trace.get("flow_cfg_schedule") != "linear":
         raise RuntimeError(f"missing cfg schedule trace: {trace}")
 
     target = batch["image_latents"][0, 2:6].view(2, 2, 4).permute(2, 0, 1)
@@ -230,7 +235,7 @@ def save_and_reload(model, ema_model, config, output_dir, batch, device):
     hf_dir = output_dir / "hf_model-smoke"
     model.save_pretrained(hf_dir, safe_serialization=True)
 
-    _save_image_diffusion_adapter(ema_model, config, accelerator, "smoke")
+    _save_image_flow_adapter(ema_model, config, accelerator, "smoke")
     _save_ema_state(ema_model, config, accelerator, 1)
 
     loaded = Qwen3ForCausalLM.from_pretrained(hf_dir).to(device)
@@ -238,7 +243,7 @@ def save_and_reload(model, ema_model, config, output_dir, batch, device):
     loaded_metrics = run_validation(loaded, batch)
 
     adapter_loaded = Qwen3ForCausalLM(tiny_config()).to(device)
-    _load_image_diffusion_adapter(adapter_loaded, output_dir / "image_diffusion_adapter-smoke.pt", config)
+    _load_image_flow_adapter(adapter_loaded, output_dir / "image_flow_adapter-smoke.pt", config)
     adapter_metrics = run_validation(adapter_loaded, batch)
 
     ema_loaded = Qwen3ForCausalLM(tiny_config()).to(device)
@@ -249,7 +254,7 @@ def save_and_reload(model, ema_model, config, output_dir, batch, device):
 
     return {
         "hf_model_dir": str(hf_dir),
-        "adapter_path": str(output_dir / "image_diffusion_adapter-smoke.pt"),
+        "adapter_path": str(output_dir / "image_flow_adapter-smoke.pt"),
         "ema_state_path": str(output_dir / "checkpoint-1" / "ema_state.pt"),
         "loaded_validation": loaded_metrics,
         "adapter_validation": adapter_metrics,

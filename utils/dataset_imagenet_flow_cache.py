@@ -16,6 +16,7 @@ kept as context for image tokens but is ignored by the CE loss.
 """
 
 import json
+import random
 import re
 from functools import partial
 from pathlib import Path
@@ -45,6 +46,7 @@ class ImageNetFlowCacheDataset(Dataset):
         max_seq_length: Optional[int] = None,
         max_samples: int = -1,
         seed: int = 42,
+        latent_hflip_prob: float = 0.0,
     ):
         self.cache_path = Path(cache_path)
         if not self.cache_path.exists():
@@ -82,6 +84,16 @@ class ImageNetFlowCacheDataset(Dataset):
         self.max_seq_length = int(max_seq_length) if max_seq_length else None
         self.seed = int(seed)
         self.epoch = 0
+        self.latent_hflip_prob = float(latent_hflip_prob)
+        if not 0.0 <= self.latent_hflip_prob <= 1.0:
+            raise ValueError(f"latent_hflip_prob must be in [0, 1], got {latent_hflip_prob}")
+        self.latent_side = int(self.image_tokens_per_img ** 0.5)
+        if self.latent_hflip_prob > 0.0 and self.latent_side * self.latent_side != self.image_tokens_per_img:
+            raise ValueError(
+                "latent_hflip_prob requires image_tokens_per_img to be a square grid, "
+                f"got {self.image_tokens_per_img}."
+            )
+        self.augmentation_train_size: Optional[int] = None
         self.synsets = self._load_synsets(manifest_jsonl)
         self.synset_names = self._load_synset_names(synset_mapping_path)
         self.prompt_cache = self._build_prompt_cache()
@@ -347,6 +359,19 @@ class ImageNetFlowCacheDataset(Dataset):
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
 
+    def set_augmentation_train_size(self, train_size: int) -> None:
+        self.augmentation_train_size = int(train_size)
+
+    def _augment_latents(self, latents: torch.Tensor, idx: int) -> torch.Tensor:
+        if self.latent_hflip_prob <= 0.0:
+            return latents
+        if self.augmentation_train_size is not None and int(idx) >= self.augmentation_train_size:
+            return latents
+        rng = random.Random(self.seed + self.epoch * 1_000_003 + int(idx) * 9_176 + 13_579)
+        if rng.random() >= self.latent_hflip_prob:
+            return latents
+        return latents.view(self.latent_side, self.latent_side, self.image_latent_dim).flip(1).reshape_as(latents)
+
     def _text_ids(self, text: str) -> torch.Tensor:
         text = text.strip()
         if not text:
@@ -448,12 +473,13 @@ class ImageNetFlowCacheDataset(Dataset):
         return cached
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        latents = self._augment_latents(self.latents[idx], int(idx))
         if self.fixed_length is not None:
             return {
                 "input_ids": self.fixed_input_ids,
                 "token_types": self.fixed_token_types,
                 "labels": self.fixed_labels,
-                "image_latents": self.latents[idx],
+                "image_latents": latents,
                 "prompt_len": torch.tensor(0, dtype=torch.long),
                 "suffix_len": torch.tensor(0, dtype=torch.long),
                 "image_start": torch.tensor(1, dtype=torch.long),
@@ -473,7 +499,7 @@ class ImageNetFlowCacheDataset(Dataset):
             "input_ids": sequence["input_ids"],
             "token_types": sequence["token_types"],
             "labels": sequence["labels"],
-            "image_latents": self.latents[idx],
+            "image_latents": latents,
             "prompt_len": sequence["prompt_len"],
             "suffix_len": sequence["suffix_len"],
             "image_start": sequence["image_start"],
@@ -598,11 +624,13 @@ def build_imagenet_flow_cache_dataloaders(config, tokenizer):
         max_seq_length=params.get("max_seq_length", config.dataset.preprocessing.max_seq_length),
         max_samples=params.get("max_samples", -1),
         seed=config.training.seed,
+        latent_hflip_prob=params.get("latent_hflip_prob", 0.0),
     )
 
     val_ratio = params.get("val_ratio", 0.001)
     val_size = max(1, int(len(dataset) * val_ratio))
     train_size = max(0, len(dataset) - val_size)
+    dataset.set_augmentation_train_size(train_size)
     train_dataset = Subset(dataset, list(range(train_size)))
     val_dataset = Subset(dataset, list(range(train_size, len(dataset))))
 

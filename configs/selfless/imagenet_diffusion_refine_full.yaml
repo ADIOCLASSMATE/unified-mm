@@ -1,6 +1,6 @@
 experiment:
-    project: "selfless-diffusion-0.6B-imagenet-refine-full"
-    name: "imagenet-diffusion-refine-full"
+    project: "selfless-flow-0.6B-imagenet-refine-full"
+    name: "imagenet-flow-refine-full"
     wandb_project: "unified-mm"
     output_dir: "output"
     save_every: 1000
@@ -13,11 +13,11 @@ experiment:
     val_every: 1000
     validation_image_every: 1000
     validation_image_samples: 4
-    validation_diffusion_temperature: 1.0
-    validation_diffusion_cfg: 1.0
-    validation_diffusion_cfg_schedule: "linear"
-    validation_diffusion_clip_denoised: false
-    validation_denoise_timestep: 500
+    validation_flow_temperature: 1.0
+    validation_flow_cfg: 1.0
+    validation_flow_cfg_schedule: "linear"
+    validation_flow_solver: "heun"
+    validation_flow_probe_times: [0.25, 0.5, 0.75, 0.95]
     validation_vae_dtype: "fp32"
     validation_save_debug_images: false
     validation_single_stream_images: true
@@ -47,14 +47,22 @@ model:
     image_tokens_per_img: 256
     image_latent_dim: 16
     image_projector_width: 2048
-    image_diffusion_depth: 8
-    image_diffusion_width: 1280
-    image_diffusion_num_sampling_steps: "100"
-    image_diffusion_batch_mul: 4
-    image_diffusion_condition_norm: "rms"
-    image_diffusion_condition_norm_eps: 1.0e-6
-    image_condition_drop_prob: 0.1
-    pretrained_image_diffusion_adapter: "../mar/pretrained_models/mar/mar_large_hf/mar-large.safetensors"
+    image_generation_head_type: "flow"
+    image_flow_depth: 8
+    image_flow_width: 1280
+    image_flow_num_sampling_steps: "100"
+    image_flow_batch_mul: 4
+    image_flow_condition_norm: "rms"
+    image_flow_condition_norm_eps: 1.0e-6
+    image_flow_time_scale: 1000.0
+    image_flow_time_sampling: "logit_normal"
+    image_flow_logit_mean: 0.0
+    image_flow_logit_std: 1.0
+    image_flow_time_eps: 1.0e-5
+    image_flow_time_uniform_mix: 0.1
+    image_flow_solver: "heun"
+    image_uncond_prob: 0.1
+    pretrained_image_flow_adapter: "../mar/pretrained_models/mar/mar_large_hf/mar-large.safetensors"
 
 dataset:
     class_name: "ImageNetFlowCacheDataset"
@@ -77,7 +85,7 @@ optimizer:
         learning_rate: 1.0e-4
         backbone_learning_rate: 0.0
         projector_learning_rate: 1.0e-4
-        diffusion_learning_rate: 2.0e-4
+        flow_learning_rate: 2.0e-4
         special_token_learning_rate: 1.0e-5
         scale_lr: false
         beta1: 0.9
@@ -107,11 +115,11 @@ training:
     use_gradient_checkpointing: false
     step_scheduler_with_optimizer: false
     from_scratch: false
-    freeze_backbone_for_image_diffusion_refine: true
+    freeze_backbone_for_image_flow_refine: true
     use_ema: true
     ema_decay: 0.9999
     ema_update_after_step: 0
     ema_validate: true
     ema_save_adapter: true
     ema_save_hf_model: true
-    save_image_diffusion_adapter: true
+    save_image_flow_adapter: true
