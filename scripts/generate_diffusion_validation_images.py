@@ -62,6 +62,15 @@ def parse_args():
     )
     parser.add_argument("--parallel_rate", type=int, default=1)
     parser.add_argument("--strategies", default="sigma,hidden_norm")
+    parser.add_argument(
+        "--refine_ratios",
+        default="",
+        help=(
+            "Comma-separated remask ratios for inference-only refinement, "
+            "for example 0.5,0.25,0.125,0.0625."
+        ),
+    )
+    parser.add_argument("--refine_seed_offset", type=int, default=9000)
     parser.add_argument("--vae_dtype", choices=["fp32", "fp16"], default="fp32")
     parser.add_argument("--save_individual", action="store_true")
     parser.add_argument("--no_progress", action="store_true")
@@ -213,6 +222,35 @@ def _migrate_head_state(model, head_state: dict[str, torch.Tensor]):
     }
 
 
+def _migrate_condition_proj_state(model, projector_state: dict[str, torch.Tensor]):
+    projector = getattr(model, "image_flow_condition_proj", None)
+    if projector is None:
+        return {"loaded": 0, "missing": [], "unexpected": [], "skipped": {"_module": "missing"}}
+    target = projector.state_dict()
+    if not target:
+        return {"loaded": 0, "missing": [], "unexpected": [], "skipped": {"_module": "empty"}}
+
+    load_state = {}
+    skipped = {}
+    for key, value in projector_state.items():
+        if key not in target:
+            skipped[key] = [list(value.shape), None]
+            continue
+        target_shape = tuple(target[key].shape)
+        value_shape = tuple(value.shape)
+        if value_shape == target_shape:
+            load_state[key] = value
+        else:
+            skipped[key] = [list(value_shape), list(target_shape)]
+    missing, unexpected = projector.load_state_dict(load_state, strict=False)
+    return {
+        "loaded": len(load_state),
+        "missing": list(missing),
+        "unexpected": list(unexpected),
+        "skipped": skipped,
+    }
+
+
 def load_adapter(model, adapter_path: str):
     if adapter_path.lower() in {"none", "null", "false", ""}:
         return {"adapter": None}
@@ -226,6 +264,7 @@ def load_adapter(model, adapter_path: str):
     report = {"adapter": str(path)}
     if path.suffix == ".safetensors":
         head_state = {}
+        condition_proj_state = {}
         projector_state = {}
         projector_target = model.image_token_embedder.state_dict()
         mar_mask_token = None
@@ -240,6 +279,10 @@ def load_adapter(model, adapter_path: str):
                     head_state[key[len("diffloss."):]] = f.get_tensor(key)
                 elif key.startswith("image_flow_head."):
                     head_state[key[len("image_flow_head."):]] = f.get_tensor(key)
+                elif key.startswith("image_flow_condition_proj."):
+                    condition_proj_state[key[len("image_flow_condition_proj."):]] = f.get_tensor(key)
+                elif key.startswith("model.image_flow_condition_proj."):
+                    condition_proj_state[key[len("model.image_flow_condition_proj."):]] = f.get_tensor(key)
                 elif key.startswith("model.image_token_embedder."):
                     maybe_add_projector_key(key[len("model.image_token_embedder."):], f.get_tensor(key))
                 elif key in {"z_proj.weight", "z_proj.bias", "z_proj_ln.weight", "z_proj_ln.bias"}:
@@ -253,6 +296,8 @@ def load_adapter(model, adapter_path: str):
                     mar_mask_token = f.get_tensor(key).reshape(-1)
 
         report["image_flow_head"] = _migrate_head_state(model, head_state)
+        if condition_proj_state:
+            report["image_flow_condition_proj"] = _migrate_condition_proj_state(model, condition_proj_state)
         if projector_state:
             missing, unexpected = model.image_token_embedder.load_state_dict(projector_state, strict=False)
             report["image_token_embedder_missing"] = list(missing)
@@ -269,6 +314,8 @@ def load_adapter(model, adapter_path: str):
     state = torch.load(path, map_location="cpu")
     if "image_flow_head" in state:
         report["image_flow_head"] = _migrate_head_state(model, state["image_flow_head"])
+    if "image_flow_condition_proj" in state:
+        report["image_flow_condition_proj"] = _migrate_condition_proj_state(model, state["image_flow_condition_proj"])
     if "image_token_embedder" in state:
         missing, unexpected = model.image_token_embedder.load_state_dict(state["image_token_embedder"], strict=False)
         report["image_token_embedder_missing"] = list(missing)
@@ -327,10 +374,176 @@ def decode_latents(vae, latents, scaling_factor):
     return (decoded + 1.0) / 2.0
 
 
+@torch.no_grad()
+def refine_single_stream_latents(
+    model,
+    input_ids: torch.Tensor,
+    token_types: torch.Tensor,
+    sigma: torch.Tensor,
+    spans: list[tuple[int, int, int]],
+    draft_latents: torch.Tensor,
+    refine_ratios: list[float],
+    *,
+    temperature: float,
+    cfg: float,
+    cfg_schedule: str,
+    solver: str,
+    seed: int,
+) -> tuple[torch.Tensor, dict]:
+    if not refine_ratios:
+        return draft_latents, {"rounds": []}
+
+    device = input_ids.device
+    image_tokens = int(getattr(model.config, "image_tokens_per_img", 256))
+    latent_dim = int(getattr(model.config, "image_latent_dim", draft_latents.shape[1]))
+    side = int(image_tokens ** 0.5)
+    if side * side != image_tokens:
+        raise ValueError(f"image_tokens_per_img={image_tokens} is not square")
+
+    selected_input_ids = torch.stack([input_ids[b] for b, _, _ in spans]).to(device=device)
+    selected_token_types = torch.stack([token_types[b] for b, _, _ in spans]).to(device=device)
+    selected_sigma = torch.stack([sigma[b] for b, _, _ in spans]).to(device=device, dtype=torch.float32)
+    work_latents = torch.zeros(
+        selected_input_ids.shape[0],
+        selected_input_ids.shape[1],
+        latent_dim,
+        device=device,
+        dtype=model.image_flow_head.net.final_layer.linear.weight.dtype,
+    )
+    current = draft_latents.to(device=device, dtype=work_latents.dtype)
+    current_seq = current.permute(0, 2, 3, 1).reshape(len(spans), image_tokens, latent_dim)
+    for sample_idx, (_, start, end) in enumerate(spans):
+        work_latents[sample_idx, start:end] = current_seq[sample_idx]
+
+    all_positions = torch.arange(image_tokens, device=device, dtype=torch.long)
+    use_cfg = cfg != 1.0
+    boi_token_id = getattr(model.config, "boi_token_id", None)
+    if use_cfg and boi_token_id is None:
+        raise ValueError("cfg != 1.0 requires model.config.boi_token_id")
+
+    trace = {"rounds": []}
+    for round_idx, ratio in enumerate(refine_ratios):
+        ratio = float(ratio)
+        if ratio <= 0.0:
+            continue
+        remask_count = max(1, min(image_tokens, int(round(ratio * image_tokens))))
+        target_masks = []
+        for sample_idx in range(len(spans)):
+            generator = torch.Generator(device=device).manual_seed(seed + round_idx * 1_000_003 + sample_idx * 97)
+            perm = torch.randperm(image_tokens, device=device, generator=generator)
+            mask = torch.zeros(image_tokens, device=device, dtype=torch.bool)
+            mask[perm[:remask_count]] = True
+            target_masks.append(mask)
+        target_masks = torch.stack(target_masks)
+        keep_masks = ~target_masks
+
+        image_latent_mask = torch.zeros_like(selected_token_types, dtype=torch.bool)
+        current_sigma = selected_sigma.clone()
+        for sample_idx, (_, start, end) in enumerate(spans):
+            image_latent_mask[sample_idx, start:end] = keep_masks[sample_idx]
+            non_padding = selected_token_types[sample_idx] != 3
+            base = float(selected_sigma[sample_idx, non_padding].min().item())
+            kept = all_positions[keep_masks[sample_idx]]
+            targets = all_positions[target_masks[sample_idx]]
+            if kept.numel() > 0:
+                current_sigma[sample_idx, start + kept] = base + torch.arange(
+                    kept.numel(),
+                    device=device,
+                    dtype=current_sigma.dtype,
+                )
+            current_sigma[sample_idx, start + targets] = base + image_tokens + 1.0
+
+        attention_mask = get_selfless_mask(
+            sigma=current_sigma,
+            seq_len=selected_input_ids.shape[1],
+            device=device,
+        )
+        hidden = model.model(
+            X0_input_ids=selected_input_ids,
+            attention_mask=attention_mask,
+            token_types=selected_token_types,
+            image_latents=work_latents,
+            image_latent_mask=image_latent_mask,
+            calculate_likelihood=False,
+        ).last_hidden_state
+
+        uncond_hidden = None
+        if use_cfg:
+            uncond_attention_mask = get_selfless_mask(
+                sigma=current_sigma,
+                seq_len=selected_input_ids.shape[1],
+                device=device,
+                input_ids=selected_input_ids,
+                token_types=selected_token_types,
+                boi_token_id=int(boi_token_id),
+                image_uncond_rows=torch.ones(selected_input_ids.shape[0], device=device, dtype=torch.bool),
+            )
+            uncond_hidden = model.model(
+                X0_input_ids=selected_input_ids,
+                attention_mask=uncond_attention_mask,
+                token_types=selected_token_types,
+                image_latents=work_latents,
+                image_latent_mask=image_latent_mask,
+                calculate_likelihood=False,
+            ).last_hidden_state
+
+        sample_indices = []
+        seq_positions = []
+        local_positions = []
+        for sample_idx, (_, start, _) in enumerate(spans):
+            positions = all_positions[target_masks[sample_idx]]
+            sample_indices.append(torch.full_like(positions, sample_idx))
+            seq_positions.append(start + positions)
+            local_positions.append(positions)
+        sample_indices = torch.cat(sample_indices)
+        seq_positions = torch.cat(seq_positions)
+        local_positions = torch.cat(local_positions)
+
+        z = model._prepare_image_flow_condition(hidden[sample_indices, seq_positions], local_positions)
+        z_uncond = None
+        if uncond_hidden is not None:
+            z_uncond = model._prepare_image_flow_condition(
+                uncond_hidden[sample_indices, seq_positions],
+                local_positions,
+            )
+        progress = 1.0 - (round_idx / max(1, len(refine_ratios)))
+        cfg_iter = cfg if str(cfg_schedule).lower() == "constant" else 1.0 + (cfg - 1.0) * progress
+        torch.manual_seed(seed + 17_171 + round_idx)
+        pred = model.sample_image_flow_with_cfg(
+            z,
+            z_uncond=z_uncond,
+            temperature=temperature,
+            cfg=cfg_iter,
+            solver=solver,
+        ).to(dtype=work_latents.dtype)
+
+        cursor = 0
+        for sample_idx, (_, start, _) in enumerate(spans):
+            positions = all_positions[target_masks[sample_idx]]
+            count = positions.numel()
+            work_latents[sample_idx, start + positions] = pred[cursor : cursor + count]
+            cursor += count
+
+        trace["rounds"].append(
+            {
+                "round": int(round_idx),
+                "ratio": ratio,
+                "remask_count": int(remask_count),
+                "cfg": float(cfg_iter),
+            }
+        )
+
+    refined = []
+    for sample_idx, (_, start, end) in enumerate(spans):
+        refined.append(work_latents[sample_idx, start:end].view(side, side, latent_dim).permute(2, 0, 1))
+    return torch.stack(refined), trace
+
+
 def main():
     args = parse_args()
     progress = not args.no_progress
     oracle_reveal_ratios = parse_float_list(args.oracle_reveal_ratios)
+    refine_ratios = parse_float_list(args.refine_ratios)
     probe_times = parse_float_list(args.probe_times)
     torch.manual_seed(args.seed)
     device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
@@ -429,6 +642,7 @@ def main():
         "probe_times": probe_times,
         "oracle_reveal_ratios": oracle_reveal_ratios,
         "oracle_reveal_order": args.oracle_reveal_order,
+        "refine_ratios": refine_ratios,
         "loss": float(output.loss.detach().float().item()),
         "flow_stats": {
             key: float(value.detach().float().item())
@@ -530,6 +744,34 @@ def main():
                 "latent_mse_to_target": float(F.mse_loss(single_latents.float(), target_chw).item()),
                 "generation_step_max": float(trace["generation_step"].float().max().item()) if trace else None,
             }
+            if refine_ratios:
+                with torch.no_grad():
+                    refined_latents, refine_trace = refine_single_stream_latents(
+                        model=model,
+                        input_ids=input_ids,
+                        token_types=token_types,
+                        sigma=sigma,
+                        spans=spans,
+                        draft_latents=single_latents,
+                        refine_ratios=refine_ratios,
+                        temperature=args.temperature,
+                        cfg=args.cfg,
+                        cfg_schedule=args.cfg_schedule,
+                        solver=args.flow_solver,
+                        seed=args.seed + args.refine_seed_offset,
+                    )
+                refined_img = decode_latents(vae, refined_latents.float(), scaling_factor)
+                save_image(
+                    make_grid(torch.stack([target_img, single_img, refined_img], dim=1).flatten(0, 1), nrow=3),
+                    out_dir / f"strategy_{tag}_refined.png",
+                )
+                overview_columns.append((f"strategy_{tag}_refined", refined_img))
+                metrics[f"single_stream_{tag}_refined"] = {
+                    "latent_rms": float(refined_latents.float().pow(2).mean().sqrt().item()),
+                    "latent_mse_to_target": float(F.mse_loss(refined_latents.float(), target_chw).item()),
+                    "latent_mse_to_draft": float(F.mse_loss(refined_latents.float(), single_latents.float()).item()),
+                    "trace": refine_trace,
+                }
 
             for ratio in oracle_reveal_ratios:
                 oracle_mask = build_oracle_initial_mask(

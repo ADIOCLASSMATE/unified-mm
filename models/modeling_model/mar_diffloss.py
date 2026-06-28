@@ -130,16 +130,21 @@ class ResBlock(nn.Module):
 
     def __init__(
         self,
-        channels
+        channels,
+        mlp_ratio=1.0,
     ):
         super().__init__()
         self.channels = channels
+        self.mlp_ratio = float(mlp_ratio)
+        self.intermediate_size = int(channels * self.mlp_ratio)
+        if self.intermediate_size <= 0:
+            raise ValueError(f"mlp_ratio must produce a positive hidden size, got {mlp_ratio}")
 
         self.in_ln = nn.LayerNorm(channels, eps=1e-6)
         self.mlp = nn.Sequential(
-            nn.Linear(channels, channels, bias=True),
+            nn.Linear(channels, self.intermediate_size, bias=True),
             nn.SiLU(),
-            nn.Linear(channels, channels, bias=True),
+            nn.Linear(self.intermediate_size, channels, bias=True),
         )
 
         self.adaLN_modulation = nn.Sequential(
@@ -191,7 +196,8 @@ class SimpleMLPAdaLN(nn.Module):
         out_channels,
         z_channels,
         num_res_blocks,
-        grad_checkpointing=False
+        grad_checkpointing=False,
+        mlp_ratio=1.0,
     ):
         super().__init__()
 
@@ -200,6 +206,7 @@ class SimpleMLPAdaLN(nn.Module):
         self.out_channels = out_channels
         self.num_res_blocks = num_res_blocks
         self.grad_checkpointing = grad_checkpointing
+        self.mlp_ratio = float(mlp_ratio)
 
         self.time_embed = TimestepEmbedder(model_channels)
         self.cond_embed = nn.Linear(z_channels, model_channels)
@@ -210,6 +217,7 @@ class SimpleMLPAdaLN(nn.Module):
         for i in range(num_res_blocks):
             res_blocks.append(ResBlock(
                 model_channels,
+                mlp_ratio=self.mlp_ratio,
             ))
 
         self.res_blocks = nn.ModuleList(res_blocks)

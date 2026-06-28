@@ -96,6 +96,7 @@ class ImageNetFlowCacheDataset(Dataset):
                 f"got {self.image_tokens_per_img}."
             )
         self.augmentation_train_size: Optional[int] = None
+        self.augmentation_index_mask: Optional[torch.Tensor] = None
         self.synsets = self._load_synsets(manifest_jsonl)
         self.synset_names = self._load_synset_names(synset_mapping_path)
         self.prompt_cache = self._build_prompt_cache()
@@ -365,11 +366,23 @@ class ImageNetFlowCacheDataset(Dataset):
 
     def set_augmentation_train_size(self, train_size: int) -> None:
         self.augmentation_train_size = int(train_size)
+        self.augmentation_index_mask = None
+
+    def set_augmentation_indices(self, indices: Sequence[int]) -> None:
+        mask = torch.zeros(len(self), dtype=torch.bool)
+        if len(indices) > 0:
+            mask[torch.as_tensor(list(indices), dtype=torch.long)] = True
+        self.augmentation_train_size = None
+        self.augmentation_index_mask = mask
 
     def _augment_latents(self, latents: torch.Tensor, idx: int) -> torch.Tensor:
         if self.latent_hflip_prob <= 0.0:
             return latents
-        if self.augmentation_train_size is not None and int(idx) >= self.augmentation_train_size:
+        idx = int(idx)
+        if self.augmentation_index_mask is not None:
+            if idx < 0 or idx >= int(self.augmentation_index_mask.numel()) or not bool(self.augmentation_index_mask[idx]):
+                return latents
+        elif self.augmentation_train_size is not None and idx >= self.augmentation_train_size:
             return latents
         rng = random.Random(self.seed + self.epoch * 1_000_003 + int(idx) * 9_176 + 13_579)
         if rng.random() >= self.latent_hflip_prob:
@@ -612,6 +625,71 @@ def collate_imagenet_flow_cache(
     }
 
 
+def _split_key_for_index(dataset: ImageNetFlowCacheDataset, idx: int) -> str:
+    img_id = int(dataset.img_ids[int(idx)].item())
+    return dataset.synsets.get(img_id, "")
+
+
+def _build_split_indices(
+    dataset: ImageNetFlowCacheDataset,
+    val_ratio: float,
+    seed: int,
+    strategy: str,
+) -> Tuple[List[int], List[int]]:
+    n_items = len(dataset)
+    if n_items <= 0:
+        return [], []
+    val_size = max(1, int(n_items * float(val_ratio)))
+    val_size = min(val_size, max(1, n_items - 1))
+    strategy = str(strategy or "stratified").lower()
+
+    if strategy in {"contiguous", "tail"}:
+        train_size = max(0, n_items - val_size)
+        return list(range(train_size)), list(range(train_size, n_items))
+
+    rng = random.Random(int(seed))
+    if strategy in {"shuffle", "shuffled", "random"}:
+        indices = list(range(n_items))
+        rng.shuffle(indices)
+        val_indices = indices[:val_size]
+        train_indices = indices[val_size:]
+        return train_indices, val_indices
+
+    if strategy not in {"stratified", "synset", "stratified_synset"}:
+        raise ValueError(
+            f"Unknown ImageNet flow split_strategy={strategy!r}; "
+            "expected stratified, shuffled, or contiguous."
+        )
+
+    groups: Dict[str, List[int]] = {}
+    for idx in range(n_items):
+        key = _split_key_for_index(dataset, idx)
+        groups.setdefault(key, []).append(idx)
+    if len(groups) <= 1:
+        indices = list(range(n_items))
+        rng.shuffle(indices)
+        val_indices = indices[:val_size]
+        train_indices = indices[val_size:]
+        return train_indices, val_indices
+
+    train_indices: List[int] = []
+    val_indices: List[int] = []
+    for key in sorted(groups):
+        group_indices = list(groups[key])
+        rng.shuffle(group_indices)
+        group_val_size = max(1, int(len(group_indices) * float(val_ratio)))
+        if len(group_indices) > 1:
+            group_val_size = min(group_val_size, len(group_indices) - 1)
+        else:
+            group_val_size = 0
+        val_indices.extend(group_indices[:group_val_size])
+        train_indices.extend(group_indices[group_val_size:])
+
+    rng.shuffle(train_indices)
+    rng.shuffle(val_indices)
+    return train_indices, val_indices
+
+
 def build_imagenet_flow_cache_dataloaders(config, tokenizer):
     params = config.dataset.params
     dataset = ImageNetFlowCacheDataset(
@@ -636,11 +714,17 @@ def build_imagenet_flow_cache_dataloaders(config, tokenizer):
     )
 
     val_ratio = params.get("val_ratio", 0.001)
-    val_size = max(1, int(len(dataset) * val_ratio))
-    train_size = max(0, len(dataset) - val_size)
-    dataset.set_augmentation_train_size(train_size)
-    train_dataset = Subset(dataset, list(range(train_size)))
-    val_dataset = Subset(dataset, list(range(train_size, len(dataset))))
+    split_seed = params.get("split_seed", config.training.seed)
+    split_strategy = params.get("split_strategy", "stratified")
+    train_indices, val_indices = _build_split_indices(
+        dataset=dataset,
+        val_ratio=float(val_ratio),
+        seed=int(split_seed),
+        strategy=str(split_strategy),
+    )
+    dataset.set_augmentation_indices(train_indices)
+    train_dataset = Subset(dataset, train_indices)
+    val_dataset = Subset(dataset, val_indices)
 
     pad_to_length = params.get("pad_to_length", None)
     if params.get("pad_to_max_length", False):

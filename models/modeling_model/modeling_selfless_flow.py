@@ -19,6 +19,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 import os
 from typing import Callable, Optional, Union
 
@@ -53,27 +54,66 @@ try:
     liger_kernel_is_available = True
 except ImportError:
     liger_kernel_is_available = False
-    
+
+
+def _sincos_1d_position_embedding(positions: torch.Tensor, dim: int, max_period: float = 10000.0) -> torch.Tensor:
+    if dim <= 0:
+        return torch.zeros((positions.numel(), 0), dtype=torch.float32)
+    n_freqs = (dim + 1) // 2
+    freqs = torch.exp(
+        -math.log(max_period) * torch.arange(n_freqs, dtype=torch.float32) / max(n_freqs, 1)
+    )
+    args = positions.float().reshape(-1, 1) * freqs.reshape(1, -1)
+    return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)[:, :dim]
+
+
+def _build_2d_sincos_position_embedding(num_positions: int, dim: int) -> torch.Tensor:
+    side = int(num_positions ** 0.5)
+    if side * side != int(num_positions):
+        raise ValueError(f"2D sin-cos image positions require a square grid, got {num_positions} tokens")
+    positions = torch.arange(num_positions, dtype=torch.long)
+    rows = positions.div(side, rounding_mode="floor").float()
+    cols = (positions % side).float()
+    row_dim = dim // 2
+    col_dim = dim - row_dim
+    return torch.cat(
+        [
+            _sincos_1d_position_embedding(rows, row_dim),
+            _sincos_1d_position_embedding(cols, col_dim),
+        ],
+        dim=-1,
+    )
+
 
 class ImageTokenEmbedder(nn.Module):
-    def __init__(self, latent_dim, hidden_size, projector_width=None, image_tokens_per_img=256):
+    def __init__(
+        self,
+        latent_dim,
+        hidden_size,
+        projector_width=None,
+        image_tokens_per_img=256,
+        initializer_range=0.02,
+    ):
         super().__init__()
         self.latent_dim = int(latent_dim)
         self.hidden_size = int(hidden_size)
         self.image_tokens_per_img = int(image_tokens_per_img)
+        self.initializer_range = float(initializer_range)
         self.z_proj = nn.Linear(self.latent_dim, self.hidden_size, bias=True)
         self.z_proj_ln = nn.LayerNorm(self.hidden_size, eps=1e-6)
-        self.image_pos_embed = nn.Embedding(self.image_tokens_per_img, self.hidden_size)
-        self.diffusion_pos_embed = nn.Embedding(self.image_tokens_per_img, self.hidden_size)
-        self._reset_mar_slots()
+        pos_embed = _build_2d_sincos_position_embedding(self.image_tokens_per_img, self.hidden_size)
+        self.register_buffer("image_pos_embed", pos_embed.clone(), persistent=False)
+        self.register_buffer("diffusion_pos_embed", pos_embed.clone(), persistent=False)
+        self._reset_parameters()
 
-    def _reset_mar_slots(self):
-        nn.init.zeros_(self.z_proj.weight)
+    def _reset_parameters(self):
+        nn.init.normal_(self.z_proj.weight, mean=0.0, std=self.initializer_range)
         nn.init.zeros_(self.z_proj.bias)
         nn.init.ones_(self.z_proj_ln.weight)
         nn.init.zeros_(self.z_proj_ln.bias)
-        nn.init.zeros_(self.image_pos_embed.weight)
-        nn.init.zeros_(self.diffusion_pos_embed.weight)
+
+    def _reset_mar_slots(self):
+        self._reset_parameters()
 
     @property
     def weight_dtype(self):
@@ -91,12 +131,17 @@ class ImageTokenEmbedder(nn.Module):
                 )
         return local_positions
 
+    def _lookup_pos_embed(self, pos_embed: torch.Tensor, local_positions: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        flat_positions = local_positions.reshape(-1)
+        values = pos_embed.to(device=local_positions.device, dtype=dtype).index_select(0, flat_positions)
+        return values.reshape(local_positions.shape + (self.hidden_size,))
+
     def embed_latents(self, latents, local_positions=None):
         x = latents.to(dtype=self.z_proj.weight.dtype)
         x = self.z_proj(x)
         local_positions = self._positions(local_positions, x.device)
         if local_positions is not None:
-            x = x + self.image_pos_embed(local_positions).to(dtype=x.dtype)
+            x = x + self._lookup_pos_embed(self.image_pos_embed, local_positions, x.dtype)
         return self.z_proj_ln(x)
 
     def embed_mask(self, local_positions, mask_embedding):
@@ -105,14 +150,14 @@ class ImageTokenEmbedder(nn.Module):
             raise ValueError("local_positions must be provided when embedding image mask tokens.")
         x = mask_embedding.to(dtype=self.z_proj.weight.dtype)
         x = x.expand(local_positions.shape + (x.shape[-1],))
-        x = x + self.image_pos_embed(local_positions).to(dtype=x.dtype)
+        x = x + self._lookup_pos_embed(self.image_pos_embed, local_positions, x.dtype)
         return self.z_proj_ln(x)
 
     def add_diffusion_pos(self, z, local_positions=None):
         local_positions = self._positions(local_positions, z.device)
         if local_positions is None:
             return z
-        return z + self.diffusion_pos_embed(local_positions).to(dtype=z.dtype)
+        return z + self._lookup_pos_embed(self.diffusion_pos_embed, local_positions, z.dtype)
 
     def forward(self, latents, local_positions=None):
         return self.embed_latents(latents, local_positions=local_positions)
@@ -592,7 +637,9 @@ class Qwen3Model(Qwen3PreTrainedModel):
             config.hidden_size,
             getattr(config, "image_projector_width", None),
             getattr(config, "image_tokens_per_img", 256),
+            getattr(config, "initializer_range", 0.02),
         )
+        self.image_input_noise_strength = float(getattr(config, "image_input_noise_strength", 1.0e-2))
         self.layers = nn.ModuleList(
             [Qwen3DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
@@ -602,7 +649,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
         # Initialize weights and apply final processing
         self.post_init()
-        self.image_token_embedder._reset_mar_slots()
+        self.image_token_embedder._reset_parameters()
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -635,6 +682,12 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 f"image_latents last dimension ({image_latents.shape[-1]}) must match "
                 f"config.image_latent_dim ({self.image_latent_dim})."
             )
+
+    def _maybe_add_image_input_noise(self, image_latents: torch.Tensor) -> torch.Tensor:
+        strength = self.image_input_noise_strength
+        if not self.training or strength <= 0.0:
+            return image_latents
+        return image_latents + torch.randn_like(image_latents) * strength
 
     def _build_x0_inputs_embeds(
         self,
@@ -676,8 +729,9 @@ class Qwen3Model(Qwen3PreTrainedModel):
                     image_mask_embedding,
                 ).to(dtype=inputs_embeds.dtype)
             if use_image_latent.any():
+                latent_values = self._maybe_add_image_input_noise(image_latents[use_image_latent])
                 inputs_embeds[use_image_latent] = self.image_token_embedder(
-                    image_latents[use_image_latent],
+                    latent_values,
                     image_local_positions[use_image_latent],
                 ).to(dtype=inputs_embeds.dtype)
         elif self.training:
@@ -824,7 +878,9 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         self.image_flow_condition_norm_eps = float(
             getattr(config, "image_flow_condition_norm_eps", 1e-6)
         )
+        self.image_flow_mlp_ratio = float(getattr(config, "image_flow_mlp_ratio", 1.0))
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.image_flow_condition_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=True)
         self.image_flow_head = FlowLoss(
             target_channels=self.image_latent_dim,
             z_channels=config.hidden_size,
@@ -839,11 +895,14 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             time_eps=getattr(config, "image_flow_time_eps", 1.0e-4),
             uniform_mix=getattr(config, "image_flow_time_uniform_mix", 0.1),
             solver=getattr(config, "image_flow_solver", "heun"),
+            mlp_ratio=self.image_flow_mlp_ratio,
         )
 
         # Initialize weights and apply final processing
         self.post_init()
-        self.image_token_embedder._reset_mar_slots()
+        self.image_flow_head.net.initialize_weights()
+        self.image_token_embedder._reset_parameters()
+        self._reset_image_flow_condition_proj()
 
     @property
     def image_token_embedder(self) -> ImageTokenEmbedder:
@@ -852,6 +911,12 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
     def image_local_positions(self, token_types: torch.Tensor) -> torch.Tensor:
         return self.model.image_local_positions(token_types)
 
+    def _reset_image_flow_condition_proj(self):
+        with torch.no_grad():
+            std = float(getattr(self.config, "initializer_range", 0.02))
+            nn.init.normal_(self.image_flow_condition_proj.weight, mean=0.0, std=std)
+            nn.init.zeros_(self.image_flow_condition_proj.bias)
+
     def _prepare_image_flow_condition(
         self,
         z: torch.Tensor,
@@ -859,11 +924,12 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
     ) -> torch.Tensor:
         if image_local_positions is not None:
             z = self.image_token_embedder.add_diffusion_pos(z, image_local_positions)
-        return _normalize_image_flow_condition(
+        z = _normalize_image_flow_condition(
             z,
             self.image_flow_condition_norm,
             self.image_flow_condition_norm_eps,
         )
+        return self.image_flow_condition_proj(z)
 
     def sample_image_flow_with_cfg(
         self,

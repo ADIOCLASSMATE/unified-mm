@@ -1,6 +1,6 @@
 experiment:
-    project: "selfless-flow-stage0-imagenet10c"
-    name: "stage0-10c-classcond-pure-flow"
+    project: "selfless-flow-stage0-animals10c"
+    name: "stage0-animals10c-classcond-pure-flow"
     wandb_project: "unified-mm"
     output_dir: "output"
     save_every: 2000
@@ -57,14 +57,17 @@ model:
     image_flow_time_eps: 1.0e-5
     image_flow_time_uniform_mix: 0.1
     image_flow_solver: "heun"
+    image_flow_mlp_ratio: 1.0
+    image_input_noise_strength: 1.0e-2
     image_uncond_prob: 0.0
-    pretrained_image_flow_adapter: "../mar/pretrained_models/mar/mar_large_hf/mar-large.safetensors"
+    reinitialize_image_modules: true
+    pretrained_image_flow_adapter: none
 
 dataset:
     class_name: "ImageNetFlowCacheDataset"
     params:
-        cache_path: "public/datasets/imagenet_stage0_10c/vae_latents_mar_kl16/flow_latents_10c_fp16.pt"
-        manifest_jsonl: "public/datasets/imagenet_stage0_10c/manifest.jsonl"
+        cache_path: "public/datasets/imagenet_stage0_animals10c/vae_latents_mar_kl16/flow_latents_10c_fp16.pt"
+        manifest_jsonl: "public/datasets/imagenet_stage0_animals10c/manifest.jsonl"
         synset_mapping_path: "/inspire/dataset/imagenet/v1/LOC_synset_mapping.txt"
         prompt_templates:
             - "{class_name} {image}"
@@ -75,7 +78,9 @@ dataset:
         pad_to_length: 320
         pad_to_multiple_of: 64
         val_ratio: 0.02
-        latent_hflip_prob: 0.0
+        split_strategy: "stratified"
+        split_seed: 42
+        latent_hflip_prob: 0.5
     preprocessing:
         max_seq_length: 320
 
@@ -102,7 +107,7 @@ lr_scheduler:
         min_lr_scale: 0.1
 
 training:
-    batch_size: 16
+    batch_size: 64
     total_batch_size: 512
     mixed_precision: "bf16"
     enable_tf32: true

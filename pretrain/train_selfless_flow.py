@@ -36,6 +36,13 @@ logger = get_logger(__name__, log_level="INFO")
 _MAR_VAE_CACHE = None
 
 
+def _log_info(message):
+    try:
+        logger.info(message)
+    except RuntimeError:
+        logging.getLogger(__name__).info(message)
+
+
 def _special_token_ids(config):
     ids = {
         "mask": int(config.model.mask_token_id),
@@ -60,6 +67,8 @@ def _apply_image_flow_warmup_freeze(model, config):
     for param in model.image_flow_head.parameters():
         param.requires_grad = True
     for param in model.image_token_embedder.parameters():
+        param.requires_grad = True
+    for param in model.image_flow_condition_proj.parameters():
         param.requires_grad = True
 
     embed_weight = model.model.embed_tokens.weight
@@ -109,10 +118,66 @@ def _migrate_image_flow_head_state(model, head_state, source):
     )
 
 
-def _load_image_flow_adapter(model, adapter_path, config):
-    if isinstance(adapter_path, str) and adapter_path.lower() in {"none", "null", "false", ""}:
+def _migrate_image_flow_condition_proj_state(model, projector_state, source):
+    projector = getattr(model, "image_flow_condition_proj", None)
+    if projector is None:
+        logger.info(f"Skipping image_flow_condition_proj load from {source}: model has no projector")
         return
-    if adapter_path is None:
+    target_state = projector.state_dict()
+    if not target_state:
+        logger.info(f"Skipping image_flow_condition_proj load from {source}: projector has no parameters")
+        return
+
+    load_state = {}
+    skipped = {}
+    for name, value in projector_state.items():
+        if name not in target_state:
+            skipped[name] = (tuple(value.shape), None)
+            continue
+        target_shape = tuple(target_state[name].shape)
+        value_shape = tuple(value.shape)
+        if value_shape == target_shape:
+            load_state[name] = value
+            continue
+        skipped[name] = (value_shape, target_shape)
+
+    missing, unexpected = projector.load_state_dict(load_state, strict=False)
+    logger.info(
+        f"Migrated image_flow_condition_proj from {source}: loaded={len(load_state)}, "
+        f"missing={list(missing)}, unexpected={list(unexpected)}, skipped={skipped}"
+    )
+
+
+def _is_disabled_path(value):
+    return value is None or (
+        isinstance(value, str) and value.lower() in {"none", "null", "false", ""}
+    )
+
+
+def _reinitialize_image_modules(model, config):
+    if not config.model.get("reinitialize_image_modules", False):
+        return False
+
+    reset_modules = []
+    if hasattr(model, "image_flow_head") and hasattr(model.image_flow_head, "net"):
+        model.image_flow_head.net.initialize_weights()
+        reset_modules.append("image_flow_head")
+    if hasattr(model, "image_token_embedder") and hasattr(model.image_token_embedder, "_reset_parameters"):
+        model.image_token_embedder._reset_parameters()
+        reset_modules.append("image_token_embedder")
+    if hasattr(model, "_reset_image_flow_condition_proj"):
+        model._reset_image_flow_condition_proj()
+        reset_modules.append("image_flow_condition_proj")
+
+    _log_info(
+        "Reinitialized image modules after loading the base model: "
+        f"{', '.join(reset_modules) if reset_modules else 'none'}"
+    )
+    return True
+
+
+def _load_image_flow_adapter(model, adapter_path, config):
+    if _is_disabled_path(adapter_path):
         return
 
     adapter_path = Path(adapter_path)
@@ -122,6 +187,7 @@ def _load_image_flow_adapter(model, adapter_path, config):
         from safetensors import safe_open
 
         head_state = {}
+        condition_proj_state = {}
         projector_state = {}
         projector_target = model.image_token_embedder.state_dict()
         projector_skipped = {}
@@ -143,6 +209,10 @@ def _load_image_flow_adapter(model, adapter_path, config):
                     head_state[key[len("diffloss."):]] = f.get_tensor(key)
                 elif key.startswith("image_flow_head."):
                     head_state[key[len("image_flow_head."):]] = f.get_tensor(key)
+                elif key.startswith("image_flow_condition_proj."):
+                    condition_proj_state[key[len("image_flow_condition_proj."):]] = f.get_tensor(key)
+                elif key.startswith("model.image_flow_condition_proj."):
+                    condition_proj_state[key[len("model.image_flow_condition_proj."):]] = f.get_tensor(key)
                 elif key.startswith("model.image_token_embedder."):
                     name = key[len("model.image_token_embedder."):]
                     _maybe_add_projector_key(name, f.get_tensor(key))
@@ -156,6 +226,8 @@ def _load_image_flow_adapter(model, adapter_path, config):
                 elif key == "mask_token":
                     mar_mask_token = f.get_tensor(key).reshape(-1)
         _migrate_image_flow_head_state(model, head_state, adapter_path)
+        if condition_proj_state:
+            _migrate_image_flow_condition_proj_state(model, condition_proj_state, adapter_path)
         if projector_state:
             missing, unexpected = model.image_token_embedder.load_state_dict(projector_state, strict=False)
             logger.info(
@@ -195,6 +267,15 @@ def _load_image_flow_adapter(model, adapter_path, config):
                 flat_head[key[len("image_flow_head."):]] = value
         if flat_head:
             _migrate_image_flow_head_state(model, flat_head, adapter_path)
+    if "image_flow_condition_proj" in state:
+        _migrate_image_flow_condition_proj_state(model, state["image_flow_condition_proj"], adapter_path)
+    else:
+        flat_condition_proj = {}
+        for key, value in (state.items() if isinstance(state, dict) else []):
+            if key.startswith("image_flow_condition_proj."):
+                flat_condition_proj[key[len("image_flow_condition_proj."):]] = value
+        if flat_condition_proj:
+            _migrate_image_flow_condition_proj_state(model, flat_condition_proj, adapter_path)
     if "image_token_embedder" in state:
         missing, unexpected = model.image_token_embedder.load_state_dict(
             state["image_token_embedder"], strict=False
@@ -229,6 +310,10 @@ def _save_image_flow_adapter(model, config, accelerator, global_step):
     embed = unwrapped.model.embed_tokens.weight.detach().cpu()
     state = {
         "image_flow_head": {k: v.detach().cpu() for k, v in unwrapped.image_flow_head.state_dict().items()},
+        "image_flow_condition_proj": {
+            k: v.detach().cpu()
+            for k, v in unwrapped.image_flow_condition_proj.state_dict().items()
+        },
         "image_token_embedder": {
             k: v.detach().cpu()
             for k, v in unwrapped.image_token_embedder.state_dict().items()
@@ -428,8 +513,15 @@ def main():
     logger.info("Loading tokenizer and model")
     model, tokenizer = load_model_tokenizer(config=config, logger=logger)
 
+    reinitialized_image_modules = _reinitialize_image_modules(model, config)
     flow_adapter = config.model.get("pretrained_image_flow_adapter", None)
-    _load_image_flow_adapter(model, flow_adapter, config)
+    if reinitialized_image_modules and not _is_disabled_path(flow_adapter):
+        logger.warning(
+            "Skipping pretrained_image_flow_adapter because reinitialize_image_modules=true: "
+            f"{flow_adapter}"
+        )
+    else:
+        _load_image_flow_adapter(model, flow_adapter, config)
     _apply_image_flow_warmup_freeze(model, config)
 
     if config.training.get("use_gradient_checkpointing", False):
@@ -480,7 +572,7 @@ def main():
     def lr_for_param(name):
         if name.startswith("image_flow_head."):
             return flow_lr
-        if "image_token_embedder" in name:
+        if "image_token_embedder" in name or name.startswith("image_flow_condition_proj."):
             return projector_lr
         if "embed_tokens.weight" in name:
             return special_token_lr
@@ -500,7 +592,8 @@ def main():
     ]
     logger.info(
         "Optimizer LRs: "
-        f"backbone={backbone_lr:g}, image_token_embedder={projector_lr:g}, image_flow_head={flow_lr:g}; "
+        f"backbone={backbone_lr:g}, image_token_embedder/image_flow_condition_proj={projector_lr:g}, "
+        f"image_flow_head={flow_lr:g}; "
         f"special_tokens={special_token_lr:g}; "
         f"weight_decay={optimizer_config.weight_decay:g}"
     )
@@ -620,16 +713,34 @@ def main():
     data_time_m = AverageMeter()
     end = time.time()
     batches_to_skip = 0
+    resume_epoch = 0
+    initial_train_dataloader = train_dataloader
     if resume_step > 0:
-        batches_to_skip = resume_step * accelerator.gradient_accumulation_steps
-        logger.info(f"Resuming from step {resume_step}, skipping {batches_to_skip} batches...")
-        train_dataloader = accelerator.skip_first_batches(train_dataloader, batches_to_skip)
+        raw_batches_to_skip = resume_step * accelerator.gradient_accumulation_steps
+        try:
+            dataloader_len = len(train_dataloader)
+        except TypeError:
+            dataloader_len = 0
+        if dataloader_len > 0:
+            resume_epoch = raw_batches_to_skip // dataloader_len
+            batches_to_skip = raw_batches_to_skip % dataloader_len
+            logger.info(
+                f"Resuming from step {resume_step}: dataloader_len={dataloader_len}, "
+                f"resume_epoch={resume_epoch}, skipping {batches_to_skip} batches in the first resumed epoch."
+            )
+            if _is_multimodal_ds:
+                ds.set_epoch(resume_epoch)
+        else:
+            batches_to_skip = raw_batches_to_skip
+            logger.info(f"Resuming from step {resume_step}, skipping {batches_to_skip} batches...")
+        if batches_to_skip > 0:
+            initial_train_dataloader = accelerator.skip_first_batches(train_dataloader, batches_to_skip)
 
     model.train()
     if ema_model is not None:
         ema_model.eval()
 
-    train_iter = iter(train_dataloader)
+    train_iter = iter(initial_train_dataloader)
 
     # Accumulators for per-modality loss across gradient-accumulation micro-batches.
     # Reset after each optimizer step (sync_gradients=True).
@@ -641,7 +752,7 @@ def main():
     acc_flow_stats = {}
     acc_flow_stat_batches = torch.tensor(0.0, device=accelerator.device)
 
-    epoch = 0
+    epoch = resume_epoch
     while global_step < config.training.max_train_steps:
         try:
             batch = next(train_iter)

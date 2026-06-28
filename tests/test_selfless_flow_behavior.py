@@ -9,6 +9,7 @@ os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
 
 import torch
 from datasets import Dataset as HFDataset
+from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 from torch import nn
 from transformers import Qwen3Config
@@ -16,7 +17,11 @@ from transformers import Qwen3Config
 from models.modeling_model.mar_flowloss import FlowLoss
 from models.modeling_model.modeling_selfless_flow import ImageTokenEmbedder, Qwen3ForCausalLM, Qwen3Model
 from utils.dataset_combined_flow import CombinedBatchDataLoader, TextArrowDataset, collate_text_arrow
-from utils.dataset_imagenet_flow_cache import ImageNetFlowCacheDataset, collate_imagenet_flow_cache
+from utils.dataset_imagenet_flow_cache import (
+    ImageNetFlowCacheDataset,
+    build_imagenet_flow_cache_dataloaders,
+    collate_imagenet_flow_cache,
+)
 from utils.utils import get_selfless_mask
 
 
@@ -34,6 +39,7 @@ def tiny_qwen3_config():
     config.image_mask_token_id = 8
     config.image_latent_dim = 4
     config.image_tokens_per_img = 4
+    config.image_input_noise_strength = 0.0
     return config
 
 
@@ -135,6 +141,7 @@ class FakeCausalInnerModel(nn.Module):
 class FakeTokenizer:
     def __init__(self):
         self.vocab = {}
+        self.eos_token_id = 14
 
     def encode(self, text, add_special_tokens=False):
         ids = []
@@ -427,6 +434,82 @@ class SelflessFlowBehaviorTest(unittest.TestCase):
         expected_flipped = torch.tensor([[2.0], [1.0], [4.0], [3.0]], dtype=torch.float16)
         self.assertTrue(torch.equal(train_item["image_latents"], expected_flipped))
         self.assertTrue(torch.equal(val_item["image_latents"], latents[1]))
+
+    def test_imagenet_flow_cache_stratified_split_and_train_only_augmentation(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            latents = torch.arange(30 * 4, dtype=torch.float16).view(30, 4, 1)
+            img_ids = torch.arange(30)
+            torch.save({"latents": latents, "img_ids": img_ids}, root / "latents.pt")
+            manifest_lines = []
+            mapping_lines = []
+            for class_idx in range(3):
+                synset = f"n0000000{class_idx}"
+                mapping_lines.append(f"{synset} class{class_idx}\n")
+                for sample_idx in range(10):
+                    img_id = class_idx * 10 + sample_idx
+                    manifest_lines.append(f'{{"img_id": {img_id}, "synset": "{synset}"}}\n')
+            (root / "manifest.jsonl").write_text("".join(manifest_lines))
+            (root / "mapping.txt").write_text("".join(mapping_lines))
+
+            config = OmegaConf.create(
+                {
+                    "model": {
+                        "boi_token_id": 11,
+                        "eoi_token_id": 12,
+                        "mask_token_id": 13,
+                        "image_tokens_per_img": 4,
+                        "image_latent_dim": 1,
+                    },
+                    "dataset": {
+                        "params": {
+                            "cache_path": str(root / "latents.pt"),
+                            "manifest_jsonl": str(root / "manifest.jsonl"),
+                            "synset_mapping_path": str(root / "mapping.txt"),
+                            "prompt_templates": ["{class_name} {image}"],
+                            "image_tokens_per_img": 4,
+                            "image_latent_dim": 1,
+                            "max_seq_length": 16,
+                            "pad_to_length": 16,
+                            "val_ratio": 0.2,
+                            "split_strategy": "stratified",
+                            "split_seed": 7,
+                            "latent_hflip_prob": 1.0,
+                        },
+                        "preprocessing": {"max_seq_length": 16},
+                    },
+                    "training": {
+                        "batch_size": 4,
+                        "dataloader_workers": 0,
+                        "seed": 7,
+                    },
+                }
+            )
+
+            train_loader, val_loader = build_imagenet_flow_cache_dataloaders(config, FakeTokenizer())
+            dataset = train_loader.dataset.dataset
+            train_indices = list(train_loader.dataset.indices)
+            val_indices = list(val_loader.dataset.indices)
+
+            def synset_counts(indices):
+                counts = {}
+                for idx in indices:
+                    img_id = int(dataset.img_ids[idx].item())
+                    synset = dataset.synsets[img_id]
+                    counts[synset] = counts.get(synset, 0) + 1
+                return counts
+
+            self.assertEqual(synset_counts(val_indices), {"n00000000": 2, "n00000001": 2, "n00000002": 2})
+            self.assertEqual(synset_counts(train_indices), {"n00000000": 8, "n00000001": 8, "n00000002": 8})
+
+            train_idx = train_indices[0]
+            val_idx = val_indices[0]
+            train_item = dataset[train_idx]
+            val_item = dataset[val_idx]
+            expected_train = latents[train_idx].view(2, 2, 1).flip(1).reshape(4, 1)
+
+            self.assertTrue(torch.equal(train_item["image_latents"], expected_train))
+            self.assertTrue(torch.equal(val_item["image_latents"], latents[val_idx]))
 
     def test_image_token_embedder_handles_bfloat16_weights(self):
         projector = ImageTokenEmbedder(latent_dim=4, hidden_size=8, projector_width=16, image_tokens_per_img=4).to(dtype=torch.bfloat16)

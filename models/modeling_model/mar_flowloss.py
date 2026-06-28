@@ -25,6 +25,7 @@ class FlowLoss(nn.Module):
         time_eps=1.0e-4,
         uniform_mix=0.1,
         solver="heun",
+        mlp_ratio=1.0,
     ):
         super().__init__()
         self.in_channels = int(target_channels)
@@ -36,6 +37,7 @@ class FlowLoss(nn.Module):
         self.time_eps = float(time_eps)
         self.uniform_mix = float(uniform_mix)
         self.solver = str(solver or "heun").lower()
+        self.mlp_ratio = float(mlp_ratio)
         if self.num_sampling_steps <= 0:
             raise ValueError(f"num_sampling_steps must be positive, got {num_sampling_steps}")
         if not 0.0 <= self.uniform_mix <= 1.0:
@@ -50,6 +52,7 @@ class FlowLoss(nn.Module):
             z_channels=z_channels,
             num_res_blocks=depth,
             grad_checkpointing=grad_checkpointing,
+            mlp_ratio=self.mlp_ratio,
         )
         self.last_forward_stats = {}
 
