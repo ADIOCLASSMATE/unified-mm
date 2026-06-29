@@ -68,7 +68,7 @@ dataset:
     params:
         cache_path: "public/datasets/imagenet_stage0_animals10c/vae_latents_mar_kl16/flow_latents_10c_fp16.pt"
         manifest_jsonl: "public/datasets/imagenet_stage0_animals10c/manifest.jsonl"
-        synset_mapping_path: "/inspire/dataset/imagenet/v1/LOC_synset_mapping.txt"
+        synset_mapping_path: "public/datasets/imagenet/LOC_synset_mapping.txt"
         prompt_templates:
             - "{class_name} {image}"
         label_text: false

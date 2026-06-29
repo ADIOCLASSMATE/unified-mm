@@ -133,3 +133,17 @@ def test_image_token_embedder_uses_fixed_2d_sincos_positions():
 
     assert torch.allclose(with_diffusion_pos, embedder.diffusion_pos_embed)
     assert not torch.allclose(embedder.image_pos_embed[0], embedder.image_pos_embed[1])
+
+
+def test_image_token_embedder_rebuilds_fixed_positions_if_buffer_is_corrupted():
+    embedder = ImageTokenEmbedder(latent_dim=4, hidden_size=8, image_tokens_per_img=4)
+    positions = torch.arange(4)
+    zeros = torch.zeros(4, 8)
+    expected = embedder.add_diffusion_pos(zeros, positions)
+
+    embedder.diffusion_pos_embed.fill_(torch.finfo(torch.float32).max)
+    actual = embedder.add_diffusion_pos(zeros, positions)
+
+    assert torch.isfinite(actual).all()
+    assert actual.abs().max() <= 1.0
+    assert torch.allclose(actual, expected)

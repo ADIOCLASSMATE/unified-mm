@@ -65,7 +65,7 @@ dataset:
     params:
         cache_path: "public/datasets/imagenet_full/vae_latents_mar_kl16/flow_latents_all_fp16.pt"
         manifest_jsonl: "public/datasets/imagenet_full/manifest.jsonl"
-        synset_mapping_path: "/inspire/dataset/imagenet/v1/LOC_synset_mapping.txt"
+        synset_mapping_path: "public/datasets/imagenet/LOC_synset_mapping.txt"
         prompt_templates_path: "configs/selfless/imagenet_prompt_templates.yaml"
         image_tokens_per_img: 256
         image_latent_dim: 16
