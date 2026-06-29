@@ -242,8 +242,8 @@ class SelflessFlowBehaviorTest(unittest.TestCase):
                 image_tokens_per_img=4,
                 image_latent_dim=2,
                 manifest_jsonl=str(root / "manifest.jsonl"),
-                prompt_template="a photo of {class_name}",
                 synset_mapping_path=str(root / "mapping.txt"),
+                conditioning_mode="class_image",
                 max_seq_length=16,
             )
 
@@ -255,7 +255,7 @@ class SelflessFlowBehaviorTest(unittest.TestCase):
         sigma = batch["sigma"][0]
         image_latents = batch["image_latents"][0]
 
-        prompt_len = 5
+        prompt_len = 2
         image_start = prompt_len + 1
         eoi_pos = image_start + 4
         eos_pos = eoi_pos + 1
@@ -277,13 +277,18 @@ class SelflessFlowBehaviorTest(unittest.TestCase):
         self.assertTrue(torch.all(sigma[image_start:eoi_pos] > sigma[eoi_pos]))
         self.assertTrue(torch.all(sigma[eos_pos] > sigma[image_start:eoi_pos]))
 
-    def test_full_imagenet_cache_collate_supports_image_first_templates(self):
+    def test_full_imagenet_cache_collate_supports_caption_i2t(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             latents = torch.arange(8, dtype=torch.float16).view(1, 4, 2)
             torch.save({"latents": latents, "img_ids": torch.tensor([1])}, root / "latents.pt")
-            (root / "manifest.jsonl").write_text('{"img_id": 1, "synset": "n00000001"}\n')
-            (root / "mapping.txt").write_text("n00000001 test class\n")
+            (root / "manifest.jsonl").write_text(
+                '{"img_id": 1, "source_path": "/data/train/n00000001/n00000001_1.JPEG", "synset": "n00000001"}\n'
+            )
+            (root / "captions.jsonl").write_text(
+                '{"path": "n00000001/n00000001_1.JPEG", "id": "n00000001_1", '
+                '"recaption_short": "this image shows test class"}\n'
+            )
 
             tokenizer = FakeTokenizer()
             dataset = ImageNetFlowCacheDataset(
@@ -296,8 +301,10 @@ class SelflessFlowBehaviorTest(unittest.TestCase):
                 image_tokens_per_img=4,
                 image_latent_dim=2,
                 manifest_jsonl=str(root / "manifest.jsonl"),
-                prompt_templates=["{image} this image shows {class_name}"],
-                synset_mapping_path=str(root / "mapping.txt"),
+                conditioning_mode="caption_image",
+                caption_jsonl=str(root / "captions.jsonl"),
+                caption_sequence_modes=["i2t"],
+                caption_i2t_prefixes=["describe image"],
                 max_seq_length=16,
             )
 
@@ -308,14 +315,17 @@ class SelflessFlowBehaviorTest(unittest.TestCase):
         token_types = batch["token_types"][0]
         sigma = batch["sigma"][0]
 
-        image_start = 1
+        prefix_len = 2
+        image_start = prefix_len + 1
         eoi_pos = image_start + 4
         suffix_start = eoi_pos + 1
         eos_pos = suffix_start + 5
 
-        self.assertEqual(input_ids[0].item(), 11)
+        self.assertEqual(input_ids[prefix_len].item(), 11)
         self.assertEqual(input_ids[eoi_pos].item(), 12)
         self.assertEqual(input_ids[eos_pos].item(), 14)
+        self.assertTrue(torch.equal(token_types[:prefix_len], torch.zeros(prefix_len, dtype=torch.uint8)))
+        self.assertTrue(torch.equal(labels[:prefix_len], input_ids[:prefix_len]))
         self.assertTrue(torch.equal(token_types[suffix_start:eos_pos], torch.zeros(5, dtype=torch.uint8)))
         self.assertTrue(torch.equal(labels[suffix_start:eos_pos], input_ids[suffix_start:eos_pos]))
         self.assertEqual(labels[eoi_pos].item(), -100)
@@ -323,21 +333,17 @@ class SelflessFlowBehaviorTest(unittest.TestCase):
         self.assertTrue(torch.all(sigma[suffix_start:eos_pos] > sigma[image_start:eoi_pos].max()))
         self.assertTrue(torch.all(sigma[eos_pos] > sigma[suffix_start:eos_pos]))
 
-    def test_full_imagenet_cache_uses_category_prompt_file(self):
+    def test_full_imagenet_cache_uses_caption_jsonl_for_t2i(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             latents = torch.arange(8, dtype=torch.float16).view(1, 4, 2)
             torch.save({"latents": latents, "img_ids": torch.tensor([1])}, root / "latents.pt")
-            (root / "manifest.jsonl").write_text('{"img_id": 1, "synset": "n00000001"}\n')
-            (root / "mapping.txt").write_text("n00000001 tabby cat\n")
-            (root / "prompts.yaml").write_text(
-                "fallback_templates:\n"
-                "  - 'fallback object {image}'\n"
-                "groups:\n"
-                "  - name: cats\n"
-                "    keywords: ['cat']\n"
-                "    templates:\n"
-                "      - 'cat specific prefix {class_name} {image} cat specific suffix'\n"
+            (root / "manifest.jsonl").write_text(
+                '{"img_id": 1, "source_path": "/data/train/n00000001/n00000001_1.JPEG", "synset": "n00000001"}\n'
+            )
+            (root / "captions.jsonl").write_text(
+                '{"path": "n00000001/n00000001_1.JPEG", "id": "n00000001_1", '
+                '"recaption_short": "cat specific prefix tabby cat cat specific suffix"}\n'
             )
 
             tokenizer = FakeTokenizer()
@@ -351,8 +357,10 @@ class SelflessFlowBehaviorTest(unittest.TestCase):
                 image_tokens_per_img=4,
                 image_latent_dim=2,
                 manifest_jsonl=str(root / "manifest.jsonl"),
-                prompt_templates_path=str(root / "prompts.yaml"),
-                synset_mapping_path=str(root / "mapping.txt"),
+                conditioning_mode="caption_image",
+                caption_jsonl=str(root / "captions.jsonl"),
+                caption_sequence_modes=["t2i"],
+                caption_t2i_prefixes=["make image"],
                 max_seq_length=32,
             )
 
@@ -364,12 +372,15 @@ class SelflessFlowBehaviorTest(unittest.TestCase):
         text_tokens = input_ids[token_types == 0].tolist()
         text_labels = labels[(token_types == 0) & (labels != -100)].tolist()
 
-        expected = tokenizer.encode("cat specific prefix tabby cat cat specific suffix", add_special_tokens=False)
+        expected = tokenizer.encode(
+            "make image cat specific prefix tabby cat cat specific suffix",
+            add_special_tokens=False,
+        )
         self.assertEqual(text_tokens, expected)
         self.assertEqual(text_labels, expected)
         self.assertEqual(
             batch["input_ids"][0, 0].item(),
-            tokenizer.encode("cat", add_special_tokens=False)[0],
+            tokenizer.encode("make", add_special_tokens=False)[0],
         )
 
     def test_imagenet_flow_cache_can_disable_all_text_labels_for_stage0(self):
@@ -391,8 +402,8 @@ class SelflessFlowBehaviorTest(unittest.TestCase):
                 image_tokens_per_img=4,
                 image_latent_dim=2,
                 manifest_jsonl=str(root / "manifest.jsonl"),
-                prompt_templates=["{class_name} {image}"],
                 synset_mapping_path=str(root / "mapping.txt"),
+                conditioning_mode="class_image",
                 max_seq_length=16,
                 label_text=False,
             )
@@ -466,7 +477,7 @@ class SelflessFlowBehaviorTest(unittest.TestCase):
                             "cache_path": str(root / "latents.pt"),
                             "manifest_jsonl": str(root / "manifest.jsonl"),
                             "synset_mapping_path": str(root / "mapping.txt"),
-                            "prompt_templates": ["{class_name} {image}"],
+                            "conditioning_mode": "class_image",
                             "image_tokens_per_img": 4,
                             "image_latent_dim": 1,
                             "max_seq_length": 16,

@@ -1,7 +1,7 @@
 """
 Packed ImageNet prompt dataset for continuous VAE-latent flow training.
 
-Rows are read from the JSONL produced by scripts/imagenet_prompt_dataset.py.
+Rows are read from an OmniCorpus-compatible JSONL document file.
 Each image segment becomes:
     <|boi|> [image latent placeholders] <|eoi|>
 

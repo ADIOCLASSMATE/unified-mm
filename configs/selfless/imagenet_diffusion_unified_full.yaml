@@ -72,7 +72,33 @@ dataset:
             cache_path: "public/datasets/imagenet_full/vae_latents_mar_kl16/flow_latents_all_fp16.pt"
             manifest_jsonl: "public/datasets/imagenet_full/manifest.jsonl"
             synset_mapping_path: "public/datasets/imagenet/LOC_synset_mapping.txt"
-            prompt_templates_path: "configs/selfless/imagenet_prompt_templates.yaml"
+            conditioning_mode: "caption_image"
+            caption_jsonl: "public/datasets/csfm-imagenet1k-caption/train.jsonl"
+            caption_sequence_modes:
+                - "t2i"
+                - "i2t"
+            caption_t2i_prefixes:
+                - "Generate an image matching this caption:"
+                - "Create an image described by this caption:"
+                - "Draw a realistic image for this caption:"
+                - "Produce an image that follows this description:"
+                - "Render the scene described here:"
+                - "Create a visual scene from this caption:"
+                - "Generate a picture based on this description:"
+                - "Make an image that matches the following caption:"
+                - "Turn this caption into an image:"
+                - "Synthesize an image for this visual description:"
+            caption_i2t_prefixes:
+                - "Describe this image in one detailed caption."
+                - "Write a detailed caption for this image."
+                - "Summarize the visual content of this image."
+                - "Provide a natural-language caption for this image."
+                - "Describe the main subject, setting, and visible details."
+                - "Write one caption that explains what is visible in this image."
+                - "Describe this picture clearly and naturally."
+                - "Create a caption for the image shown here."
+                - "State what this image shows in a detailed caption."
+                - "Caption this image with the important visual details."
             latent_hflip_prob: 0.5
             image_tokens_per_img: 256
             image_latent_dim: 16
