@@ -42,7 +42,7 @@ def test_image_projectors_use_normal_init_with_nextstep_mlp_ratio():
     assert model.image_flow_condition_proj.weight.detach().float().std() > 0
     assert torch.allclose(model.image_token_embedder.z_proj.bias, torch.zeros_like(model.image_token_embedder.z_proj.bias))
     assert torch.allclose(model.image_flow_condition_proj.bias, torch.zeros(config.hidden_size))
-    assert model.image_flow_head.net.res_blocks[0].intermediate_size == config.image_flow_width
+    assert model.image_flow_head.net.blocks[0].mlp[0].out_features == config.image_flow_width
     assert torch.allclose(
         model.image_flow_head.net.final_layer.linear.weight,
         torch.zeros_like(model.image_flow_head.net.final_layer.linear.weight),
@@ -56,8 +56,8 @@ def test_image_projectors_use_normal_init_with_nextstep_mlp_ratio():
         torch.zeros_like(model.image_flow_head.net.final_layer.adaLN_modulation[-1].weight),
     )
     assert torch.allclose(
-        model.image_flow_head.net.res_blocks[0].adaLN_modulation[-1].weight,
-        torch.zeros_like(model.image_flow_head.net.res_blocks[0].adaLN_modulation[-1].weight),
+        model.image_flow_head.net.blocks[0].adaLN_modulation[-1].weight,
+        torch.zeros_like(model.image_flow_head.net.blocks[0].adaLN_modulation[-1].weight),
     )
 
 
@@ -66,7 +66,7 @@ def test_image_flow_mlp_ratio_can_widen_resblocks():
     config.image_flow_mlp_ratio = 2.0
     model = Qwen3ForCausalLM(config)
 
-    assert model.image_flow_head.net.res_blocks[0].intermediate_size == 16
+    assert model.image_flow_head.net.blocks[0].mlp[0].out_features == 16
 
     z = torch.randn(3, config.hidden_size)
     out = model._prepare_image_flow_condition(z)
@@ -123,27 +123,40 @@ def test_image_token_embedder_uses_fixed_2d_sincos_positions():
     state_keys = set(embedder.state_dict().keys())
 
     assert "image_pos_embed.weight" not in state_keys
-    assert "diffusion_pos_embed.weight" not in state_keys
+    assert "flow_pos_embed.weight" not in state_keys
     assert embedder.image_pos_embed.shape == (4, 8)
-    assert embedder.diffusion_pos_embed.shape == (4, 8)
+    assert embedder.flow_pos_embed.shape == (4, 8)
 
     positions = torch.arange(4)
     zeros = torch.zeros(4, 8)
-    with_diffusion_pos = embedder.add_diffusion_pos(zeros, positions)
+    with_flow_pos = embedder.add_flow_pos(zeros, positions)
 
-    assert torch.allclose(with_diffusion_pos, embedder.diffusion_pos_embed)
+    assert torch.allclose(with_flow_pos, embedder.flow_pos_embed)
     assert not torch.allclose(embedder.image_pos_embed[0], embedder.image_pos_embed[1])
 
 
-def test_image_token_embedder_rebuilds_fixed_positions_if_buffer_is_corrupted():
+def test_image_token_embedder_rebuilds_fixed_positions_on_reset():
     embedder = ImageTokenEmbedder(latent_dim=4, hidden_size=8, image_tokens_per_img=4)
     positions = torch.arange(4)
     zeros = torch.zeros(4, 8)
-    expected = embedder.add_diffusion_pos(zeros, positions)
+    expected = embedder.add_flow_pos(zeros, positions)
 
-    embedder.diffusion_pos_embed.fill_(torch.finfo(torch.float32).max)
-    actual = embedder.add_diffusion_pos(zeros, positions)
+    embedder.flow_pos_embed.fill_(torch.finfo(torch.float32).max)
+    embedder._reset_position_buffers()
+    actual = embedder.add_flow_pos(zeros, positions)
 
     assert torch.isfinite(actual).all()
     assert actual.abs().max() <= 1.0
     assert torch.allclose(actual, expected)
+
+
+def test_image_token_embedder_loads_legacy_diffusion_pos_key():
+    source = ImageTokenEmbedder(latent_dim=4, hidden_size=8, image_tokens_per_img=4)
+    state = source.state_dict()
+    legacy_pos = state.pop("flow_pos_embed").clone()
+    state["diffusion_pos_embed"] = legacy_pos
+
+    target = ImageTokenEmbedder(latent_dim=4, hidden_size=8, image_tokens_per_img=4)
+    target.load_state_dict(state, strict=True)
+
+    assert torch.allclose(target.flow_pos_embed, legacy_pos)

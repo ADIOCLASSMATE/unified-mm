@@ -48,7 +48,7 @@ from transformers.utils.generic import maybe_autocast, merge_with_config_default
 from torch.nn.attention.flex_attention import flex_attention, BlockMask, create_block_mask, and_masks
 from flash_attn.ops.triton.layer_norm import rms_norm_fn as flash_rms_norm
 from .image_position_utils import build_2d_sincos_position_embedding as _build_2d_sincos_position_embedding
-from .mar_flowloss import FlowLoss
+from .image_flow_loss import FlowLoss
 try:
     from liger_kernel.ops.swiglu import LigerSiLUMulFunction  # noqa: F401
     liger_kernel_is_available = True
@@ -83,7 +83,7 @@ class ImageTokenEmbedder(nn.Module):
         self.z_proj_ln = nn.LayerNorm(self.hidden_size, eps=1e-6)
         pos_embed = torch.empty(self.image_tokens_per_img, self.hidden_size)
         self.register_buffer("image_pos_embed", pos_embed.clone())
-        self.register_buffer("diffusion_pos_embed", pos_embed.clone())
+        self.register_buffer("flow_pos_embed", pos_embed.clone())
         self._reset_parameters()
 
     def _reset_parameters(self):
@@ -103,10 +103,34 @@ class ImageTokenEmbedder(nn.Module):
             device=device,
         )
         self.image_pos_embed = pos_embed.clone()
-        self.diffusion_pos_embed = pos_embed.clone()
+        self.flow_pos_embed = pos_embed.clone()
 
-    def _reset_mar_slots(self):
+    def _reset_image_slots(self):
         self._reset_parameters()
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        old_key = prefix + "diffusion_pos_embed"
+        new_key = prefix + "flow_pos_embed"
+        if new_key not in state_dict and old_key in state_dict:
+            state_dict[new_key] = state_dict.pop(old_key)
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     @property
     def weight_dtype(self):
@@ -147,11 +171,11 @@ class ImageTokenEmbedder(nn.Module):
         x = x + self._lookup_pos_embed(self.image_pos_embed, local_positions, x.dtype)
         return self.z_proj_ln(x)
 
-    def add_diffusion_pos(self, z, local_positions=None):
+    def add_flow_pos(self, z, local_positions=None):
         local_positions = self._positions(local_positions, z.device)
         if local_positions is None:
             return z
-        return z + self._lookup_pos_embed(self.diffusion_pos_embed, local_positions, z.dtype)
+        return z + self._lookup_pos_embed(self.flow_pos_embed, local_positions, z.dtype)
 
     def forward(self, latents, local_positions=None):
         return self.embed_latents(latents, local_positions=local_positions)
@@ -830,7 +854,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
         if (X0_input_ids is None) ^ (X0_inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
         if attention_mask is None:
-            raise ValueError("attention_mask must be provided for diffusion-causal attention.")
+            raise ValueError("attention_mask must be provided for selfless sigma-causal attention.")
 
         if X0_inputs_embeds is None:
             X0_inputs_embeds = self._build_x0_inputs_embeds(
@@ -963,7 +987,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         image_local_positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if image_local_positions is not None:
-            z = self.image_token_embedder.add_diffusion_pos(z, image_local_positions)
+            z = self.image_token_embedder.add_flow_pos(z, image_local_positions)
         z = _normalize_image_flow_condition(
             z,
             self.image_flow_condition_norm,
@@ -1055,15 +1079,12 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         Args:
             X0_input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
                 Indices of input sequence tokens in the vocabulary. The input sequence should be formatted as
-                `[X0_1, X0_2, ..., X0_n]`, where `X0_i` represents the tokens at diffusion time step 0 for the i-th
-                position. All tokens in `X0_input_ids` should have the same diffusion time step (i.e., all should be
-                from the same "diffusion slice"). If `inputs_embeds` is not provided, this argument will be used to
+                `[X0_1, X0_2, ..., X0_n]`, where `X0_i` represents the visible content token for the i-th
+                position. If `inputs_embeds` is not provided, this argument will be used to
                 compute the input embeddings.
             attention_mask (`BlockMask`, *optional*):
-                Attention mask for diffusion-causal attention. Should be a block mask of shape `(batch_size,
-                sequence_length)` where each block corresponds to a diffusion time step. The mask should be designed
-                such that tokens can only attend to tokens from the same or earlier diffusion time steps, and not to
-                tokens from later diffusion time steps.
+                Attention mask for selfless sigma-causal attention. The mask should be designed such that
+                query positions can only attend to key/value positions with lower sigma.
             labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
                 Labels for language modeling. Tokens with labels set to -100 will be ignored when computing the loss.
             image_latents (`torch.FloatTensor` of shape `(batch_size, sequence_length, image_latent_dim)`, *optional*):
@@ -1810,7 +1831,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         sigma = torch.empty(seq.shape[0], dtype=torch.float32, device=device)
         if prompt_task == "ar":
             sigma[:] = torch.arange(seq.shape[0], device=device, dtype=sigma.dtype)
-        elif prompt_task == "diffusion":
+        elif prompt_task in {"random_sigma", "random"}:
             sigma[:] = torch.rand(seq.shape[0], device=device, dtype=sigma.dtype)
         else:
             raise ValueError(f"Invalid prompt task: {prompt_task}")
@@ -2072,7 +2093,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         # Context 的 Sigma 设置
         if prompt_task == 'ar':
             sigma[:, :prompt_len] = torch.arange(0, prompt_len, device=self.device)
-        elif prompt_task == 'diffusion':
+        elif prompt_task in {'random_sigma', 'random'}:
             sigma[:, :prompt_len] = torch.rand(num_response, prompt_len, device=self.device)
         else:
             raise ValueError(f"Invalid prompt task: {prompt_task}")

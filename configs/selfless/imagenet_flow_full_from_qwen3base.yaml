@@ -26,7 +26,7 @@ experiment:
     validation_single_stream_order_strategies:
         - "causal_sigma"
         - "spatial_halton"
-    validation_mar_root: "/inspire/hdd/global_user/wanjiaxin-253108030048/code/mar"
+    validation_vae_module_root: "/inspire/hdd/global_user/wanjiaxin-253108030048/code/mar"
     validation_vae_path: "public/vae/mar-kl16/kl16.ckpt"
     validation_vae_scaling_factor: 0.2325
     resume_from_checkpoint: none

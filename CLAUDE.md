@@ -1,6 +1,6 @@
 # Unified-MM Project Context
 
-This project currently studies a **two-stream Qwen3 LLM with MAR-like image
+This project currently studies a **two-stream Qwen3 LLM with contextual image
 flow** for unified text-image modeling. Older documentation about
 OmniCorpus-only discrete image-token CE is obsolete for the active path.
 
@@ -26,7 +26,7 @@ q attends to kv iff sigma[kv] < sigma[q]
 The diagonal is excluded, so a token cannot see itself. With AR sigma values,
 text still gets causal information flow, but `labels == input_ids` at valid text
 positions. Image positions use the aligned `XT` hidden state as the condition
-for a MAR-like rectified-flow loss.
+for a contextual rectified-flow head.
 
 ## Active Architecture
 
@@ -34,7 +34,7 @@ Core model:
 
 - `models/modeling_model/modeling_selfless_flow.py`
 - Qwen3-based two-stream Transformer.
-- `ImageTokenEmbedder` projects MAR KL16 latents into the hidden space.
+- `ImageTokenEmbedder` projects KL16 VAE latents into the hidden space.
 - `FlowLoss` predicts rectified-flow velocity for continuous image latents.
 - Text uses normal LM-head cross-entropy.
 - Image slots use flow MSE, not discrete image-token CE.
@@ -46,16 +46,16 @@ loss = lambda_text * text_ce + lambda_image * image_flow_mse
 ```
 
 Text-to-image generation works by letting image slots attend to prompt/context
-tokens, then sampling MAR KL16 latents from the flow head. Image-to-text works
+tokens, then sampling KL16 latents from the flow head. Image-to-text works
 by letting later text positions attend image latent tokens through the same
 Transformer attention.
 
 ## Current Data Direction
 
-Active image data uses cached MAR KL16 VAE latents:
+Active image data uses cached KL16 VAE latents:
 
 ```text
-ImageNet image -> MAR KL16 VAE -> Tensor[256, 16]
+ImageNet image -> KL16 VAE -> Tensor[256, 16]
 ```
 
 Each training sample is represented as:
@@ -80,37 +80,30 @@ Text selfless adaptation:
 bash script/selfless/pretraining_text_selfless_2048.sh
 ```
 
-Encode ImageNet into MAR KL16 latent cache:
+Encode ImageNet into the KL16 latent cache:
 
 ```bash
-bash script/selfless/encode_imagenet_full_mar_kl16.sh
+bash script/selfless/encode_imagenet_full_kl16_vae.sh
 ```
 
-Image-flow warmup:
+10-class ImageNet flow debug run:
 
 ```bash
-bash script/selfless/pretraining_imagenet_diffusion_warmup_full.sh
+bash script/selfless/pretraining_imagenet_flow_stage0_10c.sh
 ```
 
-Unified image/text training:
+Full ImageNet flow training:
 
 ```bash
-bash script/selfless/pretraining_imagenet_diffusion_unified_full.sh
-```
-
-Flow refinement:
-
-```bash
-bash script/selfless/pretraining_imagenet_diffusion_refine_full.sh
+bash script/selfless/pretraining_imagenet_flow_full_from_qwen3base.sh
 ```
 
 Main configs:
 
 ```text
 configs/selfless/text_selfless_2048_ft.yaml
-configs/selfless/imagenet_diffusion_warmup_full.yaml
-configs/selfless/imagenet_diffusion_unified_full.yaml
-configs/selfless/imagenet_diffusion_refine_full.yaml
+configs/selfless/imagenet_flow_stage0_10c.yaml
+configs/selfless/imagenet_flow_full_from_qwen3base.yaml
 ```
 
 ## Implementation Status
@@ -120,8 +113,8 @@ Done:
 - Two-stream strict selfless attention for Qwen3.
 - Shift-free text objective with same-position labels.
 - Continuous image latent embedding path.
-- MAR-like rectified-flow image loss.
-- MAR adapter migration for warmup.
+- Contextual rectified-flow image loss.
+- Legacy adapter migration for image modules.
 - ImageNet latent-cache dataset.
 - Combined image/text dataloader.
 - Single-stream image latent generation with multiple order strategies.
@@ -138,13 +131,12 @@ Still research/development work:
 ## Engineering Notes
 
 - The active training loop is `pretrain/train_selfless_flow.py`.
-- The active model class is loaded when the project name contains `flow` or
-  `diffusion`.
+- The active model class is loaded when the project name contains `flow`.
 - Do not reintroduce shifted labels into the selfless flow path.
 - Do not treat image slots as discrete codebook CE targets in the active flow
   configs.
-- Keep `image_tokens_per_img=256` and `image_latent_dim=16` aligned with MAR
-  KL16 assumptions unless all datasets, validation, and samplers are updated.
+- Keep `image_tokens_per_img=256` and `image_latent_dim=16` aligned with KL16
+  latent assumptions unless all datasets, validation, and samplers are updated.
 - If changing image generation, check `sample_image_latents_single_stream()` and
-  `scripts/generate_diffusion_validation_images.py`.
+  `scripts/generate_flow_validation_images.py`.
 - If changing attention visibility, check `utils/utils.py:get_selfless_mask()`.

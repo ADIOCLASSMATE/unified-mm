@@ -17,7 +17,7 @@
    - 对比以上差异，判断 hidden condition 是否被 latent context 抢主导。
 
 3. Position embedding 可能有重复。
-   - Qwen hidden condition 在 _prepare_image_flow_condition 里会通过 image_token_embedder.add_diffusion_pos 加一次 image local position。
+   - Qwen hidden condition 在 _prepare_image_flow_condition 里会通过 image_token_embedder.add_flow_pos 加一次 image local position。
    - flow head 对 query x 和 context_latents 又加 fixed 2D sin-cos position embedding。
    - 这不一定是 bug，但可能让位置信息过强或重复，需要训练后看是否影响泛化、空间一致性和编辑响应。
 

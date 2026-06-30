@@ -160,7 +160,7 @@ def load_model_tokenizer(config: OmegaConf, logger=None):
     elif "xlnet" in project.lower():
         from models.modeling_model.modeling_xlnet import Qwen3ForCausalLM
         model_class = Qwen3ForCausalLM
-    elif "flow" in project.lower() or "diffusion" in project.lower():
+    elif "flow" in project.lower():
         from models.modeling_model.modeling_selfless_flow import Qwen3ForCausalLM
         model_class = Qwen3ForCausalLM
     elif "selfless" in project.lower() or "sigma" in project.lower():
@@ -243,7 +243,6 @@ def load_model_tokenizer(config: OmegaConf, logger=None):
 
         if (
             "flow" in project.lower()
-            or "diffusion" in project.lower()
             or config.model.get("continuous_image_latents", False)
         ):
             if len(tokenizer) > model.config.vocab_size:

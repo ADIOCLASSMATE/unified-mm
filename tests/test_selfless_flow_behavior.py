@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader
 from torch import nn
 from transformers import Qwen3Config
 
-from models.modeling_model.mar_flowloss import FlowLoss
+from models.modeling_model.image_flow_loss import FlowLoss
 from models.modeling_model.modeling_selfless_flow import ImageTokenEmbedder, Qwen3ForCausalLM, Qwen3Model
 from utils.dataset_combined_flow import CombinedBatchDataLoader, TextArrowDataset, collate_text_arrow
 from utils.dataset_imagenet_flow_cache import (
@@ -112,7 +112,7 @@ class FakeCallableFlowHead(nn.Module):
 
 
 class FakeConditionEmbedder(nn.Module):
-    def add_diffusion_pos(self, z, image_local_positions):
+    def add_flow_pos(self, z, image_local_positions):
         return z
 
 

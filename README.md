@@ -1,7 +1,7 @@
-# Unified-MM: Two-Stream LLM with MAR-Like Image Flow
+# Unified-MM: Two-Stream LLM with Contextual Image Flow
 
 This repository trains a unified text-image model by combining a two-stream
-Qwen3 language backbone with a MAR-style rectified-flow loss over continuous
+Qwen3 language backbone with a contextual rectified-flow head over continuous
 image latents.
 
 The current idea is simple:
@@ -39,7 +39,7 @@ Because the diagonal is excluded, a position cannot see its own content token.
 With AR sigma values, text still behaves like left-to-right language modeling,
 but the tensors no longer need a shifted label convention: `labels == input_ids`
 at valid text positions. For image positions, the `XT` hidden state at that same
-position becomes the conditioning vector for a MAR-like flow head.
+position becomes the conditioning vector for a contextual flow head.
 
 ## Unified Multimodal Behavior
 
@@ -93,7 +93,7 @@ The active ImageNet flow format is:
 optional prompt text [BOI] 256 image latent slots [EOI] optional suffix text [EOS]
 ```
 
-The 256 image slots are MAR KL16 VAE latents with shape `[256, 16]`.
+The 256 image slots are KL16 VAE latents with shape `[256, 16]`.
 
 ## Active Training Path
 
@@ -103,10 +103,10 @@ The 256 image slots are MAR KL16 VAE latents with shape `[256, 16]`.
 bash script/selfless/pretraining_text_selfless_2048.sh
 ```
 
-2. Encode ImageNet images into MAR KL16 latent cache:
+2. Encode ImageNet images into the KL16 latent cache:
 
 ```bash
-bash script/selfless/encode_imagenet_full_mar_kl16.sh
+bash script/selfless/encode_imagenet_full_kl16_vae.sh
 ```
 
 3. Run the 10-class ImageNet stage0 preflight/debug training:
@@ -133,14 +133,14 @@ configs/selfless/imagenet_flow_full_from_qwen3base.yaml
 
 - `models/modeling_model/modeling_selfless_flow.py`: two-stream Qwen3 model,
   image latent embedding, text CE, image flow loss, and image latent sampling.
-- `models/modeling_model/mar_flowloss.py`: MAR-like rectified-flow objective.
+- `models/modeling_model/image_flow_loss.py`: contextual rectified-flow objective.
 - `utils/utils.py`: tokenizer/model loading and strict selfless mask creation.
 - `utils/dataset_imagenet_flow_cache.py`: ImageNet latent-cache dataset.
 - `utils/dataset_combined_flow.py`: mixed ImageNet-flow and text dataloaders.
 - `pretrain/train_selfless_flow.py`: active training loop, validation image
   decoding, EMA, adapter save/load, and flow diagnostics.
-- `scripts/imagenet_encode_mar_kl16.py`: MAR KL16 VAE latent encoder.
-- `scripts/generate_diffusion_validation_images.py`: manual flow validation and
+- `scripts/imagenet_encode_kl16_vae.py`: KL16 VAE latent encoder.
+- `scripts/generate_flow_validation_images.py`: manual flow validation and
   strategy comparison.
 - `docs/RESEARCH.md`: current research plan and rationale.
 
@@ -155,7 +155,7 @@ uv run pytest tests/test_selfless_flow_behavior.py
 Run a manual image-flow validation pass:
 
 ```bash
-uv run python scripts/generate_diffusion_validation_images.py \
+uv run python scripts/generate_flow_validation_images.py \
   --config configs/selfless/imagenet_flow_full_from_qwen3base.yaml \
   --single_stream \
   --strategies sigma,spatial_halton,hidden_norm
@@ -171,4 +171,4 @@ uv run python scripts/check_selfless_flow_text_regression.py
 
 Older discrete image-token and OmniCorpus preprocessing code is still present in
 the repository, but it is no longer the active research path described here. The
-mainline flow configs train on continuous MAR KL16 latents and text Arrow shards.
+mainline flow configs train on continuous KL16 latents and text Arrow shards.

@@ -35,7 +35,7 @@ from utils.utils import get_config, flatten_omega_conf, get_selfless_mask, log_g
 from models.modeling_model.modeling_selfless_flow import Qwen3ForCausalLM as FlowQwen3ForCausalLM
 
 logger = get_logger(__name__, log_level="INFO")
-_MAR_VAE_CACHE = None
+_VAE_CACHE = None
 
 
 def load_model_tokenizer(config: OmegaConf, logger=None):
@@ -306,9 +306,15 @@ def _load_image_flow_adapter(model, adapter_path, config):
         projector_state = {}
         projector_target = model.image_token_embedder.state_dict()
         projector_skipped = {}
-        mar_mask_token = None
+        adapter_mask_token = None
+
+        def _canonical_projector_key(name):
+            if name == "diffusion_pos_embed":
+                return "flow_pos_embed"
+            return name
 
         def _maybe_add_projector_key(name, value):
+            name = _canonical_projector_key(name)
             if name not in projector_target:
                 projector_skipped[name] = (tuple(value.shape), None)
                 return
@@ -337,9 +343,9 @@ def _load_image_flow_adapter(model, adapter_path, config):
                     pos = f.get_tensor(key).squeeze(0)
                     _maybe_add_projector_key("image_pos_embed", pos[-model.image_token_embedder.image_tokens_per_img:])
                 elif key == "diffusion_pos_embed_learned":
-                    _maybe_add_projector_key("diffusion_pos_embed", f.get_tensor(key).squeeze(0))
+                    _maybe_add_projector_key("flow_pos_embed", f.get_tensor(key).squeeze(0))
                 elif key == "mask_token":
-                    mar_mask_token = f.get_tensor(key).reshape(-1)
+                    adapter_mask_token = f.get_tensor(key).reshape(-1)
         _migrate_image_flow_head_state(model, head_state, adapter_path)
         if condition_proj_state:
             _migrate_image_flow_condition_proj_state(model, condition_proj_state, adapter_path)
@@ -352,23 +358,23 @@ def _load_image_flow_adapter(model, adapter_path, config):
             )
         else:
             logger.warning(
-                f"No MAR image_token_embedder keys were loaded from {adapter_path}; skipped={projector_skipped}"
+                f"No image_token_embedder keys were loaded from {adapter_path}; skipped={projector_skipped}"
             )
         image_mask_token_id = config.model.get("image_mask_token_id", None)
-        if mar_mask_token is not None and image_mask_token_id is not None:
+        if adapter_mask_token is not None and image_mask_token_id is not None:
             with torch.no_grad():
                 embed = model.model.embed_tokens.weight
-                if mar_mask_token.numel() != embed.shape[1]:
+                if adapter_mask_token.numel() != embed.shape[1]:
                     logger.warning(
-                        f"Skipping MAR mask_token load: shape={tuple(mar_mask_token.shape)} "
+                        f"Skipping adapter mask_token load: shape={tuple(adapter_mask_token.shape)} "
                         f"does not match embedding dim={embed.shape[1]}"
                     )
                 else:
                     embed[int(image_mask_token_id)].copy_(
-                        mar_mask_token.to(device=embed.device, dtype=embed.dtype)
+                        adapter_mask_token.to(device=embed.device, dtype=embed.dtype)
                     )
                     logger.info(
-                        f"Loaded MAR mask_token into image_mask_token_id={int(image_mask_token_id)}"
+                        f"Loaded adapter mask_token into image_mask_token_id={int(image_mask_token_id)}"
                     )
         return
 
@@ -667,7 +673,7 @@ def main():
     optimizer_config = config.optimizer.params
 
     # Use lower LR for pretrained backbone and higher LR for continuous-image
-    # modules. Match MAR-style head training by keeping the flow MLP out of weight decay.
+    # modules. Keep flow head normalization/projection parameters out of weight decay.
     base_lr = float(optimizer_config.learning_rate)
     backbone_lr = float(optimizer_config.get("backbone_learning_rate", base_lr))
     flow_lr = float(optimizer_config.get("flow_learning_rate", base_lr))
@@ -1242,25 +1248,30 @@ def _validate_text_only(model, val_dataloader, selfless_sampler, accelerator, gl
 
 
 @torch.no_grad()
-def _load_mar_vae(config, accelerator):
-    global _MAR_VAE_CACHE
-    if _MAR_VAE_CACHE is not None:
-        return _MAR_VAE_CACHE
+def _load_vae_decoder(config, accelerator):
+    global _VAE_CACHE
+    if _VAE_CACHE is not None:
+        return _VAE_CACHE
 
     vae_path = Path(config.experiment.get("validation_vae_path", "public/vae/mar-kl16/kl16.ckpt"))
     if not vae_path.exists():
         logger.warning(f"Skipping validation image decode; missing VAE checkpoint: {vae_path}")
         return None
 
-    mar_root = Path(config.experiment.get("validation_mar_root", "/inspire/hdd/global_user/wanjiaxin-253108030048/code/mar"))
-    vae_module_path = mar_root / "models" / "vae.py"
+    vae_module_root = Path(
+        config.experiment.get(
+            "validation_vae_module_root",
+            config.experiment.get("validation_mar_root", "/inspire/hdd/global_user/wanjiaxin-253108030048/code/mar"),
+        )
+    )
+    vae_module_path = vae_module_root / "models" / "vae.py"
     if not vae_module_path.exists():
-        logger.warning(f"Skipping validation image decode; missing MAR VAE module: {vae_module_path}")
+        logger.warning(f"Skipping validation image decode; missing VAE module: {vae_module_path}")
         return None
-    spec = importlib.util.spec_from_file_location("mar_vae", vae_module_path)
-    mar_vae = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mar_vae)
-    AutoencoderKL = mar_vae.AutoencoderKL
+    spec = importlib.util.spec_from_file_location("kl16_vae", vae_module_path)
+    vae_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(vae_module)
+    AutoencoderKL = vae_module.AutoencoderKL
 
     vae = AutoencoderKL(embed_dim=16, ch_mult=(1, 1, 2, 2, 4), ckpt_path=str(vae_path))
     vae_dtype_name = str(config.experiment.get("validation_vae_dtype", "fp32")).lower()
@@ -1268,7 +1279,7 @@ def _load_mar_vae(config, accelerator):
     vae = vae.to(device=accelerator.device, dtype=dtype).eval()
     for param in vae.parameters():
         param.requires_grad_(False)
-    _MAR_VAE_CACHE = vae
+    _VAE_CACHE = vae
     return vae
 
 
@@ -1366,7 +1377,7 @@ def _save_validation_flow_images(
             logger.warning("Skipping validation image decode; no complete image span in validation batch.")
             return
 
-        vae = _load_mar_vae(config, accelerator)
+        vae = _load_vae_decoder(config, accelerator)
         if vae is None:
             return
 

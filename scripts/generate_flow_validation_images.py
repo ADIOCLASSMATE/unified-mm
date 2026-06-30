@@ -22,12 +22,12 @@ from utils.utils import get_selfless_mask, load_model_tokenizer
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Manual validation image generation for image rectified-flow heads.")
-    parser.add_argument("--config", default="configs/selfless/imagenet_diffusion_warmup_full.yaml")
+    parser.add_argument("--config", default="configs/selfless/imagenet_flow_full_from_qwen3base.yaml")
     parser.add_argument("--model_path_override", default="")
     parser.add_argument(
         "--adapter",
         default="none",
-        help="Flow adapter, old diffusion adapter/checkpoint to migrate, MAR .safetensors, or 'none'.",
+        help="Flow adapter, legacy adapter/checkpoint to migrate, external pretrained safetensors, or 'none'.",
     )
     parser.add_argument(
         "--model_state",
@@ -267,9 +267,15 @@ def load_adapter(model, adapter_path: str):
         condition_proj_state = {}
         projector_state = {}
         projector_target = model.image_token_embedder.state_dict()
-        mar_mask_token = None
+        adapter_mask_token = None
+
+        def canonical_projector_key(name):
+            if name == "diffusion_pos_embed":
+                return "flow_pos_embed"
+            return name
 
         def maybe_add_projector_key(name, value):
+            name = canonical_projector_key(name)
             if name in projector_target and tuple(value.shape) == tuple(projector_target[name].shape):
                 projector_state[name] = value
 
@@ -289,11 +295,11 @@ def load_adapter(model, adapter_path: str):
                     maybe_add_projector_key(key, f.get_tensor(key))
                 elif key == "encoder_pos_embed_learned":
                     pos = f.get_tensor(key).squeeze(0)
-                    maybe_add_projector_key("image_pos_embed.weight", pos[-model.image_token_embedder.image_tokens_per_img:])
+                    maybe_add_projector_key("image_pos_embed", pos[-model.image_token_embedder.image_tokens_per_img:])
                 elif key == "diffusion_pos_embed_learned":
-                    maybe_add_projector_key("diffusion_pos_embed.weight", f.get_tensor(key).squeeze(0))
+                    maybe_add_projector_key("flow_pos_embed", f.get_tensor(key).squeeze(0))
                 elif key == "mask_token":
-                    mar_mask_token = f.get_tensor(key).reshape(-1)
+                    adapter_mask_token = f.get_tensor(key).reshape(-1)
 
         report["image_flow_head"] = _migrate_head_state(model, head_state)
         if condition_proj_state:
@@ -303,12 +309,12 @@ def load_adapter(model, adapter_path: str):
             report["image_token_embedder_missing"] = list(missing)
             report["image_token_embedder_unexpected"] = list(unexpected)
         image_mask_token_id = getattr(model.config, "image_mask_token_id", None)
-        if mar_mask_token is not None and image_mask_token_id is not None:
+        if adapter_mask_token is not None and image_mask_token_id is not None:
             with torch.no_grad():
                 embed = model.model.embed_tokens.weight
-                if mar_mask_token.numel() == embed.shape[1]:
-                    embed[int(image_mask_token_id)].copy_(mar_mask_token.to(device=embed.device, dtype=embed.dtype))
-                    report["loaded_mar_mask_token_id"] = int(image_mask_token_id)
+                if adapter_mask_token.numel() == embed.shape[1]:
+                    embed[int(image_mask_token_id)].copy_(adapter_mask_token.to(device=embed.device, dtype=embed.dtype))
+                    report["loaded_adapter_mask_token_id"] = int(image_mask_token_id)
         return report
 
     state = torch.load(path, map_location="cpu")
@@ -355,12 +361,17 @@ def load_model_state(model, model_state_path: str):
 
 
 def load_vae(config, device, dtype_name):
-    mar_root = Path(config.experiment.validation_mar_root)
+    vae_module_root = Path(
+        config.experiment.get(
+            "validation_vae_module_root",
+            config.experiment.get("validation_mar_root", "/inspire/hdd/global_user/wanjiaxin-253108030048/code/mar"),
+        )
+    )
     vae_path = Path(config.experiment.validation_vae_path)
-    spec = importlib.util.spec_from_file_location("mar_vae", mar_root / "models" / "vae.py")
-    mar_vae = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mar_vae)
-    vae = mar_vae.AutoencoderKL(embed_dim=16, ch_mult=(1, 1, 2, 2, 4), ckpt_path=str(vae_path))
+    spec = importlib.util.spec_from_file_location("kl16_vae", vae_module_root / "models" / "vae.py")
+    vae_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(vae_module)
+    vae = vae_module.AutoencoderKL(embed_dim=16, ch_mult=(1, 1, 2, 2, 4), ckpt_path=str(vae_path))
     dtype = torch.float16 if dtype_name == "fp16" and device.type == "cuda" else torch.float32
     vae = vae.to(device=device, dtype=dtype).eval()
     for param in vae.parameters():
@@ -567,7 +578,7 @@ def main():
     print(f"Loading model state: {args.model_state or 'none'}")
     model_state_report = load_model_state(model, args.model_state)
     model = model.to(device).eval()
-    print("Loading MAR VAE...")
+    print("Loading KL16 VAE...")
     vae = load_vae(config, device, args.vae_dtype)
     scaling_factor = float(config.experiment.validation_vae_scaling_factor)
 

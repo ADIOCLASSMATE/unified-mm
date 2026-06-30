@@ -1,5 +1,5 @@
 """
-Encode ImageNet prompt-dataset images with MAR's KL16 VAE.
+Encode ImageNet prompt-dataset images with the KL16 VAE.
 
 This encoder can write per-image .pt files containing:
     {"latent": Tensor[16,16,16], "scaling_factor": 0.2325}
@@ -23,9 +23,9 @@ from torchvision import transforms
 from tqdm import tqdm
 
 
-MAR_ROOT = Path("/inspire/hdd/global_user/wanjiaxin-253108030048/code/mar")
-if str(MAR_ROOT) not in sys.path:
-    sys.path.insert(0, str(MAR_ROOT))
+VAE_MODULE_ROOT = Path("/inspire/hdd/global_user/wanjiaxin-253108030048/code/mar")
+if str(VAE_MODULE_ROOT) not in sys.path:
+    sys.path.insert(0, str(VAE_MODULE_ROOT))
 
 from models.vae import AutoencoderKL  # noqa: E402
 
@@ -216,7 +216,7 @@ def main() -> None:
 
     errors = 0
     encoded = 0
-    progress = tqdm(total=len(samples), desc="Encoding MAR KL16 latents", unit="img")
+    progress = tqdm(total=len(samples), desc="Encoding KL16 latents", unit="img")
     with torch.inference_mode():
         for batch_img_ids, images, source_paths, synsets in loader:
             try:

@@ -39,7 +39,7 @@ run_encode_shard() {
   local manifest_arg="${MANIFEST_JSONL}"
 
   if [[ -n "${gpu_id}" ]]; then
-    CUDA_VISIBLE_DEVICES="${gpu_id}" uv run python scripts/imagenet_encode_mar_kl16.py \
+    CUDA_VISIBLE_DEVICES="${gpu_id}" uv run python scripts/imagenet_encode_kl16_vae.py \
       --source_mode imagenet_train \
       --imagenet_train_dir "${IMAGENET_TRAIN_DIR}" \
       --output_dir "${OUTPUT_DIR}" \
@@ -55,7 +55,7 @@ run_encode_shard() {
       "${save_args[@]}" \
       "${overwrite_args[@]}"
   else
-    uv run python scripts/imagenet_encode_mar_kl16.py \
+    uv run python scripts/imagenet_encode_kl16_vae.py \
       --source_mode imagenet_train \
       --imagenet_train_dir "${IMAGENET_TRAIN_DIR}" \
       --output_dir "${OUTPUT_DIR}" \
@@ -84,7 +84,7 @@ if [[ "${PARALLEL}" == "1" && "${NUM_GPUS}" -gt 1 ]]; then
   pids=()
   trap 'for pid in "${pids[@]:-}"; do kill "${pid}" 2>/dev/null || true; done' INT TERM
 
-  echo "Launching ${NUM_GPUS} ImageNet MAR-KL16 VAE encode shards."
+  echo "Launching ${NUM_GPUS} ImageNet KL16 VAE encode shards."
   echo "Output: ${OUTPUT_DIR}"
   echo "Cache shards: ${CACHE_SHARD_DIR}"
   for shard in $(seq 0 $((NUM_GPUS - 1))); do

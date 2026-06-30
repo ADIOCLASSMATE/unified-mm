@@ -1,4 +1,4 @@
-# Unified Multimodal Model via Two-Stream LLM and MAR-Like Flow Loss
+# Unified Multimodal Model via Two-Stream LLM and Contextual Image Flow
 
 This document describes the current research direction of the repository. It
 supersedes the older plan centered on discrete image-token cross-entropy and
@@ -17,7 +17,7 @@ The current thesis is:
 
 > A two-stream LLM can preserve autoregressive language modeling while removing
 > the tensor-level shift. Once every target is predicted at its own position, the
-> same hidden state can condition a MAR-like rectified-flow loss for continuous
+> same hidden state can condition a contextual rectified-flow head for continuous
 > image latents. Text-to-image and image-to-text then become two sigma schedules
 > over the same shared attention mechanism.
 
@@ -39,10 +39,10 @@ not the active path.
 
 The current code uses:
 
-- continuous MAR KL16 VAE latents with shape `[256, 16]`;
+- continuous KL16 VAE latents with shape `[256, 16]`;
 - `ImageTokenEmbedder` to project visible image latents into the Qwen hidden
   space;
-- `FlowLoss` from `models/modeling_model/mar_flowloss.py` to train a velocity
+- `FlowLoss` from `models/modeling_model/image_flow_loss.py` to train a velocity
   field over each image latent token;
 - `Qwen3ForCausalLM.forward()` to combine text CE and image flow loss;
 - `sample_image_latents_single_stream()` to generate images by repeatedly using
@@ -122,15 +122,15 @@ Image latents are continuous. For each image position, the model obtains:
 
 - target latent `z_0` from `image_latents`;
 - condition `c` from the `XT` hidden state at the same position;
-- optional diffusion positional embedding based on the local image index.
+- optional flow positional embedding based on the local image index.
 
 `FlowLoss.forward()` samples noise and time:
 
 ```text
 t ~ logit_normal/uniform mixture
 eps ~ N(0, I)
-z_t = (1 - t) * z_0 + t * eps
-v_target = eps - z_0
+z_t = (1 - t) * eps + t * z_0
+v_target = z_0 - eps
 v_pred = flow_head(z_t, t, condition=c)
 loss_image = mean((v_pred - v_target)^2)
 ```
@@ -168,7 +168,7 @@ Important details:
 - image CE labels are `-100`;
 - text, BOI, suffix, and EOS can contribute to text CE;
 - EOI is kept as context but ignored by CE;
-- image slots are exactly 256 MAR KL16 latent tokens;
+- image slots are exactly 256 KL16 latent tokens;
 - local image positions are computed from contiguous image spans.
 
 The collator assigns sigma values so that prompt/special context is visible and
@@ -190,7 +190,7 @@ masked image slots. The model repeatedly:
 1. builds the strict selfless attention mask from current sigma values;
 2. runs the backbone to obtain hidden states at unfilled image slots;
 3. normalizes those hidden states into flow conditions;
-4. samples image latents with the MAR-like flow head;
+4. samples image latents with the contextual flow head;
 5. writes selected latents back into the sequence as visible `X0` content;
 6. updates sigma/order and continues until all image slots are filled.
 
@@ -232,7 +232,7 @@ The current staged path is:
   - text CE plus image flow loss
   - single-stream image latent sampling
 
-- `models/modeling_model/mar_flowloss.py`
+- `models/modeling_model/image_flow_loss.py`
   - rectified-flow objective
   - velocity prediction
   - Euler/Heun sampling
@@ -244,7 +244,7 @@ The current staged path is:
   - image-unconditional CFG mask support
 
 - `utils/dataset_imagenet_flow_cache.py`
-  - MAR KL16 latent-cache dataset
+  - KL16 latent-cache dataset
   - prompt template rendering
   - sigma and label assignment
 
@@ -320,12 +320,12 @@ Useful ablations:
 - `spatial_uniform`;
 - different `parallel_rate` values.
 
-### RQ5: How Valuable Is MAR Adapter Migration?
+### RQ5: How Valuable Is Legacy Adapter Migration?
 
-The warmup code can migrate MAR `.safetensors` keys into the image flow head,
-image projector, diffusion positional embeddings, and image mask token. The key
+The loader can migrate legacy `.safetensors` keys into the image flow head,
+image projector, flow positional embeddings, and image mask token. The key
 question is whether this provides a better initialization than training the flow
-adapter from scratch under the LLM condition distribution.
+head from scratch under the LLM condition distribution.
 
 ## Evaluation Plan
 
@@ -362,7 +362,7 @@ reliable indicators during the current adapter/warmup phase.
 This project studies a unified multimodal objective in which a two-stream LLM
 removes the standard autoregressive label shift, aligns every target with its
 own query position, and uses those aligned hidden states to condition a
-MAR-like rectified-flow loss over continuous image latents. Under this design,
+contextual rectified-flow head over continuous image latents. Under this design,
 image generation and image understanding are not separate architectural modes:
 they are produced by the same strict attention rule under different sigma
 schedules.

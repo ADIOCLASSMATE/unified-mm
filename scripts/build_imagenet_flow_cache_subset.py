@@ -14,7 +14,7 @@ def parse_args():
     parser.add_argument(
         "--source_cache",
         default="public/datasets/imagenet_full/vae_latents_mar_kl16/flow_latents_all_fp16.pt",
-        help="Full cache produced by scripts/imagenet_encode_mar_kl16.py.",
+        help="Full cache produced by scripts/imagenet_encode_kl16_vae.py.",
     )
     parser.add_argument(
         "--source_manifest",
