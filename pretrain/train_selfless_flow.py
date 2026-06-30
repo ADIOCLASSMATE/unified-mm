@@ -11,6 +11,7 @@ import math
 import shutil
 import time
 import importlib.util
+import colorsys
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Union
@@ -1278,6 +1279,113 @@ def _heatmap_images(values: torch.Tensor) -> torch.Tensor:
     return heatmap
 
 
+def _generation_color(value: float) -> tuple[int, int, int]:
+    value = max(0.0, min(1.0, float(value)))
+    hue = (2.0 / 3.0) * (1.0 - value)
+    red, green, blue = colorsys.hsv_to_rgb(hue, 0.78, 0.95)
+    return int(red * 255), int(green * 255), int(blue * 255)
+
+
+def _save_readable_generation_map(
+    values: torch.Tensor,
+    path: Path,
+    *,
+    title: str,
+    label_prefix: str = "",
+    normalize_labels: bool = False,
+) -> None:
+    from PIL import Image, ImageDraw, ImageFont
+
+    values = values.detach().float().cpu()
+    if values.dim() == 2:
+        values = values.unsqueeze(0)
+    if values.dim() != 3:
+        raise ValueError(f"generation map must be [N,H,W] or [H,W], got {tuple(values.shape)}")
+
+    valid = torch.isfinite(values)
+    if valid.any():
+        min_val = float(values[valid].min().item())
+        max_val = float(values[valid].max().item())
+    else:
+        min_val, max_val = 0.0, 1.0
+    span = max(max_val - min_val, 1e-6)
+
+    def font(size: int):
+        try:
+            return ImageFont.truetype("DejaVuSans.ttf", size)
+        except Exception:
+            return ImageFont.load_default()
+
+    title_font = font(16)
+    cell_font = font(10)
+    caption_font = font(11)
+    cell = 34
+    top = 36
+    left = 12
+    right = 96
+    bottom = 46
+    gap = 18
+    panels = []
+
+    for sample_idx, sample in enumerate(values):
+        height, width = sample.shape
+        panel_w = left + width * cell + right
+        panel_h = top + height * cell + bottom
+        image = Image.new("RGB", (panel_w, panel_h), "white")
+        draw = ImageDraw.Draw(image)
+        draw.text((left, 8), f"{title} | sample {sample_idx + 1}", fill=(20, 20, 20), font=title_font)
+
+        for row in range(height):
+            for col in range(width):
+                raw = float(sample[row, col].item())
+                is_valid = math.isfinite(raw)
+                norm = 0.0 if not is_valid else (raw - min_val) / span
+                x0 = left + col * cell
+                y0 = top + row * cell
+                color = _generation_color(norm) if is_valid else (235, 235, 235)
+                draw.rectangle([x0, y0, x0 + cell, y0 + cell], fill=color, outline=(75, 75, 75))
+                if is_valid:
+                    label_value = raw - min_val if normalize_labels else raw
+                    label = f"{label_prefix}{int(round(label_value)) + 1}"
+                    luminance = 0.2126 * color[0] + 0.7152 * color[1] + 0.0722 * color[2]
+                    text_color = (0, 0, 0) if luminance > 145 else (255, 255, 255)
+                    bbox = draw.textbbox((0, 0), label, font=cell_font)
+                    text_w = bbox[2] - bbox[0]
+                    text_h = bbox[3] - bbox[1]
+                    draw.text(
+                        (x0 + (cell - text_w) / 2, y0 + (cell - text_h) / 2 - 1),
+                        label,
+                        fill=text_color,
+                        font=cell_font,
+                    )
+
+        bar_x = left + width * cell + 22
+        bar_y = top
+        bar_w = 18
+        bar_h = height * cell
+        for offset in range(bar_h):
+            norm = 1.0 - offset / max(1, bar_h - 1)
+            draw.line(
+                [(bar_x, bar_y + offset), (bar_x + bar_w, bar_y + offset)],
+                fill=_generation_color(norm),
+            )
+        draw.rectangle([bar_x, bar_y, bar_x + bar_w, bar_y + bar_h], outline=(75, 75, 75))
+        draw.text((bar_x + bar_w + 6, bar_y - 2), "late", fill=(30, 30, 30), font=caption_font)
+        draw.text((bar_x + bar_w + 6, bar_y + bar_h - 12), "early", fill=(30, 30, 30), font=caption_font)
+        draw.text((left, top + height * cell + 10), "Numbers are 1-indexed: 1 = first generated.", fill=(45, 45, 45), font=caption_font)
+        panels.append(image)
+
+    total_w = sum(panel.width for panel in panels) + gap * max(0, len(panels) - 1)
+    total_h = max(panel.height for panel in panels)
+    canvas = Image.new("RGB", (total_w, total_h), "white")
+    x = 0
+    for panel in panels:
+        canvas.paste(panel, (x, 0))
+        x += panel.width + gap
+    path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(path)
+
+
 def _log_wandb_validation_images(accelerator, image_paths: dict[str, Path], global_step: int) -> None:
     if not image_paths:
         return
@@ -1613,16 +1721,25 @@ def _save_validation_flow_images(
                     if isinstance(order_map, torch.Tensor):
                         logs[f"{log_prefix}/generation_order_max"] = order_map.float().max().item()
                         if save_debug_images:
-                            order_grid = make_grid(_heatmap_images(order_map), nrow=sample_count)
                             order_path = image_dir / f"step-{global_step:08d}-single_stream_order_{trace_strategy}.png"
-                            save_image(order_grid, order_path)
+                            _save_readable_generation_map(
+                                order_map,
+                                order_path,
+                                title=f"{trace_strategy} generation order",
+                                normalize_labels=True,
+                            )
                             wandb_images[f"{log_prefix}/debug/generation_order"] = order_path
                     if isinstance(step_map, torch.Tensor):
                         logs[f"{log_prefix}/generation_step_max"] = step_map.float().max().item()
                         if save_debug_images:
-                            step_grid = make_grid(_heatmap_images(step_map), nrow=sample_count)
                             step_path = image_dir / f"step-{global_step:08d}-single_stream_steps_{trace_strategy}.png"
-                            save_image(step_grid, step_path)
+                            _save_readable_generation_map(
+                                step_map,
+                                step_path,
+                                title=f"{trace_strategy} generation round",
+                                label_prefix="R",
+                                normalize_labels=True,
+                            )
                             wandb_images[f"{log_prefix}/debug/generation_steps"] = step_path
                     if isinstance(score_map, torch.Tensor):
                         valid_scores = score_map[score_map != 0].float()
