@@ -1489,15 +1489,15 @@ def _save_validation_flow_images(
                 )
                 noise = torch.randn_like(target)
                 t_view = t.view(-1, 1).to(dtype=target.dtype)
-                x_t = (1.0 - t_view) * target + t_view * noise
-                v_target = noise - target
+                x_t = (1.0 - t_view) * noise + t_view * target
+                v_target = target - noise
                 v_pred = unwrapped.image_flow_head.velocity(
                     x_t.unsqueeze(0),
                     t.unsqueeze(0),
                     z.unsqueeze(0),
                     **sequence_context,
                 ).squeeze(0).to(dtype=target.dtype)
-                x0_est = x_t - t_view * v_pred
+                x0_est = x_t + (1.0 - t_view) * v_pred
                 probe_x0_latents[time_value].append(x0_est.view(side, side, -1).permute(2, 0, 1))
                 probe_v_mse[time_value].append(F.mse_loss(v_pred.float(), v_target.float()).detach().float())
                 probe_x0_mse[time_value].append(F.mse_loss(x0_est.float(), target.float()).detach().float())

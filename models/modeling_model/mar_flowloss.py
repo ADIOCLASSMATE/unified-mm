@@ -8,7 +8,10 @@ from .mar_diffloss import SimpleMLPAdaLN
 
 
 class FlowLoss(nn.Module):
-    """Rectified-flow loss over per-token continuous image latents."""
+    """Rectified-flow loss over per-token continuous image latents.
+
+    Uses the standard flow-matching convention: t=0 is noise and t=1 is data.
+    """
 
     def __init__(
         self,
@@ -99,8 +102,8 @@ class FlowLoss(nn.Module):
         t = self._sample_times(target.shape[0], target.device)
         noise = torch.randn_like(target)
         t_view = t.view(-1, *([1] * (target.ndim - 1))).to(dtype=target.dtype)
-        x_t = (1.0 - t_view) * target + t_view * noise
-        v_target = noise - target
+        x_t = (1.0 - t_view) * noise + t_view * target
+        v_target = target - noise
         v_pred = self.velocity(x_t, t, z)
         loss = mean_flat((v_pred.float() - v_target.float()) ** 2)
         if mask is not None:
@@ -122,7 +125,8 @@ class FlowLoss(nn.Module):
 
     def estimate_x0(self, x_t: torch.Tensor, t: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
         v = self.velocity(x_t, t, z)
-        return x_t - t.view(-1, *([1] * (x_t.ndim - 1))).to(dtype=x_t.dtype) * v
+        t_view = t.view(-1, *([1] * (x_t.ndim - 1))).to(dtype=x_t.dtype)
+        return x_t + (1.0 - t_view) * v
 
     def sample(
         self,
@@ -147,7 +151,7 @@ class FlowLoss(nn.Module):
         solver = str(solver or self.solver).lower()
         x_batch = z.shape[0] // 2 if cfg != 1.0 else z.shape[0]
         x = torch.randn(x_batch, self.in_channels, device=z.device, dtype=z.dtype) * float(temperature)
-        times = torch.linspace(1.0, 0.0, steps + 1, device=z.device, dtype=torch.float32)
+        times = torch.linspace(0.0, 1.0, steps + 1, device=z.device, dtype=torch.float32)
 
         for idx in range(steps):
             t = times[idx].expand(x_batch)

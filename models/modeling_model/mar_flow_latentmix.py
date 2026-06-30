@@ -521,7 +521,10 @@ class ContextualFlowTransformerHead(nn.Module):
 
 
 class FlowLoss(nn.Module):
-    """Rectified-flow loss with a contextual latent transformer velocity head."""
+    """Rectified-flow loss with a contextual latent transformer velocity head.
+
+    Uses the standard flow-matching convention: t=0 is noise and t=1 is data.
+    """
 
     def __init__(
         self,
@@ -733,8 +736,8 @@ class FlowLoss(nn.Module):
         t = self._sample_times(int(math.prod(batch_shape)), model_device).view(batch_shape)
         noise = torch.randn(target_float.shape, device=model_device, dtype=torch.float32)
         t_view = t.unsqueeze(-1).float()
-        x_t_float = (1.0 - t_view) * target_float + t_view * noise
-        v_target = noise - target_float
+        x_t_float = (1.0 - t_view) * noise + t_view * target_float
+        v_target = target_float - noise
         context_kwargs = self._training_context(target_model, sigma, image_positions, context_latents=context_latents)
         v_pred = self.velocity(x_t_float.to(dtype=model_dtype), t, z, **context_kwargs)
         token_loss = (v_pred.float() - v_target).pow(2).mean(dim=-1)
@@ -762,7 +765,8 @@ class FlowLoss(nn.Module):
 
     def estimate_x0(self, x_t: torch.Tensor, t: torch.Tensor, z: torch.Tensor, **context_kwargs) -> torch.Tensor:
         v = self.velocity(x_t, t, z, **context_kwargs)
-        return x_t - t.view(*t.shape, *([1] * (x_t.ndim - t.ndim))).to(dtype=x_t.dtype) * v
+        t_view = t.view(*t.shape, *([1] * (x_t.ndim - t.ndim))).to(dtype=x_t.dtype)
+        return x_t + (1.0 - t_view) * v
 
     @staticmethod
     def _duplicate_context(context_kwargs):
@@ -850,7 +854,7 @@ class FlowLoss(nn.Module):
         if cfg != 1.0:
             context_kwargs = self._duplicate_context(context_kwargs)
             context_is_paired = True
-        times = torch.linspace(1.0, 0.0, steps + 1, device=z.device, dtype=torch.float32)
+        times = torch.linspace(0.0, 1.0, steps + 1, device=z.device, dtype=torch.float32)
 
         for idx in range(steps):
             t = times[idx].expand(x_shape)
