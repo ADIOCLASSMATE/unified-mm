@@ -109,31 +109,24 @@ bash script/selfless/pretraining_text_selfless_2048.sh
 bash script/selfless/encode_imagenet_full_mar_kl16.sh
 ```
 
-3. Warm up the image flow modules, optionally migrating MAR adapter weights:
+3. Run the 10-class ImageNet stage0 preflight/debug training:
 
 ```bash
-bash script/selfless/pretraining_imagenet_diffusion_warmup_full.sh
+bash script/selfless/pretraining_imagenet_flow_stage0_10c.sh
 ```
 
-4. Train the unified model with mixed image-flow and text batches:
+4. Train the full ImageNet flow baseline from Qwen3-Base:
 
 ```bash
-bash script/selfless/pretraining_imagenet_diffusion_unified_full.sh
-```
-
-5. Optionally refine the flow adapter:
-
-```bash
-bash script/selfless/pretraining_imagenet_diffusion_refine_full.sh
+bash script/selfless/pretraining_imagenet_flow_full_from_qwen3base.sh
 ```
 
 Main configs:
 
 ```text
 configs/selfless/text_selfless_2048_ft.yaml
-configs/selfless/imagenet_diffusion_warmup_full.yaml
-configs/selfless/imagenet_diffusion_unified_full.yaml
-configs/selfless/imagenet_diffusion_refine_full.yaml
+configs/selfless/imagenet_flow_stage0_10c.yaml
+configs/selfless/imagenet_flow_full_from_qwen3base.yaml
 ```
 
 ## Key Files
@@ -163,7 +156,7 @@ Run a manual image-flow validation pass:
 
 ```bash
 uv run python scripts/generate_diffusion_validation_images.py \
-  --config configs/selfless/imagenet_diffusion_unified_full.yaml \
+  --config configs/selfless/imagenet_flow_full_from_qwen3base.yaml \
   --single_stream \
   --strategies sigma,spatial_halton,hidden_norm
 ```

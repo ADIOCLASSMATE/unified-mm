@@ -81,7 +81,7 @@ class FakeImageFlowHead:
         self.latent_dim = latent_dim
         self.sample_calls = []
 
-    def sample(self, z, temperature=1.0, cfg=1.0, solver=None, num_steps=None):
+    def sample(self, z, temperature=1.0, cfg=1.0, solver=None, num_steps=None, **context_kwargs):
         self.sample_calls.append(
             {
                 "z": z.detach().clone(),
@@ -89,6 +89,7 @@ class FakeImageFlowHead:
                 "cfg": cfg,
                 "solver": solver,
                 "num_steps": num_steps,
+                "context_kwargs": context_kwargs,
             }
         )
         out_batch = z.shape[0] // 2 if cfg != 1.0 else z.shape[0]
@@ -101,7 +102,7 @@ class FakeCallableFlowHead(nn.Module):
         self.loss_value = float(loss_value)
         self.last_forward_stats = {}
 
-    def forward(self, target, z):
+    def forward(self, target, z, **kwargs):
         loss = target.float().sum() * 0.0 + z.float().sum() * 0.0 + self.loss_value
         self.last_forward_stats = {
             "flow/v_mse": loss.detach(),
@@ -136,6 +137,9 @@ class FakeCausalInnerModel(nn.Module):
         is_image = token_types == 1
         positions = is_image.long().cumsum(dim=1) - 1
         return positions.masked_fill(~is_image, 0)
+
+    def _maybe_add_image_input_noise(self, image_latents):
+        return image_latents
 
 
 class FakeTokenizer:

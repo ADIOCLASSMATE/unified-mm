@@ -19,6 +19,7 @@ from omegaconf import OmegaConf
 import torch
 from torch.optim import AdamW
 import torch.nn.functional as F
+from transformers import AutoConfig, AutoTokenizer
 
 
 from accelerate import Accelerator
@@ -30,10 +31,124 @@ from utils.selfless_utils import SelflessSampler
 from utils.wsd_schedule import get_wsd_schedule
 from models.logging import set_verbosity_info, set_verbosity_error
 
-from utils.utils import get_config, flatten_omega_conf, get_selfless_mask, load_model_tokenizer, log_grad_norm, AverageMeter, save_checkpoint, save_hf_model
+from utils.utils import get_config, flatten_omega_conf, get_selfless_mask, log_grad_norm, AverageMeter, save_checkpoint, save_hf_model
+from models.modeling_model.modeling_selfless_flow import Qwen3ForCausalLM as FlowQwen3ForCausalLM
 
 logger = get_logger(__name__, log_level="INFO")
 _MAR_VAE_CACHE = None
+
+
+def load_model_tokenizer(config: OmegaConf, logger=None):
+    tokenizer = AutoTokenizer.from_pretrained(config.model.model_path, fix_mistral_regex=True)
+    mask_token = "<|mdm_mask|>"
+    if mask_token in tokenizer.get_vocab():
+        mask_token_id = tokenizer.convert_tokens_to_ids(mask_token)
+    else:
+        tokenizer.add_special_tokens({"mask_token": mask_token})
+        mask_token_id = tokenizer.convert_tokens_to_ids(mask_token)
+    config.model.mask_token_id = mask_token_id
+
+    boi_token = "<|boi|>"
+    eoi_token = "<|eoi|>"
+    image_mask_token = "<|img_mask|>"
+    tokens_to_add = [
+        token
+        for token in (boi_token, eoi_token, image_mask_token)
+        if token not in tokenizer.get_vocab()
+    ]
+    added_image_mask_token = image_mask_token in tokens_to_add
+    if tokens_to_add:
+        tokenizer.add_tokens(tokens_to_add, special_tokens=True)
+
+    config.model.boi_token_id = tokenizer.convert_tokens_to_ids(boi_token)
+    config.model.eoi_token_id = tokenizer.convert_tokens_to_ids(eoi_token)
+    config.model.image_mask_token_id = tokenizer.convert_tokens_to_ids(image_mask_token)
+    unified_head = getattr(config.model, "unified_head", False)
+    config.model.image_offset = getattr(config.model, "image_offset", None) or (len(tokenizer) if unified_head else 200000)
+
+    if logger is not None:
+        logger.info("Using flow model implementation.")
+        logger.info('special tokens : \n', tokenizer.special_tokens_map)
+        logger.info(
+            f"BOI token id: {config.model.boi_token_id}, "
+            f"EOI token id: {config.model.eoi_token_id}, "
+            f"IMG_MASK token id: {config.model.image_mask_token_id}"
+        )
+
+    multimodal_config_keys = (
+        "image_vocab_size", "image_offset", "lambda_image", "lambda_text",
+        "boi_token_id", "eoi_token_id", "image_mask_token_id", "unified_head", "image_tokens_per_img",
+        "image_latent_dim", "continuous_image_latents",
+        "image_generation_head_type", "image_flow_width", "image_flow_depth",
+        "image_flow_num_sampling_steps", "image_flow_batch_mul",
+        "image_flow_grad_checkpointing", "image_flow_condition_norm",
+        "image_flow_condition_norm_eps", "image_flow_time_scale",
+        "image_flow_time_sampling", "image_flow_logit_mean", "image_flow_logit_std",
+        "image_flow_time_eps", "image_flow_time_uniform_mix", "image_flow_solver",
+        "image_flow_mlp_ratio",
+        "image_flow_latent_mixer_heads", "image_flow_latent_mixer_dropout",
+        "image_flow_latent_mixer_zero_init_gate",
+        "image_input_noise_strength", "image_input_noise_strength_std",
+        "image_input_noise_strength_min", "image_input_noise_strength_max",
+        "image_uncond_prob", "image_projector_width",
+    )
+
+    model_config = AutoConfig.from_pretrained(config.model.model_path, trust_remote_code=True)
+    model_config.mask_token_id = config.model.mask_token_id
+    model_config.use_flex_attention = config.model.use_flex_attention
+    model_config.eos_token_id = tokenizer.eos_token_id
+    for key in multimodal_config_keys:
+        val = config.model.get(key)
+        if val is not None:
+            setattr(model_config, key, val)
+
+    if hasattr(tokenizer, "im_end_token_id") and tokenizer.im_end_token_id is not None:
+        model_config.im_end_token_id = tokenizer.im_end_token_id
+    else:
+        try:
+            im_end_ids = tokenizer.encode("<|im_end|>", add_special_tokens=False)
+            model_config.im_end_token_id = im_end_ids[0] if len(im_end_ids) > 0 else None
+        except Exception:
+            model_config.im_end_token_id = None
+
+    if config.training.from_scratch:
+        if logger is not None:
+            logger.info(f"Initializing flow model from scratch using config from: {config.model.model_path}")
+        model = FlowQwen3ForCausalLM(model_config).to(dtype=torch.bfloat16)
+    else:
+        if logger is not None:
+            logger.info(f"Loading pretrained weights into flow model from: {config.model.model_path}")
+        model = FlowQwen3ForCausalLM.from_pretrained(
+            pretrained_model_name_or_path=config.model.model_path,
+            config=model_config,
+            dtype=torch.bfloat16,
+            trust_remote_code=True,
+        )
+
+    if len(tokenizer) > model.config.vocab_size:
+        model.resize_token_embeddings(len(tokenizer))
+
+    image_mask_token_id = getattr(model.config, "image_mask_token_id", None)
+    if image_mask_token_id is not None and added_image_mask_token:
+        with torch.no_grad():
+            embed = model.model.embed_tokens.weight
+            mask_token_id = int(model.config.mask_token_id)
+            image_mask_token_id = int(image_mask_token_id)
+            if 0 <= mask_token_id < embed.shape[0] and 0 <= image_mask_token_id < embed.shape[0]:
+                embed[image_mask_token_id].copy_(embed[mask_token_id])
+                if logger is not None:
+                    logger.info(
+                        f"Initialized newly added image mask token id={image_mask_token_id} "
+                        f"from text mask token id={mask_token_id}"
+                    )
+
+    if config.training.get("use_gradient_checkpointing", True):
+        model.gradient_checkpointing_enable()
+        model.config.use_cache = False
+        if logger is not None:
+            logger.info("Gradient checkpointing enabled")
+
+    return model, tokenizer
 
 
 def _log_info(message):
@@ -220,9 +335,9 @@ def _load_image_flow_adapter(model, adapter_path, config):
                     _maybe_add_projector_key(key, f.get_tensor(key))
                 elif key == "encoder_pos_embed_learned":
                     pos = f.get_tensor(key).squeeze(0)
-                    _maybe_add_projector_key("image_pos_embed.weight", pos[-model.image_token_embedder.image_tokens_per_img:])
+                    _maybe_add_projector_key("image_pos_embed", pos[-model.image_token_embedder.image_tokens_per_img:])
                 elif key == "diffusion_pos_embed_learned":
-                    _maybe_add_projector_key("diffusion_pos_embed.weight", f.get_tensor(key).squeeze(0))
+                    _maybe_add_projector_key("diffusion_pos_embed", f.get_tensor(key).squeeze(0))
                 elif key == "mask_token":
                     mar_mask_token = f.get_tensor(key).reshape(-1)
         _migrate_image_flow_head_state(model, head_state, adapter_path)
@@ -582,7 +697,12 @@ def main():
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        weight_decay = 0.0 if name.startswith("image_flow_head.") or any(nd in name for nd in no_decay) else optimizer_config.weight_decay
+        is_image_module = (
+            name.startswith("image_flow_head.")
+            or "image_token_embedder" in name
+            or name.startswith("image_flow_condition_proj.")
+        )
+        weight_decay = 0.0 if is_image_module or any(nd in name for nd in no_decay) else optimizer_config.weight_decay
         key = (lr_for_param(name), weight_decay)
         grouped.setdefault(key, []).append(param)
 
@@ -855,6 +975,7 @@ def main():
             }
             if token_types is not None:
                 forward_kwargs["token_types"] = token_types
+                forward_kwargs["flow_sigma"] = sigma
             if is_multimodal and image_latents is not None:
                 forward_kwargs["image_latents"] = image_latents
 
@@ -1171,7 +1292,7 @@ def _image_spans(token_types: torch.Tensor, image_tokens_per_img: int):
 
 def _heatmap_images(values: torch.Tensor) -> torch.Tensor:
     values = values.detach().float().cpu()
-    valid = values > 0
+    valid = torch.isfinite(values) & (values != 0)
     if valid.any():
         min_val = values[valid].min()
         max_val = values[valid].max()
@@ -1301,12 +1422,44 @@ def _save_validation_flow_images(
         probe_x0_mse = {time_value: [] for time_value in probe_times}
         target_latents = []
         selected_spans = spans[:sample_count]
+
+        def _sequence_mixer_context(
+            target: torch.Tensor,
+            span_sigma: torch.Tensor,
+            local_positions: torch.Tensor,
+        ) -> dict[str, torch.Tensor]:
+            sigma_row = span_sigma.to(device=target.device, dtype=torch.float32).unsqueeze(0)
+            positions = local_positions.to(device=target.device, dtype=torch.long).unsqueeze(0)
+            return {
+                "context_latents": target.unsqueeze(0),
+                "context_mask": sigma_row.unsqueeze(1) < sigma_row.unsqueeze(2),
+                "query_positions": positions,
+                "context_positions": positions,
+            }
+
+        def _flat_query_mixer_context(
+            target: torch.Tensor,
+            span_sigma: torch.Tensor,
+            local_positions: torch.Tensor,
+        ) -> dict[str, torch.Tensor]:
+            query_count = target.shape[0]
+            sigma_values = span_sigma.to(device=target.device, dtype=torch.float32)
+            positions = local_positions.to(device=target.device, dtype=torch.long)
+            return {
+                "context_latents": target.unsqueeze(0).expand(query_count, -1, -1).contiguous(),
+                "context_mask": (sigma_values.unsqueeze(0) < sigma_values.unsqueeze(1)).unsqueeze(1),
+                "query_positions": positions,
+                "context_positions": positions.unsqueeze(0).expand(query_count, -1).contiguous(),
+            }
+
         for b, start, end in selected_spans:
             local_positions = torch.arange(
                 end - start,
                 device=accelerator.device,
                 dtype=torch.long,
             )
+            target = image_latents[b, start:end].to(device=accelerator.device)
+            span_sigma = sigma[b, start:end].to(device=accelerator.device, dtype=torch.float32)
             z = unwrapped._prepare_image_flow_condition(
                 hidden_states[b, start:end].to(device=accelerator.device),
                 local_positions,
@@ -1323,8 +1476,10 @@ def _save_validation_flow_images(
                 temperature=flow_temperature,
                 cfg=flow_cfg,
                 solver=flow_solver,
+                **_flat_query_mixer_context(target, span_sigma, local_positions),
             )
-            target = image_latents[b, start:end].to(device=accelerator.device, dtype=pred.dtype)
+            target = target.to(dtype=pred.dtype)
+            sequence_context = _sequence_mixer_context(target, span_sigma, local_positions)
             for time_value in probe_times:
                 t = torch.full(
                     (target.shape[0],),
@@ -1336,7 +1491,12 @@ def _save_validation_flow_images(
                 t_view = t.view(-1, 1).to(dtype=target.dtype)
                 x_t = (1.0 - t_view) * noise + t_view * target
                 v_target = target - noise
-                v_pred = unwrapped.image_flow_head.velocity(x_t, t, z).to(dtype=target.dtype)
+                v_pred = unwrapped.image_flow_head.velocity(
+                    x_t.unsqueeze(0),
+                    t.unsqueeze(0),
+                    z.unsqueeze(0),
+                    **sequence_context,
+                ).squeeze(0).to(dtype=target.dtype)
                 x0_est = x_t + (1.0 - t_view) * v_pred
                 probe_x0_latents[time_value].append(x0_est.view(side, side, -1).permute(2, 0, 1))
                 probe_v_mse[time_value].append(F.mse_loss(v_pred.float(), v_target.float()).detach().float())
@@ -1567,6 +1727,7 @@ def _validate_multimodal(model, val_dataloader, accelerator, global_step, config
             attention_mask=selfless_attention_mask,
             token_types=token_types,
             image_latents=image_latents,
+            flow_sigma=sigma,
             calculate_likelihood=True,
         )
         if not saved_validation_images and image_latents is not None and image_mask.any():

@@ -215,20 +215,14 @@ The current staged path is:
    - text labels are not shifted;
    - unused image modules can be frozen.
 
-2. `imagenet_diffusion_warmup_full`
-   - load the text-adapted checkpoint;
-   - train image flow adapter and image latent projection;
-   - optionally migrate MAR adapter weights;
-   - freeze the backbone for a stable image-flow warmup.
+2. `imagenet_flow_stage0_10c`
+   - small 10-class ImageNet run for debugging the current flow baseline;
+   - exercises train, validation, single-stream generation, and image decode.
 
-3. `imagenet_diffusion_unified_full`
-   - mix ImageNet flow batches and text Arrow batches;
-   - unfreeze backbone with smaller LR;
-   - optimize both text retention and image flow loss.
-
-4. `imagenet_diffusion_refine_full`
-   - optional adapter-style refinement;
-   - useful for testing flow sampling and generation-order strategies.
+3. `imagenet_flow_full_from_qwen3base`
+   - full ImageNet class-conditioned flow training from Qwen3-Base;
+   - trains the image latent embedder, Qwen backbone, condition projection, and
+     contextual flow head as the current baseline.
 
 ## Implementation Map
 
