@@ -1,0 +1,33 @@
+1. context_latents加噪随sigma变化。
+
+## 当前 Contextual Flow head 先跑一版后再验证/改进
+
+先按当前代码跑完整训练；如果没有严重问题，不在这一版继续堆结构改动。训练结束后重点检查下面这些点：
+
+1. Hidden condition 对 text editing / controllable generation 可能偏弱。
+   - 当前 Qwen hidden condition 主要用于生成 AdaLN 的 shift / scale / gate，调制 flow head 每层 cross-attn 的 query 分支和 MLP 分支；最后 FinalLayer 也使用 y。
+   - flow head 目前看不到完整文本 hidden 序列、编辑指令 token、可控条件 token；它只能假设 Qwen 已经把所有语义、编辑和控制信息压进当前 image token 的 hidden 里。
+   - latent context 是每层 cross-attn 的 K/V memory，信息带宽更高；模型可能更依赖 visible / generated latent context，而不是充分响应 Qwen hidden condition。
+
+2. 当前版本训练结束后做 condition / context 影响力 ablation。
+   固定 x_t 和 context_latents：
+   - 换 z_cond / z_uncond，看 velocity 差异有多大。
+   - 固定 z，换 context_latents，看 velocity 差异有多大。
+   - 看 CFG 下 v_cond - v_uncond 的范数是否足够大。
+   - 对比以上差异，判断 hidden condition 是否被 latent context 抢主导。
+
+3. Position embedding 可能有重复。
+   - Qwen hidden condition 在 _prepare_image_flow_condition 里会通过 image_token_embedder.add_diffusion_pos 加一次 image local position。
+   - flow head 对 query x 和 context_latents 又加 fixed 2D sin-cos position embedding。
+   - 这不一定是 bug，但可能让位置信息过强或重复，需要训练后看是否影响泛化、空间一致性和编辑响应。
+
+4. Qwen hidden 的幅度信息可能被洗掉。
+   - _prepare_image_flow_condition 默认使用 RMS norm，再过 image_flow_condition_proj。
+   - 这会让 condition 更稳定，但也会去掉 hidden norm / amplitude 中可能携带的置信度、可编辑性、难度或控制强度信息。
+   - 训练后可以比较 image_flow_condition_norm=rms / none，或者记录 hidden RMS 与生成质量、CFG 差异的相关性。
+
+5. 如果 hidden condition 确认偏弱，下一版考虑更高带宽的 Qwen condition path。
+   - 保留当前 AdaLN-Zero 调制。
+   - 额外加 Qwen hidden cross-attention，让 flow query 直接 attend 到 Qwen hidden tokens / relevant condition tokens。
+   - condition K/V 不做 AdaLN 调制，保持 cache 友好；AdaLN 继续只调制 Q 和 MLP。
+   - latent context cross-attn 继续负责 visible latent consistency，Qwen condition cross-attn 负责语义、编辑和控制。
