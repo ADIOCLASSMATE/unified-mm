@@ -44,8 +44,8 @@ model:
     image_latent_dim: 16
     image_projector_width: 2048
     image_generation_head_type: "flow"
-    image_flow_depth: 8
-    image_flow_width: 1280
+    image_flow_depth: 4
+    image_flow_width: 768
     image_flow_num_sampling_steps: "100"
     image_flow_batch_mul: 4
     image_flow_condition_norm: "rms"
@@ -57,11 +57,14 @@ model:
     image_flow_time_eps: 1.0e-5
     image_flow_time_uniform_mix: 0.1
     image_flow_solver: "heun"
-    image_flow_mlp_ratio: 1.0
+    image_flow_mlp_ratio: 2.0
     image_flow_latent_mixer_heads: 8
     image_flow_latent_mixer_dropout: 0.0
     image_flow_latent_mixer_zero_init_gate: true
-    image_input_noise_strength: 1.0e-2
+    image_input_noise_strength: 1.5e-1
+    image_input_noise_strength_std: 5.0e-2
+    image_input_noise_strength_min: 5.0e-2
+    image_input_noise_strength_max: 2.5e-1
     image_uncond_prob: 0.1
     reinitialize_image_modules: true
     pretrained_image_flow_adapter: none

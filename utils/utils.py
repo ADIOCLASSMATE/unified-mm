@@ -190,7 +190,9 @@ def load_model_tokenizer(config: OmegaConf, logger=None):
         "image_flow_time_sampling", "image_flow_logit_mean", "image_flow_logit_std",
         "image_flow_time_eps", "image_flow_time_uniform_mix", "image_flow_solver",
         "image_flow_mlp_ratio",
-        "image_input_noise_strength", "image_uncond_prob", "image_projector_width",
+        "image_input_noise_strength", "image_input_noise_strength_std",
+        "image_input_noise_strength_min", "image_input_noise_strength_max",
+        "image_uncond_prob", "image_projector_width",
     )
 
     if config.training.from_scratch:

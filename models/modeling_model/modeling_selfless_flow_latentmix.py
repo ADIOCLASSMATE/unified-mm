@@ -642,6 +642,22 @@ class Qwen3Model(Qwen3PreTrainedModel):
             getattr(config, "initializer_range", 0.02),
         )
         self.image_input_noise_strength = float(getattr(config, "image_input_noise_strength", 1.0e-2))
+        self.image_input_noise_strength_std = float(getattr(config, "image_input_noise_strength_std", 0.0))
+        self.image_input_noise_strength_min = getattr(config, "image_input_noise_strength_min", None)
+        self.image_input_noise_strength_max = getattr(config, "image_input_noise_strength_max", None)
+        if self.image_input_noise_strength_min is not None:
+            self.image_input_noise_strength_min = float(self.image_input_noise_strength_min)
+        if self.image_input_noise_strength_max is not None:
+            self.image_input_noise_strength_max = float(self.image_input_noise_strength_max)
+        if (
+            self.image_input_noise_strength_min is not None
+            and self.image_input_noise_strength_max is not None
+            and self.image_input_noise_strength_min > self.image_input_noise_strength_max
+        ):
+            raise ValueError(
+                "image_input_noise_strength_min must be <= image_input_noise_strength_max, "
+                f"got {self.image_input_noise_strength_min} > {self.image_input_noise_strength_max}"
+            )
         self.layers = nn.ModuleList(
             [Qwen3DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
@@ -686,9 +702,23 @@ class Qwen3Model(Qwen3PreTrainedModel):
             )
 
     def _maybe_add_image_input_noise(self, image_latents: torch.Tensor) -> torch.Tensor:
-        strength = self.image_input_noise_strength
-        if not self.training or strength <= 0.0:
+        mean = self.image_input_noise_strength
+        std = self.image_input_noise_strength_std
+        if not self.training or (mean <= 0.0 and std <= 0.0):
             return image_latents
+        if std <= 0.0:
+            strength = float(mean)
+        else:
+            strength = torch.randn(
+                image_latents.shape[:-1] + (1,),
+                device=image_latents.device,
+                dtype=torch.float32,
+            ) * float(std) + float(mean)
+            min_strength = 0.0 if self.image_input_noise_strength_min is None else self.image_input_noise_strength_min
+            strength = strength.clamp_min(min_strength)
+            if self.image_input_noise_strength_max is not None:
+                strength = strength.clamp_max(self.image_input_noise_strength_max)
+            strength = strength.to(dtype=image_latents.dtype)
         return image_latents + torch.randn_like(image_latents) * strength
 
     def _build_x0_inputs_embeds(
@@ -952,12 +982,11 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
     ) -> torch.Tensor | None:
         if image_latents is None:
             return None
-        strength = float(getattr(self.model, "image_input_noise_strength", 0.0))
-        if not self.training or strength <= 0.0:
+        if not self.training:
             return image_latents
         if token_types is not None and not (token_types.to(image_latents.device) == 1).any():
             return image_latents
-        return image_latents + torch.randn_like(image_latents) * strength
+        return self.model._maybe_add_image_input_noise(image_latents)
 
     def sample_image_flow_with_cfg(
         self,

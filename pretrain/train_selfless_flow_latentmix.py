@@ -88,7 +88,9 @@ def load_model_tokenizer(config: OmegaConf, logger=None):
         "image_flow_mlp_ratio",
         "image_flow_latent_mixer_heads", "image_flow_latent_mixer_dropout",
         "image_flow_latent_mixer_zero_init_gate",
-        "image_input_noise_strength", "image_uncond_prob", "image_projector_width",
+        "image_input_noise_strength", "image_input_noise_strength_std",
+        "image_input_noise_strength_min", "image_input_noise_strength_max",
+        "image_uncond_prob", "image_projector_width",
     )
 
     model_config = AutoConfig.from_pretrained(config.model.model_path, trust_remote_code=True)
@@ -1290,7 +1292,7 @@ def _image_spans(token_types: torch.Tensor, image_tokens_per_img: int):
 
 def _heatmap_images(values: torch.Tensor) -> torch.Tensor:
     values = values.detach().float().cpu()
-    valid = values > 0
+    valid = torch.isfinite(values) & (values != 0)
     if valid.any():
         min_val = values[valid].min()
         max_val = values[valid].max()
