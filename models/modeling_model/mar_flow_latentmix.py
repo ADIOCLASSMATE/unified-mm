@@ -59,33 +59,6 @@ class TimestepEmbedder(nn.Module):
         return self.mlp(t_freq)
 
 
-class ResBlock(nn.Module):
-    def __init__(self, channels, mlp_ratio=1.0):
-        super().__init__()
-        self.channels = channels
-        self.mlp_ratio = float(mlp_ratio)
-        self.intermediate_size = int(channels * self.mlp_ratio)
-        if self.intermediate_size <= 0:
-            raise ValueError(f"mlp_ratio must produce a positive hidden size, got {mlp_ratio}")
-
-        self.in_ln = nn.LayerNorm(channels, eps=1e-6)
-        self.mlp = nn.Sequential(
-            nn.Linear(channels, self.intermediate_size, bias=True),
-            nn.SiLU(),
-            nn.Linear(self.intermediate_size, channels, bias=True),
-        )
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(channels, 3 * channels, bias=True),
-        )
-
-    def forward(self, x, y):
-        shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(y).chunk(3, dim=-1)
-        h = modulate(self.in_ln(x), shift_mlp, scale_mlp)
-        h = self.mlp(h)
-        return x + gate_mlp * h
-
-
 class FinalLayer(nn.Module):
     def __init__(self, model_channels, out_channels):
         super().__init__()
@@ -102,51 +75,244 @@ class FinalLayer(nn.Module):
         return self.linear(x)
 
 
-class CausalLatentInputMixer(nn.Module):
-    """Residual cross-attention from noisy query hidden states to earlier latent context."""
-
-    def __init__(
-        self,
-        model_channels,
-        num_heads=8,
-        dropout=0.0,
-        image_tokens_per_img=256,
-        zero_init_gate=True,
-    ):
+class ContextualFlowBlock(nn.Module):
+    def __init__(self, channels, num_heads=8, mlp_ratio=2.0, dropout=0.0):
         super().__init__()
-        self.model_channels = int(model_channels)
+        self.channels = int(channels)
         self.num_heads = int(num_heads)
+        self.mlp_ratio = float(mlp_ratio)
         self.dropout = float(dropout)
-        self.image_tokens_per_img = int(image_tokens_per_img)
-        self.zero_init_gate = bool(zero_init_gate)
         if self.num_heads <= 0:
             raise ValueError(f"num_heads must be positive, got {num_heads}")
-        if self.model_channels % self.num_heads != 0:
-            raise ValueError(
-                f"model_channels={model_channels} must be divisible by num_heads={num_heads}"
-            )
-        self.head_dim = self.model_channels // self.num_heads
+        if self.channels % self.num_heads != 0:
+            raise ValueError(f"channels={channels} must be divisible by num_heads={num_heads}")
+        self.head_dim = self.channels // self.num_heads
         self.scale = self.head_dim ** -0.5
 
-        self.q_proj = nn.Linear(self.model_channels, self.model_channels)
-        self.k_proj = nn.Linear(self.model_channels, self.model_channels)
-        self.v_proj = nn.Linear(self.model_channels, self.model_channels)
-        self.out_proj = nn.Linear(self.model_channels, self.model_channels)
-        self.q_norm = nn.LayerNorm(self.model_channels, eps=1e-6)
-        self.kv_norm = nn.LayerNorm(self.model_channels, eps=1e-6)
+        self.cross_q_norm = nn.LayerNorm(self.channels, eps=1e-6)
+        self.cross_kv_norm = nn.LayerNorm(self.channels, eps=1e-6)
+        self.cross_q = nn.Linear(self.channels, self.channels)
+        self.cross_k = nn.Linear(self.channels, self.channels)
+        self.cross_v = nn.Linear(self.channels, self.channels)
+        self.cross_out = nn.Linear(self.channels, self.channels)
+
+        self.mlp_norm = nn.LayerNorm(self.channels, eps=1e-6)
+        hidden = int(self.channels * self.mlp_ratio)
+        if hidden <= 0:
+            raise ValueError(f"mlp_ratio must produce a positive hidden size, got {mlp_ratio}")
+        self.mlp = nn.Sequential(
+            nn.Linear(self.channels, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, self.channels),
+        )
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(self.channels, 6 * self.channels),
+        )
+        self.last_gate_abs_mean = None
+
+    def _split_heads(self, x):
+        batch_size, seq_len, _ = x.shape
+        return x.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+
+    def _merge_heads(self, x):
+        batch_size, _, seq_len, _ = x.shape
+        return x.transpose(1, 2).reshape(batch_size, seq_len, self.channels)
+
+    def _format_context_mask(self, context_mask, batch_size, query_len, context_len, device):
+        if context_mask is None:
+            return torch.ones(batch_size, query_len, context_len, device=device, dtype=torch.bool)
+        context_mask = context_mask.to(device=device, dtype=torch.bool)
+        if context_mask.dim() == 2:
+            context_mask = context_mask.unsqueeze(1)
+        if context_mask.shape[1] == 1 and query_len != 1:
+            context_mask = context_mask.expand(batch_size, query_len, context_len)
+        if context_mask.shape != (batch_size, query_len, context_len):
+            raise ValueError(
+                f"context_mask must have shape {(batch_size, query_len, context_len)}, "
+                f"got {tuple(context_mask.shape)}"
+            )
+        return context_mask
+
+    def prepare_cross_cache(self, context_hidden):
+        context_hidden = self.cross_kv_norm(context_hidden)
+        k = self._split_heads(self.cross_k(context_hidden))
+        v = self._split_heads(self.cross_v(context_hidden))
+        return {"k": k, "v": v}
+
+    def _cross_attention(self, x, layer_cache, context_mask, context_block_mask=None, use_flex_attention=False):
+        if layer_cache is None:
+            return None
+        k = layer_cache.get("k")
+        v = layer_cache.get("v")
+        if k is None or v is None:
+            return None
+        batch_size, query_len, _ = x.shape
+        if k.shape[0] != batch_size:
+            raise ValueError(f"context cache batch {k.shape[0]} must match query batch {batch_size}")
+        context_len = k.shape[2]
+        if context_len == 0:
+            return None
+
+        q = self._split_heads(self.cross_q(x))
+        attn_dtype = q.dtype
+        k = k.to(device=x.device, dtype=attn_dtype)
+        v = v.to(device=x.device, dtype=attn_dtype)
+        if use_flex_attention:
+            out = flex_attention(
+                query=q,
+                key=k,
+                value=v,
+                score_mod=None,
+                block_mask=context_block_mask,
+                scale=self.scale,
+                enable_gqa=False,
+                return_lse=False,
+            )
+            if self.dropout > 0.0 and self.training:
+                out = F.dropout(out, p=self.dropout, training=True)
+            return self.cross_out(self._merge_heads(out))
+
+        context_mask = self._format_context_mask(
+            context_mask,
+            batch_size,
+            query_len,
+            context_len,
+            x.device,
+        )
+        has_context = context_mask.any(dim=-1)
+        safe_mask = context_mask
+        if not bool(has_context.all().item()):
+            safe_mask = context_mask.clone()
+            safe_mask[~has_context] = True
+        out = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=safe_mask.unsqueeze(1),
+            dropout_p=self.dropout if self.training else 0.0,
+            is_causal=False,
+            scale=self.scale,
+        )
+        if not bool(has_context.all().item()):
+            out = out * has_context[:, None, :, None].to(dtype=out.dtype)
+        return self.cross_out(self._merge_heads(out))
+
+    def forward(
+        self,
+        x,
+        y,
+        layer_cache=None,
+        context_mask=None,
+        context_block_mask=None,
+        use_flex_attention=False,
+    ):
+        (
+            shift_cross,
+            scale_cross,
+            gate_cross,
+            shift_mlp,
+            scale_mlp,
+            gate_mlp,
+        ) = self.adaLN_modulation(y).chunk(6, dim=-1)
+
+        if layer_cache is not None:
+            h = modulate(self.cross_q_norm(x), shift_cross, scale_cross)
+            mixed = self._cross_attention(
+                h,
+                layer_cache,
+                context_mask,
+                context_block_mask=context_block_mask,
+                use_flex_attention=use_flex_attention,
+            )
+            if mixed is not None:
+                x = x + gate_cross * mixed
+
+        h = modulate(self.mlp_norm(x), shift_mlp, scale_mlp)
+        x = x + gate_mlp * self.mlp(h)
+        self.last_gate_abs_mean = torch.stack(
+            [
+                gate_cross.detach().float().abs().mean(),
+                gate_mlp.detach().float().abs().mean(),
+            ]
+        ).mean()
+        return x
+
+
+class ContextualFlowTransformerHead(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        model_channels,
+        out_channels,
+        z_channels,
+        num_res_blocks,
+        grad_checkpointing=False,
+        mlp_ratio=1.0,
+        latent_mixer_heads=8,
+        latent_mixer_dropout=0.0,
+        latent_mixer_zero_init_gate=True,
+        image_tokens_per_img=256,
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.model_channels = model_channels
+        self.out_channels = out_channels
+        self.num_res_blocks = num_res_blocks
+        self.grad_checkpointing = grad_checkpointing
+        self.mlp_ratio = float(mlp_ratio)
+        self.num_heads = int(latent_mixer_heads)
+        self.dropout = float(latent_mixer_dropout)
+        self.zero_init_gate = bool(latent_mixer_zero_init_gate)
+        self.image_tokens_per_img = int(image_tokens_per_img)
+
+        self.time_embed = TimestepEmbedder(model_channels)
+        self.cond_embed = nn.Linear(z_channels, model_channels)
+        self.input_proj = nn.Linear(in_channels, model_channels)
         pos_embed = torch.empty(self.image_tokens_per_img, self.model_channels)
         self.register_buffer("image_pos_embed", pos_embed.clone())
-        self._reset_position_buffer()
-        self.gate = nn.Parameter(torch.empty((), dtype=torch.float32))
-        self._reset_gate()
+        self.blocks = nn.ModuleList(
+            [
+                ContextualFlowBlock(
+                    model_channels,
+                    num_heads=self.num_heads,
+                    mlp_ratio=self.mlp_ratio,
+                    dropout=self.dropout,
+                )
+                for _ in range(num_res_blocks)
+            ]
+        )
+        self.final_layer = FinalLayer(model_channels, out_channels)
+        self.last_gate_abs_mean = None
+        self.initialize_weights()
 
-    def _reset_gate(self):
-        gate_init = 0.0 if self.zero_init_gate else 1.0
-        with torch.no_grad():
-            self.gate.fill_(gate_init)
+    def initialize_weights(self):
+        def _basic_init(module):
+            if isinstance(module, nn.Linear):
+                _xavier_uniform_init_fp32_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+            elif isinstance(module, nn.LayerNorm):
+                if module.elementwise_affine:
+                    nn.init.ones_(module.weight)
+                    nn.init.zeros_(module.bias)
+
+        self.apply(_basic_init)
+        _normal_init_fp32_(self.time_embed.mlp[0].weight, std=0.02)
+        _normal_init_fp32_(self.time_embed.mlp[2].weight, std=0.02)
+        self._reset_position_buffer()
+
+        if self.zero_init_gate:
+            for block in self.blocks:
+                nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+                nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
+        nn.init.constant_(self.final_layer.linear.weight, 0)
+        nn.init.constant_(self.final_layer.linear.bias, 0)
 
     def _reset_position_buffer(self):
-        device = self.q_proj.weight.device
+        device = self.input_proj.weight.device
         if device.type == "meta":
             device = None
         pos_embed = build_2d_sincos_position_embedding(
@@ -155,6 +321,12 @@ class CausalLatentInputMixer(nn.Module):
             device=device,
         )
         self.image_pos_embed = pos_embed.clone()
+
+    def _shape_time(self, t, batch_shape):
+        t = t.to(device=self.input_proj.weight.device)
+        if len(batch_shape) == 1:
+            return self.time_embed(t.reshape(-1))
+        return self.time_embed(t.reshape(-1)).view(*batch_shape, self.model_channels)
 
     def _positions(self, positions, batch_size, seq_len, device):
         if positions is None:
@@ -172,15 +344,13 @@ class CausalLatentInputMixer(nn.Module):
                     f"or [{batch_size}] for seq_len=1"
                 )
         if positions.shape != (batch_size, seq_len):
-            raise ValueError(
-                f"positions must have shape {(batch_size, seq_len)}, got {tuple(positions.shape)}"
-            )
+            raise ValueError(f"positions must have shape {(batch_size, seq_len)}, got {tuple(positions.shape)}")
         if positions.numel() > 0:
             min_pos = int(positions.min().item())
             max_pos = int(positions.max().item())
             if min_pos < 0 or max_pos >= self.image_tokens_per_img:
                 raise ValueError(
-                    f"latent mixer positions must be in [0, {self.image_tokens_per_img}), "
+                    f"flow positions must be in [0, {self.image_tokens_per_img}), "
                     f"got min={min_pos}, max={max_pos}"
                 )
         return positions
@@ -191,9 +361,21 @@ class CausalLatentInputMixer(nn.Module):
         values = pos_embed.index_select(0, flat_positions)
         return values.reshape(positions.shape + (self.model_channels,))
 
-    def _format_context_mask(self, context_mask, batch_size, query_len, context_len, device):
+    def _ensure_sequence(self, x, positions=None):
+        squeeze = False
+        if x.dim() == 2:
+            x = x.unsqueeze(1)
+            squeeze = True
+        if x.dim() != 3:
+            raise ValueError(f"expected [B,D] or [B,Q,D], got {tuple(x.shape)}")
+        batch_size, seq_len, _ = x.shape
+        positions = self._positions(positions, batch_size, seq_len, x.device)
+        return x, positions, squeeze
+
+    @staticmethod
+    def _format_context_mask(context_mask, batch_size, query_len, context_len, device):
         if context_mask is None:
-            return torch.ones(batch_size, query_len, context_len, device=device, dtype=torch.bool)
+            return None
         context_mask = context_mask.to(device=device, dtype=torch.bool)
         if context_mask.dim() == 2:
             context_mask = context_mask.unsqueeze(1)
@@ -206,134 +388,21 @@ class CausalLatentInputMixer(nn.Module):
             )
         return context_mask
 
-    def _project_query(self, query_hidden, query_positions):
-        batch_size, query_len, _ = query_hidden.shape
-        dtype = query_hidden.dtype
-        device = query_hidden.device
-        q_pos = self._positions(query_positions, batch_size, query_len, device)
-        query_for_attn = query_hidden + self._lookup_pos_embed(q_pos, dtype)
-        q = self.q_proj(self.q_norm(query_for_attn))
-        return q.view(batch_size, query_len, self.num_heads, self.head_dim).transpose(1, 2)
-
-    def _project_context(self, context_hidden, context_positions):
-        batch_size, context_len, _ = context_hidden.shape
-        dtype = context_hidden.dtype
-        device = context_hidden.device
-        kv_pos = self._positions(context_positions, batch_size, context_len, device)
-        kv_for_attn = context_hidden + self._lookup_pos_embed(kv_pos, dtype)
-        kv_for_attn = self.kv_norm(kv_for_attn)
-        k = self.k_proj(kv_for_attn)
-        v = self.v_proj(kv_for_attn)
-        k = k.view(batch_size, context_len, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(batch_size, context_len, self.num_heads, self.head_dim).transpose(1, 2)
-        return k, v
-
-    def prepare_context_cache(self, context_hidden, context_mask=None, context_positions=None):
-        if context_hidden is None:
-            return None
-        if context_hidden.dim() != 3:
-            raise ValueError(f"context_hidden must be [B,K,D], got {tuple(context_hidden.shape)}")
-        batch_size, context_len, hidden_dim = context_hidden.shape
-        if hidden_dim != self.model_channels:
-            raise ValueError(
-                f"context hidden dim {hidden_dim} must match model_channels={self.model_channels}"
-            )
-        if context_len == 0:
-            return None
-
-        device = context_hidden.device
-        if context_mask is not None:
-            context_mask = context_mask.to(device=device, dtype=torch.bool)
-            if context_mask.dim() == 2:
-                context_mask = context_mask.unsqueeze(1)
-            if (
-                context_mask.dim() != 3
-                or context_mask.shape[0] != batch_size
-                or context_mask.shape[-1] != context_len
-            ):
-                raise ValueError(
-                    f"context_mask must have shape [B,Q,K] or [B,K] with "
-                    f"B={batch_size}, K={context_len}; got {tuple(context_mask.shape)}"
-                )
-        k, v = self._project_context(context_hidden, context_positions)
-        return {
-            "k": k,
-            "v": v,
-            "context_mask": context_mask,
-        }
-
-    def apply_context_cache(self, query_hidden, context_cache=None, query_positions=None):
-        if context_cache is None:
-            return query_hidden
-
-        squeeze_query = False
-        if query_hidden.dim() == 2:
-            query_hidden = query_hidden.unsqueeze(1)
-            squeeze_query = True
-        if query_hidden.dim() != 3:
-            raise ValueError(f"query_hidden must be [N,D] or [B,Q,D], got {tuple(query_hidden.shape)}")
-
-        k = context_cache.get("k")
-        v = context_cache.get("v")
-        if k is None or v is None:
-            return query_hidden.squeeze(1) if squeeze_query else query_hidden
-        if k.dim() != 4 or v.dim() != 4:
-            raise ValueError("cached k/v must be [B,H,K,Dh]")
-        batch_size, query_len, hidden_dim = query_hidden.shape
-        if hidden_dim != self.model_channels:
-            raise ValueError(
-                f"query hidden dim {hidden_dim} must match model_channels={self.model_channels}"
-            )
-        if k.shape != v.shape:
-            raise ValueError(f"cached k/v shapes must match, got {tuple(k.shape)} vs {tuple(v.shape)}")
-        if k.shape[0] != batch_size or k.shape[1] != self.num_heads or k.shape[3] != self.head_dim:
-            raise ValueError(
-                f"cached k/v shape {tuple(k.shape)} is incompatible with "
-                f"batch={batch_size}, heads={self.num_heads}, head_dim={self.head_dim}"
-            )
-        context_len = k.shape[2]
-        if context_len == 0:
-            return query_hidden.squeeze(1) if squeeze_query else query_hidden
-
-        dtype = query_hidden.dtype
-        device = query_hidden.device
-        k = k.to(device=device, dtype=dtype)
-        v = v.to(device=device, dtype=dtype)
+    def _build_context_block_mask(self, context_mask, batch_size, query_len, context_len, device):
         context_mask = self._format_context_mask(
-            context_cache.get("context_mask"),
+            context_mask,
             batch_size,
             query_len,
             context_len,
             device,
         )
-        has_context = context_mask.any(dim=-1)
-        safe_mask = context_mask
-        if not bool(has_context.all().item()):
-            safe_mask = context_mask.clone()
-            safe_mask[~has_context] = True
+        if context_mask is None:
+            return None, None
 
-        q = self._project_query(query_hidden, query_positions)
-        mixed = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=safe_mask.unsqueeze(1),
-            dropout_p=self.dropout if self.training else 0.0,
-            is_causal=False,
-            scale=self.scale,
-        )
-        if not bool(has_context.all().item()):
-            mixed = mixed * has_context[:, None, :, None].to(dtype=mixed.dtype)
-        mixed = mixed.transpose(1, 2).reshape(batch_size, query_len, self.model_channels)
-        mixed = self.out_proj(mixed)
-        out = query_hidden + self.gate.to(dtype=dtype) * mixed
-        return out.squeeze(1) if squeeze_query else out
-
-    def _build_context_block_mask(self, context_mask, batch_size, query_len, context_len, device):
         def mask_mod(b, h, q_idx, kv_idx):
             return context_mask[b, q_idx, kv_idx]
 
-        return create_block_mask(
+        block_mask = create_block_mask(
             mask_mod,
             B=batch_size,
             H=None,
@@ -341,158 +410,7 @@ class CausalLatentInputMixer(nn.Module):
             KV_LEN=context_len,
             device=device,
         )
-
-    def forward(
-        self,
-        query_hidden,
-        context_hidden=None,
-        context_mask=None,
-        query_positions=None,
-        context_positions=None,
-    ):
-        if context_hidden is None:
-            return query_hidden
-
-        squeeze_query = False
-        if query_hidden.dim() == 2:
-            query_hidden = query_hidden.unsqueeze(1)
-            squeeze_query = True
-        if query_hidden.dim() != 3:
-            raise ValueError(f"query_hidden must be [N,D] or [B,Q,D], got {tuple(query_hidden.shape)}")
-        if context_hidden.dim() != 3:
-            raise ValueError(f"context_hidden must be [B,K,D], got {tuple(context_hidden.shape)}")
-
-        batch_size, query_len, _ = query_hidden.shape
-        if query_hidden.shape[-1] != self.model_channels:
-            raise ValueError(
-                f"query hidden dim {query_hidden.shape[-1]} must match model_channels={self.model_channels}"
-            )
-        if context_hidden.shape[0] != batch_size:
-            raise ValueError(
-                f"context batch {context_hidden.shape[0]} must match query batch {batch_size}"
-            )
-        if context_hidden.shape[-1] != self.model_channels:
-            raise ValueError(
-                f"context hidden dim {context_hidden.shape[-1]} must match model_channels={self.model_channels}"
-            )
-        context_len = context_hidden.shape[1]
-        if context_len == 0:
-            return query_hidden.squeeze(1) if squeeze_query else query_hidden
-
-        dtype = query_hidden.dtype
-        device = query_hidden.device
-        context_hidden = context_hidden.to(device=device, dtype=dtype)
-
-        context_mask = self._format_context_mask(
-            context_mask,
-            batch_size,
-            query_len,
-            context_len,
-            device,
-        )
-        q = self._project_query(query_hidden, query_positions)
-        k, v = self._project_context(context_hidden, context_positions)
-
-        block_mask = self._build_context_block_mask(
-            context_mask,
-            batch_size,
-            query_len,
-            context_len,
-            device,
-        )
-        mixed = flex_attention(
-            query=q,
-            key=k,
-            value=v,
-            score_mod=None,
-            block_mask=block_mask,
-            scale=self.scale,
-            enable_gqa=False,
-            return_lse=False,
-        )
-        mixed = F.dropout(mixed, p=self.dropout, training=self.training) if self.dropout > 0.0 else mixed
-        mixed = mixed.transpose(1, 2).reshape(batch_size, query_len, self.model_channels)
-        mixed = self.out_proj(mixed)
-        out = query_hidden + self.gate.to(dtype=dtype) * mixed
-        return out.squeeze(1) if squeeze_query else out
-
-
-class SimpleFlowMLPAdaLN(nn.Module):
-    def __init__(
-        self,
-        in_channels,
-        model_channels,
-        out_channels,
-        z_channels,
-        num_res_blocks,
-        grad_checkpointing=False,
-        mlp_ratio=1.0,
-        latent_mixer_heads=8,
-        latent_mixer_dropout=0.0,
-        latent_mixer_enabled=True,
-        latent_mixer_zero_init_gate=True,
-        image_tokens_per_img=256,
-    ):
-        super().__init__()
-        self.in_channels = in_channels
-        self.model_channels = model_channels
-        self.out_channels = out_channels
-        self.num_res_blocks = num_res_blocks
-        self.grad_checkpointing = grad_checkpointing
-        self.mlp_ratio = float(mlp_ratio)
-        self.latent_mixer_enabled = bool(latent_mixer_enabled)
-
-        self.time_embed = TimestepEmbedder(model_channels)
-        self.cond_embed = nn.Linear(z_channels, model_channels)
-        self.input_proj = nn.Linear(in_channels, model_channels)
-        if self.latent_mixer_enabled:
-            self.input_mixer = CausalLatentInputMixer(
-                model_channels=model_channels,
-                num_heads=latent_mixer_heads,
-                dropout=latent_mixer_dropout,
-                image_tokens_per_img=image_tokens_per_img,
-                zero_init_gate=latent_mixer_zero_init_gate,
-            )
-        else:
-            self.input_mixer = None
-
-        self.res_blocks = nn.ModuleList(
-            [ResBlock(model_channels, mlp_ratio=self.mlp_ratio) for _ in range(num_res_blocks)]
-        )
-        self.final_layer = FinalLayer(model_channels, out_channels)
-        self.initialize_weights()
-
-    def initialize_weights(self):
-        def _basic_init(module):
-            if isinstance(module, nn.Linear):
-                _xavier_uniform_init_fp32_(module.weight)
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0)
-            elif isinstance(module, nn.LayerNorm):
-                if module.elementwise_affine:
-                    nn.init.ones_(module.weight)
-                    nn.init.zeros_(module.bias)
-
-        self.apply(_basic_init)
-        _normal_init_fp32_(self.time_embed.mlp[0].weight, std=0.02)
-        _normal_init_fp32_(self.time_embed.mlp[2].weight, std=0.02)
-
-        for block in self.res_blocks:
-            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
-            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
-        nn.init.constant_(self.final_layer.linear.weight, 0)
-        nn.init.constant_(self.final_layer.linear.bias, 0)
-        if self.input_mixer is not None:
-            self.input_mixer._reset_position_buffer()
-            self.input_mixer._reset_gate()
-
-    def _shape_time(self, t, batch_shape):
-        t = t.to(device=self.input_proj.weight.device)
-        if len(batch_shape) == 1:
-            return self.time_embed(t.reshape(-1))
-        return self.time_embed(t.reshape(-1)).view(*batch_shape, self.model_channels)
+        return context_mask, block_mask
 
     def prepare_latent_mixer_cache(
         self,
@@ -500,7 +418,7 @@ class SimpleFlowMLPAdaLN(nn.Module):
         context_mask=None,
         context_positions=None,
     ):
-        if self.input_mixer is None or context_latents is None:
+        if context_latents is None:
             return None
         if context_latents.dim() != 3:
             raise ValueError(f"context_latents must be [B,K,D], got {tuple(context_latents.shape)}")
@@ -509,12 +427,16 @@ class SimpleFlowMLPAdaLN(nn.Module):
         model_dtype = self.input_proj.weight.dtype
         model_device = self.input_proj.weight.device
         context_latents = context_latents.to(device=model_device, dtype=model_dtype)
+        batch_size, context_len, _ = context_latents.shape
+        context_positions = self._positions(context_positions, batch_size, context_len, model_device)
         context_hidden = self.input_proj(context_latents)
-        return self.input_mixer.prepare_context_cache(
-            context_hidden,
-            context_mask=context_mask,
-            context_positions=context_positions,
-        )
+        context_hidden = context_hidden + self._lookup_pos_embed(context_positions, context_hidden.dtype)
+        if context_mask is not None:
+            context_mask = context_mask.to(device=model_device, dtype=torch.bool)
+        return {
+            "layers": [block.prepare_cross_cache(context_hidden) for block in self.blocks],
+            "context_mask": context_mask,
+        }
 
     def forward(
         self,
@@ -531,39 +453,75 @@ class SimpleFlowMLPAdaLN(nn.Module):
         x = x.to(device=self.input_proj.weight.device, dtype=model_dtype)
         c = c.to(device=x.device, dtype=model_dtype)
         batch_shape = x.shape[:-1]
+        x, query_positions, squeeze = self._ensure_sequence(x, query_positions)
         x = self.input_proj(x)
-        if self.input_mixer is not None:
-            if latent_mixer_cache is not None:
-                x = self.input_mixer.apply_context_cache(
-                    x,
-                    context_cache=latent_mixer_cache,
-                    query_positions=query_positions,
-                )
-            elif context_latents is not None:
-                context_latents = context_latents.to(device=x.device, dtype=model_dtype)
-                context_hidden = self.input_proj(context_latents)
-                x = self.input_mixer(
-                    x,
-                    context_hidden=context_hidden,
-                    context_mask=context_mask,
-                    query_positions=query_positions,
-                    context_positions=context_positions,
-                )
+        x = x + self._lookup_pos_embed(query_positions, x.dtype)
         t = self._shape_time(t, batch_shape)
         c = self.cond_embed(c)
         y = t + c
+        if y.dim() == 2:
+            y = y.unsqueeze(1)
 
+        use_direct_context = latent_mixer_cache is None and context_latents is not None
+        if use_direct_context:
+            latent_mixer_cache = self.prepare_latent_mixer_cache(
+                context_latents=context_latents,
+                context_mask=context_mask,
+                context_positions=context_positions,
+            )
+        context_layers = None
+        context_mask = None
+        if latent_mixer_cache is not None:
+            context_layers = latent_mixer_cache.get("layers")
+            context_mask = latent_mixer_cache.get("context_mask")
+        context_block_mask = None
+        use_flex_attention = bool(context_layers) and (self.training or use_direct_context)
+        if use_flex_attention:
+            batch_size, query_len, _ = x.shape
+            context_len = context_layers[0]["k"].shape[2]
+            context_mask, context_block_mask = self._build_context_block_mask(
+                context_mask,
+                batch_size,
+                query_len,
+                context_len,
+                x.device,
+            )
+        gate_stats = []
         if self.grad_checkpointing and not torch.jit.is_scripting():
-            for block in self.res_blocks:
-                x = checkpoint(block, x, y)
+            for layer_idx, block in enumerate(self.blocks):
+                layer_cache = None if context_layers is None else context_layers[layer_idx]
+                x = checkpoint(
+                    block,
+                    x,
+                    y,
+                    layer_cache,
+                    context_mask,
+                    context_block_mask,
+                    use_flex_attention,
+                    use_reentrant=False,
+                )
+                if block.last_gate_abs_mean is not None:
+                    gate_stats.append(block.last_gate_abs_mean)
         else:
-            for block in self.res_blocks:
-                x = block(x, y)
-        return self.final_layer(x, y)
+            for layer_idx, block in enumerate(self.blocks):
+                layer_cache = None if context_layers is None else context_layers[layer_idx]
+                x = block(
+                    x,
+                    y,
+                    layer_cache=layer_cache,
+                    context_mask=context_mask,
+                    context_block_mask=context_block_mask,
+                    use_flex_attention=use_flex_attention,
+                )
+                if block.last_gate_abs_mean is not None:
+                    gate_stats.append(block.last_gate_abs_mean)
+        self.last_gate_abs_mean = torch.stack(gate_stats).mean() if gate_stats else None
+        out = self.final_layer(x, y)
+        return out.squeeze(1) if squeeze else out
 
 
 class FlowLoss(nn.Module):
-    """Rectified-flow loss with optional causal latent input mixing."""
+    """Rectified-flow loss with a contextual latent transformer velocity head."""
 
     def __init__(
         self,
@@ -604,7 +562,7 @@ class FlowLoss(nn.Module):
         if not 0.0 <= self.time_eps < 0.5:
             raise ValueError(f"time_eps must be in [0, 0.5), got {time_eps}")
 
-        self.net = SimpleFlowMLPAdaLN(
+        self.net = ContextualFlowTransformerHead(
             in_channels=self.in_channels,
             model_channels=width,
             out_channels=self.in_channels,
@@ -657,15 +615,20 @@ class FlowLoss(nn.Module):
     def _cache_to_device(self, cache, device, dtype):
         if cache is None:
             return None
-        out = {}
-        for key, value in cache.items():
+        def _convert(value, key=None):
             if value is None:
-                out[key] = None
-            elif key == "context_mask":
-                out[key] = value.to(device=device, dtype=torch.bool)
-            else:
-                out[key] = value.to(device=device, dtype=dtype)
-        return out
+                return None
+            if isinstance(value, dict):
+                return {sub_key: _convert(sub_value, sub_key) for sub_key, sub_value in value.items()}
+            if isinstance(value, list):
+                return [_convert(item, key) for item in value]
+            if isinstance(value, tuple):
+                return tuple(_convert(item, key) for item in value)
+            if key == "context_mask":
+                return value.to(device=device, dtype=torch.bool)
+            return value.to(device=device, dtype=dtype)
+
+        return _convert(cache)
 
     def prepare_latent_mixer_cache(
         self,
@@ -791,9 +754,9 @@ class FlowLoss(nn.Module):
             "flow/v_target_rms": self._rms_stat(v_target),
             "flow/v_pred_rms": self._rms_stat(v_pred),
         }
-        mixer = getattr(self.net, "input_mixer", None)
-        if mixer is not None:
-            stats["flow/latent_mixer_gate"] = mixer.gate.detach().float()
+        gate_stat = getattr(self.net, "last_gate_abs_mean", None)
+        if gate_stat is not None:
+            stats["flow/latent_mixer_gate"] = gate_stat.detach().float()
         self.last_forward_stats = stats
         return loss_mean
 
@@ -803,21 +766,20 @@ class FlowLoss(nn.Module):
 
     @staticmethod
     def _duplicate_context(context_kwargs):
+        def _duplicate_value(value):
+            if value is None:
+                return None
+            if isinstance(value, dict):
+                return {key: _duplicate_value(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [_duplicate_value(item) for item in value]
+            if isinstance(value, tuple):
+                return tuple(_duplicate_value(item) for item in value)
+            return torch.cat([value, value], dim=0)
+
         out = {}
         for key, value in context_kwargs.items():
-            if value is None:
-                out[key] = None
-            elif isinstance(value, dict):
-                out[key] = {
-                    cache_key: (
-                        None
-                        if cache_value is None
-                        else torch.cat([cache_value, cache_value], dim=0)
-                    )
-                    for cache_key, cache_value in value.items()
-                }
-            else:
-                out[key] = torch.cat([value, value], dim=0)
+            out[key] = _duplicate_value(value)
         return out
 
     def _guided_velocity(
@@ -863,8 +825,8 @@ class FlowLoss(nn.Module):
         if steps <= 0:
             raise ValueError(f"num_steps must be positive, got {steps}")
         solver = str(solver or self.solver).lower()
-        x_batch = z.shape[0] // 2 if cfg != 1.0 else z.shape[0]
-        x = torch.randn(x_batch, self.in_channels, device=z.device, dtype=torch.float32) * float(temperature)
+        x_shape = (z.shape[0] // 2, *z.shape[1:-1]) if cfg != 1.0 else z.shape[:-1]
+        x = torch.randn(*x_shape, self.in_channels, device=z.device, dtype=torch.float32) * float(temperature)
         raw_context_kwargs = self._context_to_device(
             {
                 "context_latents": context_latents,
@@ -891,8 +853,8 @@ class FlowLoss(nn.Module):
         times = torch.linspace(1.0, 0.0, steps + 1, device=z.device, dtype=torch.float32)
 
         for idx in range(steps):
-            t = times[idx].expand(x_batch)
-            t_next = times[idx + 1].expand(x_batch)
+            t = times[idx].expand(x_shape)
+            t_next = times[idx + 1].expand(x_shape)
             dt = (times[idx + 1] - times[idx]).float()
             v = self._guided_velocity(
                 x.to(dtype=model_dtype),
