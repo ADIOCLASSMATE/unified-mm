@@ -167,7 +167,7 @@ For text regression against a local checkpoint:
 uv run python scripts/check_selfless_flow_text_regression.py
 ```
 
-## Legacy Paths
+## Inactive Paths
 
 Older discrete image-token and OmniCorpus preprocessing code is still present in
 the repository, but it is no longer the active research path described here. The

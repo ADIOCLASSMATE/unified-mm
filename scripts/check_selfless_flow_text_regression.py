@@ -3,7 +3,7 @@
 
 This script intentionally stays out of the default pytest suite because it loads
 a large local checkpoint and FineWeb-Edu Arrow shards. It verifies:
-  1. Legacy text-only loss path used by pretrain/train_selfless_text.py.
+  1. Text-only loss path used by pretrain/train_selfless_text.py.
   2. Flow text-batch loss path where token_types are present.
   3. Eval-time single-stream text decoding with calculate_likelihood=False.
 """
@@ -269,11 +269,11 @@ def main() -> int:
     model, tokenizer = load_model(args.checkpoint, device, args.dtype)
     loader = build_loader(args, tokenizer, model)
 
-    legacy_metrics = evaluate_loss(model, loader, device, include_token_types=False)
+    text_only_metrics = evaluate_loss(model, loader, device, include_token_types=False)
     loader = build_loader(args, tokenizer, model)
     flow_text_metrics = evaluate_loss(model, loader, device, include_token_types=True)
 
-    assert_loss_ok("legacy_text", legacy_metrics, args.max_loss)
+    assert_loss_ok("text_only", text_only_metrics, args.max_loss)
     assert_loss_ok("flow_text", flow_text_metrics, args.max_loss)
 
     prompts = args.prompt or [
@@ -305,7 +305,7 @@ def main() -> int:
         "max_seq_length": args.max_seq_length,
         "num_loss_batches": args.num_loss_batches,
         "batch_size": args.batch_size,
-        "legacy_text": legacy_metrics,
+        "text_only": text_only_metrics,
         "flow_text": flow_text_metrics,
         "generations": generations,
     }

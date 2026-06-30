@@ -691,7 +691,7 @@ class SelflessFlowBehaviorTest(unittest.TestCase):
         for group_start in range(0, len(sources), 2):
             self.assertLessEqual(sources[group_start:group_start + 2].count("text"), 1)
 
-    def test_mar_flow_head_predicts_velocity_and_samples_latents(self):
+    def test_image_flow_head_predicts_velocity_and_samples_latents(self):
         head = FlowLoss(
             target_channels=4,
             z_channels=8,

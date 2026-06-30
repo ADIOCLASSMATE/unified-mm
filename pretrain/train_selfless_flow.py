@@ -158,6 +158,13 @@ def _log_info(message):
         logging.getLogger(__name__).info(message)
 
 
+def _log_warning(message):
+    try:
+        logger.warning(message)
+    except RuntimeError:
+        logging.getLogger(__name__).warning(message)
+
+
 def _special_token_ids(config):
     ids = {
         "mask": int(config.model.mask_token_id),
@@ -227,7 +234,7 @@ def _migrate_image_flow_head_state(model, head_state, source):
         skipped[name] = (value_shape, target_shape)
 
     missing, unexpected = model.image_flow_head.load_state_dict(load_state, strict=False)
-    logger.info(
+    _log_info(
         f"Migrated image_flow_head from {source}: loaded={len(load_state)}, "
         f"missing={list(missing)}, unexpected={list(unexpected)}, skipped={skipped}"
     )
@@ -236,11 +243,11 @@ def _migrate_image_flow_head_state(model, head_state, source):
 def _migrate_image_flow_condition_proj_state(model, projector_state, source):
     projector = getattr(model, "image_flow_condition_proj", None)
     if projector is None:
-        logger.info(f"Skipping image_flow_condition_proj load from {source}: model has no projector")
+        _log_info(f"Skipping image_flow_condition_proj load from {source}: model has no projector")
         return
     target_state = projector.state_dict()
     if not target_state:
-        logger.info(f"Skipping image_flow_condition_proj load from {source}: projector has no parameters")
+        _log_info(f"Skipping image_flow_condition_proj load from {source}: projector has no parameters")
         return
 
     load_state = {}
@@ -257,7 +264,7 @@ def _migrate_image_flow_condition_proj_state(model, projector_state, source):
         skipped[name] = (value_shape, target_shape)
 
     missing, unexpected = projector.load_state_dict(load_state, strict=False)
-    logger.info(
+    _log_info(
         f"Migrated image_flow_condition_proj from {source}: loaded={len(load_state)}, "
         f"missing={list(missing)}, unexpected={list(unexpected)}, skipped={skipped}"
     )
@@ -306,15 +313,8 @@ def _load_image_flow_adapter(model, adapter_path, config):
         projector_state = {}
         projector_target = model.image_token_embedder.state_dict()
         projector_skipped = {}
-        adapter_mask_token = None
-
-        def _canonical_projector_key(name):
-            if name == "diffusion_pos_embed":
-                return "flow_pos_embed"
-            return name
 
         def _maybe_add_projector_key(name, value):
-            name = _canonical_projector_key(name)
             if name not in projector_target:
                 projector_skipped[name] = (tuple(value.shape), None)
                 return
@@ -326,9 +326,7 @@ def _load_image_flow_adapter(model, adapter_path, config):
 
         with safe_open(str(adapter_path), framework="pt", device="cpu") as f:
             for key in f.keys():
-                if key.startswith("diffloss."):
-                    head_state[key[len("diffloss."):]] = f.get_tensor(key)
-                elif key.startswith("image_flow_head."):
+                if key.startswith("image_flow_head."):
                     head_state[key[len("image_flow_head."):]] = f.get_tensor(key)
                 elif key.startswith("image_flow_condition_proj."):
                     condition_proj_state[key[len("image_flow_condition_proj."):]] = f.get_tensor(key)
@@ -337,71 +335,32 @@ def _load_image_flow_adapter(model, adapter_path, config):
                 elif key.startswith("model.image_token_embedder."):
                     name = key[len("model.image_token_embedder."):]
                     _maybe_add_projector_key(name, f.get_tensor(key))
-                elif key in {"z_proj.weight", "z_proj.bias", "z_proj_ln.weight", "z_proj_ln.bias"}:
-                    _maybe_add_projector_key(key, f.get_tensor(key))
-                elif key == "encoder_pos_embed_learned":
-                    pos = f.get_tensor(key).squeeze(0)
-                    _maybe_add_projector_key("image_pos_embed", pos[-model.image_token_embedder.image_tokens_per_img:])
-                elif key == "diffusion_pos_embed_learned":
-                    _maybe_add_projector_key("flow_pos_embed", f.get_tensor(key).squeeze(0))
-                elif key == "mask_token":
-                    adapter_mask_token = f.get_tensor(key).reshape(-1)
         _migrate_image_flow_head_state(model, head_state, adapter_path)
         if condition_proj_state:
             _migrate_image_flow_condition_proj_state(model, condition_proj_state, adapter_path)
         if projector_state:
             missing, unexpected = model.image_token_embedder.load_state_dict(projector_state, strict=False)
-            logger.info(
+            _log_info(
                 f"Loaded image_token_embedder from {adapter_path}: "
                 f"keys={len(projector_state)}, missing={missing}, unexpected={unexpected}, "
                 f"skipped={projector_skipped}"
             )
         else:
-            logger.warning(
+            _log_warning(
                 f"No image_token_embedder keys were loaded from {adapter_path}; skipped={projector_skipped}"
             )
-        image_mask_token_id = config.model.get("image_mask_token_id", None)
-        if adapter_mask_token is not None and image_mask_token_id is not None:
-            with torch.no_grad():
-                embed = model.model.embed_tokens.weight
-                if adapter_mask_token.numel() != embed.shape[1]:
-                    logger.warning(
-                        f"Skipping adapter mask_token load: shape={tuple(adapter_mask_token.shape)} "
-                        f"does not match embedding dim={embed.shape[1]}"
-                    )
-                else:
-                    embed[int(image_mask_token_id)].copy_(
-                        adapter_mask_token.to(device=embed.device, dtype=embed.dtype)
-                    )
-                    logger.info(
-                        f"Loaded adapter mask_token into image_mask_token_id={int(image_mask_token_id)}"
-                    )
         return
 
     state = torch.load(adapter_path, map_location="cpu")
     if "image_flow_head" in state:
         _migrate_image_flow_head_state(model, state["image_flow_head"], adapter_path)
-    else:
-        flat_head = {}
-        for key, value in (state.items() if isinstance(state, dict) else []):
-            if key.startswith("image_flow_head."):
-                flat_head[key[len("image_flow_head."):]] = value
-        if flat_head:
-            _migrate_image_flow_head_state(model, flat_head, adapter_path)
     if "image_flow_condition_proj" in state:
         _migrate_image_flow_condition_proj_state(model, state["image_flow_condition_proj"], adapter_path)
-    else:
-        flat_condition_proj = {}
-        for key, value in (state.items() if isinstance(state, dict) else []):
-            if key.startswith("image_flow_condition_proj."):
-                flat_condition_proj[key[len("image_flow_condition_proj."):]] = value
-        if flat_condition_proj:
-            _migrate_image_flow_condition_proj_state(model, flat_condition_proj, adapter_path)
     if "image_token_embedder" in state:
         missing, unexpected = model.image_token_embedder.load_state_dict(
             state["image_token_embedder"], strict=False
         )
-        logger.info(
+        _log_info(
             f"Loaded adapter image_token_embedder from {adapter_path}: "
             f"missing={missing}, unexpected={unexpected}"
         )
@@ -417,7 +376,7 @@ def _load_image_flow_adapter(model, adapter_path, config):
                     dtype=embed.dtype,
                 )
                 embed[token_id].copy_(value)
-        logger.info(f"Loaded adapter special token embeddings from {adapter_path}")
+        _log_info(f"Loaded adapter special token embeddings from {adapter_path}")
 
 
 def _save_image_flow_adapter(model, config, accelerator, global_step):
@@ -951,7 +910,7 @@ def main():
                     )
 
         else:
-            # Legacy text-only path
+            # Text-only path
             text_ids = batch["input_ids"][:, :-1].contiguous()
             token_types = None
             B, L = text_ids.shape
@@ -1261,7 +1220,7 @@ def _load_vae_decoder(config, accelerator):
     vae_module_root = Path(
         config.experiment.get(
             "validation_vae_module_root",
-            config.experiment.get("validation_mar_root", "/inspire/hdd/global_user/wanjiaxin-253108030048/code/mar"),
+            "/inspire/hdd/global_user/wanjiaxin-253108030048/code/mar",
         )
     )
     vae_module_path = vae_module_root / "models" / "vae.py"
@@ -1524,8 +1483,7 @@ def _save_validation_flow_images(
             ]
             strategies = config.experiment.get("validation_single_stream_order_strategies", None)
             if strategies is None:
-                legacy_strategy = config.experiment.get("validation_single_stream_order_strategy", None)
-                strategies = [legacy_strategy] if legacy_strategy else default_strategies
+                strategies = default_strategies
             if isinstance(strategies, str):
                 strategies = [item.strip() for item in strategies.split(",") if item.strip()]
             for order_strategy in strategies:

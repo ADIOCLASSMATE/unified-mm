@@ -27,7 +27,7 @@ def parse_args():
     parser.add_argument(
         "--adapter",
         default="none",
-        help="Flow adapter, legacy adapter/checkpoint to migrate, external pretrained safetensors, or 'none'.",
+        help="Flow adapter, current flow checkpoint safetensors, or 'none'.",
     )
     parser.add_argument(
         "--model_state",
@@ -267,23 +267,14 @@ def load_adapter(model, adapter_path: str):
         condition_proj_state = {}
         projector_state = {}
         projector_target = model.image_token_embedder.state_dict()
-        adapter_mask_token = None
-
-        def canonical_projector_key(name):
-            if name == "diffusion_pos_embed":
-                return "flow_pos_embed"
-            return name
 
         def maybe_add_projector_key(name, value):
-            name = canonical_projector_key(name)
             if name in projector_target and tuple(value.shape) == tuple(projector_target[name].shape):
                 projector_state[name] = value
 
         with safe_open(str(path), framework="pt", device="cpu") as f:
             for key in f.keys():
-                if key.startswith("diffloss."):
-                    head_state[key[len("diffloss."):]] = f.get_tensor(key)
-                elif key.startswith("image_flow_head."):
+                if key.startswith("image_flow_head."):
                     head_state[key[len("image_flow_head."):]] = f.get_tensor(key)
                 elif key.startswith("image_flow_condition_proj."):
                     condition_proj_state[key[len("image_flow_condition_proj."):]] = f.get_tensor(key)
@@ -291,15 +282,6 @@ def load_adapter(model, adapter_path: str):
                     condition_proj_state[key[len("model.image_flow_condition_proj."):]] = f.get_tensor(key)
                 elif key.startswith("model.image_token_embedder."):
                     maybe_add_projector_key(key[len("model.image_token_embedder."):], f.get_tensor(key))
-                elif key in {"z_proj.weight", "z_proj.bias", "z_proj_ln.weight", "z_proj_ln.bias"}:
-                    maybe_add_projector_key(key, f.get_tensor(key))
-                elif key == "encoder_pos_embed_learned":
-                    pos = f.get_tensor(key).squeeze(0)
-                    maybe_add_projector_key("image_pos_embed", pos[-model.image_token_embedder.image_tokens_per_img:])
-                elif key == "diffusion_pos_embed_learned":
-                    maybe_add_projector_key("flow_pos_embed", f.get_tensor(key).squeeze(0))
-                elif key == "mask_token":
-                    adapter_mask_token = f.get_tensor(key).reshape(-1)
 
         report["image_flow_head"] = _migrate_head_state(model, head_state)
         if condition_proj_state:
@@ -308,13 +290,6 @@ def load_adapter(model, adapter_path: str):
             missing, unexpected = model.image_token_embedder.load_state_dict(projector_state, strict=False)
             report["image_token_embedder_missing"] = list(missing)
             report["image_token_embedder_unexpected"] = list(unexpected)
-        image_mask_token_id = getattr(model.config, "image_mask_token_id", None)
-        if adapter_mask_token is not None and image_mask_token_id is not None:
-            with torch.no_grad():
-                embed = model.model.embed_tokens.weight
-                if adapter_mask_token.numel() == embed.shape[1]:
-                    embed[int(image_mask_token_id)].copy_(adapter_mask_token.to(device=embed.device, dtype=embed.dtype))
-                    report["loaded_adapter_mask_token_id"] = int(image_mask_token_id)
         return report
 
     state = torch.load(path, map_location="cpu")
@@ -364,7 +339,7 @@ def load_vae(config, device, dtype_name):
     vae_module_root = Path(
         config.experiment.get(
             "validation_vae_module_root",
-            config.experiment.get("validation_mar_root", "/inspire/hdd/global_user/wanjiaxin-253108030048/code/mar"),
+            "/inspire/hdd/global_user/wanjiaxin-253108030048/code/mar",
         )
     )
     vae_path = Path(config.experiment.validation_vae_path)

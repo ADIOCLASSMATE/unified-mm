@@ -296,7 +296,7 @@ def main():
                            f"labels -100 ratio: {(labels==-100).sum().item() / labels.numel():.3f}")
 
         else:
-            # Legacy text-only path
+            # Text-only path
             text_ids = batch["input_ids"][:, :-1].contiguous()
             token_types = None
             B, L = text_ids.shape

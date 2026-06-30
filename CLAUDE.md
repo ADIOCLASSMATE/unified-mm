@@ -114,7 +114,6 @@ Done:
 - Shift-free text objective with same-position labels.
 - Continuous image latent embedding path.
 - Contextual rectified-flow image loss.
-- Legacy adapter migration for image modules.
 - ImageNet latent-cache dataset.
 - Combined image/text dataloader.
 - Single-stream image latent generation with multiple order strategies.

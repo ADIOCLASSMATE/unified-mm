@@ -108,30 +108,6 @@ class ImageTokenEmbedder(nn.Module):
     def _reset_image_slots(self):
         self._reset_parameters()
 
-    def _load_from_state_dict(
-        self,
-        state_dict,
-        prefix,
-        local_metadata,
-        strict,
-        missing_keys,
-        unexpected_keys,
-        error_msgs,
-    ):
-        old_key = prefix + "diffusion_pos_embed"
-        new_key = prefix + "flow_pos_embed"
-        if new_key not in state_dict and old_key in state_dict:
-            state_dict[new_key] = state_dict.pop(old_key)
-        super()._load_from_state_dict(
-            state_dict,
-            prefix,
-            local_metadata,
-            strict,
-            missing_keys,
-            unexpected_keys,
-            error_msgs,
-        )
-
     @property
     def weight_dtype(self):
         return self.z_proj.weight.dtype

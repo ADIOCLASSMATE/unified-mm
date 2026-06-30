@@ -148,15 +148,3 @@ def test_image_token_embedder_rebuilds_fixed_positions_on_reset():
     assert torch.isfinite(actual).all()
     assert actual.abs().max() <= 1.0
     assert torch.allclose(actual, expected)
-
-
-def test_image_token_embedder_loads_legacy_diffusion_pos_key():
-    source = ImageTokenEmbedder(latent_dim=4, hidden_size=8, image_tokens_per_img=4)
-    state = source.state_dict()
-    legacy_pos = state.pop("flow_pos_embed").clone()
-    state["diffusion_pos_embed"] = legacy_pos
-
-    target = ImageTokenEmbedder(latent_dim=4, hidden_size=8, image_tokens_per_img=4)
-    target.load_state_dict(state, strict=True)
-
-    assert torch.allclose(target.flow_pos_embed, legacy_pos)

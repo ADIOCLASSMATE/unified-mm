@@ -320,13 +320,6 @@ Useful ablations:
 - `spatial_uniform`;
 - different `parallel_rate` values.
 
-### RQ5: How Valuable Is Legacy Adapter Migration?
-
-The loader can migrate legacy `.safetensors` keys into the image flow head,
-image projector, flow positional embeddings, and image mask token. The key
-question is whether this provides a better initialization than training the flow
-head from scratch under the LLM condition distribution.
-
 ## Evaluation Plan
 
 Early-stage validation should focus on structural and latent-space signals:
