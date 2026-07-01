@@ -796,7 +796,8 @@ class FlowLoss(nn.Module):
         *,
         context_is_paired: bool = False,
     ) -> torch.Tensor:
-        if cfg == 1.0:
+        z_is_paired = z.shape[0] == x.shape[0] * 2
+        if cfg == 1.0 and not z_is_paired:
             return self.velocity(x, t, z, **context_kwargs)
         x_pair = torch.cat([x, x], dim=0)
         t_pair = torch.cat([t, t], dim=0)
@@ -805,11 +806,25 @@ class FlowLoss(nn.Module):
         v_cond, v_uncond = torch.chunk(v_pair, 2, dim=0)
         return v_uncond + float(cfg) * (v_cond - v_uncond)
 
+    @staticmethod
+    def _scheduled_cfg(cfg: float, schedule: str | None, progress: float) -> float:
+        cfg = float(cfg)
+        if cfg == 1.0:
+            return 1.0
+        schedule = str(schedule or "constant").lower()
+        if schedule in {"constant", "none", "off", ""}:
+            return cfg
+        progress = max(0.0, min(1.0, float(progress)))
+        if schedule == "linear":
+            return 1.0 + (cfg - 1.0) * progress
+        raise ValueError(f"Unknown image flow cfg_schedule={schedule!r}; expected constant or linear.")
+
     def sample(
         self,
         z,
         temperature=1.0,
         cfg=1.0,
+        cfg_schedule="constant",
         solver=None,
         num_steps=None,
         return_trace=False,
@@ -860,11 +875,12 @@ class FlowLoss(nn.Module):
             t = times[idx].expand(x_shape)
             t_next = times[idx + 1].expand(x_shape)
             dt = (times[idx + 1] - times[idx]).float()
+            cfg_t = self._scheduled_cfg(cfg, cfg_schedule, float(times[idx].item()))
             v = self._guided_velocity(
                 x.to(dtype=model_dtype),
                 t,
                 z,
-                cfg,
+                cfg_t,
                 context_kwargs,
                 context_is_paired=context_is_paired,
             ).float()
@@ -872,11 +888,12 @@ class FlowLoss(nn.Module):
                 x = x + dt * v
             elif solver == "heun":
                 x_euler = x + dt * v
+                cfg_t_next = self._scheduled_cfg(cfg, cfg_schedule, float(times[idx + 1].item()))
                 v_next = self._guided_velocity(
                     x_euler.to(dtype=model_dtype),
                     t_next,
                     z,
-                    cfg,
+                    cfg_t_next,
                     context_kwargs,
                     context_is_paired=context_is_paired,
                 ).float()
@@ -885,5 +902,9 @@ class FlowLoss(nn.Module):
                 raise ValueError(f"Unknown image_flow_solver={solver!r}; expected heun or euler.")
 
         if return_trace:
-            return x.to(dtype=model_dtype), {"solver": solver, "num_steps": steps}
+            return x.to(dtype=model_dtype), {
+                "solver": solver,
+                "num_steps": steps,
+                "cfg_schedule": str(cfg_schedule or "constant"),
+            }
         return x.to(dtype=model_dtype)

@@ -81,12 +81,22 @@ class FakeImageFlowHead:
         self.latent_dim = latent_dim
         self.sample_calls = []
 
-    def sample(self, z, temperature=1.0, cfg=1.0, solver=None, num_steps=None, **context_kwargs):
+    def sample(
+        self,
+        z,
+        temperature=1.0,
+        cfg=1.0,
+        cfg_schedule="constant",
+        solver=None,
+        num_steps=None,
+        **context_kwargs,
+    ):
         self.sample_calls.append(
             {
                 "z": z.detach().clone(),
                 "temperature": temperature,
                 "cfg": cfg,
+                "cfg_schedule": cfg_schedule,
                 "solver": solver,
                 "num_steps": num_steps,
                 "context_kwargs": context_kwargs,
@@ -943,6 +953,7 @@ class SelflessFlowBehaviorTest(unittest.TestCase):
         self.assertEqual(tuple(out.shape), (3, latent_dim))
         call = head.sample_calls[-1]
         self.assertEqual(call["cfg"], 3.0)
+        self.assertEqual(call["cfg_schedule"], "constant")
         self.assertEqual(call["temperature"], 0.7)
         self.assertEqual(call["solver"], "euler")
         self.assertEqual(call["num_steps"], 7)
@@ -1093,9 +1104,10 @@ class SelflessFlowBehaviorTest(unittest.TestCase):
             self.assertTrue(uncond_call["image_uncond"])
             self.assertTrue(torch.equal(cond_call["sigma"], sigma))
             self.assertTrue(torch.equal(uncond_call["sigma"], sigma + 100))
-        expected_cfg = [1.25, 1.5, 1.75, 2.0]
+        expected_cfg = [2.0, 2.0, 2.0, 2.0]
         for sample_call, cfg in zip(dummy.image_flow_head.sample_calls, expected_cfg):
             self.assertAlmostEqual(sample_call["cfg"], cfg)
+            self.assertEqual(sample_call["cfg_schedule"], "constant")
             self.assertEqual(tuple(sample_call["z"].shape), (2, hidden_size))
             self.assertTrue(torch.all(sample_call["z"][0] == 1.0))
             self.assertTrue(torch.all(sample_call["z"][1] == 2.0))

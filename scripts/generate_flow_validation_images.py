@@ -54,7 +54,7 @@ def parse_args():
     parser.add_argument("--sampling_steps", default="50")
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--cfg", type=float, default=1.0)
-    parser.add_argument("--cfg_schedule", choices=["constant", "linear"], default="linear")
+    parser.add_argument("--cfg_schedule", choices=["constant", "linear"], default="constant")
     parser.add_argument("--flow_solver", choices=["heun", "euler"], default="heun")
     parser.add_argument("--probe_times", default="0.25,0.5,0.75,0.95")
     parser.add_argument("--single_stream", action="store_true")
@@ -561,14 +561,13 @@ def refine_single_stream_latents(
                 uncond_hidden[sample_indices, seq_positions],
                 local_positions,
             )
-        progress = 1.0 - (round_idx / max(1, len(refine_ratios)))
-        cfg_iter = cfg if str(cfg_schedule).lower() == "constant" else 1.0 + (cfg - 1.0) * progress
         torch.manual_seed(seed + 17_171 + round_idx)
         pred = model.sample_image_flow_with_cfg(
             z,
             z_uncond=z_uncond,
             temperature=temperature,
-            cfg=cfg_iter,
+            cfg=cfg,
+            cfg_schedule=cfg_schedule,
             solver=solver,
         ).to(dtype=work_latents.dtype)
 
@@ -584,7 +583,8 @@ def refine_single_stream_latents(
                 "round": int(round_idx),
                 "ratio": ratio,
                 "remask_count": int(remask_count),
-                "cfg": float(cfg_iter),
+                "cfg": float(cfg),
+                "cfg_schedule": str(cfg_schedule),
             }
         )
 
@@ -732,6 +732,7 @@ def main():
                 z_uncond=z_uncond,
                 temperature=args.temperature,
                 cfg=args.cfg,
+                cfg_schedule=args.cfg_schedule,
                 solver=args.flow_solver,
                 **flat_query_mixer_context(target, span_sigma, local_positions),
             ).to(dtype=target.dtype)

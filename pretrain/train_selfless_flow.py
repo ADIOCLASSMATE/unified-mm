@@ -1508,7 +1508,7 @@ def _save_validation_flow_images(
         sample_count = min(int(config.experiment.get("validation_image_samples", 4)), len(spans))
         flow_temperature = float(config.experiment.get("validation_flow_temperature", 1.0))
         flow_cfg = float(config.experiment.get("validation_flow_cfg", 1.0))
-        flow_cfg_schedule = str(config.experiment.get("validation_flow_cfg_schedule", "linear"))
+        flow_cfg_schedule = str(config.experiment.get("validation_flow_cfg_schedule", "constant"))
         flow_solver = config.experiment.get("validation_flow_solver", config.model.get("image_flow_solver", None))
         probe_config = config.experiment.get("validation_flow_probe_times", [0.25, 0.5, 0.75, 0.95])
         if isinstance(probe_config, str):
@@ -1610,6 +1610,7 @@ def _save_validation_flow_images(
                 z_uncond=z_uncond,
                 temperature=flow_temperature,
                 cfg=flow_cfg,
+                cfg_schedule=flow_cfg_schedule,
                 solver=flow_solver,
                 **_flat_query_mixer_context(target, span_sigma, local_positions),
             )

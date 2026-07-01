@@ -15,7 +15,7 @@ experiment:
     validation_image_samples: 2
     validation_flow_temperature: 1.0
     validation_flow_cfg: 1.0
-    validation_flow_cfg_schedule: "linear"
+    validation_flow_cfg_schedule: "constant"
     validation_flow_solver: "heun"
     validation_flow_probe_times: [0.25, 0.5, 0.75, 0.95]
     validation_vae_dtype: "fp32"

@@ -42,7 +42,7 @@ from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_u
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.processing_utils import Unpack
-from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
+from transformers.utils import TransformersKwargs, can_return_tuple
 from transformers.utils.deprecation import deprecate_kwarg
 from transformers.utils.generic import maybe_autocast, merge_with_config_defaults
 from torch.nn.attention.flex_attention import flex_attention, BlockMask, create_block_mask, and_masks
@@ -54,6 +54,15 @@ try:
     liger_kernel_is_available = True
 except ImportError:
     liger_kernel_is_available = False
+
+
+def auto_docstring(obj=None, **_kwargs):
+    def decorator(target):
+        return target
+
+    if obj is None:
+        return decorator
+    return decorator(obj)
 
 
 def _normal_init_fp32_(tensor: torch.Tensor, mean: float = 0.0, std: float = 1.0):
@@ -306,25 +315,6 @@ def _image_flow_condition_norm_config(obj) -> tuple[str, float]:
     if eps is None:
         eps = 1e-6
     return str(norm_mode).lower(), float(eps)
-
-
-def _scheduled_flow_cfg(
-    cfg: float,
-    schedule: str | None,
-    progress: float,
-) -> float:
-    cfg = float(cfg)
-    if cfg == 1.0:
-        return 1.0
-    schedule = str(schedule or "constant").lower()
-    if schedule in {"constant", "none", "off", ""}:
-        return cfg
-    progress = max(0.0, min(1.0, float(progress)))
-    if schedule == "linear":
-        return 1.0 + (cfg - 1.0) * progress
-    raise ValueError(
-        f"Unknown flow_cfg_schedule={schedule!r}; expected constant or linear."
-    )
 
 
 def compute_image_local_positions(
@@ -994,6 +984,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         z_uncond: torch.Tensor | None = None,
         temperature: float = 1.0,
         cfg: float = 1.0,
+        cfg_schedule: str = "constant",
         solver: str | None = None,
         num_steps: int | None = None,
         context_latents: torch.Tensor | None = None,
@@ -1006,6 +997,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 z,
                 temperature=temperature,
                 cfg=1.0,
+                cfg_schedule=cfg_schedule,
                 solver=solver,
                 num_steps=num_steps,
                 context_latents=context_latents,
@@ -1022,6 +1014,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             paired,
             temperature=temperature,
             cfg=cfg,
+            cfg_schedule=cfg_schedule,
             solver=solver,
             num_steps=num_steps,
             context_latents=context_latents,
@@ -1281,7 +1274,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         initial_image_latent_mask: torch.Tensor | None = None,
         flow_temperature: float = 1.0,
         flow_cfg: float = 1.0,
-        flow_cfg_schedule: str = "linear",
+        flow_cfg_schedule: str = "constant",
         flow_solver: str | None = None,
         flow_num_steps: int | None = None,
         parallel_rate: int = 32,
@@ -1514,20 +1507,6 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         ) if use_flow_cfg else None
 
         while not filled.all():
-            remaining_per_sample = (~filled).sum(dim=1)
-            planned_fill = torch.minimum(
-                remaining_per_sample,
-                torch.full_like(remaining_per_sample, k),
-            ).sum()
-            progress_after_step = (
-                float(filled.sum().item() + planned_fill.item())
-                / float(max(1, filled.numel()))
-            )
-            cfg_iter = _scheduled_flow_cfg(
-                flow_cfg,
-                flow_cfg_schedule,
-                progress_after_step,
-            )
             attention_mask = get_selfless_mask(
                 sigma=current_sigma,
                 seq_len=selected_input_ids.shape[1],
@@ -1603,7 +1582,8 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                     z,
                     z_uncond=z_uncond,
                     temperature=flow_temperature,
-                    cfg=cfg_iter,
+                    cfg=flow_cfg,
+                    cfg_schedule=flow_cfg_schedule,
                     solver=flow_solver,
                     num_steps=flow_num_steps,
                     **_flow_context(all_sample_indices, all_local_positions),
@@ -1693,7 +1673,8 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                     z,
                     z_uncond=z_uncond,
                     temperature=flow_temperature,
-                    cfg=cfg_iter,
+                    cfg=flow_cfg,
+                    cfg_schedule=flow_cfg_schedule,
                     solver=flow_solver,
                     num_steps=flow_num_steps,
                     **_flow_context(sample_indices, local_positions_for_condition),
@@ -1766,7 +1747,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         decode_strategy: str,
         flow_temperature: float = 1.0,
         flow_cfg: float = 1.0,
-        flow_cfg_schedule: str = "linear",
+        flow_cfg_schedule: str = "constant",
         flow_solver: str | None = None,
         flow_num_steps: int | None = None,
         image_parallel_rate: int | None = None,
@@ -1961,7 +1942,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         image_spans = []
         flow_temperature = float(kwargs.pop("flow_temperature", 1.0))
         flow_cfg = float(kwargs.pop("flow_cfg", 1.0))
-        flow_cfg_schedule = str(kwargs.pop("flow_cfg_schedule", "linear"))
+        flow_cfg_schedule = str(kwargs.pop("flow_cfg_schedule", "constant"))
         flow_solver = kwargs.pop("flow_solver", None)
         flow_num_steps = kwargs.pop("flow_num_steps", None)
         image_parallel_rate = kwargs.pop("image_parallel_rate", parallel_rate)
