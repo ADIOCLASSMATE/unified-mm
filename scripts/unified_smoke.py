@@ -24,6 +24,7 @@ from pretrain.train_selfless_flow import (
     _create_ema_model,
     _load_ema_state_if_available,
     _load_image_flow_adapter,
+    _maybe_update_ema_model,
     _save_ema_state,
     _save_image_flow_adapter,
     _sync_ema_model,
@@ -65,7 +66,14 @@ def patch_cpu_runtime():
 
     selfless_flow.Qwen3RMSNorm.forward = rms_norm_forward
 
-    def no_mask(sigma, seq_len, device):
+    def no_mask(*args, **kwargs):
+        sigma = kwargs.get("sigma", args[0] if args else None)
+        seq_len = kwargs.get("seq_len")
+        if seq_len is None and len(args) > 1:
+            seq_len = args[1]
+        device = kwargs.get("device")
+        if device is None and len(args) > 2:
+            device = args[2]
         return SimpleNamespace(sigma=sigma, seq_len=seq_len, device=device)
 
     import utils.utils as utils_mod
@@ -230,6 +238,100 @@ def run_validation(model, batch):
     }
 
 
+@torch.no_grad()
+def verify_ema_precision_and_delay(device):
+    config = smoke_train_config(Path("unused"))
+    config.training.ema_decay = 0.5
+
+    model = Qwen3ForCausalLM(tiny_config()).to(device=device, dtype=torch.bfloat16)
+    ema_model = _create_ema_model(model, config).to(device)
+    accelerator = SmokeAccelerator(device)
+
+    floating_dtypes = {
+        value.dtype
+        for value in ema_model.state_dict().values()
+        if torch.is_floating_point(value)
+    }
+    if floating_dtypes != {torch.float32}:
+        raise RuntimeError(f"EMA floating state must be fp32, got {sorted(str(dtype) for dtype in floating_dtypes)}")
+
+    _sync_ema_model(ema_model, model, accelerator)
+    started = False
+    with torch.no_grad():
+        ema_model.model.embed_tokens.weight.fill_(1.0)
+        model.model.embed_tokens.weight.fill_(2.0)
+
+    started = _maybe_update_ema_model(
+        ema_model,
+        model,
+        accelerator,
+        decay=0.5,
+        next_step=4,
+        update_after_step=5,
+        ema_started=started,
+    )
+    if started:
+        raise RuntimeError("EMA should not start before ema_update_after_step.")
+    if not torch.allclose(ema_model.model.embed_tokens.weight, torch.ones_like(ema_model.model.embed_tokens.weight)):
+        raise RuntimeError("EMA changed before ema_update_after_step.")
+
+    started = _maybe_update_ema_model(
+        ema_model,
+        model,
+        accelerator,
+        decay=0.5,
+        next_step=5,
+        update_after_step=5,
+        ema_started=started,
+    )
+    if not started:
+        raise RuntimeError("EMA did not start at ema_update_after_step.")
+    expected_sync = torch.full_like(ema_model.model.embed_tokens.weight, 2.0)
+    if not torch.allclose(ema_model.model.embed_tokens.weight, expected_sync):
+        raise RuntimeError("EMA start should sync current weights before averaging.")
+
+    with torch.no_grad():
+        model.model.embed_tokens.weight.fill_(4.0)
+    _maybe_update_ema_model(
+        ema_model,
+        model,
+        accelerator,
+        decay=0.5,
+        next_step=6,
+        update_after_step=5,
+        ema_started=started,
+    )
+    expected_ema = torch.full_like(ema_model.model.embed_tokens.weight, 3.0)
+    if not torch.allclose(ema_model.model.embed_tokens.weight, expected_ema):
+        raise RuntimeError("EMA did not average after the delayed sync step.")
+
+    class TiedSmokeModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = torch.nn.Embedding(2, 2)
+            self.head = torch.nn.Linear(2, 2, bias=False)
+            self.head.weight = self.embed.weight
+
+    tied_model = TiedSmokeModel().to(device)
+    tied_ema = _create_ema_model(tied_model, config).to(device)
+    if tied_ema.embed.weight.data_ptr() != tied_ema.head.weight.data_ptr():
+        raise RuntimeError("Tied smoke model lost weight tying in EMA copy.")
+    with torch.no_grad():
+        tied_model.embed.weight.fill_(10.0)
+        tied_ema.embed.weight.zero_()
+    _update_ema_model(tied_ema, tied_model, accelerator, decay=0.9)
+    tied_value = float(tied_ema.embed.weight.flatten()[0].item())
+    if abs(tied_value - 1.0) > 1.0e-6:
+        raise RuntimeError(f"Tied EMA weight was updated more than once: got {tied_value}")
+
+    return {
+        "floating_dtype": "torch.float32",
+        "delay_sync_value": float(expected_sync.flatten()[0].item()),
+        "post_start_ema_value": float(expected_ema.flatten()[0].item()),
+        "tied_single_update_value": tied_value,
+    }
+
+
 def save_and_reload(model, ema_model, config, output_dir, batch, device):
     accelerator = SmokeAccelerator(device)
     hf_dir = output_dir / "hf_model-smoke"
@@ -291,6 +393,7 @@ def main():
 
     ema_model = _create_ema_model(model, config)
     _sync_ema_model(ema_model, model, SmokeAccelerator(device))
+    ema_regression = verify_ema_precision_and_delay(device)
 
     train_loss = run_train_step(model, batch)
     _update_ema_model(ema_model, model, SmokeAccelerator(device), decay=float(config.training.ema_decay))
@@ -302,6 +405,7 @@ def main():
     report = {
         "device": str(device),
         "train_loss": train_loss,
+        "ema_regression": ema_regression,
         "ema_validation": validation,
         "reload": reload_metrics,
     }

@@ -425,6 +425,7 @@ def _create_ema_model(model, config):
     if not _ema_enabled(config):
         return None
     ema_model = copy.deepcopy(model)
+    ema_model.float()
     ema_model.eval()
     for param in ema_model.parameters():
         param.requires_grad_(False)
@@ -453,6 +454,7 @@ def _sync_ema_model(ema_model, model, accelerator) -> None:
 def _update_ema_model(ema_model, model, accelerator, decay: float) -> None:
     source_state = accelerator.unwrap_model(model).state_dict()
     ema_state = ema_model.state_dict()
+    updated_floating_values = set()
     for name, ema_value in ema_state.items():
         source_value = source_state[name].detach().to(
             device=ema_value.device,
@@ -460,9 +462,34 @@ def _update_ema_model(ema_model, model, accelerator, decay: float) -> None:
             non_blocking=True,
         )
         if torch.is_floating_point(ema_value):
+            storage_key = (ema_value.device, ema_value.data_ptr())
+            if storage_key in updated_floating_values:
+                continue
+            updated_floating_values.add(storage_key)
             ema_value.mul_(decay).add_(source_value, alpha=1.0 - decay)
         else:
             ema_value.copy_(source_value)
+
+
+@torch.no_grad()
+def _maybe_update_ema_model(
+    ema_model,
+    model,
+    accelerator,
+    decay: float,
+    next_step: int,
+    update_after_step: int,
+    ema_started: bool,
+) -> bool:
+    if ema_model is None:
+        return ema_started
+    if next_step < update_after_step:
+        return ema_started
+    if not ema_started and update_after_step > 0:
+        _sync_ema_model(ema_model, model, accelerator)
+        return True
+    _update_ema_model(ema_model, model, accelerator, decay)
+    return True
 
 
 def _ema_state_path(config, global_step) -> Path:
@@ -612,10 +639,12 @@ def main():
     ema_model = _create_ema_model(model, config)
     ema_decay_value = _ema_decay(config) if ema_model is not None else None
     ema_update_after_step = int(config.training.get("ema_update_after_step", 0))
+    if ema_update_after_step < 0:
+        raise ValueError(f"ema_update_after_step must be >= 0, got {ema_update_after_step}")
     if ema_model is not None:
         logger.info(
             "EMA enabled: "
-            f"decay={ema_decay_value:g}, update_after_step={ema_update_after_step}, "
+            f"decay={ema_decay_value:g}, update_after_step={ema_update_after_step}, dtype=fp32, "
             f"validate={bool(config.training.get('ema_validate', True))}, "
             f"save_adapter={bool(config.training.get('ema_save_adapter', True))}, "
             f"save_hf_model={bool(config.training.get('ema_save_hf_model', True))}"
@@ -767,12 +796,24 @@ def main():
         global_step = 0
         resume_step = 0
 
+    ema_started = False
     if ema_model is not None:
+        loaded_ema_state = False
         if resume_checkpoint_dir and _load_ema_state_if_available(ema_model, resume_checkpoint_dir):
             ema_model.to(accelerator.device)
+            loaded_ema_state = True
         else:
             _sync_ema_model(ema_model, model, accelerator)
             logger.info("Initialized EMA weights from the current training model.")
+        ema_started = global_step >= ema_update_after_step
+        if ema_started:
+            source = "loaded checkpoint" if loaded_ema_state else "current training model"
+            logger.info(f"EMA is active at global_step={global_step} from {source}.")
+        else:
+            logger.info(
+                "EMA updates are delayed until "
+                f"global_step={ema_update_after_step}; validation and adapter saves will use the training model until then."
+            )
         ema_model.eval()
 
     ##################################
@@ -979,8 +1020,20 @@ def main():
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
-                if ema_model is not None and (global_step + 1) >= ema_update_after_step:
-                    _update_ema_model(ema_model, model, accelerator, ema_decay_value)
+                if ema_model is not None:
+                    next_step = global_step + 1
+                    was_ema_started = ema_started
+                    ema_started = _maybe_update_ema_model(
+                        ema_model,
+                        model,
+                        accelerator,
+                        ema_decay_value,
+                        next_step,
+                        ema_update_after_step,
+                        ema_started,
+                    )
+                    if ema_started and not was_ema_started and accelerator.is_main_process:
+                        logger.info(f"Started EMA at global_step={next_step} by syncing current model weights.")
 
                 # 记录梯度范数 (可选)
                 if (global_step + 1) % config.experiment.log_grad_norm_every == 0 and accelerator.is_main_process:
@@ -1016,6 +1069,7 @@ def main():
                 }
                 if ema_model is not None:
                     logs["ema/decay"] = ema_decay_value
+                    logs["ema/started"] = float(ema_started)
                 if is_multimodal and pack_stats is not None:
                     valid_tokens, image_tokens, padding_tokens, packed_len = pack_stats.tolist()
                     logs["pack/valid_tokens"] = valid_tokens
@@ -1068,24 +1122,26 @@ def main():
 
             # Checkpointing
             if global_step % config.experiment.save_every == 0:
+                active_ema_model = ema_model if ema_started else None
                 save_checkpoint(model, config, accelerator, global_step)
-                _save_ema_state(ema_model, config, accelerator, global_step)
+                _save_ema_state(active_ema_model, config, accelerator, global_step)
                 adapter_model = (
-                    ema_model
-                    if ema_model is not None and bool(config.training.get("ema_save_adapter", True))
+                    active_ema_model
+                    if active_ema_model is not None and bool(config.training.get("ema_save_adapter", True))
                     else model
                 )
                 _save_image_flow_adapter(adapter_model, config, accelerator, global_step)
             
             if global_step % config.experiment.save_hfmodel_every == 0:
+                active_ema_model = ema_model if ema_started else None
                 save_hf_model(model, tokenizer, config, accelerator, global_step)
-                _save_ema_hf_model(ema_model, tokenizer, config, accelerator, global_step)
+                _save_ema_hf_model(active_ema_model, tokenizer, config, accelerator, global_step)
                 
             # Validation
             if global_step % config.experiment.val_every == 0:
                 eval_model = (
                     ema_model
-                    if ema_model is not None and bool(config.training.get("ema_validate", True))
+                    if ema_model is not None and ema_started and bool(config.training.get("ema_validate", True))
                     else model
                 )
                 validate(eval_model, val_dataloader, selfless_sampler, accelerator, global_step, config)
@@ -1110,12 +1166,13 @@ def main():
                 break
 
     accelerator.wait_for_everyone()
+    active_ema_model = ema_model if ema_started else None
     save_hf_model(model, tokenizer, config, accelerator, "final")
-    _save_ema_hf_model(ema_model, tokenizer, config, accelerator, "final")
-    _save_ema_state(ema_model, config, accelerator, "final")
+    _save_ema_hf_model(active_ema_model, tokenizer, config, accelerator, "final")
+    _save_ema_state(active_ema_model, config, accelerator, "final")
     adapter_model = (
-        ema_model
-        if ema_model is not None and bool(config.training.get("ema_save_adapter", True))
+        active_ema_model
+        if active_ema_model is not None and bool(config.training.get("ema_save_adapter", True))
         else model
     )
     _save_image_flow_adapter(adapter_model, config, accelerator, "final")
