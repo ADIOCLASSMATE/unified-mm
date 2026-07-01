@@ -37,6 +37,14 @@ def parse_args():
             "mp_rank_00_model_states.pt file with a 'module' key or a plain state_dict."
         ),
     )
+    parser.add_argument(
+        "--ema_state",
+        default="",
+        help=(
+            "Optional EMA state to load after model_state/adapter. Supports checkpoint "
+            "ema_state.pt files with a 'state_dict' key or a plain state_dict."
+        ),
+    )
     parser.add_argument("--output_dir", default="output/manual_flow_validation")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=42)
@@ -199,6 +207,37 @@ def masked_mse_and_rms(pred: torch.Tensor, target: torch.Tensor, mask_hw: torch.
     }
 
 
+def sequence_mixer_context(
+    target: torch.Tensor,
+    span_sigma: torch.Tensor,
+    local_positions: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    sigma_row = span_sigma.to(device=target.device, dtype=torch.float32).unsqueeze(0)
+    positions = local_positions.to(device=target.device, dtype=torch.long).unsqueeze(0)
+    return {
+        "context_latents": target.unsqueeze(0),
+        "context_mask": sigma_row.unsqueeze(1) < sigma_row.unsqueeze(2),
+        "query_positions": positions,
+        "context_positions": positions,
+    }
+
+
+def flat_query_mixer_context(
+    target: torch.Tensor,
+    span_sigma: torch.Tensor,
+    local_positions: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    query_count = target.shape[0]
+    sigma_values = span_sigma.to(device=target.device, dtype=torch.float32)
+    positions = local_positions.to(device=target.device, dtype=torch.long)
+    return {
+        "context_latents": target.unsqueeze(0).expand(query_count, -1, -1).contiguous(),
+        "context_mask": (sigma_values.unsqueeze(0) < sigma_values.unsqueeze(1)).unsqueeze(1),
+        "query_positions": positions,
+        "context_positions": positions.unsqueeze(0).expand(query_count, -1).contiguous(),
+    }
+
+
 def _migrate_head_state(model, head_state: dict[str, torch.Tensor]):
     target = model.image_flow_head.state_dict()
     load_state = {}
@@ -329,6 +368,36 @@ def load_model_state(model, model_state_path: str):
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     return {
         "model_state": str(path),
+        "keys": len(state_dict),
+        "missing": list(missing),
+        "unexpected": list(unexpected),
+    }
+
+
+def load_ema_state(model, ema_state_path: str):
+    if not ema_state_path:
+        return {"ema_state": None}
+    path = Path(ema_state_path)
+    if path.is_dir():
+        candidate = path / "ema_state.pt"
+        if candidate.exists():
+            path = candidate
+    if not path.exists():
+        raise FileNotFoundError(path)
+    state = torch.load(path, map_location="cpu")
+    if isinstance(state, dict) and "state_dict" in state:
+        state_dict = state["state_dict"]
+        global_step = state.get("global_step")
+        decay = state.get("decay")
+    else:
+        state_dict = state
+        global_step = None
+        decay = None
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    return {
+        "ema_state": str(path),
+        "global_step": global_step,
+        "decay": decay,
         "keys": len(state_dict),
         "missing": list(missing),
         "unexpected": list(unexpected),
@@ -552,6 +621,8 @@ def main():
     )
     print(f"Loading model state: {args.model_state or 'none'}")
     model_state_report = load_model_state(model, args.model_state)
+    print(f"Loading EMA state: {args.ema_state or 'none'}")
+    ema_state_report = load_ema_state(model, args.ema_state)
     model = model.to(device).eval()
     print("Loading KL16 VAE...")
     vae = load_vae(config, device, args.vae_dtype)
@@ -618,6 +689,7 @@ def main():
     metrics = {
         "adapter": adapter_report,
         "model_state": model_state_report,
+        "ema_state": ema_state_report,
         "config": args.config,
         "model_path": str(config.model.model_path),
         "sampling_steps": str(args.sampling_steps),
@@ -653,6 +725,7 @@ def main():
                     local_positions,
                 )
             target = image_latents[batch_idx, start:end].to(dtype=z.dtype)
+            span_sigma = sigma[batch_idx, start:end].to(device=device, dtype=torch.float32)
             torch.manual_seed(args.seed + 2000 + sample_idx)
             full_sample = model.sample_image_flow_with_cfg(
                 z,
@@ -660,6 +733,7 @@ def main():
                 temperature=args.temperature,
                 cfg=args.cfg,
                 solver=args.flow_solver,
+                **flat_query_mixer_context(target, span_sigma, local_positions),
             ).to(dtype=target.dtype)
 
             sample_metrics = {
@@ -674,10 +748,15 @@ def main():
                 t = torch.full((target.shape[0],), time_value, device=device, dtype=torch.float32)
                 noise = torch.randn_like(target)
                 t_view = t.view(-1, 1).to(dtype=target.dtype)
-                x_t = (1.0 - t_view) * target + t_view * noise
-                v_target = noise - target
-                v_pred = model.image_flow_head.velocity(x_t, t, z).to(dtype=target.dtype)
-                x0_est = x_t - t_view * v_pred
+                x_t = (1.0 - t_view) * noise + t_view * target
+                v_target = target - noise
+                v_pred = model.image_flow_head.velocity(
+                    x_t.unsqueeze(0),
+                    t.unsqueeze(0),
+                    z.unsqueeze(0),
+                    **sequence_mixer_context(target, span_sigma, local_positions),
+                ).squeeze(0).to(dtype=target.dtype)
+                x0_est = x_t + (1.0 - t_view) * v_pred
                 sample_metrics["probes"][str(time_value)] = {
                     "v_mse": float(F.mse_loss(v_pred.float(), v_target.float()).item()),
                     "x0_est_mse": float(F.mse_loss(x0_est.float(), target.float()).item()),
