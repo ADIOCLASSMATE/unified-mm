@@ -70,7 +70,6 @@ class ImageTokenEmbedder(nn.Module):
         self,
         latent_dim,
         hidden_size,
-        projector_width=None,
         image_tokens_per_img=256,
         initializer_range=0.02,
     ):
@@ -637,7 +636,6 @@ class Qwen3Model(Qwen3PreTrainedModel):
         self.image_token_embedder = ImageTokenEmbedder(
             self.image_latent_dim,
             config.hidden_size,
-            getattr(config, "image_projector_width", None),
             getattr(config, "image_tokens_per_img", 256),
             getattr(config, "initializer_range", 0.02),
         )

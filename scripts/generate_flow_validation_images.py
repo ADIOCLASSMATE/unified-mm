@@ -3,7 +3,14 @@ import argparse
 import importlib.util
 import json
 import math
+import os
 from pathlib import Path
+
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
+os.environ.setdefault("DIFFUSERS_OFFLINE", "1")
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 
 import torch
 import torch.nn.functional as F
@@ -554,12 +561,11 @@ def refine_single_stream_latents(
         seq_positions = torch.cat(seq_positions)
         local_positions = torch.cat(local_positions)
 
-        z = model._prepare_image_flow_condition(hidden[sample_indices, seq_positions], local_positions)
+        z = model._prepare_image_flow_condition(hidden[sample_indices, seq_positions])
         z_uncond = None
         if uncond_hidden is not None:
             z_uncond = model._prepare_image_flow_condition(
-                uncond_hidden[sample_indices, seq_positions],
-                local_positions,
+                uncond_hidden[sample_indices, seq_positions]
             )
         torch.manual_seed(seed + 17_171 + round_idx)
         pred = model.sample_image_flow_with_cfg(
@@ -717,12 +723,11 @@ def main():
     with torch.no_grad():
         for sample_idx, (batch_idx, start, end) in sample_iter:
             local_positions = torch.arange(end - start, device=device, dtype=torch.long)
-            z = model._prepare_image_flow_condition(output.last_hidden_state[batch_idx, start:end], local_positions)
+            z = model._prepare_image_flow_condition(output.last_hidden_state[batch_idx, start:end])
             z_uncond = None
             if uncond_output is not None:
                 z_uncond = model._prepare_image_flow_condition(
-                    uncond_output.last_hidden_state[batch_idx, start:end],
-                    local_positions,
+                    uncond_output.last_hidden_state[batch_idx, start:end]
                 )
             target = image_latents[batch_idx, start:end].to(dtype=z.dtype)
             span_sigma = sigma[batch_idx, start:end].to(device=device, dtype=torch.float32)

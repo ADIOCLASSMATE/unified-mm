@@ -1,6 +1,6 @@
 experiment:
-    project: "selfless-flow-stage0-imagenet-full-from-qwen3base-latentmix"
-    name: "imagenet-full-classcond-latentmix-flow-from-qwen3base-8xh200-b1024"
+    project: "selfless-flow-stage0-imagenet-full-from-qwen3base-ablation-image-embedder-nonorm"
+    name: "imagenet-full-classcond-flow-qwen3base-image-embedder-nonorm-8xh200-b1024"
     wandb_project: "unified-mm"
     output_dir: "output"
     save_every: 5000
@@ -15,7 +15,7 @@ experiment:
     validation_image_samples: 4
     validation_flow_temperature: 1.0
     validation_flow_cfg: 2.0
-    validation_flow_cfg_schedule: "linear"
+    validation_flow_cfg_schedule: "constant"
     validation_flow_solver: "heun"
     validation_flow_probe_times: [0.25, 0.5, 0.75, 0.95]
     validation_vae_dtype: "fp32"
@@ -26,7 +26,7 @@ experiment:
     validation_single_stream_order_strategies:
         - "causal_sigma"
         - "spatial_halton"
-    validation_mar_root: "/inspire/hdd/global_user/wanjiaxin-253108030048/code/mar"
+    validation_vae_module_root: "/inspire/hdd/global_user/wanjiaxin-253108030048/code/mar"
     validation_vae_path: "public/vae/mar-kl16/kl16.ckpt"
     validation_vae_scaling_factor: 0.2325
     resume_from_checkpoint: none
@@ -42,13 +42,14 @@ model:
     continuous_image_latents: true
     image_tokens_per_img: 256
     image_latent_dim: 16
+    image_token_embedder_norm: "none"
+    image_token_embedder_init_mode: "balanced"
+    image_token_embedder_latent_rms: 1.0
     image_generation_head_type: "flow"
     image_flow_depth: 8
     image_flow_width: 1280
     image_flow_num_sampling_steps: "100"
     image_flow_batch_mul: 4
-    image_flow_condition_norm: "rms"
-    image_flow_condition_norm_eps: 1.0e-6
     image_flow_time_scale: 1000.0
     image_flow_time_sampling: "logit_normal"
     image_flow_logit_mean: 0.0
@@ -61,6 +62,9 @@ model:
     image_flow_latent_mixer_dropout: 0.0
     image_flow_latent_mixer_zero_init_gate: true
     image_input_noise_strength: 1.0e-2
+    image_input_noise_strength_std: 0.0
+    image_input_noise_strength_min: null
+    image_input_noise_strength_max: null
     image_uncond_prob: 0.1
     reinitialize_image_modules: true
     pretrained_image_flow_adapter: none

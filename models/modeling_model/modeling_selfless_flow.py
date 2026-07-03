@@ -19,6 +19,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 import os
 from typing import Callable, Optional, Union
 
@@ -79,28 +80,77 @@ class ImageTokenEmbedder(nn.Module):
         self,
         latent_dim,
         hidden_size,
-        projector_width=None,
         image_tokens_per_img=256,
         initializer_range=0.02,
+        norm_mode="layernorm",
+        init_mode="default",
+        latent_rms=1.0,
     ):
         super().__init__()
         self.latent_dim = int(latent_dim)
         self.hidden_size = int(hidden_size)
         self.image_tokens_per_img = int(image_tokens_per_img)
         self.initializer_range = float(initializer_range)
+        self.norm_mode = str(norm_mode or "layernorm").lower()
+        self.init_mode = str(init_mode or "default").lower()
+        self.latent_rms = float(latent_rms)
         self.z_proj = nn.Linear(self.latent_dim, self.hidden_size, bias=True)
         self.z_proj_ln = nn.LayerNorm(self.hidden_size, eps=1e-6)
         pos_embed = torch.empty(self.image_tokens_per_img, self.hidden_size)
         self.register_buffer("image_pos_embed", pos_embed.clone())
-        self.register_buffer("flow_pos_embed", pos_embed.clone())
+        if self._uses_learned_image_pos_gain():
+            self.image_pos_gain = nn.Parameter(torch.ones(()))
+        else:
+            self.register_parameter("image_pos_gain", None)
+        self.last_init_stats = None
         self._reset_parameters()
 
     def _reset_parameters(self):
-        _normal_init_fp32_(self.z_proj.weight, mean=0.0, std=self.initializer_range)
+        self._reset_position_buffers()
+        weight_std = self.initializer_range
+        init_stats = {
+            "init_mode": self.init_mode,
+            "z_proj_weight_std": float(weight_std),
+            "image_pos_gain": None,
+            "latent_rms": float(self.latent_rms),
+        }
+        if self._uses_balanced_no_norm_init():
+            latent_rms = max(float(self.latent_rms), 1e-6)
+            component_rms = self.initializer_range / math.sqrt(2.0)
+            weight_std = component_rms / (math.sqrt(float(self.latent_dim)) * latent_rms)
+            init_stats.update(
+                {
+                    "component_rms": float(component_rms),
+                    "z_proj_weight_std": float(weight_std),
+                    "latent_rms": float(latent_rms),
+                }
+            )
+            if self.image_pos_gain is not None:
+                if self.image_pos_embed.is_meta or self.image_pos_gain.is_meta:
+                    init_stats["image_pos_rms"] = None
+                    init_stats["image_pos_gain"] = None
+                else:
+                    image_pos_rms = self.image_pos_embed.detach().float().pow(2).mean().sqrt()
+                    pos_gain = 0.0
+                    if torch.isfinite(image_pos_rms) and float(image_pos_rms.item()) > 0.0:
+                        pos_gain = float(component_rms / float(image_pos_rms.item()))
+                    with torch.no_grad():
+                        self.image_pos_gain.fill_(pos_gain)
+                    init_stats["image_pos_rms"] = float(image_pos_rms.item())
+                    init_stats["image_pos_gain"] = float(pos_gain)
+        elif self.image_pos_gain is not None:
+            if self.image_pos_gain.is_meta:
+                init_stats["image_pos_gain"] = None
+            else:
+                with torch.no_grad():
+                    self.image_pos_gain.fill_(1.0)
+                init_stats["image_pos_gain"] = 1.0
+
+        _normal_init_fp32_(self.z_proj.weight, mean=0.0, std=float(weight_std))
         nn.init.zeros_(self.z_proj.bias)
         nn.init.ones_(self.z_proj_ln.weight)
         nn.init.zeros_(self.z_proj_ln.bias)
-        self._reset_position_buffers()
+        self.last_init_stats = init_stats
 
     def _reset_position_buffers(self):
         device = self.z_proj.weight.device
@@ -112,7 +162,6 @@ class ImageTokenEmbedder(nn.Module):
             device=device,
         )
         self.image_pos_embed = pos_embed.clone()
-        self.flow_pos_embed = pos_embed.clone()
 
     def _reset_image_slots(self):
         self._reset_parameters()
@@ -120,6 +169,42 @@ class ImageTokenEmbedder(nn.Module):
     @property
     def weight_dtype(self):
         return self.z_proj.weight.dtype
+
+    def _uses_post_norm(self) -> bool:
+        if self.norm_mode in {"layernorm", "layer_norm", "ln"}:
+            return True
+        if self.norm_mode in {"none", "false", "off", "no_norm", "nonorm", ""}:
+            return False
+        raise ValueError(
+            f"Unknown image_token_embedder_norm={self.norm_mode!r}; "
+            "expected layernorm or none."
+        )
+
+    def _apply_post_norm(self, x):
+        if self._uses_post_norm():
+            return self.z_proj_ln(x)
+        return x
+
+    def _uses_balanced_no_norm_init(self) -> bool:
+        if self.init_mode in {"default", "standard", "normal", ""}:
+            return False
+        if self.init_mode in {"balanced", "balanced_pos_gain", "initializer_range"}:
+            if self._uses_post_norm():
+                raise ValueError("image_token_embedder_init_mode='balanced' requires image_token_embedder_norm='none'.")
+            return True
+        raise ValueError(
+            f"Unknown image_token_embedder_init_mode={self.init_mode!r}; "
+            "expected default or balanced."
+        )
+
+    def _uses_learned_image_pos_gain(self) -> bool:
+        return self.init_mode in {"balanced", "balanced_pos_gain", "initializer_range"} and not self._uses_post_norm()
+
+    def _scale_image_pos(self, pos):
+        if self.image_pos_gain is None:
+            return pos
+        gain = self.image_pos_gain.to(device=pos.device, dtype=pos.dtype)
+        return pos * gain
 
     def _positions(self, local_positions, device):
         if local_positions is None:
@@ -144,8 +229,9 @@ class ImageTokenEmbedder(nn.Module):
         x = self.z_proj(x)
         local_positions = self._positions(local_positions, x.device)
         if local_positions is not None:
-            x = x + self._lookup_pos_embed(self.image_pos_embed, local_positions, x.dtype)
-        return self.z_proj_ln(x)
+            pos = self._lookup_pos_embed(self.image_pos_embed, local_positions, x.dtype)
+            x = x + self._scale_image_pos(pos)
+        return self._apply_post_norm(x)
 
     def embed_mask(self, local_positions, mask_embedding):
         local_positions = self._positions(local_positions, mask_embedding.device)
@@ -153,14 +239,9 @@ class ImageTokenEmbedder(nn.Module):
             raise ValueError("local_positions must be provided when embedding image mask tokens.")
         x = mask_embedding.to(dtype=self.z_proj.weight.dtype)
         x = x.expand(local_positions.shape + (x.shape[-1],))
-        x = x + self._lookup_pos_embed(self.image_pos_embed, local_positions, x.dtype)
-        return self.z_proj_ln(x)
-
-    def add_flow_pos(self, z, local_positions=None):
-        local_positions = self._positions(local_positions, z.device)
-        if local_positions is None:
-            return z
-        return z + self._lookup_pos_embed(self.flow_pos_embed, local_positions, z.dtype)
+        pos = self._lookup_pos_embed(self.image_pos_embed, local_positions, x.dtype)
+        x = x + self._scale_image_pos(pos)
+        return self._apply_post_norm(x)
 
     def forward(self, latents, local_positions=None):
         return self.embed_latents(latents, local_positions=local_positions)
@@ -279,42 +360,6 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
         return hidden_states
     hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
-
-
-def _normalize_image_flow_condition(
-    z: torch.Tensor,
-    norm_mode: str = "none",
-    eps: float = 1e-6,
-) -> torch.Tensor:
-    norm_mode = str(norm_mode or "none").lower()
-    if norm_mode in {"none", "false", "off", ""}:
-        return z
-    z_float = z.float()
-    if norm_mode in {"rms", "rmsnorm"}:
-        rms = z_float.pow(2).mean(dim=-1, keepdim=True).sqrt()
-        return (z_float / rms.clamp_min(float(eps))).to(z.dtype)
-    if norm_mode in {"layernorm", "layer_norm", "ln"}:
-        return F.layer_norm(z_float, (z.shape[-1],)).to(z.dtype)
-    raise ValueError(
-        f"Unknown image_flow_condition_norm={norm_mode!r}; "
-        "expected rms, layer_norm, or none."
-    )
-
-
-def _image_flow_condition_norm_config(obj) -> tuple[str, float]:
-    config = getattr(obj, "config", None)
-    norm_mode = getattr(obj, "image_flow_condition_norm", None)
-    if norm_mode is None and config is not None:
-        norm_mode = getattr(config, "image_flow_condition_norm", None)
-    if norm_mode is None:
-        norm_mode = "none"
-
-    eps = getattr(obj, "image_flow_condition_norm_eps", None)
-    if eps is None and config is not None:
-        eps = getattr(config, "image_flow_condition_norm_eps", None)
-    if eps is None:
-        eps = 1e-6
-    return str(norm_mode).lower(), float(eps)
 
 
 def compute_image_local_positions(
@@ -627,9 +672,11 @@ class Qwen3Model(Qwen3PreTrainedModel):
         self.image_token_embedder = ImageTokenEmbedder(
             self.image_latent_dim,
             config.hidden_size,
-            getattr(config, "image_projector_width", None),
             getattr(config, "image_tokens_per_img", 256),
             getattr(config, "initializer_range", 0.02),
+            getattr(config, "image_token_embedder_norm", "layernorm"),
+            getattr(config, "image_token_embedder_init_mode", "default"),
+            getattr(config, "image_token_embedder_latent_rms", 1.0),
         )
         self.image_input_noise_strength = float(getattr(config, "image_input_noise_strength", 1.0e-2))
         self.image_input_noise_strength_std = float(getattr(config, "image_input_noise_strength_std", 0.0))
@@ -657,13 +704,17 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
         # Initialize weights and apply final processing
         self.post_init()
-        self.image_token_embedder._reset_parameters()
+        self.reset_image_token_embedder()
 
     def get_input_embeddings(self):
         return self.embed_tokens
 
     def set_input_embeddings(self, new_embeddings):
         self.embed_tokens = new_embeddings
+
+    def reset_image_token_embedder(self):
+        self.image_token_embedder._reset_parameters()
+        return self.image_token_embedder.last_init_stats
 
     def _image_mask_token_id(self) -> int:
         return int(getattr(self.config, "image_mask_token_id", self.config.mask_token_id))
@@ -898,12 +949,6 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         self.lambda_image = getattr(config, "lambda_image", 0.5)
         self.lambda_text = getattr(config, "lambda_text", 1.0)
         self.image_flow_batch_mul = int(getattr(config, "image_flow_batch_mul", 1))
-        self.image_flow_condition_norm = str(
-            getattr(config, "image_flow_condition_norm", "rms")
-        ).lower()
-        self.image_flow_condition_norm_eps = float(
-            getattr(config, "image_flow_condition_norm_eps", 1e-6)
-        )
         self.image_flow_mlp_ratio = float(getattr(config, "image_flow_mlp_ratio", 1.0))
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.image_flow_condition_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=True)
@@ -931,12 +976,15 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         # Initialize weights and apply final processing
         self.post_init()
         self.image_flow_head.net.initialize_weights()
-        self.image_token_embedder._reset_parameters()
+        self.reset_image_token_embedder()
         self._reset_image_flow_condition_proj()
 
     @property
     def image_token_embedder(self) -> ImageTokenEmbedder:
         return self.model.image_token_embedder
+
+    def reset_image_token_embedder(self):
+        return self.model.reset_image_token_embedder()
 
     def image_local_positions(self, token_types: torch.Tensor) -> torch.Tensor:
         return self.model.image_local_positions(token_types)
@@ -950,15 +998,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
     def _prepare_image_flow_condition(
         self,
         z: torch.Tensor,
-        image_local_positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if image_local_positions is not None:
-            z = self.image_token_embedder.add_flow_pos(z, image_local_positions)
-        z = _normalize_image_flow_condition(
-            z,
-            self.image_flow_condition_norm,
-            self.image_flow_condition_norm_eps,
-        )
         z = z.to(
             device=self.image_flow_condition_proj.weight.device,
             dtype=self.image_flow_condition_proj.weight.dtype,
@@ -1159,8 +1199,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                             span_context_latents.append(context_image_latents_for_loss[batch_idx, run])
                             span_conditions.append(
                                 self._prepare_image_flow_condition(
-                                    hidden_states[batch_idx, run],
-                                    positions,
+                                    hidden_states[batch_idx, run]
                                 )
                             )
                             if flow_sigma is None:
@@ -1413,16 +1452,9 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         next_image_order = torch.zeros(len(spans), device=device, dtype=torch.float32)
         k = max(1, int(parallel_rate))
         order_strategy = str(order_strategy or "condition_norm").lower()
-        condition_norm_mode, condition_norm_eps = _image_flow_condition_norm_config(self)
         replay_original_sigma = order_strategy in {"sigma", "sigma_replay", "causal_sigma"}
         def _condition(hidden_values: torch.Tensor, local_positions: torch.Tensor) -> torch.Tensor:
-            if hasattr(self, "_prepare_image_flow_condition"):
-                return self._prepare_image_flow_condition(hidden_values, local_positions)
-            return _normalize_image_flow_condition(
-                hidden_values,
-                condition_norm_mode,
-                condition_norm_eps,
-            )
+            return self._prepare_image_flow_condition(hidden_values)
 
         def _flow_context(sample_indices: torch.Tensor, local_positions: torch.Tensor) -> dict[str, torch.Tensor]:
             sample_index_list = sample_indices.detach().to(device="cpu").tolist()

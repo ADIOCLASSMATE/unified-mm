@@ -4,7 +4,13 @@ import random
 import re
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-os.environ["TOKENIZERS_PARALLELISM"] = "true"
+os.environ.setdefault("WANDB_MODE", "offline")
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
+os.environ.setdefault("DIFFUSERS_OFFLINE", "1")
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "true")
 import json
 import logging
 import math
@@ -82,8 +88,7 @@ def load_model_tokenizer(config: OmegaConf, logger=None):
         "image_latent_dim", "continuous_image_latents",
         "image_generation_head_type", "image_flow_width", "image_flow_depth",
         "image_flow_num_sampling_steps", "image_flow_batch_mul",
-        "image_flow_grad_checkpointing", "image_flow_condition_norm",
-        "image_flow_condition_norm_eps", "image_flow_time_scale",
+        "image_flow_grad_checkpointing", "image_flow_time_scale",
         "image_flow_time_sampling", "image_flow_logit_mean", "image_flow_logit_std",
         "image_flow_time_eps", "image_flow_time_uniform_mix", "image_flow_solver",
         "image_flow_mlp_ratio",
@@ -91,7 +96,9 @@ def load_model_tokenizer(config: OmegaConf, logger=None):
         "image_flow_latent_mixer_zero_init_gate",
         "image_input_noise_strength", "image_input_noise_strength_std",
         "image_input_noise_strength_min", "image_input_noise_strength_max",
-        "image_uncond_prob", "image_projector_width",
+        "image_uncond_prob",
+        "image_token_embedder_norm", "image_token_embedder_init_mode",
+        "image_token_embedder_latent_rms",
     )
 
     model_config = AutoConfig.from_pretrained(config.model.model_path, trust_remote_code=True)
@@ -285,7 +292,10 @@ def _reinitialize_image_modules(model, config):
     if hasattr(model, "image_flow_head") and hasattr(model.image_flow_head, "net"):
         model.image_flow_head.net.initialize_weights()
         reset_modules.append("image_flow_head")
-    if hasattr(model, "image_token_embedder") and hasattr(model.image_token_embedder, "_reset_parameters"):
+    if hasattr(model, "reset_image_token_embedder"):
+        model.reset_image_token_embedder()
+        reset_modules.append("image_token_embedder")
+    elif hasattr(model, "image_token_embedder") and hasattr(model.image_token_embedder, "_reset_parameters"):
         model.image_token_embedder._reset_parameters()
         reset_modules.append("image_token_embedder")
     if hasattr(model, "_reset_image_flow_condition_proj"):
@@ -603,7 +613,7 @@ def main():
         wandb_init_kwargs = {
             "name": config.experiment.name,
             "resume": "allow",
-            "mode": os.environ.get("WANDB_MODE", "online"),
+            "mode": os.environ.get("WANDB_MODE", "offline"),
         }
         accelerator.init_trackers(
             config.experiment.wandb_project,
@@ -1526,31 +1536,6 @@ def _save_validation_flow_images(
             return
 
         hidden_states = output.last_hidden_state
-        uncond_hidden_states = None
-        if flow_cfg != 1.0:
-            image_uncond_rows = torch.ones(
-                input_ids.shape[0],
-                device=accelerator.device,
-                dtype=torch.bool,
-            )
-            attention_mask = get_selfless_mask(
-                sigma=sigma,
-                seq_len=input_ids.shape[1],
-                device=accelerator.device,
-                input_ids=input_ids,
-                token_types=token_types,
-                boi_token_id=int(config.model.boi_token_id),
-                image_uncond_rows=image_uncond_rows,
-            )
-            uncond_output = unwrapped(
-                X0_input_ids=input_ids,
-                attention_mask=attention_mask,
-                token_types=token_types,
-                image_latents=image_latents,
-                calculate_likelihood=True,
-                return_logits=False,
-            )
-            uncond_hidden_states = uncond_output.last_hidden_state
         pred_latents = []
         probe_x0_latents = {time_value: [] for time_value in probe_times}
         probe_v_mse = {time_value: [] for time_value in probe_times}
@@ -1596,21 +1581,14 @@ def _save_validation_flow_images(
             target = image_latents[b, start:end].to(device=accelerator.device)
             span_sigma = sigma[b, start:end].to(device=accelerator.device, dtype=torch.float32)
             z = unwrapped._prepare_image_flow_condition(
-                hidden_states[b, start:end].to(device=accelerator.device),
-                local_positions,
+                hidden_states[b, start:end].to(device=accelerator.device)
             )
-            z_uncond = None
-            if uncond_hidden_states is not None:
-                z_uncond = unwrapped._prepare_image_flow_condition(
-                    uncond_hidden_states[b, start:end].to(device=accelerator.device),
-                    local_positions,
-                )
             pred = unwrapped.sample_image_flow_with_cfg(
                 z,
-                z_uncond=z_uncond,
+                z_uncond=None,
                 temperature=flow_temperature,
-                cfg=flow_cfg,
-                cfg_schedule=flow_cfg_schedule,
+                cfg=1.0,
+                cfg_schedule="constant",
                 solver=flow_solver,
                 **_flat_query_mixer_context(target, span_sigma, local_positions),
             )
@@ -1712,6 +1690,7 @@ def _save_validation_flow_images(
 
         target_rms = raw_target_latents.float().pow(2).mean().sqrt().item()
         logs = {
+            "val/flow_full_sample_cfg": 1.0,
             "val/flow_full_sample_latent_mse": F.mse_loss(raw_pred_latents.float(), raw_target_latents.float()).item(),
             "val/flow_full_sample_latent_rms": raw_pred_latents.float().pow(2).mean().sqrt().item(),
             "val/flow_target_latent_rms": target_rms,

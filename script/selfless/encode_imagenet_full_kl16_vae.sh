@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+source "${REPO_ROOT}/script/offline_env.sh"
+
 IMAGENET_TRAIN_DIR="${IMAGENET_TRAIN_DIR:-/inspire/dataset/imagenet/v1/ILSVRC/Data/CLS-LOC/train}"
 OUTPUT_DIR="${OUTPUT_DIR:-public/datasets/imagenet_full/vae_latents_mar_kl16}"
 MANIFEST_JSONL="${MANIFEST_JSONL:-public/datasets/imagenet_full/manifest.jsonl}"
@@ -39,7 +42,7 @@ run_encode_shard() {
   local manifest_arg="${MANIFEST_JSONL}"
 
   if [[ -n "${gpu_id}" ]]; then
-    CUDA_VISIBLE_DEVICES="${gpu_id}" uv run python scripts/imagenet_encode_kl16_vae.py \
+    CUDA_VISIBLE_DEVICES="${gpu_id}" python scripts/imagenet_encode_kl16_vae.py \
       --source_mode imagenet_train \
       --imagenet_train_dir "${IMAGENET_TRAIN_DIR}" \
       --output_dir "${OUTPUT_DIR}" \
@@ -55,7 +58,7 @@ run_encode_shard() {
       "${save_args[@]}" \
       "${overwrite_args[@]}"
   else
-    uv run python scripts/imagenet_encode_kl16_vae.py \
+    python scripts/imagenet_encode_kl16_vae.py \
       --source_mode imagenet_train \
       --imagenet_train_dir "${IMAGENET_TRAIN_DIR}" \
       --output_dir "${OUTPUT_DIR}" \
@@ -114,7 +117,7 @@ else
 fi
 
 if [[ "${MERGE_CACHE}" == "1" ]]; then
-  uv run python pretrain/merge_flow_latent_shards.py \
+  python pretrain/merge_flow_latent_shards.py \
     --shard_dir "${CACHE_SHARD_DIR}" \
     --output_path "${CACHE_PATH}" \
     --mmap

@@ -2,15 +2,15 @@
 Download OmniCorpus-CC parquet shards from Hugging Face.
 
 Examples:
-    uv run python scripts/omnicorpus_download.py \
+    python scripts/omnicorpus_download.py \
         --include "data/CC-MAIN-2016-26/shard_0.parquet" \
         --local_dir public/datasets/omnicorpus/raw
 
-    uv run python scripts/omnicorpus_download.py \
+    python scripts/omnicorpus_download.py \
         --max_shards 4 \
         --local_dir public/datasets/omnicorpus/raw
 
-    uv run python scripts/omnicorpus_download.py \
+    python scripts/omnicorpus_download.py \
         --local_dir public/datasets/omnicorpus/raw \
         --max_workers 2 \
         --retries 20 \

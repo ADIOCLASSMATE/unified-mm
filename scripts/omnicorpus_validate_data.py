@@ -2,11 +2,11 @@
 Validate OmniCorpus JSONL/image/token snapshots.
 
 Fast default:
-    uv run python scripts/omnicorpus_validate_data.py \
+    python scripts/omnicorpus_validate_data.py \
         --docs_jsonl public/datasets/omnicorpus/docs/snapshots/train_20260623_064740_2946703docs.jsonl
 
 Strict scan:
-    uv run python scripts/omnicorpus_validate_data.py --full --verify-images
+    python scripts/omnicorpus_validate_data.py --full --verify-images
 
 The default mode checks small head/tail samples and uses the checkpoint, when
 present, for global document/image-id counts. Use --full when you need exact

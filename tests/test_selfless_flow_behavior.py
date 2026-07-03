@@ -121,16 +121,10 @@ class FakeCallableFlowHead(nn.Module):
         return loss
 
 
-class FakeConditionEmbedder(nn.Module):
-    def add_flow_pos(self, z, image_local_positions):
-        return z
-
-
 class FakeCausalInnerModel(nn.Module):
     def __init__(self, hidden_size):
         super().__init__()
         self.hidden_size = int(hidden_size)
-        self.image_token_embedder = FakeConditionEmbedder()
 
     def forward(self, X0_input_ids, **kwargs):
         bsz, seq_len = X0_input_ids.shape
@@ -537,7 +531,7 @@ class SelflessFlowBehaviorTest(unittest.TestCase):
             self.assertTrue(torch.equal(val_item["image_latents"], latents[val_idx]))
 
     def test_image_token_embedder_handles_bfloat16_weights(self):
-        projector = ImageTokenEmbedder(latent_dim=4, hidden_size=8, projector_width=16, image_tokens_per_img=4).to(dtype=torch.bfloat16)
+        projector = ImageTokenEmbedder(latent_dim=4, hidden_size=8, image_tokens_per_img=4).to(dtype=torch.bfloat16)
         latents = torch.randn(5, 4, dtype=torch.float32)
         positions = torch.tensor([0, 1, 2, 3, 0])
         out = projector(latents, positions)

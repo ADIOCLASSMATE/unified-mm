@@ -11,7 +11,7 @@ lm_head. The model/dataloader applies image_offset only at runtime when
 unified_head=true.
 
 Example:
-    uv run python scripts/omnicorpus_preprocess_training.py \
+    python scripts/omnicorpus_preprocess_training.py \
         --docs_jsonl public/datasets/omnicorpus/docs/snapshots/train_20260623_064740_2946703docs.jsonl \
         --max_docs 2000 \
         --work_dir public/datasets/omnicorpus/pretrain_smoke

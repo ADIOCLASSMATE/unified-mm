@@ -100,13 +100,10 @@ def tiny_config() -> Qwen3Config:
     config.eoi_token_id = 12
     config.image_latent_dim = 4
     config.image_tokens_per_img = 4
-    config.image_projector_width = 16
     config.image_flow_width = 8
     config.image_flow_depth = 1
     config.image_flow_num_sampling_steps = "2"
     config.image_flow_batch_mul = 1
-    config.image_flow_condition_norm = "rms"
-    config.image_flow_condition_norm_eps = 1e-6
     config.image_flow_time_scale = 1000.0
     config.image_flow_time_sampling = "uniform"
     config.image_flow_time_eps = 1e-4
@@ -203,10 +200,7 @@ def run_validation(model, batch):
     if not torch.isfinite(loss):
         raise RuntimeError(f"validation loss is not finite: {loss.item()}")
 
-    z = model._prepare_image_flow_condition(
-        output.last_hidden_state[0, 2:6],
-        torch.arange(4, device=device),
-    )
+    z = model._prepare_image_flow_condition(output.last_hidden_state[0, 2:6])
     sampled = model.sample_image_flow_with_cfg(z, temperature=1.0, cfg=1.0)
     if tuple(sampled.shape) != (4, 4):
         raise RuntimeError(f"unexpected flow sample shape: {tuple(sampled.shape)}")

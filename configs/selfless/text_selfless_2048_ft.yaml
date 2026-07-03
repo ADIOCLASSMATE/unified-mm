@@ -24,14 +24,11 @@ model:
     continuous_image_latents: true
     image_tokens_per_img: 256
     image_latent_dim: 16
-    image_projector_width: 2048
     image_generation_head_type: "flow"
     image_flow_depth: 8
     image_flow_width: 1280
     image_flow_num_sampling_steps: "100"
     image_flow_batch_mul: 4
-    image_flow_condition_norm: "rms"
-    image_flow_condition_norm_eps: 1.0e-6
     image_flow_time_scale: 1000.0
     image_flow_time_sampling: "logit_normal"
     image_flow_logit_mean: 0.0

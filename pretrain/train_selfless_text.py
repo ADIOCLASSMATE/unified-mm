@@ -7,7 +7,13 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-os.environ["TOKENIZERS_PARALLELISM"] = "true"
+os.environ.setdefault("WANDB_MODE", "offline")
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
+os.environ.setdefault("DIFFUSERS_OFFLINE", "1")
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "true")
 
 import torch
 from accelerate import Accelerator
@@ -169,7 +175,7 @@ def main():
         wandb_init_kwargs = {
             "name": config.experiment.name,
             "resume": "allow",
-            "mode": os.environ.get("WANDB_MODE", "online"),
+            "mode": os.environ.get("WANDB_MODE", "offline"),
         }
         accelerator.init_trackers(
             config.experiment.wandb_project,

@@ -15,6 +15,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$SCRIPT_DIR"
+source "$SCRIPT_DIR/script/offline_env.sh"
 
 DOCS_JSONL="${DOCS_JSONL:-public/datasets/omnicorpus/docs/snapshots/train_20260623_064740_2946703docs.jsonl}"
 IMAGE_DIR="${IMAGE_DIR:-public/datasets/omnicorpus/images}"
@@ -90,7 +91,7 @@ fi
 
 if [ "$SKIP_VALIDATE" != "1" ]; then
     echo "=== Step 1/4: validate JSONL/JPG snapshot sample ==="
-    uv run python scripts/omnicorpus_validate_data.py \
+    python scripts/omnicorpus_validate_data.py \
         --docs_jsonl "$DOCS_JSONL" \
         --image_dir "$IMAGE_DIR" \
         --sample_docs "$VALIDATE_SAMPLE_DOCS"
@@ -107,7 +108,7 @@ if [ "$SKIP_ENCODE" != "1" ]; then
         echo "  shard ${shard_idx}/${NUM_SHARDS} on GPU ${device}: ${log_file}"
         (
             export CUDA_VISIBLE_DEVICES="$device"
-            uv run python scripts/omnicorpus_encode_images.py \
+            python scripts/omnicorpus_encode_images.py \
                 --docs_jsonl "$DOCS_JSONL" \
                 --image_dir "$IMAGE_DIR" \
                 --output_dir "$IMAGE_TOKEN_DIR" \
@@ -147,7 +148,7 @@ if [ "$SKIP_ARROW" != "1" ]; then
         exit 1
     fi
     if [ "$ARROW_WORKERS" -le 1 ]; then
-        uv run python scripts/omnicorpus_build_arrow.py \
+        python scripts/omnicorpus_build_arrow.py \
             --config "$CONFIG" \
             --docs_jsonl "$DOCS_JSONL" \
             --image_token_dir "$IMAGE_TOKEN_DIR" \
@@ -163,7 +164,7 @@ if [ "$SKIP_ARROW" != "1" ]; then
             log_file="${LOG_DIR}/build_arrow_worker_${worker_idx}.log"
             echo "  worker ${worker_idx}/${ARROW_WORKERS}: ${log_file}"
             (
-                uv run python scripts/omnicorpus_build_arrow.py \
+                python scripts/omnicorpus_build_arrow.py \
                     --config "$CONFIG" \
                     --docs_jsonl "$DOCS_JSONL" \
                     --image_token_dir "$IMAGE_TOKEN_DIR" \
@@ -198,7 +199,7 @@ if [ ! -d "$ARROW_DIR" ] || ! find "$ARROW_DIR" -maxdepth 1 -type d -name 'shard
     echo "No Arrow shards found in $ARROW_DIR; skipping quick check because SKIP_ARROW=$SKIP_ARROW."
     exit 0
 fi
-uv run python - <<PY
+python - <<PY
 from pathlib import Path
 from datasets import load_from_disk
 
@@ -225,7 +226,7 @@ if image_ids:
 print("quick_check: OK")
 PY
 
-uv run python - <<PY
+python - <<PY
 import json
 from pathlib import Path
 

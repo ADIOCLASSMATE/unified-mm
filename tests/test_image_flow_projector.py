@@ -1,4 +1,6 @@
+import math
 import os
+import tempfile
 
 os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
 
@@ -27,7 +29,6 @@ def tiny_qwen3_config():
     config.image_flow_width = 8
     config.image_flow_depth = 1
     config.image_flow_num_sampling_steps = "2"
-    config.image_flow_condition_norm = "none"
     return config
 
 
@@ -123,28 +124,126 @@ def test_image_token_embedder_uses_fixed_2d_sincos_positions():
     state_keys = set(embedder.state_dict().keys())
 
     assert "image_pos_embed.weight" not in state_keys
-    assert "flow_pos_embed.weight" not in state_keys
+    assert "flow_pos_embed" not in state_keys
     assert embedder.image_pos_embed.shape == (4, 8)
-    assert embedder.flow_pos_embed.shape == (4, 8)
 
     positions = torch.arange(4)
-    zeros = torch.zeros(4, 8)
-    with_flow_pos = embedder.add_flow_pos(zeros, positions)
+    zeros = torch.zeros(4, 4)
+    with_image_pos = embedder(zeros, positions)
 
-    assert torch.allclose(with_flow_pos, embedder.flow_pos_embed)
+    assert with_image_pos.shape == (4, 8)
     assert not torch.allclose(embedder.image_pos_embed[0], embedder.image_pos_embed[1])
 
 
 def test_image_token_embedder_rebuilds_fixed_positions_on_reset():
     embedder = ImageTokenEmbedder(latent_dim=4, hidden_size=8, image_tokens_per_img=4)
-    positions = torch.arange(4)
-    zeros = torch.zeros(4, 8)
-    expected = embedder.add_flow_pos(zeros, positions)
+    expected = embedder.image_pos_embed.clone()
 
-    embedder.flow_pos_embed.fill_(torch.finfo(torch.float32).max)
+    embedder.image_pos_embed.fill_(torch.finfo(torch.float32).max)
     embedder._reset_position_buffers()
-    actual = embedder.add_flow_pos(zeros, positions)
+    actual = embedder.image_pos_embed
 
     assert torch.isfinite(actual).all()
     assert actual.abs().max() <= 1.0
     assert torch.allclose(actual, expected)
+
+
+def test_no_norm_image_token_embedder_uses_balanced_pos_gain_init():
+    config = tiny_qwen3_config()
+    config.image_token_embedder_norm = "none"
+    config.image_token_embedder_init_mode = "balanced"
+    config.image_token_embedder_latent_rms = 1.0
+    model = Qwen3ForCausalLM(config)
+
+    generator = torch.Generator().manual_seed(0)
+    latents = torch.randn(1024, config.image_latent_dim, generator=generator)
+    positions = torch.arange(config.image_tokens_per_img).repeat(1024 // config.image_tokens_per_img)
+    image_embeds = model.image_token_embedder(latents, positions).detach().float()
+    image_rms = image_embeds.pow(2).mean(dim=-1).sqrt().mean()
+    target_rms = float(config.initializer_range)
+    stats = model.image_token_embedder.last_init_stats
+
+    assert stats is not None
+    assert stats["init_mode"] == "balanced"
+    assert math.isclose(stats["component_rms"], target_rms / math.sqrt(2.0), rel_tol=1e-6)
+    assert isinstance(model.image_token_embedder.image_pos_gain, torch.nn.Parameter)
+    assert math.isclose(model.image_token_embedder.image_pos_gain.item(), stats["image_pos_gain"], rel_tol=1e-6)
+    assert image_rms < target_rms * 3.0
+    assert image_rms > target_rms * 0.3
+    assert image_rms < 0.2
+
+
+def test_balanced_pos_gain_scales_image_pos():
+    embedder = ImageTokenEmbedder(
+        latent_dim=4,
+        hidden_size=8,
+        image_tokens_per_img=4,
+        norm_mode="none",
+        init_mode="balanced",
+        latent_rms=1.0,
+    )
+    positions = torch.arange(4)
+    zeros_latent = torch.zeros(4, 4)
+
+    with torch.no_grad():
+        embedder.z_proj.weight.zero_()
+        embedder.z_proj.bias.zero_()
+
+    image_pos = embedder(zeros_latent, positions)
+
+    assert torch.allclose(
+        image_pos,
+        embedder.image_pos_embed * embedder.image_pos_gain.to(embedder.image_pos_embed.dtype),
+    )
+
+
+def test_image_flow_condition_does_not_add_position():
+    config = tiny_qwen3_config()
+    model = Qwen3ForCausalLM(config)
+
+    z = torch.randn(4, config.hidden_size)
+    expected = model.image_flow_condition_proj(
+        z.to(
+            device=model.image_flow_condition_proj.weight.device,
+            dtype=model.image_flow_condition_proj.weight.dtype,
+        )
+    )
+    no_pos = model._prepare_image_flow_condition(z)
+
+    assert torch.allclose(no_pos, expected)
+
+
+def test_legacy_flow_pos_embed_key_is_unexpected():
+    config = tiny_qwen3_config()
+    model = Qwen3ForCausalLM(config)
+    state = model.state_dict()
+    state["model.image_token_embedder.flow_pos_embed"] = torch.zeros(
+        config.image_tokens_per_img,
+        config.hidden_size,
+    )
+
+    clone = Qwen3ForCausalLM(config)
+    missing, unexpected = clone.load_state_dict(state, strict=False)
+
+    assert missing == []
+    assert unexpected == ["model.image_token_embedder.flow_pos_embed"]
+
+
+def test_balanced_image_pos_gain_round_trips_with_pretrained_save():
+    config = tiny_qwen3_config()
+    config.image_token_embedder_norm = "none"
+    config.image_token_embedder_init_mode = "balanced"
+    config.image_token_embedder_latent_rms = 1.0
+    model = Qwen3ForCausalLM(config)
+    with torch.no_grad():
+        model.image_token_embedder.image_pos_gain.fill_(0.123)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model.save_pretrained(tmpdir, safe_serialization=True)
+        loaded = Qwen3ForCausalLM.from_pretrained(tmpdir, trust_remote_code=True)
+
+    assert loaded.config.image_token_embedder_norm == "none"
+    assert loaded.config.image_token_embedder_init_mode == "balanced"
+    assert math.isclose(float(loaded.config.image_token_embedder_latent_rms), 1.0)
+    assert isinstance(loaded.image_token_embedder.image_pos_gain, torch.nn.Parameter)
+    assert math.isclose(loaded.image_token_embedder.image_pos_gain.item(), 0.123, rel_tol=1e-6)

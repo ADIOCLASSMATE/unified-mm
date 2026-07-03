@@ -5,9 +5,9 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "${REPO_ROOT}/script/offline_env.sh"
 
 NUM_GPUS="${NUM_GPUS:-8}"
-CONFIG="${CONFIG:-configs/selfless/imagenet_flow_full_from_qwen3base.yaml}"
+CONFIG="${CONFIG:-configs/ablation/imagenet_flow_full_from_qwen3base_image_embedder_nonorm.yaml}"
 ACCELERATE_CONFIG="${ACCELERATE_CONFIG:-accelerate_configs/8_gpus_deepspeed_zero2.yaml}"
-PORT="${PORT:-8890}"
+PORT="${PORT:-8891}"
 WANDB_MODE="${WANDB_MODE:-offline}"
 
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}" \

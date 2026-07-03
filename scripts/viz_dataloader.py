@@ -2,8 +2,8 @@
 Visualize OmniCorpus multimodal dataloader samples.
 
 Usage:
-    uv run python scripts/viz_dataloader.py
-    uv run python scripts/viz_dataloader.py --config configs/selfless/omnicorpus.yaml
+    python scripts/viz_dataloader.py
+    python scripts/viz_dataloader.py --config configs/selfless/omnicorpus.yaml
 """
 
 import argparse

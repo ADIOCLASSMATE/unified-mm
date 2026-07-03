@@ -7,8 +7,15 @@ from a numeric image directory, and writes one .pt file per image id.
 
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import Iterable, List, Tuple
+
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
+os.environ.setdefault("DIFFUSERS_OFFLINE", "1")
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 
 import torch
 from PIL import Image
