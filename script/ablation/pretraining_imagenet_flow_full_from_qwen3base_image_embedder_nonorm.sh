@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-source "${REPO_ROOT}/script/offline_env.sh"
+cd /inspire/hdd/global_user/wanjiaxin-253108030048/code/unified-mm
+source "./script/offline_env.sh"
 
 NUM_GPUS="${NUM_GPUS:-8}"
 CONFIG="${CONFIG:-configs/ablation/imagenet_flow_full_from_qwen3base_image_embedder_nonorm.yaml}"
