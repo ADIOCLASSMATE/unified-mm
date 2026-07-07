@@ -67,7 +67,7 @@ def parse_args():
     parser.add_argument("--cfg_schedule", choices=["constant", "linear"], default="constant")
     parser.add_argument("--flow_solver", choices=["heun", "euler"], default="heun")
     parser.add_argument("--parallel_rate", type=int, default=4)
-    parser.add_argument("--strategies", default="spatial_halton,spatial_uniform,random,hidden_norm,latent_proj_cosine")
+    parser.add_argument("--strategies", default="causal_sigma,spatial_halton,spatial_uniform,random,hidden_norm,latent_proj_cosine")
     parser.add_argument("--vae_dtype", choices=["fp32", "fp16"], default="fp32")
     parser.add_argument("--fid_feature", type=int, default=2048)
     parser.add_argument("--is_splits", type=int, default=10)
@@ -103,7 +103,7 @@ def parse_args():
     parser.add_argument(
         "--allow_sigma_strategies",
         action="store_true",
-        help="Allow sigma/causal_sigma strategies. Disabled by default because real generation cannot know training sigma.",
+        help="Allow sigma/sigma_replay strategies. Disabled by default because real generation cannot know training sigma.",
     )
     parser.add_argument("--no_progress", action="store_true")
     return parser.parse_args()
@@ -259,7 +259,7 @@ def finite_or_none(value: float) -> float | None:
 def validate_strategies(strategies: list[str], allow_sigma_strategies: bool) -> None:
     if allow_sigma_strategies:
         return
-    forbidden = {"sigma", "sigma_replay", "causal_sigma"}
+    forbidden = {"sigma", "sigma_replay"}
     found = sorted({strategy.lower() for strategy in strategies} & forbidden)
     if found:
         raise ValueError(
