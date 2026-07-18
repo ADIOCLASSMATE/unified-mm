@@ -530,6 +530,80 @@ class SelflessFlowBehaviorTest(unittest.TestCase):
             self.assertTrue(torch.equal(train_item["image_latents"], expected_train))
             self.assertTrue(torch.equal(val_item["image_latents"], latents[val_idx]))
 
+    def test_imagenet_flow_cache_supports_fixed_validation_samples_per_class(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            latents = torch.arange(24 * 4, dtype=torch.float16).view(24, 4, 1)
+            img_ids = torch.arange(24)
+            torch.save({"latents": latents, "img_ids": img_ids}, root / "latents.pt")
+            manifest_lines = []
+            mapping_lines = []
+            for class_idx in range(3):
+                synset = f"n0000000{class_idx}"
+                mapping_lines.append(f"{synset} class{class_idx}\n")
+                for sample_idx in range(8):
+                    img_id = class_idx * 8 + sample_idx
+                    manifest_lines.append(f'{{"img_id": {img_id}, "synset": "{synset}"}}\n')
+            (root / "manifest.jsonl").write_text("".join(manifest_lines))
+            (root / "mapping.txt").write_text("".join(mapping_lines))
+
+            config = OmegaConf.create(
+                {
+                    "model": {
+                        "boi_token_id": 11,
+                        "eoi_token_id": 12,
+                        "mask_token_id": 13,
+                        "image_tokens_per_img": 4,
+                        "image_latent_dim": 1,
+                    },
+                    "dataset": {
+                        "params": {
+                            "cache_path": str(root / "latents.pt"),
+                            "manifest_jsonl": str(root / "manifest.jsonl"),
+                            "synset_mapping_path": str(root / "mapping.txt"),
+                            "conditioning_mode": "class_image",
+                            "image_tokens_per_img": 4,
+                            "image_latent_dim": 1,
+                            "max_seq_length": 16,
+                            "pad_to_length": 16,
+                            "val_ratio": 0.01,
+                            "val_samples_per_class": 3,
+                            "split_strategy": "stratified",
+                            "split_seed": 7,
+                        },
+                        "preprocessing": {"max_seq_length": 16},
+                    },
+                    "training": {
+                        "batch_size": 4,
+                        "dataloader_workers": 0,
+                        "seed": 7,
+                    },
+                }
+            )
+
+            train_loader, val_loader = build_imagenet_flow_cache_dataloaders(
+                config,
+                FakeTokenizer(),
+            )
+            dataset = train_loader.dataset.dataset
+
+            def synset_counts(indices):
+                counts = {}
+                for idx in indices:
+                    img_id = int(dataset.img_ids[idx].item())
+                    synset = dataset.synsets[img_id]
+                    counts[synset] = counts.get(synset, 0) + 1
+                return counts
+
+            self.assertEqual(
+                synset_counts(val_loader.dataset.indices),
+                {"n00000000": 3, "n00000001": 3, "n00000002": 3},
+            )
+            self.assertEqual(
+                synset_counts(train_loader.dataset.indices),
+                {"n00000000": 5, "n00000001": 5, "n00000002": 5},
+            )
+
     def test_image_token_embedder_handles_bfloat16_weights(self):
         projector = ImageTokenEmbedder(latent_dim=4, hidden_size=8, image_tokens_per_img=4).to(dtype=torch.bfloat16)
         latents = torch.randn(5, 4, dtype=torch.float32)
@@ -961,6 +1035,7 @@ class SelflessFlowBehaviorTest(unittest.TestCase):
             config=types.SimpleNamespace(image_tokens_per_img=4, boi_token_id=11),
             model=FakeInnerModel(hidden_size=hidden_size),
             image_flow_head=FakeImageFlowHead(latent_dim=latent_dim),
+            _prepare_image_flow_condition=lambda hidden: hidden,
         )
 
         input_ids = torch.tensor([[10, 11, 7, 7, 7, 7, 12, 13]])
@@ -1015,6 +1090,7 @@ class SelflessFlowBehaviorTest(unittest.TestCase):
             config=types.SimpleNamespace(image_tokens_per_img=4, boi_token_id=11),
             model=FakeInnerModel(hidden_size=hidden_size),
             image_flow_head=FakeImageFlowHead(latent_dim=latent_dim),
+            _prepare_image_flow_condition=lambda hidden: hidden,
         )
 
         input_ids = torch.tensor([[10, 11, 7, 7, 7, 7, 12, 13]])
@@ -1060,6 +1136,7 @@ class SelflessFlowBehaviorTest(unittest.TestCase):
             config=types.SimpleNamespace(image_tokens_per_img=4, boi_token_id=11),
             model=FakeInnerModel(hidden_size=hidden_size),
             image_flow_head=FakeImageFlowHead(latent_dim=latent_dim),
+            _prepare_image_flow_condition=lambda hidden: hidden,
         )
 
         input_ids = torch.tensor([[10, 11, 7, 7, 7, 7, 12, 13]])

@@ -634,6 +634,7 @@ def _build_split_indices(
     val_ratio: float,
     seed: int,
     strategy: str,
+    val_samples_per_class: Optional[int] = None,
 ) -> Tuple[List[int], List[int]]:
     n_items = len(dataset)
     if n_items <= 0:
@@ -641,6 +642,24 @@ def _build_split_indices(
     val_size = max(1, int(n_items * float(val_ratio)))
     val_size = min(val_size, max(1, n_items - 1))
     strategy = str(strategy or "stratified").lower()
+    fixed_val_size = (
+        int(val_samples_per_class)
+        if val_samples_per_class is not None
+        else None
+    )
+    if fixed_val_size is not None and fixed_val_size <= 0:
+        raise ValueError(
+            f"val_samples_per_class must be positive, got {val_samples_per_class}"
+        )
+    if fixed_val_size is not None and strategy not in {
+        "stratified",
+        "synset",
+        "stratified_synset",
+    }:
+        raise ValueError(
+            "val_samples_per_class requires a stratified split strategy, "
+            f"got {strategy!r}."
+        )
 
     if strategy in {"contiguous", "tail"}:
         train_size = max(0, n_items - val_size)
@@ -667,8 +686,10 @@ def _build_split_indices(
     if len(groups) <= 1:
         indices = list(range(n_items))
         rng.shuffle(indices)
-        val_indices = indices[:val_size]
-        train_indices = indices[val_size:]
+        single_group_val_size = fixed_val_size if fixed_val_size is not None else val_size
+        single_group_val_size = min(single_group_val_size, max(1, n_items - 1))
+        val_indices = indices[:single_group_val_size]
+        train_indices = indices[single_group_val_size:]
         return train_indices, val_indices
 
     train_indices: List[int] = []
@@ -676,7 +697,10 @@ def _build_split_indices(
     for key in sorted(groups):
         group_indices = list(groups[key])
         rng.shuffle(group_indices)
-        group_val_size = max(1, int(len(group_indices) * float(val_ratio)))
+        if fixed_val_size is not None:
+            group_val_size = fixed_val_size
+        else:
+            group_val_size = max(1, int(len(group_indices) * float(val_ratio)))
         if len(group_indices) > 1:
             group_val_size = min(group_val_size, len(group_indices) - 1)
         else:
@@ -686,6 +710,79 @@ def _build_split_indices(
 
     rng.shuffle(train_indices)
     rng.shuffle(val_indices)
+    return train_indices, val_indices
+
+
+def _load_explicit_split_indices(
+    dataset: ImageNetFlowCacheDataset,
+    split_manifest_jsonl: str,
+) -> Tuple[List[int], List[int]]:
+    """Resolve a shared split manifest by image id.
+
+    This keeps continuous-flow and discrete-VQ ablations on exactly the same
+    train/validation members even when their packed cache row orders differ.
+    """
+
+    path = Path(split_manifest_jsonl)
+    if not path.exists():
+        raise FileNotFoundError(path)
+    index_by_image_id = {
+        int(image_id.item()): index
+        for index, image_id in enumerate(dataset.img_ids)
+    }
+    split_rows: Dict[str, List[Tuple[int, int]]] = {
+        "train": [],
+        "validation": [],
+    }
+    seen: set[int] = set()
+    with path.open() as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            image_id = int(row["img_id"])
+            split = str(row["split"]).lower()
+            if split == "val":
+                split = "validation"
+            if split not in split_rows:
+                raise ValueError(
+                    f"{path}:{line_number} has unsupported split={split!r}"
+                )
+            if image_id in seen:
+                raise ValueError(f"duplicate img_id={image_id} in {path}")
+            if image_id not in index_by_image_id:
+                raise ValueError(
+                    f"{path}:{line_number} img_id={image_id} is absent from cache"
+                )
+            expected_synset = dataset.synsets.get(image_id, "")
+            row_synset = str(row.get("synset", expected_synset))
+            if row_synset != expected_synset:
+                raise ValueError(
+                    f"{path}:{line_number} synset mismatch for img_id={image_id}: "
+                    f"{row_synset!r} != {expected_synset!r}"
+                )
+            split_index = int(row.get("split_index", len(split_rows[split])))
+            split_rows[split].append((split_index, index_by_image_id[image_id]))
+            seen.add(image_id)
+    if seen != set(index_by_image_id):
+        missing = sorted(set(index_by_image_id).difference(seen))
+        raise ValueError(
+            f"{path} does not cover the complete cache; missing {len(missing)} "
+            f"image ids, first={missing[:8]}"
+        )
+    train_indices = [
+        index for _, index in sorted(split_rows["train"], key=lambda item: item[0])
+    ]
+    val_indices = [
+        index
+        for _, index in sorted(
+            split_rows["validation"], key=lambda item: item[0]
+        )
+    ]
+    if not train_indices or not val_indices:
+        raise ValueError(
+            f"{path} must contain non-empty train and validation assignments"
+        )
     return train_indices, val_indices
 
 
@@ -721,14 +818,26 @@ def build_imagenet_flow_cache_dataloaders(config, tokenizer):
     )
 
     val_ratio = params.get("val_ratio", 0.001)
+    val_samples_per_class = params.get("val_samples_per_class", None)
     split_seed = params.get("split_seed", config.training.seed)
     split_strategy = params.get("split_strategy", "stratified")
-    train_indices, val_indices = _build_split_indices(
-        dataset=dataset,
-        val_ratio=float(val_ratio),
-        seed=int(split_seed),
-        strategy=str(split_strategy),
-    )
+    split_manifest_jsonl = params.get("split_manifest_jsonl", None)
+    if split_manifest_jsonl:
+        train_indices, val_indices = _load_explicit_split_indices(
+            dataset, str(split_manifest_jsonl)
+        )
+    else:
+        train_indices, val_indices = _build_split_indices(
+            dataset=dataset,
+            val_ratio=float(val_ratio),
+            seed=int(split_seed),
+            strategy=str(split_strategy),
+            val_samples_per_class=(
+                int(val_samples_per_class)
+                if val_samples_per_class is not None
+                else None
+            ),
+        )
     dataset.set_augmentation_indices(train_indices)
     train_dataset = Subset(dataset, train_indices)
     val_dataset = Subset(dataset, val_indices)

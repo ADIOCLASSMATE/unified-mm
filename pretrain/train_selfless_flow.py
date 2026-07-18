@@ -545,12 +545,12 @@ def _save_ema_hf_model(ema_model, tokenizer, config, accelerator, global_step) -
     logger.info(f"Saved EMA HF model to {save_path}")
 
 
-def _unwrap_omnicorpus_dataset(dataset):
+def _unwrap_epoch_dataset(dataset):
     ds = dataset
     if hasattr(ds, "set_epoch"):
         return ds
     while hasattr(ds, "dataset"):
-        if hasattr(ds, "set_epoch") or hasattr(ds, "_packs") or ds.__class__.__name__ == "OmniCorpusPackedDataset":
+        if hasattr(ds, "set_epoch"):
             return ds
         ds = ds.dataset
     return ds
@@ -758,7 +758,7 @@ def main():
     logger.info("Preparing model, optimizer and dataloaders")
 
     # Store ref to underlying packed dataset for epoch-level reshuffling/repacking.
-    ds = _unwrap_omnicorpus_dataset(train_dataloader.dataset)
+    ds = _unwrap_epoch_dataset(train_dataloader.dataset)
     _is_multimodal_ds = hasattr(ds, 'set_epoch')
 
     if hasattr(train_dataloader, "prepare_with_accelerator"):
@@ -1176,27 +1176,27 @@ def main():
                 break
 
     accelerator.wait_for_everyone()
-    active_ema_model = ema_model if ema_started else None
-    save_hf_model(model, tokenizer, config, accelerator, "final")
-    _save_ema_hf_model(active_ema_model, tokenizer, config, accelerator, "final")
-    _save_ema_state(active_ema_model, config, accelerator, "final")
-    adapter_model = (
-        active_ema_model
-        if active_ema_model is not None and bool(config.training.get("ema_save_adapter", True))
-        else model
-    )
-    _save_image_flow_adapter(adapter_model, config, accelerator, "final")
+    if bool(config.experiment.get("save_final", True)):
+        active_ema_model = ema_model if ema_started else None
+        save_hf_model(model, tokenizer, config, accelerator, "final")
+        _save_ema_hf_model(active_ema_model, tokenizer, config, accelerator, "final")
+        _save_ema_state(active_ema_model, config, accelerator, "final")
+        adapter_model = (
+            active_ema_model
+            if active_ema_model is not None and bool(config.training.get("ema_save_adapter", True))
+            else model
+        )
+        _save_image_flow_adapter(adapter_model, config, accelerator, "final")
     accelerator.end_training()
 
 
 @torch.no_grad()
 def validate(model, val_dataloader, selfless_sampler, accelerator, global_step, config=None):
     model.eval()  # DeepSpeed requires explicit eval mode for no_grad forward
-    ds = _unwrap_omnicorpus_dataset(val_dataloader.dataset)
+    ds = _unwrap_epoch_dataset(val_dataloader.dataset)
     is_multimodal = (
         hasattr(ds, "set_epoch")
-        or hasattr(ds, "_packs")
-        or ds.__class__.__name__ in {"OmniCorpusPackedDataset", "ImageNetFlowCacheDataset"}
+        or ds.__class__.__name__ == "ImageNetFlowCacheDataset"
     )
 
     try:

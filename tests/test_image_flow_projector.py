@@ -36,6 +36,9 @@ def test_image_projectors_use_normal_init_with_nextstep_mlp_ratio():
     config = tiny_qwen3_config()
     model = Qwen3ForCausalLM(config)
 
+    assert model.image_token_embedder.norm_mode == "none"
+    assert model.image_token_embedder.init_mode == "balanced"
+    assert isinstance(model.image_token_embedder.image_pos_gain, torch.nn.Parameter)
     assert isinstance(model.image_flow_condition_proj, torch.nn.Linear)
     assert not torch.allclose(model.image_token_embedder.z_proj.weight, torch.zeros_like(model.image_token_embedder.z_proj.weight))
     assert not torch.allclose(model.image_flow_condition_proj.weight, torch.eye(config.hidden_size))
@@ -60,6 +63,15 @@ def test_image_projectors_use_normal_init_with_nextstep_mlp_ratio():
         model.image_flow_head.net.blocks[0].adaLN_modulation[-1].weight,
         torch.zeros_like(model.image_flow_head.net.blocks[0].adaLN_modulation[-1].weight),
     )
+
+
+def test_default_image_token_embedder_is_no_norm_balanced():
+    embedder = ImageTokenEmbedder(latent_dim=4, hidden_size=8, image_tokens_per_img=4)
+
+    assert embedder.norm_mode == "none"
+    assert embedder.init_mode == "balanced"
+    assert not embedder._uses_post_norm()
+    assert isinstance(embedder.image_pos_gain, torch.nn.Parameter)
 
 
 def test_image_flow_mlp_ratio_can_widen_resblocks():

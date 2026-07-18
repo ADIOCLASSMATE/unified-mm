@@ -1,20 +1,20 @@
 experiment:
-    project: "selfless-flow-stage0-imagenet-full-from-qwen3base"
-    name: "imagenet-full-classcond-flow-from-qwen3base-8xh200-b1024"
+    project: "selfless-flow-ablation-imagenet100-80ep"
+    name: "imagenet100-balanced-classcond-flow-qwen3base-8gpu-b256-80ep"
     wandb_project: "unified-mm"
     output_dir: "output"
-    save_every: 5000
-    eval_every: 100
-    generate_every: 10000
+    save_every: 8980
+    eval_every: 2245
+    generate_every: 4490
     log_every: 10
-    log_grad_norm_every: 500
-    checkpoints_total_limit: 30
-    save_hfmodel_every: 10000
-    val_every: 1000
-    validation_image_every: 2000
-    validation_image_samples: 4
+    log_grad_norm_every: 449
+    checkpoints_total_limit: 4
+    save_hfmodel_every: 35920
+    val_every: 2245
+    validation_image_every: 4490
+    validation_image_samples: 8
     validation_flow_temperature: 1.0
-    validation_flow_cfg: 2.0
+    validation_flow_cfg: 3.5
     validation_flow_cfg_schedule: "constant"
     validation_flow_solver: "heun"
     validation_flow_probe_times: [0.25, 0.5, 0.75, 0.95]
@@ -22,9 +22,8 @@ experiment:
     validation_save_debug_images: false
     validation_single_stream_images: true
     validation_single_stream_parallel_rate: 1
-    validation_single_stream_order_strategy: "sigma"
+    validation_single_stream_order_strategy: "spatial_halton"
     validation_single_stream_order_strategies:
-        - "causal_sigma"
         - "spatial_halton"
     validation_vae_module_root: "/inspire/hdd/global_user/wanjiaxin-253108030048/code/mar"
     validation_vae_path: "public/vae/mar-kl16/kl16.ckpt"
@@ -72,9 +71,11 @@ model:
 dataset:
     class_name: "ImageNetFlowCacheDataset"
     params:
-        cache_path: "public/datasets/imagenet_full/vae_latents_mar_kl16/flow_latents_all_fp16.pt"
-        manifest_jsonl: "public/datasets/imagenet_full/manifest.jsonl"
+        cache_path: "public/datasets/imagenet_ablation_100c_balanced/vae_latents_mar_kl16/flow_latents_100c_1250pc_fp16.pt"
+        manifest_jsonl: "public/datasets/imagenet_ablation_100c_balanced/manifest.jsonl"
+        split_manifest_jsonl: "public/datasets/imagenet_ablation_100c_balanced/split_seed42_val100.jsonl"
         synset_mapping_path: "public/datasets/imagenet/LOC_synset_mapping.txt"
+        num_classes: 100
         conditioning_mode: "class_image"
         label_text: false
         image_tokens_per_img: 256
@@ -82,7 +83,8 @@ dataset:
         max_seq_length: 320
         pad_to_length: 320
         pad_to_multiple_of: 64
-        val_ratio: 0.01
+        val_ratio: 0.08
+        val_samples_per_class: 100
         split_strategy: "stratified"
         split_seed: 42
         latent_hflip_prob: 0.5
@@ -108,17 +110,17 @@ lr_scheduler:
     params:
         learning_rate: ${optimizer.params.learning_rate}
         warmup_steps: 2000
-        decay_steps: 10000
+        decay_steps: 8980
         min_lr_scale: 0.1
 
 training:
-    batch_size: 64
-    total_batch_size: 1024
+    batch_size: 32
+    total_batch_size: 256
     mixed_precision: "bf16"
     enable_tf32: true
     seed: 42
     dataloader_workers: 8
-    max_train_steps: 500000
+    max_train_steps: 35920
     max_grad_norm: 1.0
     ar_ratio: -1.0
     mc_samples: 16
@@ -133,3 +135,18 @@ training:
     ema_save_adapter: true
     ema_save_hf_model: true
     save_image_flow_adapter: true
+
+evaluation:
+    checkpoint: "output/selfless-flow-ablation-imagenet100-80ep/hf_model-final-ema"
+    model_dtype: "bf16"
+    samples: 10000
+    batch_size: 512
+    sampling_steps: 100
+    temperature: 1.0
+    cfg: 3.5
+    cfg_schedule: "constant"
+    flow_solver: "heun"
+    parallel_rate: 1
+    strategies: "spatial_halton"
+    seed: 42
+    real_stats_path: "public/datasets/imagenet_ablation_100c_balanced/fid_stats/inception_v3_2048_original_256.pt"

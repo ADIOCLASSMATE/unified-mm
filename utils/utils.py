@@ -90,7 +90,16 @@ def flatten_omega_conf(cfg: Any, resolve: bool = False) -> List[Tuple[str, Any]]
 ##################################################
 #              training utils
 ##################################################
-def load_model_tokenizer(config: OmegaConf, logger=None):
+def load_model_tokenizer(
+    config: OmegaConf,
+    logger=None,
+    model_dtype: torch.dtype = torch.bfloat16,
+):
+    if model_dtype not in {torch.bfloat16, torch.float32}:
+        raise ValueError(
+            "model_dtype must be torch.bfloat16 or torch.float32, "
+            f"got {model_dtype}"
+        )
     # TOKENIZER
     tokenizer = AutoTokenizer.from_pretrained(config.model.model_path, fix_mistral_regex=True)
     mask_token = "<|mdm_mask|>"
@@ -223,7 +232,7 @@ def load_model_tokenizer(config: OmegaConf, logger=None):
                 model_config.im_end_token_id = None
         model = model_class(model_config)
         
-        model = model.to(dtype=torch.bfloat16)
+        model = model.to(dtype=model_dtype)
     else:
         if logger is not None:
             logger.info(f"Loading pretrained model weights from: {config.model.model_path}")
@@ -238,7 +247,7 @@ def load_model_tokenizer(config: OmegaConf, logger=None):
         model = model_class.from_pretrained(
             pretrained_model_name_or_path=config.model.model_path,
             config=model_config,
-            dtype=torch.bfloat16, 
+            dtype=model_dtype,
             trust_remote_code=True
         )
 

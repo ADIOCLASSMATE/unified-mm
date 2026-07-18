@@ -16,8 +16,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from omegaconf import OmegaConf
 from PIL import Image
-from torchmetrics.image.fid import FrechetInceptionDistance, NoTrainInceptionV3
-from torchmetrics.image.inception import InceptionScore
+from safetensors import safe_open
 from torchvision import transforms
 from torchvision.utils import save_image
 from tqdm.auto import tqdm
@@ -26,6 +25,13 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from scripts.evaluate_qwen_showo_fid_is import (  # noqa: E402
+    FeatureMoments,
+    InceptionScoreMoments,
+    build_inception_extractor,
+    extract_inception_features,
+    frechet_distance,
+)
 from scripts.generate_flow_validation_images import (  # noqa: E402
     decode_latents,
     load_adapter,
@@ -57,6 +63,12 @@ def parse_args():
     parser.add_argument("--ema_state", default="")
     parser.add_argument("--output_dir", default="output/single_stream_fid_is")
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--model_dtype",
+        choices=("bf16", "fp32"),
+        default="bf16",
+        help="Floating-point dtype used to load and execute the generation model.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--samples", type=int, default=1024)
@@ -66,8 +78,8 @@ def parse_args():
     parser.add_argument("--cfg", type=float, default=1.0)
     parser.add_argument("--cfg_schedule", choices=["constant", "linear"], default="constant")
     parser.add_argument("--flow_solver", choices=["heun", "euler"], default="heun")
-    parser.add_argument("--parallel_rate", type=int, default=4)
-    parser.add_argument("--strategies", default="causal_sigma,spatial_halton,spatial_uniform,random,hidden_norm,latent_proj_cosine")
+    parser.add_argument("--parallel_rate", type=int, default=1)
+    parser.add_argument("--strategies", default="spatial_halton")
     parser.add_argument("--vae_dtype", choices=["fp32", "fp16"], default="fp32")
     parser.add_argument("--fid_feature", type=int, default=2048)
     parser.add_argument("--is_splits", type=int, default=10)
@@ -89,6 +101,14 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--real_stats_path",
+        default="",
+        help=(
+            "Precomputed original-ImageNet Inception moments shared across architectures. "
+            "When set, this overrides --real_source and real images are not re-extracted."
+        ),
+    )
+    parser.add_argument(
         "--imagenet_train_dir",
         default="/inspire/dataset/imagenet/v1/ILSVRC/Data/CLS-LOC/train",
         help="Root used to resolve manifest source paths when --real_source=imagenet_original.",
@@ -105,6 +125,14 @@ def parse_args():
         action="store_true",
         help="Allow sigma/sigma_replay strategies. Disabled by default because real generation cannot know training sigma.",
     )
+    parser.add_argument(
+        "--require_official_protocol",
+        action="store_true",
+        help=(
+            "Fail unless shared real stats, the full matching fake sample count, "
+            "and 10 deterministic IS splits are used."
+        ),
+    )
     parser.add_argument("--no_progress", action="store_true")
     return parser.parse_args()
 
@@ -114,9 +142,21 @@ def init_distributed(requested_device: str):
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     distributed = world_size > 1
+    distributed_env = {
+        key: os.environ.get(key)
+        for key in ("RANK", "WORLD_SIZE", "LOCAL_RANK", "LOCAL_WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT")
+        if os.environ.get(key) is not None
+    }
+    if not distributed and (rank != 0 or local_rank != 0):
+        raise RuntimeError(
+            "Inconsistent distributed environment: got nonzero RANK/LOCAL_RANK "
+            f"but WORLD_SIZE={world_size}. Launch with torchrun/torch.distributed.run "
+            f"so every rank receives WORLD_SIZE, or unset rank env vars. env={distributed_env}"
+        )
 
-    if requested_device != "cpu" and torch.cuda.is_available():
-        if distributed:
+    requested = str(requested_device).lower()
+    if requested != "cpu" and torch.cuda.is_available():
+        if distributed or requested in {"auto", "cuda"}:
             device = torch.device(f"cuda:{local_rank}")
         else:
             device = torch.device(requested_device)
@@ -128,6 +168,35 @@ def init_distributed(requested_device: str):
         backend = "nccl" if device.type == "cuda" else "gloo"
         dist.init_process_group(backend=backend)
     return distributed, rank, world_size, local_rank, device
+
+
+def token_type_debug(token_types: torch.Tensor, image_tokens_per_img: int) -> dict:
+    token_types_cpu = token_types.detach().cpu()
+    image_counts = (token_types_cpu == 1).sum(dim=1).tolist()
+    unique_values, unique_counts = torch.unique(token_types_cpu, return_counts=True)
+    run_lengths = []
+    for row in token_types_cpu:
+        pos = 0
+        while pos < int(row.numel()):
+            if int(row[pos].item()) != 1:
+                pos += 1
+                continue
+            start = pos
+            while pos < int(row.numel()) and int(row[pos].item()) == 1:
+                pos += 1
+            run_lengths.append(pos - start)
+    return {
+        "shape": list(token_types_cpu.shape),
+        "unique_token_types": {
+            str(int(value.item())): int(count.item())
+            for value, count in zip(unique_values, unique_counts)
+        },
+        "image_token_counts_first8": [int(value) for value in image_counts[:8]],
+        "image_token_count_min": int(min(image_counts)) if image_counts else None,
+        "image_token_count_max": int(max(image_counts)) if image_counts else None,
+        "image_run_lengths_first8": [int(value) for value in run_lengths[:8]],
+        "complete_run_count": int(sum(1 for value in run_lengths if value == image_tokens_per_img)),
+    }
 
 
 def distributed_barrier(distributed: bool, device: torch.device):
@@ -256,10 +325,44 @@ def finite_or_none(value: float) -> float | None:
     return value if math.isfinite(value) else None
 
 
+def checkpoint_weight_dtypes(model_path: str | Path) -> list[str]:
+    weights_path = Path(model_path) / "model.safetensors"
+    dtype_names = {
+        "BF16": "bf16",
+        "F32": "fp32",
+        "F16": "fp16",
+    }
+    with safe_open(weights_path, framework="pt", device="cpu") as handle:
+        return sorted(
+            {
+                dtype_names.get(
+                    str(handle.get_slice(key).get_dtype()),
+                    str(handle.get_slice(key).get_dtype()).lower(),
+                )
+                for key in handle.keys()
+            }
+        )
+
+
+def is_official_flow_protocol(
+    *,
+    shared_real_count: int | None,
+    samples: int,
+    is_splits: int,
+    parallel_rate: int,
+) -> bool:
+    return bool(
+        shared_real_count is not None
+        and int(samples) == int(shared_real_count)
+        and int(is_splits) == 10
+        and int(parallel_rate) == 1
+    )
+
+
 def validate_strategies(strategies: list[str], allow_sigma_strategies: bool) -> None:
     if allow_sigma_strategies:
         return
-    forbidden = {"sigma", "sigma_replay"}
+    forbidden = {"sigma", "sigma_replay", "causal_sigma"}
     found = sorted({strategy.lower() for strategy in strategies} & forbidden)
     if found:
         raise ValueError(
@@ -278,46 +381,120 @@ def resolve_inception_weights_path(path: str) -> str | None:
     return str(weights_path)
 
 
-def make_fid_metric(feature: int, weights_path: str | None):
-    return FrechetInceptionDistance(
-        feature=int(feature),
-        normalize=True,
-        feature_extractor_weights_path=weights_path,
+def shared_feature_moments(payload, *, feature: int, device) -> FeatureMoments:
+    stats = payload["stats"]
+    count = int(stats["count"])
+    feature_sum = torch.as_tensor(stats["sum"], dtype=torch.float64, device=device)
+    outer_sum = torch.as_tensor(
+        stats["outer_sum"],
+        dtype=torch.float64,
+        device=device,
     )
-
-
-def make_inception_score_metric(splits: int, weights_path: str | None):
-    if weights_path is None:
-        return InceptionScore(
-            normalize=True,
-            splits=int(splits),
+    if tuple(feature_sum.shape) != (int(feature),):
+        raise ValueError(
+            f"shared real feature sum shape={tuple(feature_sum.shape)}; "
+            f"expected={(int(feature),)}"
         )
-    feature_extractor = NoTrainInceptionV3(
-        name="inception-v3-compat",
-        features_list=["logits_unbiased"],
-        feature_extractor_weights_path=weights_path,
-    )
-    return InceptionScore(
-        feature=feature_extractor,
-        normalize=True,
-        splits=int(splits),
-    )
+    if tuple(outer_sum.shape) != (int(feature), int(feature)):
+        raise ValueError(
+            f"shared real outer-sum shape={tuple(outer_sum.shape)}; "
+            f"expected={(int(feature), int(feature))}"
+        )
+    moments = FeatureMoments.zeros(int(feature), device)
+    moments.count.fill_(count)
+    moments.sum.copy_(feature_sum)
+    moments.outer_sum.copy_(outer_sum)
+    return moments
 
 
-def warm_metric_cache_if_needed(args, distributed: bool, rank: int, device: torch.device, weights_path: str | None):
+def load_shared_original_real_stats(
+    path: str,
+    *,
+    config,
+    fid_feature: int,
+    real_image_size: int,
+    inception_weights_path: str,
+):
+    from scripts.evaluate_qwen_showo_fid_is import (
+        build_expected_real_metadata,
+        feature_metadata,
+        load_fixed_val_records,
+        load_manifest,
+        load_synset_names,
+        metric_transform_metadata,
+        validate_real_stats_metadata,
+    )
+
+    stats_path = Path(path)
+    if not stats_path.is_file():
+        raise FileNotFoundError(stats_path)
+    manifest_path = Path(config.dataset.params.manifest_jsonl)
+    split_manifest_path = Path(config.dataset.params.split_manifest_jsonl)
+    synset_mapping_path = Path(config.dataset.params.synset_mapping_path)
+    records = load_fixed_val_records(
+        load_manifest(manifest_path),
+        split_manifest_path,
+        load_synset_names(synset_mapping_path),
+        expected_classes=int(config.dataset.params.get("num_classes", 100)),
+        expected_samples_per_class=int(
+            config.dataset.params.get("val_samples_per_class", 100)
+        ),
+    )
+    payload = torch.load(stats_path, map_location="cpu")
+    expected = build_expected_real_metadata(
+        manifest_path=manifest_path,
+        split_manifest_path=split_manifest_path,
+        selected_records=records,
+        transform=metric_transform_metadata(int(real_image_size)),
+        feature=feature_metadata(int(fid_feature), inception_weights_path),
+        val_samples_per_class=int(
+            config.dataset.params.get("val_samples_per_class", 100)
+        ),
+        split_seed=int(config.dataset.params.get("split_seed", 42)),
+    )
+    validate_real_stats_metadata(payload["metadata"], expected)
+    if int(payload["stats"]["count"]) != len(records):
+        raise ValueError(
+            f"shared real stats count={payload['stats']['count']} but split has "
+            f"{len(records)} images"
+        )
+    return payload
+
+
+def warm_inception_cache_if_needed(
+    args,
+    distributed: bool,
+    rank: int,
+    device: torch.device,
+    weights_path: str | None,
+):
     if weights_path is not None:
         return
     if not distributed or is_main_process(rank):
-        fid = make_fid_metric(int(args.fid_feature), weights_path).to(device)
-        inception_score = make_inception_score_metric(int(args.is_splits), weights_path).to(device)
-        del fid, inception_score
+        extractor = build_inception_extractor(
+            int(args.fid_feature),
+            weights_path,
+            device,
+        )
+        del extractor
     distributed_barrier(distributed, device)
 
 
 @torch.no_grad()
 def main():
     args = parse_args()
+    torch.set_float32_matmul_precision("highest")
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = True
     distributed, rank, world_size, local_rank, device = init_distributed(args.device)
+    if int(args.samples) < int(world_size):
+        raise ValueError(
+            f"--samples={args.samples} must be at least world_size={world_size}"
+        )
+    if int(args.samples) < int(args.is_splits):
+        raise ValueError(
+            f"--samples={args.samples} must be at least --is_splits={args.is_splits}"
+        )
     progress = not args.no_progress and is_main_process(rank)
     out_dir = Path(args.output_dir)
     if is_main_process(rank):
@@ -343,7 +520,15 @@ def main():
             f"device={device}, strategies={strategies}"
         )
         print("Loading model/tokenizer...")
-    model, tokenizer = load_model_tokenizer(config)
+    requested_model_dtype = {
+        "bf16": torch.bfloat16,
+        "fp32": torch.float32,
+    }[args.model_dtype]
+    stored_checkpoint_dtypes = checkpoint_weight_dtypes(config.model.model_path)
+    model, tokenizer = load_model_tokenizer(
+        config,
+        model_dtype=requested_model_dtype,
+    )
     if is_main_process(rank):
         print(f"Loading adapter: {args.adapter}")
     adapter_report = load_adapter(model, args.adapter)
@@ -354,6 +539,15 @@ def main():
         print(f"Loading EMA state: {args.ema_state or 'none'}")
     ema_state_report = load_ema_state(model, args.ema_state)
     model = model.to(device).eval()
+    parameter_dtypes = sorted(
+        {str(parameter.dtype) for parameter in model.parameters() if parameter.is_floating_point()}
+    )
+    expected_parameter_dtype = str(requested_model_dtype)
+    if parameter_dtypes != [expected_parameter_dtype]:
+        raise RuntimeError(
+            "generation model contains unexpected floating parameter dtypes: "
+            f"requested={expected_parameter_dtype}, actual={parameter_dtypes}"
+        )
 
     if is_main_process(rank):
         print("Loading KL16 VAE...")
@@ -375,26 +569,88 @@ def main():
         raise ValueError(f"image_tokens_per_img={image_tokens} is not a square grid")
 
     inception_weights_path = resolve_inception_weights_path(args.inception_weights_path)
+    real_stats_path = str(
+        args.real_stats_path
+        or config.get("evaluation", {}).get("real_stats_path", "")
+    )
+    shared_real_payload = None
+    if real_stats_path:
+        if inception_weights_path is None:
+            raise ValueError(
+                "shared original-image stats require an explicit local "
+                "--inception_weights_path so its content hash can be verified"
+            )
+        shared_real_payload = load_shared_original_real_stats(
+            real_stats_path,
+            config=config,
+            fid_feature=int(args.fid_feature),
+            real_image_size=int(args.real_image_size),
+            inception_weights_path=inception_weights_path,
+        )
+    shared_real_count = (
+        int(shared_real_payload["stats"]["count"])
+        if shared_real_payload is not None
+        else None
+    )
+    official_protocol = is_official_flow_protocol(
+        shared_real_count=shared_real_count,
+        samples=int(args.samples),
+        is_splits=int(args.is_splits),
+        parallel_rate=int(args.parallel_rate),
+    )
+    if args.require_official_protocol and not official_protocol:
+        raise ValueError(
+            "Official flow FID/IS protocol requires shared original-ImageNet "
+            f"stats, exactly its {shared_real_count} fake samples, and "
+            "--is_splits=10 with --parallel_rate=1; "
+            f"got samples={args.samples}, is_splits={args.is_splits}, "
+            f"parallel_rate={args.parallel_rate}, real_stats_path={real_stats_path!r}"
+        )
     if is_main_process(rank):
         print(
             "Inception weights: "
             f"{inception_weights_path if inception_weights_path is not None else 'torch-fidelity default cache/download'}"
         )
-    warm_metric_cache_if_needed(args, distributed, rank, device, inception_weights_path)
+        if shared_real_payload is not None:
+            print(f"Shared original-ImageNet real stats: {Path(real_stats_path).resolve()}")
+    warm_inception_cache_if_needed(
+        args,
+        distributed,
+        rank,
+        device,
+        inception_weights_path,
+    )
+    inception = build_inception_extractor(
+        int(args.fid_feature),
+        inception_weights_path,
+        device,
+    )
 
     metrics = {
         strategy: {
-            "fid": make_fid_metric(int(args.fid_feature), inception_weights_path).to(device),
-            "is": make_inception_score_metric(int(args.is_splits), inception_weights_path).to(device),
+            "fake_moments": FeatureMoments.zeros(int(args.fid_feature), device),
+            "score_moments": None,
             "latent_mse_sum": 0.0,
             "latent_rms_sum": 0.0,
             "count": 0,
         }
         for strategy in strategies
     }
+    real_moments = (
+        None
+        if shared_real_payload is not None
+        else FeatureMoments.zeros(int(args.fid_feature), device)
+    )
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
 
     generated = 0
     seen_complete_spans = 0
+    batches_seen = 0
+    batches_with_complete_spans = 0
+    selected_span_batches = 0
+    first_batch_debug = None
+    first_complete_span_debug = None
     iterator = tqdm(loader, desc="single-stream FID/IS", dynamic_ncols=True, disable=not progress)
     batch_offset = 0
     for batch_idx, batch in enumerate(iterator):
@@ -407,9 +663,23 @@ def main():
         image_latents = batch["image_latents"].to(device)
         current_batch_size = int(input_ids.shape[0])
         all_spans = image_spans(token_types, image_tokens)
+        batches_seen += 1
+        if first_batch_debug is None:
+            first_batch_debug = token_type_debug(token_types, image_tokens)
         if not all_spans:
             batch_offset += current_batch_size
             continue
+        batches_with_complete_spans += 1
+        if first_complete_span_debug is None:
+            first_complete_span_debug = {
+                "batch_idx": int(batch_idx),
+                "batch_offset": int(batch_offset),
+                "complete_spans_in_batch": int(len(all_spans)),
+                "first_spans": [
+                    [int(batch_row), int(start), int(end)]
+                    for batch_row, start, end in all_spans[:8]
+                ],
+            }
 
         selected = []
         selected_global_indices = []
@@ -428,17 +698,23 @@ def main():
                 iterator.set_postfix_str(f"seen {min(seen_complete_spans, args.samples)}/{args.samples}", refresh=False)
             continue
         spans = selected
+        selected_span_batches += 1
 
         target_latents = span_latents_to_chw(image_latents, spans, side)
         target_images = metric_images(decode_latents(vae, target_latents.float(), scaling_factor))
-        if args.real_source == "imagenet_original":
+        if shared_real_payload is not None:
+            real_images = None
+        elif args.real_source == "imagenet_original":
             real_paths = source_paths_for_spans(loader.dataset, batch_offset, spans, imagenet_train_dir)
             real_images = load_real_images(real_paths, real_transform, device)
         else:
             real_images = target_images
+        if real_moments is not None:
+            real_features, _ = extract_inception_features(inception, real_images)
+            real_moments.update(real_features)
         if args.save_images:
             save_indexed_images(target_images.cpu(), out_dir / "target_decoded", selected_global_indices)
-            if args.real_source == "imagenet_original":
+            if shared_real_payload is None and args.real_source == "imagenet_original":
                 save_indexed_images(real_images.cpu(), out_dir / "imagenet_original_real", selected_global_indices)
 
         for strategy_idx, strategy in enumerate(strategies):
@@ -459,9 +735,22 @@ def main():
             )
             generated_images = metric_images(decode_latents(vae, single_latents.float(), scaling_factor))
             state = metrics[strategy]
-            state["fid"].update(real_images, real=True)
-            state["fid"].update(generated_images, real=False)
-            state["is"].update(generated_images)
+            fake_features, fake_logits = extract_inception_features(
+                inception,
+                generated_images,
+            )
+            state["fake_moments"].update(fake_features)
+            if state["score_moments"] is None:
+                state["score_moments"] = InceptionScoreMoments.zeros(
+                    int(args.is_splits),
+                    int(fake_logits.shape[-1]),
+                    device,
+                )
+            state["score_moments"].update(
+                fake_logits,
+                selected_global_indices,
+                int(args.samples),
+            )
             count = int(generated_images.shape[0])
             state["latent_mse_sum"] += float(F.mse_loss(single_latents.float(), target_latents.float()).item()) * count
             state["latent_rms_sum"] += float(single_latents.float().pow(2).mean().sqrt().item()) * count
@@ -480,16 +769,126 @@ def main():
             )
 
     total_generated = int(reduce_sum(float(generated), device))
-    if total_generated == 0:
-        raise RuntimeError("No complete image spans were evaluated.")
+    if total_generated != int(args.samples):
+        debug = {
+            "rank": int(rank),
+            "world_size": int(world_size),
+            "local_rank": int(local_rank),
+            "distributed": bool(distributed),
+            "device": str(device),
+            "config": str(args.config),
+            "model_path": str(config.model.model_path),
+            "split": str(args.split),
+            "samples_requested": int(args.samples),
+            "batch_size": int(args.batch_size),
+            "loader_batches": int(len(loader)) if hasattr(loader, "__len__") else None,
+            "loader_dataset_len": int(len(loader.dataset)) if hasattr(loader, "dataset") else None,
+            "image_tokens_per_img": int(image_tokens),
+            "batches_seen": int(batches_seen),
+            "batches_with_complete_spans": int(batches_with_complete_spans),
+            "seen_complete_spans": int(seen_complete_spans),
+            "selected_spans_local": int(generated),
+            "selected_span_batches": int(selected_span_batches),
+            "first_batch": first_batch_debug,
+            "first_complete_span_batch": first_complete_span_debug,
+            "distributed_env": {
+                key: os.environ.get(key)
+                for key in ("RANK", "WORLD_SIZE", "LOCAL_RANK", "LOCAL_WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT")
+                if os.environ.get(key) is not None
+            },
+        }
+        raise RuntimeError(
+            f"Expected exactly {args.samples} generated samples across all ranks, "
+            f"found {total_generated}. Debug: "
+            + json.dumps(debug, sort_keys=True)
+        )
+
+    if real_moments is not None:
+        real_moments.all_reduce_()
+        if int(real_moments.count.item()) != int(args.samples):
+            raise RuntimeError(
+                f"distributed real feature count={int(real_moments.count.item())}; "
+                f"expected={args.samples}"
+            )
+    for strategy, state in metrics.items():
+        if state["score_moments"] is None:
+            raise RuntimeError(f"strategy={strategy!r} generated no Inception logits")
+        state["fake_moments"].all_reduce_()
+        state["score_moments"].all_reduce_()
+        if int(state["fake_moments"].count.item()) != int(args.samples):
+            raise RuntimeError(
+                f"strategy={strategy!r} distributed generated feature count="
+                f"{int(state['fake_moments'].count.item())}; expected={args.samples}"
+            )
+        if int(state["score_moments"].count.sum().item()) != int(args.samples):
+            raise RuntimeError(
+                f"strategy={strategy!r} distributed Inception Score count="
+                f"{int(state['score_moments'].count.sum().item())}; "
+                f"expected={args.samples}"
+            )
+
+    compute_fid = bool(
+        shared_real_payload is None
+        or int(args.samples) == int(shared_real_count)
+    )
+    if is_main_process(rank) and compute_fid:
+        real_reference_moments = (
+            shared_feature_moments(
+                shared_real_payload,
+                feature=int(args.fid_feature),
+                device=torch.device("cpu"),
+            )
+            if shared_real_payload is not None
+            else real_moments
+        )
+        real_mean, real_cov = real_reference_moments.mean_cov()
+    peak_cuda_allocated_mib = reduce_max(
+        (
+            float(torch.cuda.max_memory_allocated(device)) / (1024.0**2)
+            if device.type == "cuda"
+            else None
+        ),
+        device,
+    )
+    peak_cuda_reserved_mib = reduce_max(
+        (
+            float(torch.cuda.max_memory_reserved(device)) / (1024.0**2)
+            if device.type == "cuda"
+            else None
+        ),
+        device,
+    )
 
     results = {
+        "official_protocol": official_protocol,
+        "metric_protocol": {
+            "fid_reducer": "symmetric_eigendecomposition",
+            "is_split_assignment": "contiguous_by_global_sample_index",
+            "is_std": "population",
+            "is_splits": int(args.is_splits),
+        },
         "config": args.config,
         "model_path": str(config.model.model_path),
+        "precision_protocol": {
+            "schema": "flow_eval_precision_v1",
+            "model_dtype": str(args.model_dtype),
+            "model_parameter_dtypes": parameter_dtypes,
+            "checkpoint_weight_dtypes": stored_checkpoint_dtypes,
+            "vae_dtype": str(args.vae_dtype),
+            "flow_integrator_dtype": "fp32",
+            "autocast_enabled": False,
+            "cuda_matmul_allow_tf32": bool(
+                torch.backends.cuda.matmul.allow_tf32
+            ),
+            "cudnn_allow_tf32": bool(torch.backends.cudnn.allow_tf32),
+            "float32_matmul_precision": torch.get_float32_matmul_precision(),
+        },
         "adapter": adapter_report,
         "model_state": model_state_report,
         "ema_state": ema_state_report,
         "split": args.split,
+        "seed": int(args.seed),
+        "batch_size": int(args.batch_size),
         "samples_requested": int(args.samples),
         "samples_evaluated": int(total_generated),
         "distributed": {
@@ -497,10 +896,34 @@ def main():
             "world_size": int(world_size),
             "rank": int(rank),
             "local_rank": int(local_rank),
+            "peak_cuda_allocated_mib": peak_cuda_allocated_mib,
+            "peak_cuda_reserved_mib": peak_cuda_reserved_mib,
         },
-        "real_source": str(args.real_source),
-        "imagenet_train_dir": str(imagenet_train_dir) if args.real_source == "imagenet_original" else None,
-        "real_image_size": int(args.real_image_size) if args.real_source == "imagenet_original" else None,
+        "real_source": (
+            "cached_original_imagenet"
+            if shared_real_payload is not None
+            else str(args.real_source)
+        ),
+        "real_stats_path": (
+            str(Path(real_stats_path).resolve())
+            if shared_real_payload is not None
+            else None
+        ),
+        "real_stats_metadata": (
+            shared_real_payload["metadata"]
+            if shared_real_payload is not None
+            else None
+        ),
+        "imagenet_train_dir": (
+            str(imagenet_train_dir)
+            if shared_real_payload is None and args.real_source == "imagenet_original"
+            else None
+        ),
+        "real_image_size": (
+            int(args.real_image_size)
+            if shared_real_payload is not None or args.real_source == "imagenet_original"
+            else None
+        ),
         "cfg": float(args.cfg),
         "cfg_schedule": str(args.cfg_schedule),
         "sampling_steps": str(args.sampling_steps),
@@ -512,22 +935,44 @@ def main():
     }
 
     for strategy, state in metrics.items():
-        is_mean, is_std = state["is"].compute()
-        fid_value = state["fid"].compute()
         global_count = int(reduce_sum(float(state["count"]), device))
         global_latent_mse_sum = reduce_sum(state["latent_mse_sum"], device)
         global_latent_rms_sum = reduce_sum(state["latent_rms_sum"], device)
         global_generation_step_max = reduce_max(state.get("generation_step_max"), device)
-        count = max(global_count, 1)
-        results["strategies"][strategy] = {
-            "count": int(global_count),
-            "fid": finite_or_none(fid_value.item()),
-            "inception_score_mean": finite_or_none(is_mean.item()),
-            "inception_score_std": finite_or_none(is_std.item()),
-            "latent_mse_to_target": global_latent_mse_sum / count,
-            "latent_rms": global_latent_rms_sum / count,
-            "generation_step_max": global_generation_step_max,
-        }
+        if global_count != int(args.samples):
+            raise RuntimeError(
+                f"strategy={strategy!r} generated count={global_count}; "
+                f"expected={args.samples}"
+            )
+        if is_main_process(rank):
+            fake_mean, fake_cov = state["fake_moments"].mean_cov()
+            fid_value = (
+                frechet_distance(
+                    real_mean,
+                    real_cov,
+                    fake_mean,
+                    fake_cov,
+                )
+                if compute_fid
+                else None
+            )
+            is_mean, is_std, is_per_split = state["score_moments"].compute()
+            results["strategies"][strategy] = {
+                "count": int(global_count),
+                "fid": (
+                    finite_or_none(fid_value)
+                    if fid_value is not None
+                    else None
+                ),
+                "inception_score_mean": finite_or_none(is_mean),
+                "inception_score_std": finite_or_none(is_std),
+                "inception_score_splits": [
+                    finite_or_none(value) for value in is_per_split
+                ],
+                "latent_mse_to_target": global_latent_mse_sum / global_count,
+                "latent_rms": global_latent_rms_sum / global_count,
+                "generation_step_max": global_generation_step_max,
+            }
 
     if is_main_process(rank):
         metrics_path = out_dir / "metrics.json"

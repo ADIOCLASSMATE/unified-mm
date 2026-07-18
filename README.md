@@ -1,174 +1,114 @@
-# Unified-MM: Two-Stream LLM with Contextual Image Flow
+# Unified-MM: ImageNet-100 Architecture Ablations
 
-This repository trains a unified text-image model by combining a two-stream
-Qwen3 language backbone with a contextual rectified-flow head over continuous
-image latents.
+This repository currently compares two Qwen3-0.6B image-generation
+architectures under one controlled ImageNet-100 training and evaluation
+protocol:
 
-The current idea is simple:
+- **Selfless-Flow** uses a two-stream, same-position Qwen backbone and a
+  contextual rectified-flow head over continuous KL16 image latents.
+- **Qwen-Show-O** uses the same Qwen backbone scale with Show-O-style masked
+  prediction over official MAGVITv2 image codes.
 
-- use a two-stream LLM to remove the usual one-token label shift;
-- keep text prediction aligned with the same sequence position;
-- use the hidden state at an image position as the condition for a flow head;
-- train image generation as continuous latent flow rather than discrete image
-  token cross-entropy;
-- let text-to-image and image-to-text behavior emerge from the same attention
-  rule and sigma ordering.
+Both models train for 35,920 optimizer steps (80 epochs) on the same balanced
+115K-image training split and are evaluated on the same 10K original-ImageNet
+validation distribution. The authoritative protocol and all reported numbers
+are in [docs/IMAGENET100_ABLATION.md](docs/IMAGENET100_ABLATION.md).
 
-The active path is implemented in `models/modeling_model/modeling_selfless_flow.py`.
+## Selected evaluation defaults
 
-## Core Idea
+The single-point launchers default to the lowest-FID settings found by the
+completed sweeps:
 
-Standard causal LMs train position `i` to predict token `i + 1`. That shift is
-awkward for a unified text-image model because the hidden state is not naturally
-aligned with the image latent it should generate.
+| Architecture | Checkpoint | Selected CFG | Other fixed settings |
+| --- | --- | --- | --- |
+| Selfless-Flow | `hf_model-final-ema` | `CFG=3.5` | BF16 model, 100-step Heun, `spatial_halton`, `PARALLEL_RATE=1` |
+| Qwen-Show-O | `hf_model-final` | Show-O `s=11.75` (common `w=12.75`) | 12 MaskGIT steps, temperature 1.0 |
 
-This code uses two streams:
+Show-O uses `(1+s)*conditional - s*unconditional`; therefore its command-line
+`guidance_scale=s` is one lower than common CFG weight `w`.
 
-- `X0` is the content stream. It receives real text embeddings and visible image
-  latent embeddings, then provides K/V to attention.
-- `XT` is the query stream. It receives mask embeddings and predicts the token
-  or image latent at the same position.
+## Current pipeline
 
-Both streams use the same strict selfless attention mask:
+Build the balanced subset from the existing full KL16 cache:
 
-```text
-query position q attends to key/value position k iff sigma[k] < sigma[q]
+```bash
+bash script/ablation/build_imagenet_100c_balanced_cache.sh
 ```
 
-Because the diagonal is excluded, a position cannot see its own content token.
-With AR sigma values, text still behaves like left-to-right language modeling,
-but the tensors no longer need a shifted label convention: `labels == input_ids`
-at valid text positions. For image positions, the `XT` hidden state at that same
-position becomes the conditioning vector for a contextual flow head.
+Prepare the official Show-O MAGVITv2 tokens and cache the shared original-image
+FID distribution. Jobs that read raw ImageNet must explicitly attach dataset
+`imagenet:v1`.
 
-## Unified Multimodal Behavior
-
-Image generation uses normal attention as conditioning. Prompt text and already
-known image latents are placed at lower sigma values. Image slots to be generated
-query the backbone, attend to visible context through the shared Transformer, and
-the resulting hidden states condition `FlowLoss.sample()`.
-
-Image understanding is the same mechanism in the other direction. Image latents
-are embedded into the `X0` stream. Later text positions attend those image
-tokens through the same selfless mask and are trained with standard text
-cross-entropy. There is no separate vision cross-attention module.
-
-The total supervised objective is:
-
-```text
-loss = lambda_text * CE(text_head(XT_hidden), text_label)
-     + lambda_image * flow_mse(image_latent, condition=XT_hidden)
+```bash
+bash script/ablation/prepare_qwen_showo_vq_100c.sh
+bash script/ablation/cache_imagenet100_original_fid_stats.sh
 ```
 
-## Current Data Format
+Train both 80-epoch ablations:
 
-Training batches return:
-
-```python
-{
-    "input_ids": LongTensor[B, L],
-    "token_types": UInt8Tensor[B, L],
-    "sigma": LongTensor[B, L],
-    "labels": LongTensor[B, L],
-    "image_latents": FloatTensor[B, L, image_latent_dim],
-}
+```bash
+bash script/ablation/pretraining_imagenet_flow_100c_80ep.sh
+bash script/ablation/pretraining_qwen_showo_vq_100c_80ep.sh
 ```
 
-`token_types` are:
+Evaluate the selected defaults on all 10K validation prompts:
 
-```text
-0 = text
-1 = image latent slot
-2 = special token
-3 = padding
+```bash
+bash script/ablation/evaluate_imagenet_flow_100c.sh
+bash script/ablation/evaluate_qwen_showo_vq_100c.sh
 ```
 
-For image slots, `input_ids` contains the image mask token and the real target
-lives in `image_latents`. Image labels are `-100` for text CE; image supervision
-comes from the flow loss.
+The CFG sweep launchers remain available for explicit searches:
 
-The active ImageNet flow format is:
+```bash
+CFG_VALUES="1.5 2.0 2.5 3.0 3.5 4.0 4.5 5.0" \
+  bash script/ablation/evaluate_imagenet_flow_cfg_sweep_100c.sh
 
-```text
-optional prompt text [BOI] 256 image latent slots [EOI] optional suffix text [EOS]
+GUIDANCE_SCALES="0.0 0.5 1.0" \
+  bash script/ablation/evaluate_qwen_showo_vq_cfg_sweep_100c.sh
 ```
 
-The 256 image slots are KL16 VAE latents with shape `[256, 16]`.
+Use a new `SWEEP_ROOT` after changing any contract-bound source, config, or
+protocol. Existing sweep roots are immutable experiment snapshots.
 
-## Active Training Path
+## Repository map
 
-1. Adapt the Qwen text backbone to the selfless two-stream objective:
+- `configs/ablation/`: the two active 100C training/evaluation configs.
+- `models/modeling_model/modeling_selfless_flow.py`: Selfless-Flow backbone,
+  flow objective integration, and sampler.
+- `models/modeling_model/modeling_qwen_showo.py`: Qwen-Show-O model and official
+  iterative masked sampler.
+- `pretrain/`: the two active training loops plus retained text/full-dataset
+  utilities.
+- `script/ablation/`: data preparation, training, selected evaluation, and CFG
+  sweep launchers.
+- `scripts/`: evaluators, strict validators, immutable sweep contracts, and
+  deterministic summary builders.
+- `tests/`: architecture, dataset, metric-protocol, and default-regression
+  tests.
+
+## Preserved non-default paths
+
+The full-ImageNet Selfless-Flow training path is intentionally retained, but it
+is no longer the repository default:
+
+```bash
+bash script/selfless/encode_imagenet_full_kl16_vae.sh
+bash script/selfless/pretraining_imagenet_flow_full_from_qwen3base.sh
+```
+
+The text-only selfless adaptation path is also retained:
 
 ```bash
 bash script/selfless/pretraining_text_selfless_2048.sh
 ```
 
-2. Encode ImageNet images into the KL16 latent cache:
-
-```bash
-bash script/selfless/encode_imagenet_full_kl16_vae.sh
-```
-
-3. Run the 10-class ImageNet stage0 preflight/debug training:
-
-```bash
-bash script/selfless/pretraining_imagenet_flow_stage0_10c.sh
-```
-
-4. Train the full ImageNet flow baseline from Qwen3-Base:
-
-```bash
-bash script/selfless/pretraining_imagenet_flow_full_from_qwen3base.sh
-```
-
-Main configs:
-
-```text
-configs/selfless/text_selfless_2048_ft.yaml
-configs/selfless/imagenet_flow_stage0_10c.yaml
-configs/selfless/imagenet_flow_full_from_qwen3base.yaml
-```
-
-## Key Files
-
-- `models/modeling_model/modeling_selfless_flow.py`: two-stream Qwen3 model,
-  image latent embedding, text CE, image flow loss, and image latent sampling.
-- `models/modeling_model/image_flow_loss.py`: contextual rectified-flow objective.
-- `utils/utils.py`: tokenizer/model loading and strict selfless mask creation.
-- `utils/dataset_imagenet_flow_cache.py`: ImageNet latent-cache dataset.
-- `utils/dataset_combined_flow.py`: mixed ImageNet-flow and text dataloaders.
-- `pretrain/train_selfless_flow.py`: active training loop, validation image
-  decoding, EMA, adapter save/load, and flow diagnostics.
-- `scripts/imagenet_encode_kl16_vae.py`: KL16 VAE latent encoder.
-- `scripts/generate_flow_validation_images.py`: manual flow validation and
-  strategy comparison.
-- `docs/RESEARCH.md`: current research plan and rationale.
-
 ## Validation
 
-Run the focused behavior tests:
-
 ```bash
-uv run pytest tests/test_selfless_flow_behavior.py
+PYTHONPATH=. .venv/bin/pytest -q tests
+ruff check utils/dataset_utils.py tests/test_ablation_eval_defaults.py
 ```
 
-Run a manual image-flow validation pass:
-
-```bash
-uv run python scripts/generate_flow_validation_images.py \
-  --config configs/selfless/imagenet_flow_full_from_qwen3base.yaml \
-  --single_stream \
-  --strategies sigma,spatial_halton,hidden_norm
-```
-
-For text regression against a local checkpoint:
-
-```bash
-uv run python scripts/check_selfless_flow_text_regression.py
-```
-
-## Inactive Paths
-
-Older discrete image-token and OmniCorpus preprocessing code is still present in
-the repository, but it is no longer the active research path described here. The
-mainline flow configs train on continuous KL16 latents and text Arrow shards.
+For platform paths, resource policy, and the mandatory official ImageNet mount,
+see [INSPIRE.md](INSPIRE.md).

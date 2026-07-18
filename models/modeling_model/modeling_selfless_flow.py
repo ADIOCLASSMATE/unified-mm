@@ -47,7 +47,10 @@ from transformers.utils import TransformersKwargs, can_return_tuple
 from transformers.utils.deprecation import deprecate_kwarg
 from transformers.utils.generic import maybe_autocast, merge_with_config_defaults
 from torch.nn.attention.flex_attention import flex_attention, BlockMask, create_block_mask, and_masks
-from flash_attn.ops.triton.layer_norm import rms_norm_fn as flash_rms_norm
+try:
+    from flash_attn.ops.triton.layer_norm import rms_norm_fn as flash_rms_norm
+except Exception:
+    flash_rms_norm = None
 from .image_position_utils import build_2d_sincos_position_embedding as _build_2d_sincos_position_embedding
 from .image_flow_loss import FlowLoss
 try:
@@ -82,8 +85,8 @@ class ImageTokenEmbedder(nn.Module):
         hidden_size,
         image_tokens_per_img=256,
         initializer_range=0.02,
-        norm_mode="layernorm",
-        init_mode="default",
+        norm_mode="none",
+        init_mode="balanced",
         latent_rms=1.0,
     ):
         super().__init__()
@@ -91,8 +94,8 @@ class ImageTokenEmbedder(nn.Module):
         self.hidden_size = int(hidden_size)
         self.image_tokens_per_img = int(image_tokens_per_img)
         self.initializer_range = float(initializer_range)
-        self.norm_mode = str(norm_mode or "layernorm").lower()
-        self.init_mode = str(init_mode or "default").lower()
+        self.norm_mode = "none" if norm_mode is None else str(norm_mode).lower()
+        self.init_mode = "balanced" if init_mode is None else str(init_mode).lower()
         self.latent_rms = float(latent_rms)
         self.z_proj = nn.Linear(self.latent_dim, self.hidden_size, bias=True)
         self.z_proj_ln = nn.LayerNorm(self.hidden_size, eps=1e-6)
@@ -271,6 +274,7 @@ class Qwen3RMSNorm(nn.Module):
     def forward(self, hidden_states):
         if (
             hidden_states.is_cuda
+            and flash_rms_norm is not None
             and os.environ.get("SELFLESS_USE_FLASH_RMSNORM", "1").lower()
             not in {"0", "false", "no", "off"}
         ):
@@ -674,8 +678,8 @@ class Qwen3Model(Qwen3PreTrainedModel):
             config.hidden_size,
             getattr(config, "image_tokens_per_img", 256),
             getattr(config, "initializer_range", 0.02),
-            getattr(config, "image_token_embedder_norm", "layernorm"),
-            getattr(config, "image_token_embedder_init_mode", "default"),
+            getattr(config, "image_token_embedder_norm", "none"),
+            getattr(config, "image_token_embedder_init_mode", "balanced"),
             getattr(config, "image_token_embedder_latent_rms", 1.0),
         )
         self.image_input_noise_strength = float(getattr(config, "image_input_noise_strength", 1.0e-2))
@@ -1104,6 +1108,10 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         calculate_likelihood = calculate_likelihood or labels is not None
         return_logits = bool(kwargs.pop("return_logits", True))
         model_kwargs = dict(kwargs)
+        return_raw_modality_loss = bool(model_kwargs.pop("return_raw_modality_loss", False))
+        return_loss_tuple = bool(model_kwargs.pop("return_loss_tuple", False))
+        return_raw_loss_tuple = bool(model_kwargs.pop("return_raw_loss_tuple", False))
+        image_loss_mask_arg = model_kwargs.pop("image_loss_mask", None)
         clean_image_latents = image_latents
         if inputs_embeds is None:
             context_image_latents = self._shared_noisy_image_latents(
@@ -1142,6 +1150,10 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 token_types = token_types.to(hidden_states.device)
                 text_mask = (token_types == 0) | (token_types == 2)
                 image_mask = token_types == 1
+                if image_loss_mask_arg is not None:
+                    image_loss_mask = image_loss_mask_arg.to(device=hidden_states.device, dtype=torch.bool) & image_mask
+                else:
+                    image_loss_mask = image_mask
 
                 flat_hidden = hidden_states.view(-1, hidden_states.size(-1))
                 flat_labels = labels.view(-1)
@@ -1149,7 +1161,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 flat_image_positions = image_local_positions.view(-1)
 
                 text_flat_mask = text_mask.view(-1)
-                image_flat_mask = image_mask.view(-1)
+                image_flat_mask = image_loss_mask.view(-1)
 
                 text_loss = flat_hidden.sum() * 0.0
                 valid_text_mask = text_flat_mask & (flat_labels != -100)
@@ -1182,7 +1194,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                     span_positions = []
 
                     for batch_idx in range(token_types.shape[0]):
-                        image_indices = image_mask[batch_idx].nonzero(as_tuple=True)[0]
+                        image_indices = image_loss_mask[batch_idx].nonzero(as_tuple=True)[0]
                         if image_indices.numel() == 0:
                             continue
                         split_points = (
@@ -1274,6 +1286,26 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                     logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=-100
                 )
 
+        if return_loss_tuple:
+            if token_types is not None and loss is not None:
+                text_loss_value = (
+                    text_loss.detach()
+                    if isinstance(text_loss, torch.Tensor)
+                    else torch.tensor(text_loss or 0.0, device=hidden_states.device)
+                )
+                image_loss_value = (
+                    image_loss.detach()
+                    if isinstance(image_loss, torch.Tensor)
+                    else torch.tensor(image_loss or 0.0, device=hidden_states.device)
+                )
+                return loss, text_loss_value, image_loss_value
+            return (loss,)
+
+        if return_raw_loss_tuple:
+            if token_types is not None and loss is not None:
+                return loss, text_loss, image_loss
+            return (loss,)
+
         output = CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
@@ -1295,6 +1327,11 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             }
             output["per_modality_loss"] = per_modality_loss
             output["flow_debug_stats"] = flow_debug_stats
+            if return_raw_modality_loss:
+                output["raw_per_modality_loss"] = {
+                    "text_loss": text_loss,
+                    "image_loss": image_loss,
+                }
         return output
         
     @torch.compile(mode="max-autotune-no-cudagraphs")
