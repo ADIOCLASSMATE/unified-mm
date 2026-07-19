@@ -1,6 +1,6 @@
 experiment:
-    project: "selfless-flow-ablation-imagenet100-80ep"
-    name: "imagenet100-balanced-classcond-flow-qwen3base-8gpu-b256-80ep"
+    project: "selfless-flow-token-mlp-width1936-ablation-imagenet100-80ep"
+    name: "imagenet100-balanced-classcond-token-mlp-width1936-qwen3base-8gpu-b256-80ep"
     wandb_project: "unified-mm"
     output_dir: "output"
     save_every: 8980
@@ -44,8 +44,9 @@ model:
     image_token_embedder_init_mode: "balanced"
     image_token_embedder_latent_rms: 1.0
     image_generation_head_type: "flow"
+    image_flow_head_arch: "token_mlp"
     image_flow_depth: 8
-    image_flow_width: 1280
+    image_flow_width: 1936
     image_flow_num_sampling_steps: "100"
     image_flow_batch_mul: 4
     image_flow_time_scale: 1000.0
@@ -56,9 +57,7 @@ model:
     image_flow_time_uniform_mix: 0.1
     image_flow_solver: "heun"
     image_flow_mlp_ratio: 1.0
-    image_flow_latent_mixer_heads: 8
-    image_flow_latent_mixer_dropout: 0.0
-    image_flow_latent_mixer_zero_init_gate: true
+    image_flow_zero_init_gate: true
     image_input_noise_strength: 1.0e-2
     image_input_noise_strength_std: 0.0
     image_input_noise_strength_min: null
@@ -136,7 +135,7 @@ training:
     save_image_flow_adapter: true
 
 evaluation:
-    checkpoint: "output/selfless-flow-ablation-imagenet100-80ep/hf_model-final-ema"
+    checkpoint: "output/selfless-flow-token-mlp-width1936-ablation-imagenet100-80ep/hf_model-final-ema"
     model_dtype: "bf16"
     samples: 10000
     batch_size: 512

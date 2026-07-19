@@ -239,6 +239,145 @@ class ContextualFlowBlock(nn.Module):
         return x
 
 
+class TokenFlowBlock(nn.Module):
+    """Pointwise AdaLN-MLP block with no token-to-token communication."""
+
+    def __init__(self, channels, mlp_ratio=1.0):
+        super().__init__()
+        self.channels = int(channels)
+        self.mlp_ratio = float(mlp_ratio)
+        hidden = int(self.channels * self.mlp_ratio)
+        if hidden <= 0:
+            raise ValueError(f"mlp_ratio must produce a positive hidden size, got {mlp_ratio}")
+
+        self.mlp_norm = nn.LayerNorm(self.channels, eps=1e-6)
+        self.mlp = nn.Sequential(
+            nn.Linear(self.channels, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, self.channels),
+        )
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(self.channels, 3 * self.channels),
+        )
+        self.last_gate_abs_mean = None
+
+    def forward(self, x, y):
+        shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(y).chunk(3, dim=-1)
+        h = modulate(self.mlp_norm(x), shift_mlp, scale_mlp)
+        x = x + gate_mlp * self.mlp(h)
+        self.last_gate_abs_mean = gate_mlp.detach().float().abs().mean()
+        return x
+
+
+class TokenFlowMLPHead(nn.Module):
+    """MAR/NextStep-style flow head applied independently to each latent token.
+
+    The causal backbone condition ``c`` is the only carrier of sequence context.
+    This module contains no attention, positional mixing, or clean-latent context
+    path: each output token is a function only of its own ``x_t``, timestep, and
+    same-position backbone condition.
+    """
+
+    def __init__(
+        self,
+        in_channels,
+        model_channels,
+        out_channels,
+        z_channels,
+        num_res_blocks,
+        grad_checkpointing=False,
+        mlp_ratio=1.0,
+        zero_init_gate=True,
+    ):
+        super().__init__()
+        self.in_channels = int(in_channels)
+        self.model_channels = int(model_channels)
+        self.out_channels = int(out_channels)
+        self.num_res_blocks = int(num_res_blocks)
+        self.grad_checkpointing = bool(grad_checkpointing)
+        self.mlp_ratio = float(mlp_ratio)
+        self.zero_init_gate = bool(zero_init_gate)
+
+        self.time_embed = TimestepEmbedder(self.model_channels)
+        self.cond_embed = nn.Linear(z_channels, self.model_channels)
+        self.input_proj = nn.Linear(self.in_channels, self.model_channels)
+        self.blocks = nn.ModuleList(
+            [
+                TokenFlowBlock(
+                    self.model_channels,
+                    mlp_ratio=self.mlp_ratio,
+                )
+                for _ in range(self.num_res_blocks)
+            ]
+        )
+        self.final_layer = FinalLayer(self.model_channels, self.out_channels)
+        self.last_gate_abs_mean = None
+        self.initialize_weights()
+
+    def initialize_weights(self):
+        def _basic_init(module):
+            if isinstance(module, nn.Linear):
+                _xavier_uniform_init_fp32_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+            elif isinstance(module, nn.LayerNorm) and module.elementwise_affine:
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
+
+        self.apply(_basic_init)
+        _normal_init_fp32_(self.time_embed.mlp[0].weight, std=0.02)
+        _normal_init_fp32_(self.time_embed.mlp[2].weight, std=0.02)
+
+        if self.zero_init_gate:
+            for block in self.blocks:
+                nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+                nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
+        nn.init.constant_(self.final_layer.linear.weight, 0)
+        nn.init.constant_(self.final_layer.linear.bias, 0)
+
+    def _shape_time(self, t, batch_shape):
+        expected = int(math.prod(batch_shape))
+        if t.numel() != expected:
+            raise ValueError(
+                f"t must contain one value per latent token ({expected}), got shape {tuple(t.shape)}"
+            )
+        embedded = self.time_embed(t.to(device=self.input_proj.weight.device).reshape(-1))
+        return embedded.view(*batch_shape, self.model_channels)
+
+    def forward(self, x, t, c):
+        if x.dim() not in {2, 3}:
+            raise ValueError(f"expected [B,D] or [B,Q,D], got {tuple(x.shape)}")
+        model_dtype = self.input_proj.weight.dtype
+        model_device = self.input_proj.weight.device
+        x = x.to(device=model_device, dtype=model_dtype)
+        c = c.to(device=model_device, dtype=model_dtype)
+        batch_shape = x.shape[:-1]
+        if c.shape[:-1] != batch_shape:
+            raise ValueError(
+                f"condition batch shape must match latent batch shape {tuple(batch_shape)}, "
+                f"got {tuple(c.shape[:-1])}"
+            )
+
+        x = self.input_proj(x)
+        y = self._shape_time(t, batch_shape) + self.cond_embed(c)
+        gate_stats = []
+        if self.grad_checkpointing and not torch.jit.is_scripting():
+            for block in self.blocks:
+                x = checkpoint(block, x, y, use_reentrant=False)
+                if block.last_gate_abs_mean is not None:
+                    gate_stats.append(block.last_gate_abs_mean)
+        else:
+            for block in self.blocks:
+                x = block(x, y)
+                if block.last_gate_abs_mean is not None:
+                    gate_stats.append(block.last_gate_abs_mean)
+        self.last_gate_abs_mean = torch.stack(gate_stats).mean() if gate_stats else None
+        return self.final_layer(x, y)
+
+
 class ContextualFlowTransformerHead(nn.Module):
     def __init__(
         self,
@@ -521,7 +660,7 @@ class ContextualFlowTransformerHead(nn.Module):
 
 
 class FlowLoss(nn.Module):
-    """Rectified-flow loss with a contextual latent transformer velocity head.
+    """Rectified-flow loss with a selectable velocity-head architecture.
 
     Uses the standard flow-matching convention: t=0 is noise and t=1 is data.
     """
@@ -546,6 +685,7 @@ class FlowLoss(nn.Module):
         latent_mixer_heads=8,
         latent_mixer_dropout=0.0,
         latent_mixer_zero_init_gate=True,
+        head_arch="contextual",
     ):
         super().__init__()
         self.in_channels = int(target_channels)
@@ -558,6 +698,8 @@ class FlowLoss(nn.Module):
         self.uniform_mix = float(uniform_mix)
         self.solver = str(solver or "heun").lower()
         self.mlp_ratio = float(mlp_ratio)
+        self.head_arch = self._normalize_head_arch(head_arch)
+        self.uses_latent_mixer = self.head_arch == "contextual"
         if self.num_sampling_steps <= 0:
             raise ValueError(f"num_sampling_steps must be positive, got {num_sampling_steps}")
         if not 0.0 <= self.uniform_mix <= 1.0:
@@ -565,20 +707,43 @@ class FlowLoss(nn.Module):
         if not 0.0 <= self.time_eps < 0.5:
             raise ValueError(f"time_eps must be in [0, 0.5), got {time_eps}")
 
-        self.net = ContextualFlowTransformerHead(
-            in_channels=self.in_channels,
-            model_channels=width,
-            out_channels=self.in_channels,
-            z_channels=z_channels,
-            num_res_blocks=depth,
-            grad_checkpointing=grad_checkpointing,
-            mlp_ratio=self.mlp_ratio,
-            latent_mixer_heads=latent_mixer_heads,
-            latent_mixer_dropout=latent_mixer_dropout,
-            latent_mixer_zero_init_gate=latent_mixer_zero_init_gate,
-            image_tokens_per_img=image_tokens_per_img,
-        )
+        if self.uses_latent_mixer:
+            self.net = ContextualFlowTransformerHead(
+                in_channels=self.in_channels,
+                model_channels=width,
+                out_channels=self.in_channels,
+                z_channels=z_channels,
+                num_res_blocks=depth,
+                grad_checkpointing=grad_checkpointing,
+                mlp_ratio=self.mlp_ratio,
+                latent_mixer_heads=latent_mixer_heads,
+                latent_mixer_dropout=latent_mixer_dropout,
+                latent_mixer_zero_init_gate=latent_mixer_zero_init_gate,
+                image_tokens_per_img=image_tokens_per_img,
+            )
+        else:
+            self.net = TokenFlowMLPHead(
+                in_channels=self.in_channels,
+                model_channels=width,
+                out_channels=self.in_channels,
+                z_channels=z_channels,
+                num_res_blocks=depth,
+                grad_checkpointing=grad_checkpointing,
+                mlp_ratio=self.mlp_ratio,
+                zero_init_gate=latent_mixer_zero_init_gate,
+            )
         self.last_forward_stats = {}
+
+    @staticmethod
+    def _normalize_head_arch(head_arch: str) -> str:
+        value = str(head_arch or "contextual").strip().lower().replace("-", "_")
+        if value in {"contextual", "latent_mixer", "cross_attention", "cross_attn"}:
+            return "contextual"
+        if value in {"token_mlp", "tokenwise_mlp", "per_token", "mar", "nextstep", "no_cross_attention"}:
+            return "token_mlp"
+        raise ValueError(
+            f"Unknown image_flow_head_arch={head_arch!r}; expected contextual or token_mlp."
+        )
 
     @staticmethod
     def _rms_stat(x):
@@ -639,6 +804,8 @@ class FlowLoss(nn.Module):
         context_mask: torch.Tensor | None = None,
         context_positions: torch.Tensor | None = None,
     ):
+        if not self.uses_latent_mixer:
+            return None
         if context_latents is None:
             return None
         model_dtype = self.net.input_proj.weight.dtype
@@ -671,6 +838,9 @@ class FlowLoss(nn.Module):
         x_t = x_t.to(device=model_device, dtype=model_dtype)
         z = z.to(device=model_device, dtype=model_dtype)
         t = t.to(device=model_device)
+        if not self.uses_latent_mixer:
+            return self.net(x_t, self._scale_time(t), c=z)
+
         context_kwargs = self._context_to_device(
             {
                 "context_latents": context_latents,
@@ -695,6 +865,8 @@ class FlowLoss(nn.Module):
         )
 
     def _training_context(self, target, sigma, image_positions, context_latents=None):
+        if not self.uses_latent_mixer:
+            return {}
         if target.dim() != 3:
             return {}
         if context_latents is None:
@@ -759,7 +931,9 @@ class FlowLoss(nn.Module):
         }
         gate_stat = getattr(self.net, "last_gate_abs_mean", None)
         if gate_stat is not None:
-            stats["flow/latent_mixer_gate"] = gate_stat.detach().float()
+            stats["flow/head_residual_gate"] = gate_stat.detach().float()
+            if self.uses_latent_mixer:
+                stats["flow/latent_mixer_gate"] = gate_stat.detach().float()
         self.last_forward_stats = stats
         return loss_mean
 
@@ -846,25 +1020,28 @@ class FlowLoss(nn.Module):
         solver = str(solver or self.solver).lower()
         x_shape = (z.shape[0] // 2, *z.shape[1:-1]) if cfg != 1.0 else z.shape[:-1]
         x = torch.randn(*x_shape, self.in_channels, device=z.device, dtype=torch.float32) * float(temperature)
-        raw_context_kwargs = self._context_to_device(
-            {
-                "context_latents": context_latents,
-                "context_mask": context_mask,
-                "query_positions": query_positions,
-                "context_positions": context_positions,
-            },
-            z.device,
-            z.dtype,
-        )
-        latent_mixer_cache = self.prepare_latent_mixer_cache(
-            context_latents=raw_context_kwargs.get("context_latents"),
-            context_mask=raw_context_kwargs.get("context_mask"),
-            context_positions=raw_context_kwargs.get("context_positions"),
-        )
-        context_kwargs = {
-            "query_positions": raw_context_kwargs.get("query_positions"),
-            "latent_mixer_cache": latent_mixer_cache,
-        }
+        if self.uses_latent_mixer:
+            raw_context_kwargs = self._context_to_device(
+                {
+                    "context_latents": context_latents,
+                    "context_mask": context_mask,
+                    "query_positions": query_positions,
+                    "context_positions": context_positions,
+                },
+                z.device,
+                z.dtype,
+            )
+            latent_mixer_cache = self.prepare_latent_mixer_cache(
+                context_latents=raw_context_kwargs.get("context_latents"),
+                context_mask=raw_context_kwargs.get("context_mask"),
+                context_positions=raw_context_kwargs.get("context_positions"),
+            )
+            context_kwargs = {
+                "query_positions": raw_context_kwargs.get("query_positions"),
+                "latent_mixer_cache": latent_mixer_cache,
+            }
+        else:
+            context_kwargs = {}
         context_is_paired = False
         if cfg != 1.0:
             context_kwargs = self._duplicate_context(context_kwargs)

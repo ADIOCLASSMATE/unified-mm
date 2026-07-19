@@ -201,7 +201,7 @@ def load_model_tokenizer(
         "image_input_noise_strength", "image_input_noise_strength_std",
         "image_input_noise_strength_min", "image_input_noise_strength_max",
         "image_uncond_prob",
-        "image_token_embedder_norm", "image_token_embedder_init_mode",
+        "image_token_embedder_init_mode",
         "image_token_embedder_latent_rms",
     )
 

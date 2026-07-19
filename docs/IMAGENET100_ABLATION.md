@@ -1,10 +1,10 @@
 # ImageNet-100 Architecture Ablation: Protocol and Results
 
-Status: final 10K evaluation, 2026-07-18.
+Status: final 10K evaluation, 2026-07-19.
 
 This is the authoritative document for the balanced ImageNet-100 comparison
-between Selfless-Flow and Qwen-Show-O. It replaces the former separate research,
-dataset, and Show-O pipeline notes.
+between Selfless-Flow, its flow-head variants, and Qwen-Show-O. It replaces the
+former separate research, dataset, and Show-O pipeline notes.
 
 ## Decision summary
 
@@ -15,6 +15,9 @@ confidence.
 | Architecture / checkpoint | Selection | CFG | FID ↓ | IS ↑ |
 | --- | --- | ---: | ---: | ---: |
 | **Selfless-Flow EMA** `hf_model-final-ema` | minimum FID, default | **3.5** | **26.0110** | 59.5362 ± 1.1316 |
+| Token-only MLP EMA `hf_model-final-ema` | architecture ablation; baseline-fixed inference | **3.5** | 27.9774 | 56.9485 ± 1.5827 |
+| Token-only MLP ratio 4.5 EMA `hf_model-final-ema` | parameter-matched architecture ablation | **3.5** | 26.4404 | 58.3860 ± 1.1099 |
+| Token-only MLP width 1936 EMA `hf_model-final-ema` | alternative parameter-matched scale | **3.5** | 26.9315 | 57.3898 ± 1.4622 |
 | Selfless-Flow EMA `hf_model-final-ema` | maximum IS | 5.0 | 28.2501 | **61.6962 ± 1.0704** |
 | Selfless-Flow non-EMA `hf_model-final` | EMA-selected diagnostic | 3.5 | 26.0782 | 60.0868 ± 1.4928 |
 | **Qwen-Show-O** `hf_model-final` | minimum FID, default | common **w=12.75**, Show-O **s=11.75** | **31.1314** | 66.7629 ± 0.5617 |
@@ -87,7 +90,8 @@ Every formal point uses:
 - Inception feature dimension 2,048;
 - 10 contiguous IS splits with population standard deviation;
 - stable symmetric-eigendecomposition FID reduction;
-- saved generated images and exact filename/count validation.
+- deterministic global sample indexing; evaluations that export images also
+  validate exact filenames and counts.
 
 Key provenance hashes:
 
@@ -97,6 +101,9 @@ Key provenance hashes:
 | Validation split manifest | `02e5c67c058f95bcca46c82f3c1fc81086f61dcec62ce25049843f09d930a5ba` |
 | Inception weights | `6726825d0af5f729cebd5821db510b11b1cfad8faad88a03f1befd49fb9129b2` |
 | Selfless-Flow EMA checkpoint | `81f86d1805d732f8c8e377a08cef6a6aad285eb533677405d4867bda90a86203` |
+| Token-only MLP EMA checkpoint | `2f7af8c14b8f68a78eecae4312366c8660c9a13a4a71e94de8602e88438cd765` |
+| Token-only MLP ratio 4.5 EMA checkpoint | `b678679c868be05d253bc11c21ba1b4e9304f79d3937ed94b85ed2bbe7f3499d` |
+| Token-only MLP width 1936 EMA checkpoint | `bbad20da9c6dad7de27e489e17e224ea7203946092821e669198aa945739e1d4` |
 | Selfless-Flow non-EMA checkpoint | `1af7302e4498a8bf4b50c8bd0d8fe3b008487ab2b82f1504eb34b9ac21b2dab1` |
 | Qwen-Show-O checkpoint | `2eaf3c5958c36be4f2554ce88f67082cc6e40d67924df945c8b35a3efdec1806` |
 
@@ -115,6 +122,15 @@ directories, so they do not overwrite historical pre-sweep outputs.
 ```bash
 # EMA, CFG 3.5, BF16, parallel_rate=1
 bash script/ablation/evaluate_imagenet_flow_100c.sh
+
+# Token-only MLP architecture ablation; CFG is hard-fixed to 3.5
+bash script/ablation/evaluate_imagenet_flow_token_mlp_100c.sh
+
+# Token-only MLP, width 1280 / ratio 4.5; CFG is hard-fixed to 3.5
+bash script/ablation/evaluate_imagenet_flow_token_mlp_param_matched_100c.sh
+
+# Token-only MLP, width 1936 / ratio 1.0; CFG is hard-fixed to 3.5
+bash script/ablation/evaluate_imagenet_flow_token_mlp_width1936_100c.sh
 
 # Show-O s=11.75, equivalent to common w=12.75
 bash script/ablation/evaluate_qwen_showo_vq_100c.sh
@@ -148,6 +164,45 @@ All points below use `hf_model-final-ema`, BF16, 100-step Heun,
 
 CFG 3.5 is an interior FID optimum on the tested grid. IS continues to rise
 through CFG 5.0, with a corresponding FID regression.
+
+## Flow-head architecture ablation
+
+Architecture ablations reuse the baseline-selected inference protocol without
+per-architecture tuning: CFG 3.5, BF16 model forward, FP32 VAE and flow
+integration, 100-step Heun, `spatial_halton`, `parallel_rate=1`, seed 42, and
+10,000 samples. This keeps the measured delta attributable to training-time
+architecture choices rather than inference hyperparameter selection.
+
+| Flow head | Head parameters | Cross-token mixing in head | FID ↓ | IS ↑ |
+| --- | ---: | --- | ---: | ---: |
+| Contextual baseline | 164.073M | clean-latent cross-attention | **26.0110** | **59.5362 ± 1.1316** |
+| Token-only MLP, ratio 1.0 | 72.210M | none | 27.9774 | 56.9485 ± 1.5827 |
+| Token-only MLP, ratio 4.5 | 163.996M | none | **26.4404** | **58.3860 ± 1.1099** |
+| Token-only MLP, width 1936, ratio 1.0 | 163.828M | none | 26.9315 | 57.3898 ± 1.4622 |
+
+The token-only head raises FID by 1.9664 (+7.56%) and lowers IS by 2.5877
+(-4.35%). It is strictly pointwise: each prediction uses only its own noisy
+latent token, timestep, and same-position backbone condition. Its checkpoint
+contains no attention, QKV, positional-mixing, or clean-latent-context weights.
+
+Both parameter-matched variants recover much of the loss from the 72.210M
+head. The ratio-4.5 head is only 0.047% smaller than the contextual baseline;
+it trails that baseline by 0.4294 FID (+1.65%) and 1.1502 IS (-1.93%), while
+improving over the small token-only head by 1.5370 FID and 1.4375 IS. At nearly
+the same parameter count, ratio 4.5 also beats width 1936 by 0.4911 FID and
+0.9961 IS. Capacity is therefore better spent on the per-block expansion while
+keeping the residual stream aligned to the 1280-wide backbone than on widening
+the residual stream with ratio 1.0.
+
+The next controlled architecture ablation should keep the current best
+token-only scale (width 1280, depth 8, ratio 4.5) and add only the fixed 2D
+sine/cosine query-position feature used by the contextual head. This remains a
+strictly pointwise MAR/NextStep-style head: it introduces no attention,
+clean-latent context, learned position parameters, or token-to-token
+communication. It isolates whether the remaining 0.4294 FID gap comes from
+explicit spatial identity rather than cross-attention. Evaluation must remain
+fixed at the baseline-selected CFG 3.5; no architecture-specific CFG sweep is
+permitted.
 
 ### EMA versus non-EMA diagnostic
 
@@ -213,6 +268,18 @@ output/selfless-flow-ablation-imagenet100-80ep/
   fid_is_nonema_cfg_local_bf16/cfg_3p0/metrics.json
   fid_is_nonema_cfg_local_bf16/cfg_4p0/metrics.json
 
+output/selfless-flow-token-mlp-ablation-imagenet100-80ep/
+  hf_model-final-ema/model.safetensors
+  fid_is_selected_cfg3p5_ema/metrics.json
+
+output/selfless-flow-token-mlp-param-matched-ablation-imagenet100-80ep/
+  hf_model-final-ema/model.safetensors
+  fid_is_selected_cfg3p5_ema/metrics.json
+
+output/selfless-flow-token-mlp-width1936-ablation-imagenet100-80ep/
+  hf_model-final-ema/model.safetensors
+  fid_is_selected_cfg3p5_ema/metrics.json
+
 output/qwen-showo-vq-ablation-imagenet100-80ep/
   fid_is_cfg_sweep_official/summary.json
   fid_is_cfg_sweep_official/summary.csv
@@ -231,6 +298,10 @@ output/selfless-flow-ablation-imagenet100-80ep/
   and lacks the current guidance-formula fields. It is not a formal result.
 - FP32 model-forward diagnostics were stopped by design and are not reported.
   Production evaluation remains BF16.
+- An exploratory token-only CFG sweep was stopped after the architecture
+  protocol was clarified. Its CFG 2.0/2.5 diagnostics and incomplete work
+  directories are excluded from architecture selection; only the independently
+  rerun, baseline-fixed CFG 3.5 result above is formal.
 - Each completed sweep root has an immutable `.sweep_contract.json` binding its
   checkpoint, config, evaluator, launcher, validator, real stats, tokenizer/VAE,
   and source hashes. Repository refactors do not invalidate the recorded result,

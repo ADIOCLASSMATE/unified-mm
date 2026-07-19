@@ -165,6 +165,7 @@ def _load_point(
     metrics_path: Path,
     *,
     job_name: str | None,
+    expected_config: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     try:
         resolved_metrics_path = metrics_path.expanduser().resolve(strict=True)
@@ -188,9 +189,10 @@ def _load_point(
         )
     if _required(payload, "official_protocol", source=resolved_metrics_path) is not True:
         raise SummaryError(f"{resolved_metrics_path}: official_protocol must be true")
-    if _required(payload, "config", source=resolved_metrics_path) != EXPECTED_CONFIG:
+    if _required(payload, "config", source=resolved_metrics_path) != expected_config:
         raise SummaryError(
-            f"{resolved_metrics_path}: unexpected formal config path"
+            f"{resolved_metrics_path}: unexpected formal config path; "
+            f"expected {expected_config!r}"
         )
     expected_states = {
         "adapter": {"adapter": None},
@@ -635,6 +637,7 @@ def build_summary(
     point_specs: Sequence[str],
     job_specs: Sequence[str],
     checkpoint_sha256: str | None,
+    expected_config: str = EXPECTED_CONFIG,
 ) -> dict[str, Any]:
     if not point_specs:
         raise SummaryError("at least one --point CFG=METRICS_PATH is required")
@@ -673,6 +676,7 @@ def build_summary(
             cfg,
             points[cfg],
             job_name=jobs.get(cfg),
+            expected_config=expected_config,
         )
         if common_protocol is None:
             common_protocol = invariant
@@ -789,6 +793,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Optional 64-hex SHA256 of the evaluated checkpoint weights.",
     )
     parser.add_argument(
+        "--expected-config",
+        default=EXPECTED_CONFIG,
+        metavar="PATH",
+        help=(
+            "Formal training config path required in every metrics file "
+            f"(default: {EXPECTED_CONFIG})."
+        ),
+    )
+    parser.add_argument(
         "--output-json",
         type=Path,
         required=True,
@@ -813,6 +826,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         point_specs=args.point,
         job_specs=args.job,
         checkpoint_sha256=args.checkpoint_sha256,
+        expected_config=args.expected_config,
     )
     input_metrics_paths = {
         Path(point["metrics_path"]).resolve() for point in summary["points"]

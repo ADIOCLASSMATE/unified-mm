@@ -91,13 +91,13 @@ def load_model_tokenizer(config: OmegaConf, logger=None):
         "image_flow_grad_checkpointing", "image_flow_time_scale",
         "image_flow_time_sampling", "image_flow_logit_mean", "image_flow_logit_std",
         "image_flow_time_eps", "image_flow_time_uniform_mix", "image_flow_solver",
-        "image_flow_mlp_ratio",
+        "image_flow_mlp_ratio", "image_flow_head_arch", "image_flow_zero_init_gate",
         "image_flow_latent_mixer_heads", "image_flow_latent_mixer_dropout",
         "image_flow_latent_mixer_zero_init_gate",
         "image_input_noise_strength", "image_input_noise_strength_std",
         "image_input_noise_strength_min", "image_input_noise_strength_max",
         "image_uncond_prob",
-        "image_token_embedder_norm", "image_token_embedder_init_mode",
+        "image_token_embedder_init_mode",
         "image_token_embedder_latent_rms",
     )
 

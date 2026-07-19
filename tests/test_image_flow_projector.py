@@ -8,6 +8,7 @@ import torch
 from omegaconf import OmegaConf
 from transformers import Qwen3Config
 
+from models.modeling_model.image_flow_loss import TokenFlowMLPHead
 from models.modeling_model.modeling_selfless_flow import ImageTokenEmbedder, Qwen3ForCausalLM
 from pretrain.train_selfless_flow import _reinitialize_image_modules
 
@@ -36,8 +37,9 @@ def test_image_projectors_use_normal_init_with_nextstep_mlp_ratio():
     config = tiny_qwen3_config()
     model = Qwen3ForCausalLM(config)
 
-    assert model.image_token_embedder.norm_mode == "none"
     assert model.image_token_embedder.init_mode == "balanced"
+    assert not hasattr(model.image_token_embedder, "z_proj_ln")
+    assert not any("z_proj_ln" in name for name in model.state_dict())
     assert isinstance(model.image_token_embedder.image_pos_gain, torch.nn.Parameter)
     assert isinstance(model.image_flow_condition_proj, torch.nn.Linear)
     assert not torch.allclose(model.image_token_embedder.z_proj.weight, torch.zeros_like(model.image_token_embedder.z_proj.weight))
@@ -65,12 +67,11 @@ def test_image_projectors_use_normal_init_with_nextstep_mlp_ratio():
     )
 
 
-def test_default_image_token_embedder_is_no_norm_balanced():
+def test_default_image_token_embedder_uses_balanced_init_without_post_norm():
     embedder = ImageTokenEmbedder(latent_dim=4, hidden_size=8, image_tokens_per_img=4)
 
-    assert embedder.norm_mode == "none"
     assert embedder.init_mode == "balanced"
-    assert not embedder._uses_post_norm()
+    assert not hasattr(embedder, "z_proj_ln")
     assert isinstance(embedder.image_pos_gain, torch.nn.Parameter)
 
 
@@ -85,6 +86,73 @@ def test_image_flow_mlp_ratio_can_widen_resblocks():
     out = model._prepare_image_flow_condition(z)
     assert out.shape == z.shape
     assert torch.isfinite(out).all()
+
+
+def test_token_mlp_flow_head_contains_no_attention_and_is_strictly_pointwise():
+    config = tiny_qwen3_config()
+    config.image_flow_head_arch = "token_mlp"
+    model = Qwen3ForCausalLM(config)
+    head = model.image_flow_head
+
+    assert head.head_arch == "token_mlp"
+    assert not head.uses_latent_mixer
+    assert isinstance(head.net, TokenFlowMLPHead)
+    parameter_names = set(dict(head.named_parameters()))
+    assert not any(
+        marker in name
+        for name in parameter_names
+        for marker in ("cross", "attn", "query", "key")
+    )
+    assert not any(isinstance(module, torch.nn.MultiheadAttention) for module in head.modules())
+
+    with torch.no_grad():
+        torch.manual_seed(0)
+        head.net.final_layer.linear.weight.normal_()
+        head.net.final_layer.linear.bias.normal_()
+
+    x_t = torch.randn(1, 3, config.image_latent_dim)
+    t = torch.full((1, 3), 0.5)
+    condition = torch.randn(1, 3, config.hidden_size)
+    first = head.velocity(
+        x_t,
+        t,
+        condition,
+        context_latents=torch.randn(1, 3, config.image_latent_dim),
+        context_mask=torch.ones(1, 3, 3, dtype=torch.bool),
+        query_positions=torch.tensor([[0, 1, 2]]),
+        context_positions=torch.tensor([[0, 1, 2]]),
+    )
+
+    changed = x_t.clone()
+    changed[:, 1:] = torch.randn_like(changed[:, 1:]) * 100.0
+    changed_condition = condition.clone()
+    changed_condition[:, 1:] = torch.randn_like(changed_condition[:, 1:]) * 100.0
+    second = head.velocity(
+        changed,
+        t,
+        changed_condition,
+        context_latents=torch.randn(1, 3, config.image_latent_dim) * 100.0,
+        context_mask=torch.zeros(1, 3, 3, dtype=torch.bool),
+        query_positions=torch.tensor([[2, 1, 0]]),
+        context_positions=torch.tensor([[2, 1, 0]]),
+    )
+
+    assert torch.allclose(first[:, 0], second[:, 0])
+    assert head.prepare_latent_mixer_cache(torch.randn(1, 3, config.image_latent_dim)) is None
+
+
+def test_token_mlp_flow_head_arch_round_trips_with_pretrained_save():
+    config = tiny_qwen3_config()
+    config.image_flow_head_arch = "token_mlp"
+    model = Qwen3ForCausalLM(config)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model.save_pretrained(tmpdir, safe_serialization=True)
+        loaded = Qwen3ForCausalLM.from_pretrained(tmpdir, trust_remote_code=True)
+
+    assert loaded.config.image_flow_head_arch == "token_mlp"
+    assert loaded.image_flow_head.head_arch == "token_mlp"
+    assert isinstance(loaded.image_flow_head.net, TokenFlowMLPHead)
 
 
 def test_image_input_noise_is_train_only():
@@ -160,9 +228,8 @@ def test_image_token_embedder_rebuilds_fixed_positions_on_reset():
     assert torch.allclose(actual, expected)
 
 
-def test_no_norm_image_token_embedder_uses_balanced_pos_gain_init():
+def test_image_token_embedder_uses_balanced_pos_gain_init():
     config = tiny_qwen3_config()
-    config.image_token_embedder_norm = "none"
     config.image_token_embedder_init_mode = "balanced"
     config.image_token_embedder_latent_rms = 1.0
     model = Qwen3ForCausalLM(config)
@@ -190,7 +257,6 @@ def test_balanced_pos_gain_scales_image_pos():
         latent_dim=4,
         hidden_size=8,
         image_tokens_per_img=4,
-        norm_mode="none",
         init_mode="balanced",
         latent_rms=1.0,
     )
@@ -243,7 +309,6 @@ def test_legacy_flow_pos_embed_key_is_unexpected():
 
 def test_balanced_image_pos_gain_round_trips_with_pretrained_save():
     config = tiny_qwen3_config()
-    config.image_token_embedder_norm = "none"
     config.image_token_embedder_init_mode = "balanced"
     config.image_token_embedder_latent_rms = 1.0
     model = Qwen3ForCausalLM(config)
@@ -254,7 +319,6 @@ def test_balanced_image_pos_gain_round_trips_with_pretrained_save():
         model.save_pretrained(tmpdir, safe_serialization=True)
         loaded = Qwen3ForCausalLM.from_pretrained(tmpdir, trust_remote_code=True)
 
-    assert loaded.config.image_token_embedder_norm == "none"
     assert loaded.config.image_token_embedder_init_mode == "balanced"
     assert math.isclose(float(loaded.config.image_token_embedder_latent_rms), 1.0)
     assert isinstance(loaded.image_token_embedder.image_pos_gain, torch.nn.Parameter)

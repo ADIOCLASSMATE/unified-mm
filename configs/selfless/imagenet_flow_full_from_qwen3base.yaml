@@ -42,7 +42,6 @@ model:
     continuous_image_latents: true
     image_tokens_per_img: 256
     image_latent_dim: 16
-    image_token_embedder_norm: "none"
     image_token_embedder_init_mode: "balanced"
     image_token_embedder_latent_rms: 1.0
     image_generation_head_type: "flow"

@@ -85,7 +85,6 @@ class ImageTokenEmbedder(nn.Module):
         hidden_size,
         image_tokens_per_img=256,
         initializer_range=0.02,
-        norm_mode="none",
         init_mode="balanced",
         latent_rms=1.0,
     ):
@@ -94,11 +93,9 @@ class ImageTokenEmbedder(nn.Module):
         self.hidden_size = int(hidden_size)
         self.image_tokens_per_img = int(image_tokens_per_img)
         self.initializer_range = float(initializer_range)
-        self.norm_mode = "none" if norm_mode is None else str(norm_mode).lower()
         self.init_mode = "balanced" if init_mode is None else str(init_mode).lower()
         self.latent_rms = float(latent_rms)
         self.z_proj = nn.Linear(self.latent_dim, self.hidden_size, bias=True)
-        self.z_proj_ln = nn.LayerNorm(self.hidden_size, eps=1e-6)
         pos_embed = torch.empty(self.image_tokens_per_img, self.hidden_size)
         self.register_buffer("image_pos_embed", pos_embed.clone())
         if self._uses_learned_image_pos_gain():
@@ -117,7 +114,7 @@ class ImageTokenEmbedder(nn.Module):
             "image_pos_gain": None,
             "latent_rms": float(self.latent_rms),
         }
-        if self._uses_balanced_no_norm_init():
+        if self._uses_balanced_init():
             latent_rms = max(float(self.latent_rms), 1e-6)
             component_rms = self.initializer_range / math.sqrt(2.0)
             weight_std = component_rms / (math.sqrt(float(self.latent_dim)) * latent_rms)
@@ -151,8 +148,6 @@ class ImageTokenEmbedder(nn.Module):
 
         _normal_init_fp32_(self.z_proj.weight, mean=0.0, std=float(weight_std))
         nn.init.zeros_(self.z_proj.bias)
-        nn.init.ones_(self.z_proj_ln.weight)
-        nn.init.zeros_(self.z_proj_ln.bias)
         self.last_init_stats = init_stats
 
     def _reset_position_buffers(self):
@@ -173,27 +168,10 @@ class ImageTokenEmbedder(nn.Module):
     def weight_dtype(self):
         return self.z_proj.weight.dtype
 
-    def _uses_post_norm(self) -> bool:
-        if self.norm_mode in {"layernorm", "layer_norm", "ln"}:
-            return True
-        if self.norm_mode in {"none", "false", "off", "no_norm", "nonorm", ""}:
-            return False
-        raise ValueError(
-            f"Unknown image_token_embedder_norm={self.norm_mode!r}; "
-            "expected layernorm or none."
-        )
-
-    def _apply_post_norm(self, x):
-        if self._uses_post_norm():
-            return self.z_proj_ln(x)
-        return x
-
-    def _uses_balanced_no_norm_init(self) -> bool:
+    def _uses_balanced_init(self) -> bool:
         if self.init_mode in {"default", "standard", "normal", ""}:
             return False
         if self.init_mode in {"balanced", "balanced_pos_gain", "initializer_range"}:
-            if self._uses_post_norm():
-                raise ValueError("image_token_embedder_init_mode='balanced' requires image_token_embedder_norm='none'.")
             return True
         raise ValueError(
             f"Unknown image_token_embedder_init_mode={self.init_mode!r}; "
@@ -201,7 +179,7 @@ class ImageTokenEmbedder(nn.Module):
         )
 
     def _uses_learned_image_pos_gain(self) -> bool:
-        return self.init_mode in {"balanced", "balanced_pos_gain", "initializer_range"} and not self._uses_post_norm()
+        return self.init_mode in {"balanced", "balanced_pos_gain", "initializer_range"}
 
     def _scale_image_pos(self, pos):
         if self.image_pos_gain is None:
@@ -234,7 +212,7 @@ class ImageTokenEmbedder(nn.Module):
         if local_positions is not None:
             pos = self._lookup_pos_embed(self.image_pos_embed, local_positions, x.dtype)
             x = x + self._scale_image_pos(pos)
-        return self._apply_post_norm(x)
+        return x
 
     def embed_mask(self, local_positions, mask_embedding):
         local_positions = self._positions(local_positions, mask_embedding.device)
@@ -244,7 +222,7 @@ class ImageTokenEmbedder(nn.Module):
         x = x.expand(local_positions.shape + (x.shape[-1],))
         pos = self._lookup_pos_embed(self.image_pos_embed, local_positions, x.dtype)
         x = x + self._scale_image_pos(pos)
-        return self._apply_post_norm(x)
+        return x
 
     def forward(self, latents, local_positions=None):
         return self.embed_latents(latents, local_positions=local_positions)
@@ -674,13 +652,12 @@ class Qwen3Model(Qwen3PreTrainedModel):
         self.image_latent_dim = getattr(config, "image_latent_dim", 4)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.image_token_embedder = ImageTokenEmbedder(
-            self.image_latent_dim,
-            config.hidden_size,
-            getattr(config, "image_tokens_per_img", 256),
-            getattr(config, "initializer_range", 0.02),
-            getattr(config, "image_token_embedder_norm", "none"),
-            getattr(config, "image_token_embedder_init_mode", "balanced"),
-            getattr(config, "image_token_embedder_latent_rms", 1.0),
+            latent_dim=self.image_latent_dim,
+            hidden_size=config.hidden_size,
+            image_tokens_per_img=getattr(config, "image_tokens_per_img", 256),
+            initializer_range=getattr(config, "initializer_range", 0.02),
+            init_mode=getattr(config, "image_token_embedder_init_mode", "balanced"),
+            latent_rms=getattr(config, "image_token_embedder_latent_rms", 1.0),
         )
         self.image_input_noise_strength = float(getattr(config, "image_input_noise_strength", 1.0e-2))
         self.image_input_noise_strength_std = float(getattr(config, "image_input_noise_strength_std", 0.0))
@@ -974,7 +951,12 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             image_tokens_per_img=getattr(config, "image_tokens_per_img", 256),
             latent_mixer_heads=getattr(config, "image_flow_latent_mixer_heads", 8),
             latent_mixer_dropout=getattr(config, "image_flow_latent_mixer_dropout", 0.0),
-            latent_mixer_zero_init_gate=getattr(config, "image_flow_latent_mixer_zero_init_gate", True),
+            latent_mixer_zero_init_gate=getattr(
+                config,
+                "image_flow_zero_init_gate",
+                getattr(config, "image_flow_latent_mixer_zero_init_gate", True),
+            ),
+            head_arch=getattr(config, "image_flow_head_arch", "contextual"),
         )
 
         # Initialize weights and apply final processing
@@ -1187,6 +1169,9 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                         context_image_latents_for_loss = image_latents
                     else:
                         context_image_latents_for_loss = context_image_latents.to(hidden_states.device)
+                    uses_latent_mixer = bool(
+                        getattr(self.image_flow_head, "uses_latent_mixer", True)
+                    )
                     span_targets = []
                     span_context_latents = []
                     span_conditions = []
@@ -1208,7 +1193,10 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                                 continue
                             positions = image_local_positions[batch_idx, run]
                             span_targets.append(image_latents[batch_idx, run])
-                            span_context_latents.append(context_image_latents_for_loss[batch_idx, run])
+                            if uses_latent_mixer:
+                                span_context_latents.append(
+                                    context_image_latents_for_loss[batch_idx, run]
+                                )
                             span_conditions.append(
                                 self._prepare_image_flow_condition(
                                     hidden_states[batch_idx, run]
@@ -1228,13 +1216,20 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                         lengths = {int(target.shape[0]) for target in span_targets}
                         if len(lengths) == 1:
                             image_targets = torch.stack(span_targets, dim=0)
-                            image_context_latents = torch.stack(span_context_latents, dim=0)
+                            image_context_latents = (
+                                torch.stack(span_context_latents, dim=0)
+                                if uses_latent_mixer
+                                else None
+                            )
                             image_conditions = torch.stack(span_conditions, dim=0)
                             image_sigmas = torch.stack(span_sigmas, dim=0)
                             image_positions_for_flow = torch.stack(span_positions, dim=0)
                             if self.image_flow_batch_mul > 1:
                                 image_targets = image_targets.repeat(self.image_flow_batch_mul, 1, 1)
-                                image_context_latents = image_context_latents.repeat(self.image_flow_batch_mul, 1, 1)
+                                if image_context_latents is not None:
+                                    image_context_latents = image_context_latents.repeat(
+                                        self.image_flow_batch_mul, 1, 1
+                                    )
                                 image_conditions = image_conditions.repeat(self.image_flow_batch_mul, 1, 1)
                                 image_sigmas = image_sigmas.repeat(self.image_flow_batch_mul, 1)
                                 image_positions_for_flow = image_positions_for_flow.repeat(self.image_flow_batch_mul, 1)
@@ -1249,19 +1244,27 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                             losses = []
                             for target, context_latent, condition, sigma_span, position_span in zip(
                                 span_targets,
-                                span_context_latents,
+                                (
+                                    span_context_latents
+                                    if uses_latent_mixer
+                                    else [None] * len(span_targets)
+                                ),
                                 span_conditions,
                                 span_sigmas,
                                 span_positions,
                             ):
                                 target = target.unsqueeze(0)
-                                context_latent = context_latent.unsqueeze(0)
+                                if context_latent is not None:
+                                    context_latent = context_latent.unsqueeze(0)
                                 condition = condition.unsqueeze(0)
                                 sigma_span = sigma_span.unsqueeze(0)
                                 position_span = position_span.unsqueeze(0)
                                 if self.image_flow_batch_mul > 1:
                                     target = target.repeat(self.image_flow_batch_mul, 1, 1)
-                                    context_latent = context_latent.repeat(self.image_flow_batch_mul, 1, 1)
+                                    if context_latent is not None:
+                                        context_latent = context_latent.repeat(
+                                            self.image_flow_batch_mul, 1, 1
+                                        )
                                     condition = condition.repeat(self.image_flow_batch_mul, 1, 1)
                                     sigma_span = sigma_span.repeat(self.image_flow_batch_mul, 1)
                                     position_span = position_span.repeat(self.image_flow_batch_mul, 1)
@@ -1494,6 +1497,8 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             return self._prepare_image_flow_condition(hidden_values)
 
         def _flow_context(sample_indices: torch.Tensor, local_positions: torch.Tensor) -> dict[str, torch.Tensor]:
+            if not bool(getattr(self.image_flow_head, "uses_latent_mixer", True)):
+                return {}
             sample_index_list = sample_indices.detach().to(device="cpu").tolist()
             visible_positions_per_row = []
             max_visible = 0
