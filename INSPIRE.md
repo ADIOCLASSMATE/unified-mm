@@ -24,10 +24,13 @@ not implicitly mount the official dataset.
 
 - Use `dev-wjx` for single-GPU micro-batch/smoke checks when it is running.
 - Formal ImageNet-100 training and FID/IS evaluation use 8×H100.
-- GPU Job priority is 6.
+- GPU Job priority is 4.
 - Default project: `随机序语言建模-统一自回归与掩码扩散的随机顺序生成框架`.
 - The main project permits at most 16 concurrent GPUs, so submit at most two
   8-GPU formal jobs together.
+- Secondary project: `多模态大模型新架构评测探索与scaling-law`. It may be used
+  after a live quota/availability check, with at most 32 concurrent GPUs assigned
+  to this work. Do not keep duplicate runnable jobs in both projects.
 - Image: `docker.sii.shaipower.online/inspire-studio/dev-wjx:v-2.1`.
 
 ## Waiting

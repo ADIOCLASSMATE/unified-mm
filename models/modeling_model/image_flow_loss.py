@@ -6,7 +6,10 @@ import torch.nn.functional as F
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 from torch.utils.checkpoint import checkpoint
 
-from .image_position_utils import build_2d_sincos_position_embedding
+from .image_position_utils import (
+    apply_local_row_col_rope,
+    build_2d_sincos_position_embedding,
+)
 
 
 def _xavier_uniform_init_fp32_(tensor: torch.Tensor):
@@ -76,7 +79,16 @@ class FinalLayer(nn.Module):
 
 
 class ContextualFlowBlock(nn.Module):
-    def __init__(self, channels, num_heads=8, mlp_ratio=2.0, dropout=0.0):
+    def __init__(
+        self,
+        channels,
+        num_heads=8,
+        mlp_ratio=2.0,
+        dropout=0.0,
+        rope_mode="none",
+        rope_axis_dims=(80, 80),
+        image_tokens_per_img=256,
+    ):
         super().__init__()
         self.channels = int(channels)
         self.num_heads = int(num_heads)
@@ -88,6 +100,9 @@ class ContextualFlowBlock(nn.Module):
             raise ValueError(f"channels={channels} must be divisible by num_heads={num_heads}")
         self.head_dim = self.channels // self.num_heads
         self.scale = self.head_dim ** -0.5
+        self.rope_mode = str(rope_mode)
+        self.rope_axis_dims = tuple(int(item) for item in rope_axis_dims)
+        self.image_tokens_per_img = int(image_tokens_per_img)
 
         self.cross_q_norm = nn.LayerNorm(self.channels, eps=1e-6)
         self.cross_kv_norm = nn.LayerNorm(self.channels, eps=1e-6)
@@ -110,6 +125,13 @@ class ContextualFlowBlock(nn.Module):
             nn.Linear(self.channels, 6 * self.channels),
         )
         self.last_gate_abs_mean = None
+        self.last_gate_abs_per_token = None
+        self.last_attention_gate_abs_per_token = None
+        self.last_mlp_gate_abs_per_token = None
+        self.collect_attention_diagnostics = False
+        self.last_attention_entropy_per_token = None
+        self.last_attention_distance_per_token = None
+        self.last_update_rms_per_token = None
 
     def _split_heads(self, x):
         batch_size, seq_len, _ = x.shape
@@ -134,13 +156,94 @@ class ContextualFlowBlock(nn.Module):
             )
         return context_mask
 
-    def prepare_cross_cache(self, context_hidden):
+    def _maybe_apply_rope(self, x, positions):
+        if self.rope_mode == "none":
+            return x
+        if self.rope_mode != "row_col_2d":
+            raise ValueError(f"Unknown flow-head rope_mode={self.rope_mode!r}.")
+        if positions is None:
+            raise ValueError(
+                "row_col_2d flow-head RoPE requires explicit local positions."
+            )
+        return apply_local_row_col_rope(
+            x,
+            positions,
+            image_tokens_per_img=self.image_tokens_per_img,
+            axis_dims=self.rope_axis_dims,
+        )
+
+    def prepare_cross_cache(self, context_hidden, context_positions=None):
         context_hidden = self.cross_kv_norm(context_hidden)
         k = self._split_heads(self.cross_k(context_hidden))
+        k = self._maybe_apply_rope(k, context_positions)
         v = self._split_heads(self.cross_v(context_hidden))
-        return {"k": k, "v": v}
+        return {
+            "k": k,
+            "v": v,
+            "context_positions": context_positions,
+            "k_rotation_count": int(self.rope_mode != "none"),
+        }
 
-    def _cross_attention(self, x, layer_cache, context_mask, context_block_mask=None, use_flex_attention=False):
+    def _record_attention_diagnostics(
+        self,
+        q,
+        k,
+        context_mask,
+        query_positions,
+        context_positions,
+    ):
+        if not self.collect_attention_diagnostics:
+            return
+        batch_size, _, query_len, _ = q.shape
+        context_len = k.shape[2]
+        mask = self._format_context_mask(
+            context_mask,
+            batch_size,
+            query_len,
+            context_len,
+            q.device,
+        )
+        has_context = mask.any(dim=-1)
+        safe_mask = mask.clone()
+        safe_mask[~has_context] = True
+        scores = torch.matmul(q.float(), k.float().transpose(-2, -1)) * self.scale
+        scores = scores.masked_fill(~safe_mask.unsqueeze(1), float("-inf"))
+        probabilities = torch.softmax(scores, dim=-1)
+        probabilities = probabilities * has_context[:, None, :, None]
+        entropy = -(
+            probabilities
+            * probabilities.clamp_min(torch.finfo(torch.float32).tiny).log()
+        ).sum(dim=-1)
+        self.last_attention_entropy_per_token = entropy.mean(dim=1).detach()
+
+        if query_positions is None or context_positions is None:
+            self.last_attention_distance_per_token = None
+            return
+        side = int(math.isqrt(self.image_tokens_per_img))
+        query_positions = query_positions.to(device=q.device, dtype=torch.long)
+        context_positions = context_positions.to(device=q.device, dtype=torch.long)
+        query_row = torch.div(query_positions, side, rounding_mode="floor")
+        query_col = query_positions.remainder(side)
+        context_row = torch.div(context_positions, side, rounding_mode="floor")
+        context_col = context_positions.remainder(side)
+        distance = (
+            (query_row.unsqueeze(-1) - context_row.unsqueeze(1)).float().pow(2)
+            + (query_col.unsqueeze(-1) - context_col.unsqueeze(1)).float().pow(2)
+        ).sqrt()
+        mean_probability = probabilities.mean(dim=1)
+        self.last_attention_distance_per_token = (
+            (mean_probability * distance).sum(dim=-1).detach()
+        )
+
+    def _cross_attention(
+        self,
+        x,
+        layer_cache,
+        context_mask,
+        query_positions=None,
+        context_block_mask=None,
+        use_flex_attention=False,
+    ):
         if layer_cache is None:
             return None
         k = layer_cache.get("k")
@@ -155,9 +258,17 @@ class ContextualFlowBlock(nn.Module):
             return None
 
         q = self._split_heads(self.cross_q(x))
+        q = self._maybe_apply_rope(q, query_positions)
         attn_dtype = q.dtype
         k = k.to(device=x.device, dtype=attn_dtype)
         v = v.to(device=x.device, dtype=attn_dtype)
+        self._record_attention_diagnostics(
+            q,
+            k,
+            context_mask,
+            query_positions,
+            layer_cache.get("context_positions"),
+        )
         if use_flex_attention:
             out = flex_attention(
                 query=q,
@@ -204,9 +315,14 @@ class ContextualFlowBlock(nn.Module):
         y,
         layer_cache=None,
         context_mask=None,
+        query_positions=None,
         context_block_mask=None,
         use_flex_attention=False,
+        include_mlp=True,
     ):
+        self.last_attention_entropy_per_token = None
+        self.last_attention_distance_per_token = None
+        input_x = x
         (
             shift_cross,
             scale_cross,
@@ -222,20 +338,33 @@ class ContextualFlowBlock(nn.Module):
                 h,
                 layer_cache,
                 context_mask,
+                query_positions=query_positions,
                 context_block_mask=context_block_mask,
                 use_flex_attention=use_flex_attention,
             )
             if mixed is not None:
                 x = x + gate_cross * mixed
 
-        h = modulate(self.mlp_norm(x), shift_mlp, scale_mlp)
-        x = x + gate_mlp * self.mlp(h)
-        self.last_gate_abs_mean = torch.stack(
-            [
-                gate_cross.detach().float().abs().mean(),
-                gate_mlp.detach().float().abs().mean(),
-            ]
-        ).mean()
+        if include_mlp:
+            h = modulate(self.mlp_norm(x), shift_mlp, scale_mlp)
+            x = x + gate_mlp * self.mlp(h)
+        attention_gate = gate_cross.detach().float().abs().mean(dim=-1)
+        mlp_gate = gate_mlp.detach().float().abs().mean(dim=-1)
+        gate_per_token = (
+            torch.stack([attention_gate, mlp_gate], dim=0).mean(dim=0)
+            if include_mlp
+            else attention_gate
+        )
+        self.last_attention_gate_abs_per_token = attention_gate
+        self.last_mlp_gate_abs_per_token = mlp_gate if include_mlp else None
+        self.last_gate_abs_per_token = gate_per_token
+        self.last_gate_abs_mean = gate_per_token.mean()
+        self.last_update_rms_per_token = (
+            (x.detach().float() - input_x.detach().float())
+            .pow(2)
+            .mean(dim=-1)
+            .sqrt()
+        )
         return x
 
 
@@ -392,6 +521,14 @@ class ContextualFlowTransformerHead(nn.Module):
         latent_mixer_dropout=0.0,
         latent_mixer_zero_init_gate=True,
         image_tokens_per_img=256,
+        query_position_mode="additive_2d",
+        context_position_mode="additive_2d",
+        rope_mode="none",
+        rope_axis_dims=(80, 80),
+        rope_rotate_value=False,
+        position_variant="FH0",
+        flow_head_variant="DF1",
+        endpoint_time=1000.0,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -404,6 +541,44 @@ class ContextualFlowTransformerHead(nn.Module):
         self.dropout = float(latent_mixer_dropout)
         self.zero_init_gate = bool(latent_mixer_zero_init_gate)
         self.image_tokens_per_img = int(image_tokens_per_img)
+        self.query_position_mode = str(query_position_mode)
+        self.context_position_mode = str(context_position_mode)
+        self.rope_mode = str(rope_mode)
+        self.rope_axis_dims = tuple(int(item) for item in rope_axis_dims)
+        self.rope_rotate_value = bool(rope_rotate_value)
+        self.position_variant = str(position_variant)
+        self.flow_head_variant = self._normalize_flow_head_variant(flow_head_variant)
+        self.endpoint_time = float(endpoint_time)
+        self.dynamic_content = True
+        self.content_uses_mlp = True
+        if self.query_position_mode not in {"none", "additive_2d"}:
+            raise ValueError(
+                f"Unknown flow query_position_mode={self.query_position_mode!r}."
+            )
+        if self.context_position_mode not in {"none", "additive_2d"}:
+            raise ValueError(
+                f"Unknown flow context_position_mode={self.context_position_mode!r}."
+            )
+        if self.rope_mode not in {"none", "row_col_2d"}:
+            raise ValueError(f"Unknown flow rope_mode={self.rope_mode!r}.")
+        if self.rope_rotate_value:
+            raise ValueError("Flow-head RoPE never rotates V.")
+        baseline_position_contracts = {
+            "FH0": ("additive_2d", "additive_2d", "none"),
+            "FH4": ("none", "none", "row_col_2d"),
+        }
+        expected = baseline_position_contracts.get(self.position_variant)
+        actual = (
+            self.query_position_mode,
+            self.context_position_mode,
+            self.rope_mode,
+        )
+        if expected is None or actual != expected:
+            raise ValueError(
+                "DF1 position contract must be one of the retained baselines "
+                f"{baseline_position_contracts}, got "
+                f"{self.position_variant}={actual}."
+            )
 
         self.time_embed = TimestepEmbedder(model_channels)
         self.cond_embed = nn.Linear(z_channels, model_channels)
@@ -417,13 +592,41 @@ class ContextualFlowTransformerHead(nn.Module):
                     num_heads=self.num_heads,
                     mlp_ratio=self.mlp_ratio,
                     dropout=self.dropout,
+                    rope_mode=self.rope_mode,
+                    rope_axis_dims=self.rope_axis_dims,
+                    image_tokens_per_img=self.image_tokens_per_img,
                 )
                 for _ in range(num_res_blocks)
             ]
         )
         self.final_layer = FinalLayer(model_channels, out_channels)
         self.last_gate_abs_mean = None
+        self.last_gate_abs_per_token = None
+        self.last_attention_entropy_per_token = None
+        self.last_attention_distance_per_token = None
+        self.last_query_attention_gate_abs_per_token = None
+        self.last_query_mlp_gate_abs_per_token = None
+        self.last_content_attention_gate_abs_per_token = None
+        self.last_content_mlp_gate_abs_per_token = None
+        self.last_content_update_rms_per_token = None
+        self.last_content_relative_update_per_token = None
+        self.last_content_query_cosine_per_token = None
         self.initialize_weights()
+
+    @staticmethod
+    def _normalize_flow_head_variant(value):
+        normalized = str(value or "DF1").strip().upper().replace("_", "")
+        if normalized != "DF1":
+            raise ValueError(
+                f"Unsupported image_flow_head_variant={value!r}; "
+                "the active baseline interface only supports DF1."
+            )
+        return normalized
+
+    def set_attention_diagnostics(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        for block in self.blocks:
+            block.collect_attention_diagnostics = enabled
 
     def initialize_weights(self):
         def _basic_init(module):
@@ -511,6 +714,163 @@ class ContextualFlowTransformerHead(nn.Module):
         positions = self._positions(positions, batch_size, seq_len, x.device)
         return x, positions, squeeze
 
+    def position_contract(self):
+        return {
+            "schema": "selfless_flow_head_position_v1",
+            "variant": self.position_variant,
+            "A_q": int(self.query_position_mode == "additive_2d"),
+            "A_c": int(self.context_position_mode == "additive_2d"),
+            "R_f": int(self.rope_mode == "row_col_2d"),
+            "query_position_mode": self.query_position_mode,
+            "context_position_mode": self.context_position_mode,
+            "rope_mode": self.rope_mode,
+            "rope_axis_dims": list(self.rope_axis_dims),
+            "rotate_value": False,
+        }
+
+    def cache_contract(self):
+        return {
+            "schema": "selfless_flow_head_content_cache_v1",
+            "flow_head_variant": self.flow_head_variant,
+            "content_update": "shared_attention_mlp",
+            "strict_context": True,
+            "query_writes_cache": False,
+            "position_contract": self.position_contract(),
+        }
+
+    @staticmethod
+    def _position_digest(positions):
+        weights = torch.arange(
+            1,
+            positions.shape[1] + 1,
+            device=positions.device,
+            dtype=torch.long,
+        )
+        return torch.stack(
+            [
+                positions.sum(dim=1),
+                (positions * weights).sum(dim=1),
+                positions.min(dim=1).values,
+                positions.max(dim=1).values,
+            ],
+            dim=1,
+        )
+
+    def _validate_latent_mixer_cache(self, cache):
+        expected = self.position_contract()
+        actual = cache.get("position_contract")
+        if actual != expected:
+            raise ValueError(
+                "Flow-head context cache position contract mismatch: "
+                f"expected={expected}, actual={actual}."
+            )
+        layers = cache.get("layers")
+        if not isinstance(layers, list) or len(layers) != len(self.blocks):
+            raise ValueError(
+                "Flow-head context cache must contain one layer cache per block."
+            )
+        actual_cache_contract = cache.get("cache_contract")
+        expected_cache_contract = self.cache_contract()
+        if actual_cache_contract != expected_cache_contract:
+            raise ValueError(
+                "Dynamic flow-head content cache contract mismatch: "
+                f"expected={expected_cache_contract}, actual={actual_cache_contract}."
+            )
+
+    def _initial_content_hidden(self, context_latents, context_positions):
+        content_hidden = self.input_proj(context_latents)
+        if self.context_position_mode == "additive_2d":
+            content_hidden = content_hidden + self._lookup_pos_embed(
+                context_positions, content_hidden.dtype
+            )
+        return content_hidden
+
+    def _content_condition(self, context_conditions):
+        embedded = self.cond_embed(context_conditions)
+        endpoint = torch.full(
+            context_conditions.shape[:-1],
+            self.endpoint_time,
+            device=context_conditions.device,
+            dtype=torch.float32,
+        )
+        return self._shape_time(endpoint, context_conditions.shape[:-1]) + embedded
+
+    @staticmethod
+    def _clone_stat(value):
+        return value if value is None else value.clone()
+
+    def _capture_block_stats(self, block):
+        return {
+            "gate": self._clone_stat(block.last_gate_abs_per_token),
+            "attention_gate": self._clone_stat(
+                block.last_attention_gate_abs_per_token
+            ),
+            "mlp_gate": self._clone_stat(block.last_mlp_gate_abs_per_token),
+            "attention_entropy": self._clone_stat(
+                block.last_attention_entropy_per_token
+            ),
+            "attention_distance": self._clone_stat(
+                block.last_attention_distance_per_token
+            ),
+            "update_rms": self._clone_stat(block.last_update_rms_per_token),
+        }
+
+    @staticmethod
+    def _mean_stat(stats, key):
+        values = [item[key] for item in stats if item.get(key) is not None]
+        return torch.stack(values).mean(dim=0) if values else None
+
+    def _publish_stream_stats(self, query_stats, content_stats, content_inputs=None, content_outputs=None, query_outputs=None):
+        self.last_gate_abs_per_token = self._mean_stat(query_stats, "gate")
+        self.last_gate_abs_mean = (
+            self.last_gate_abs_per_token.mean()
+            if self.last_gate_abs_per_token is not None
+            else None
+        )
+        self.last_attention_entropy_per_token = self._mean_stat(
+            query_stats, "attention_entropy"
+        )
+        self.last_attention_distance_per_token = self._mean_stat(
+            query_stats, "attention_distance"
+        )
+        self.last_query_attention_gate_abs_per_token = self._mean_stat(
+            query_stats, "attention_gate"
+        )
+        self.last_query_mlp_gate_abs_per_token = self._mean_stat(
+            query_stats, "mlp_gate"
+        )
+        self.last_content_attention_gate_abs_per_token = self._mean_stat(
+            content_stats, "attention_gate"
+        )
+        self.last_content_mlp_gate_abs_per_token = self._mean_stat(
+            content_stats, "mlp_gate"
+        )
+        self.last_content_update_rms_per_token = self._mean_stat(
+            content_stats, "update_rms"
+        )
+        if content_inputs is not None and content_outputs is not None:
+            denominator = (
+                content_inputs.detach().float().pow(2).mean(dim=-1).sqrt()
+                .clamp_min(torch.finfo(torch.float32).tiny)
+            )
+            self.last_content_relative_update_per_token = (
+                (content_outputs.detach().float() - content_inputs.detach().float())
+                .pow(2)
+                .mean(dim=-1)
+                .sqrt()
+                / denominator
+            )
+        else:
+            self.last_content_relative_update_per_token = None
+        if content_outputs is not None and query_outputs is not None:
+            self.last_content_query_cosine_per_token = F.cosine_similarity(
+                content_outputs.detach().float(),
+                query_outputs.detach().float(),
+                dim=-1,
+            )
+        else:
+            self.last_content_query_cosine_per_token = None
+
     @staticmethod
     def _format_context_mask(context_mask, batch_size, query_len, context_len, device):
         if context_mask is None:
@@ -556,6 +916,7 @@ class ContextualFlowTransformerHead(nn.Module):
         context_latents=None,
         context_mask=None,
         context_positions=None,
+        context_conditions=None,
     ):
         if context_latents is None:
             return None
@@ -568,13 +929,260 @@ class ContextualFlowTransformerHead(nn.Module):
         context_latents = context_latents.to(device=model_device, dtype=model_dtype)
         batch_size, context_len, _ = context_latents.shape
         context_positions = self._positions(context_positions, batch_size, context_len, model_device)
-        context_hidden = self.input_proj(context_latents)
-        context_hidden = context_hidden + self._lookup_pos_embed(context_positions, context_hidden.dtype)
+        context_hidden = self._initial_content_hidden(
+            context_latents, context_positions
+        )
         if context_mask is not None:
             context_mask = context_mask.to(device=model_device, dtype=torch.bool)
+        if context_conditions is None:
+            raise ValueError(
+                "DF1 cache construction requires context_conditions for every "
+                "content token."
+            )
+        context_conditions = context_conditions.to(
+            device=model_device, dtype=model_dtype
+        )
+        if context_conditions.shape[:2] != (batch_size, context_len):
+            raise ValueError(
+                "context_conditions must match context_latents batch/sequence "
+                f"shape {(batch_size, context_len)}, got "
+                f"{tuple(context_conditions.shape[:2])}."
+            )
+        content_y = self._content_condition(context_conditions)
+        content_mask = self._format_context_mask(
+            context_mask,
+            batch_size,
+            context_len,
+            context_len,
+            model_device,
+        )
+        if content_mask is None:
+            raise ValueError(
+                "DF1 full cache construction requires an explicit strict "
+                "content mask."
+            )
+        content_mask, content_block_mask = self._build_context_block_mask(
+            content_mask,
+            batch_size,
+            context_len,
+            context_len,
+            model_device,
+        )
+        layers = []
+        for block in self.blocks:
+            layer_cache = block.prepare_cross_cache(
+                context_hidden,
+                context_positions=context_positions,
+            )
+            layers.append(layer_cache)
+            context_hidden = block(
+                context_hidden,
+                content_y,
+                layer_cache=layer_cache,
+                context_mask=content_mask,
+                query_positions=context_positions,
+                context_block_mask=content_block_mask,
+                use_flex_attention=True,
+                include_mlp=True,
+            )
         return {
-            "layers": [block.prepare_cross_cache(context_hidden) for block in self.blocks],
+            "layers": layers,
             "context_mask": context_mask,
+            "context_positions": context_positions,
+            "position_digest": self._position_digest(context_positions),
+            "position_contract": self.position_contract(),
+            "cache_contract": self.cache_contract(),
+        }
+
+    def empty_latent_mixer_cache(self, batch_size=1):
+        batch_size = int(batch_size)
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {batch_size}.")
+        device = self.input_proj.weight.device
+        dtype = self.input_proj.weight.dtype
+        empty_positions = torch.empty(batch_size, 0, device=device, dtype=torch.long)
+        layers = []
+        for block in self.blocks:
+            layers.append(
+                {
+                    "k": torch.empty(
+                        batch_size,
+                        block.num_heads,
+                        0,
+                        block.head_dim,
+                        device=device,
+                        dtype=dtype,
+                    ),
+                    "v": torch.empty(
+                        batch_size,
+                        block.num_heads,
+                        0,
+                        block.head_dim,
+                        device=device,
+                        dtype=dtype,
+                    ),
+                    "context_positions": empty_positions,
+                    "k_rotation_count": int(block.rope_mode != "none"),
+                }
+            )
+        return {
+            "layers": layers,
+            "context_mask": torch.empty(
+                batch_size, 1, 0, device=device, dtype=torch.bool
+            ),
+            "context_positions": empty_positions,
+            "position_digest": None,
+            "position_contract": self.position_contract(),
+            "cache_contract": self.cache_contract(),
+        }
+
+    def append_latent_mixer_cache(
+        self,
+        cache,
+        *,
+        context_latents,
+        context_conditions,
+        context_positions,
+    ):
+        model_device = self.input_proj.weight.device
+        model_dtype = self.input_proj.weight.dtype
+        context_latents = context_latents.to(
+            device=model_device, dtype=model_dtype
+        )
+        context_conditions = context_conditions.to(
+            device=model_device, dtype=model_dtype
+        )
+        if context_latents.dim() == 2:
+            context_latents = context_latents.unsqueeze(1)
+        if context_conditions.dim() == 2:
+            context_conditions = context_conditions.unsqueeze(1)
+        if context_latents.dim() != 3 or context_latents.shape[1] != 1:
+            raise ValueError(
+                "append_latent_mixer_cache accepts exactly one new content token "
+                f"per row, got {tuple(context_latents.shape)}."
+            )
+        if context_conditions.shape[:2] != context_latents.shape[:2]:
+            raise ValueError(
+                "context_conditions must match the appended latent batch/sequence."
+            )
+        batch_size = context_latents.shape[0]
+        context_positions = self._positions(
+            context_positions, batch_size, 1, model_device
+        )
+        if cache is None:
+            cache = self.empty_latent_mixer_cache(batch_size)
+        self._validate_latent_mixer_cache(cache)
+        if cache["layers"][0]["k"].shape[0] != batch_size:
+            raise ValueError("cache batch size must match appended content batch size.")
+
+        hidden = self._initial_content_hidden(context_latents, context_positions)
+        content_y = self._content_condition(context_conditions)
+        previous_len = cache["layers"][0]["k"].shape[2]
+        previous_mask = torch.ones(
+            batch_size,
+            1,
+            previous_len,
+            device=model_device,
+            dtype=torch.bool,
+        )
+        updated_layers = []
+        for layer_idx, block in enumerate(self.blocks):
+            previous_layer = cache["layers"][layer_idx]
+            new_layer = block.prepare_cross_cache(
+                hidden, context_positions=context_positions
+            )
+            hidden = block(
+                hidden,
+                content_y,
+                layer_cache=previous_layer if previous_len else None,
+                context_mask=previous_mask,
+                query_positions=context_positions,
+                use_flex_attention=False,
+                include_mlp=True,
+            )
+            updated_layers.append(
+                {
+                    "k": torch.cat([previous_layer["k"], new_layer["k"]], dim=2),
+                    "v": torch.cat([previous_layer["v"], new_layer["v"]], dim=2),
+                    "context_positions": torch.cat(
+                        [
+                            previous_layer["context_positions"],
+                            context_positions,
+                        ],
+                        dim=1,
+                    ),
+                    "k_rotation_count": int(block.rope_mode != "none"),
+                }
+            )
+        positions = torch.cat(
+            [cache["context_positions"], context_positions], dim=1
+        )
+        return {
+            "layers": updated_layers,
+            "context_mask": torch.ones(
+                batch_size,
+                1,
+                previous_len + 1,
+                device=model_device,
+                dtype=torch.bool,
+            ),
+            "context_positions": positions,
+            "position_digest": self._position_digest(positions),
+            "position_contract": self.position_contract(),
+            "cache_contract": self.cache_contract(),
+        }
+
+    def stack_latent_mixer_caches(self, caches):
+        if not caches:
+            return None
+        for cache in caches:
+            self._validate_latent_mixer_cache(cache)
+            if cache["layers"][0]["k"].shape[0] != 1:
+                raise ValueError("stack_latent_mixer_caches expects batch-one caches.")
+        device = self.input_proj.weight.device
+        dtype = self.input_proj.weight.dtype
+        max_len = max(cache["layers"][0]["k"].shape[2] for cache in caches)
+        batch_size = len(caches)
+        positions = torch.zeros(
+            batch_size, max_len, device=device, dtype=torch.long
+        )
+        mask = torch.zeros(
+            batch_size, 1, max_len, device=device, dtype=torch.bool
+        )
+        layers = []
+        for layer_idx, block in enumerate(self.blocks):
+            k = torch.zeros(
+                batch_size,
+                block.num_heads,
+                max_len,
+                block.head_dim,
+                device=device,
+                dtype=dtype,
+            )
+            v = torch.zeros_like(k)
+            for row, cache in enumerate(caches):
+                length = cache["layers"][layer_idx]["k"].shape[2]
+                if length:
+                    k[row, :, :length] = cache["layers"][layer_idx]["k"][0]
+                    v[row, :, :length] = cache["layers"][layer_idx]["v"][0]
+                    if layer_idx == 0:
+                        positions[row, :length] = cache["context_positions"][0]
+                        mask[row, 0, :length] = True
+            layers.append(
+                {
+                    "k": k,
+                    "v": v,
+                    "context_positions": positions,
+                    "k_rotation_count": int(block.rope_mode != "none"),
+                }
+            )
+        return {
+            "layers": layers,
+            "context_mask": mask,
+            "context_positions": positions,
+            "position_digest": None,
+            "position_contract": self.position_contract(),
+            "cache_contract": self.cache_contract(),
         }
 
     def forward(
@@ -586,6 +1194,7 @@ class ContextualFlowTransformerHead(nn.Module):
         context_mask=None,
         query_positions=None,
         context_positions=None,
+        context_conditions=None,
         latent_mixer_cache=None,
     ):
         model_dtype = self.input_proj.weight.dtype
@@ -594,27 +1203,149 @@ class ContextualFlowTransformerHead(nn.Module):
         batch_shape = x.shape[:-1]
         x, query_positions, squeeze = self._ensure_sequence(x, query_positions)
         x = self.input_proj(x)
-        x = x + self._lookup_pos_embed(query_positions, x.dtype)
+        if self.query_position_mode == "additive_2d":
+            x = x + self._lookup_pos_embed(query_positions, x.dtype)
         t = self._shape_time(t, batch_shape)
-        c = self.cond_embed(c)
+        raw_c = c
+        c = self.cond_embed(raw_c)
         y = t + c
         if y.dim() == 2:
             y = y.unsqueeze(1)
 
         use_direct_context = latent_mixer_cache is None and context_latents is not None
         if use_direct_context:
+            context_latents = context_latents.to(device=x.device, dtype=model_dtype)
+            if context_latents.dim() != 3:
+                raise ValueError(
+                    f"context_latents must be [B,K,D], got {tuple(context_latents.shape)}"
+                )
+            batch_size, context_len, _ = context_latents.shape
+            if x.shape[:2] != (batch_size, context_len):
+                raise ValueError(
+                    f"{self.flow_head_variant} training requires aligned content/query "
+                    f"streams, got content={tuple(context_latents.shape[:2])}, "
+                    f"query={tuple(x.shape[:2])}."
+            )
+            if context_conditions is None:
+                context_conditions = raw_c
+            context_conditions = context_conditions.to(
+                device=x.device, dtype=model_dtype
+            )
+            if context_conditions.shape[:2] != (batch_size, context_len):
+                raise ValueError(
+                    "context_conditions must align with the dynamic content stream."
+                )
+            context_positions = self._positions(
+                context_positions, batch_size, context_len, x.device
+            )
+            content = self._initial_content_hidden(
+                context_latents, context_positions
+            )
+            initial_content = content
+            content_y = self._content_condition(context_conditions)
+            content_mask, content_block_mask = self._build_context_block_mask(
+                context_mask,
+                batch_size,
+                context_len,
+                context_len,
+                x.device,
+            )
+            if content_mask is None:
+                raise ValueError(
+                    f"{self.flow_head_variant} training requires an explicit "
+                    "strict sigma-causal mask."
+                )
+            query_stats = []
+            content_stats = []
+            for block in self.blocks:
+                if self.grad_checkpointing and not torch.jit.is_scripting():
+                    def _dual_step(content_hidden, query_hidden):
+                        layer_cache = block.prepare_cross_cache(
+                            content_hidden,
+                            context_positions=context_positions,
+                        )
+                        next_content = block(
+                            content_hidden,
+                            content_y,
+                            layer_cache=layer_cache,
+                            context_mask=content_mask,
+                            query_positions=context_positions,
+                            context_block_mask=content_block_mask,
+                            use_flex_attention=True,
+                            include_mlp=True,
+                        )
+                        next_query = block(
+                            query_hidden,
+                            y,
+                            layer_cache=layer_cache,
+                            context_mask=content_mask,
+                            query_positions=query_positions,
+                            context_block_mask=content_block_mask,
+                            use_flex_attention=True,
+                        )
+                        return next_content, next_query
+
+                    content, x = checkpoint(
+                        _dual_step,
+                        content,
+                        x,
+                        use_reentrant=False,
+                    )
+                else:
+                    layer_cache = block.prepare_cross_cache(
+                        content,
+                        context_positions=context_positions,
+                    )
+                    content = block(
+                        content,
+                        content_y,
+                        layer_cache=layer_cache,
+                        context_mask=content_mask,
+                        query_positions=context_positions,
+                        context_block_mask=content_block_mask,
+                        use_flex_attention=True,
+                        include_mlp=True,
+                    )
+                    content_stats.append(self._capture_block_stats(block))
+                    x = block(
+                        x,
+                        y,
+                        layer_cache=layer_cache,
+                        context_mask=content_mask,
+                        query_positions=query_positions,
+                        context_block_mask=content_block_mask,
+                        use_flex_attention=True,
+                    )
+                    query_stats.append(self._capture_block_stats(block))
+            self._publish_stream_stats(
+                query_stats,
+                content_stats,
+                content_inputs=initial_content,
+                content_outputs=content,
+                query_outputs=x,
+            )
+            out = self.final_layer(x, y)
+            return out.squeeze(1) if squeeze else out
+
+        if use_direct_context:
             latent_mixer_cache = self.prepare_latent_mixer_cache(
                 context_latents=context_latents,
                 context_mask=context_mask,
                 context_positions=context_positions,
+                context_conditions=context_conditions,
             )
         context_layers = None
         context_mask = None
         if latent_mixer_cache is not None:
+            self._validate_latent_mixer_cache(latent_mixer_cache)
             context_layers = latent_mixer_cache.get("layers")
             context_mask = latent_mixer_cache.get("context_mask")
         context_block_mask = None
-        use_flex_attention = bool(context_layers) and (self.training or use_direct_context)
+        use_flex_attention = (
+            bool(context_layers)
+            and context_layers[0]["k"].shape[2] > 0
+            and (self.training or use_direct_context)
+        )
         if use_flex_attention:
             batch_size, query_len, _ = x.shape
             context_len = context_layers[0]["k"].shape[2]
@@ -626,6 +1357,9 @@ class ContextualFlowTransformerHead(nn.Module):
                 x.device,
             )
         gate_stats = []
+        gate_token_stats = []
+        attention_entropy_stats = []
+        attention_distance_stats = []
         if self.grad_checkpointing and not torch.jit.is_scripting():
             for layer_idx, block in enumerate(self.blocks):
                 layer_cache = None if context_layers is None else context_layers[layer_idx]
@@ -635,12 +1369,23 @@ class ContextualFlowTransformerHead(nn.Module):
                     y,
                     layer_cache,
                     context_mask,
+                    query_positions,
                     context_block_mask,
                     use_flex_attention,
                     use_reentrant=False,
                 )
                 if block.last_gate_abs_mean is not None:
                     gate_stats.append(block.last_gate_abs_mean)
+                if block.last_gate_abs_per_token is not None:
+                    gate_token_stats.append(block.last_gate_abs_per_token)
+                if block.last_attention_entropy_per_token is not None:
+                    attention_entropy_stats.append(
+                        block.last_attention_entropy_per_token
+                    )
+                if block.last_attention_distance_per_token is not None:
+                    attention_distance_stats.append(
+                        block.last_attention_distance_per_token
+                    )
         else:
             for layer_idx, block in enumerate(self.blocks):
                 layer_cache = None if context_layers is None else context_layers[layer_idx]
@@ -649,12 +1394,61 @@ class ContextualFlowTransformerHead(nn.Module):
                     y,
                     layer_cache=layer_cache,
                     context_mask=context_mask,
+                    query_positions=query_positions,
                     context_block_mask=context_block_mask,
                     use_flex_attention=use_flex_attention,
                 )
                 if block.last_gate_abs_mean is not None:
                     gate_stats.append(block.last_gate_abs_mean)
+                if block.last_gate_abs_per_token is not None:
+                    gate_token_stats.append(block.last_gate_abs_per_token)
+                if block.last_attention_entropy_per_token is not None:
+                    attention_entropy_stats.append(
+                        block.last_attention_entropy_per_token
+                    )
+                if block.last_attention_distance_per_token is not None:
+                    attention_distance_stats.append(
+                        block.last_attention_distance_per_token
+                    )
         self.last_gate_abs_mean = torch.stack(gate_stats).mean() if gate_stats else None
+        self.last_gate_abs_per_token = (
+            torch.stack(gate_token_stats).mean(dim=0)
+            if gate_token_stats
+            else None
+        )
+        self.last_attention_entropy_per_token = (
+            torch.stack(attention_entropy_stats).mean(dim=0)
+            if attention_entropy_stats
+            else None
+        )
+        self.last_attention_distance_per_token = (
+            torch.stack(attention_distance_stats).mean(dim=0)
+            if attention_distance_stats
+            else None
+        )
+        self.last_query_attention_gate_abs_per_token = self._mean_stat(
+            [
+                {
+                    "attention_gate": block.last_attention_gate_abs_per_token,
+                }
+                for block in self.blocks
+            ],
+            "attention_gate",
+        )
+        self.last_query_mlp_gate_abs_per_token = self._mean_stat(
+            [
+                {
+                    "mlp_gate": block.last_mlp_gate_abs_per_token,
+                }
+                for block in self.blocks
+            ],
+            "mlp_gate",
+        )
+        self.last_content_attention_gate_abs_per_token = None
+        self.last_content_mlp_gate_abs_per_token = None
+        self.last_content_update_rms_per_token = None
+        self.last_content_relative_update_per_token = None
+        self.last_content_query_cosine_per_token = None
         out = self.final_layer(x, y)
         return out.squeeze(1) if squeeze else out
 
@@ -686,6 +1480,13 @@ class FlowLoss(nn.Module):
         latent_mixer_dropout=0.0,
         latent_mixer_zero_init_gate=True,
         head_arch="contextual",
+        query_position_mode="additive_2d",
+        context_position_mode="additive_2d",
+        rope_mode="none",
+        rope_axis_dims=(80, 80),
+        rope_rotate_value=False,
+        position_variant="FH0",
+        flow_head_variant="DF1",
     ):
         super().__init__()
         self.in_channels = int(target_channels)
@@ -700,6 +1501,15 @@ class FlowLoss(nn.Module):
         self.mlp_ratio = float(mlp_ratio)
         self.head_arch = self._normalize_head_arch(head_arch)
         self.uses_latent_mixer = self.head_arch == "contextual"
+        self.flow_head_variant = None
+        if self.uses_latent_mixer:
+            self.flow_head_variant = (
+                ContextualFlowTransformerHead._normalize_flow_head_variant(
+                    flow_head_variant
+                )
+            )
+        self._guidance_diagnostic_sums = {}
+        self._guidance_diagnostic_counts = {}
         if self.num_sampling_steps <= 0:
             raise ValueError(f"num_sampling_steps must be positive, got {num_sampling_steps}")
         if not 0.0 <= self.uniform_mix <= 1.0:
@@ -720,6 +1530,14 @@ class FlowLoss(nn.Module):
                 latent_mixer_dropout=latent_mixer_dropout,
                 latent_mixer_zero_init_gate=latent_mixer_zero_init_gate,
                 image_tokens_per_img=image_tokens_per_img,
+                query_position_mode=query_position_mode,
+                context_position_mode=context_position_mode,
+                rope_mode=rope_mode,
+                rope_axis_dims=rope_axis_dims,
+                rope_rotate_value=rope_rotate_value,
+                position_variant=position_variant,
+                flow_head_variant=self.flow_head_variant,
+                endpoint_time=self.time_scale,
             )
         else:
             self.net = TokenFlowMLPHead(
@@ -794,6 +1612,12 @@ class FlowLoss(nn.Module):
                 return tuple(_convert(item, key) for item in value)
             if key == "context_mask":
                 return value.to(device=device, dtype=torch.bool)
+            if key is not None and (
+                key.endswith("positions") or key == "position_digest"
+            ):
+                return value.to(device=device)
+            if not isinstance(value, torch.Tensor):
+                return value
             return value.to(device=device, dtype=dtype)
 
         return _convert(cache)
@@ -803,6 +1627,7 @@ class FlowLoss(nn.Module):
         context_latents: torch.Tensor | None = None,
         context_mask: torch.Tensor | None = None,
         context_positions: torch.Tensor | None = None,
+        context_conditions: torch.Tensor | None = None,
     ):
         if not self.uses_latent_mixer:
             return None
@@ -815,11 +1640,31 @@ class FlowLoss(nn.Module):
             context_mask = context_mask.to(device=model_device, dtype=torch.bool)
         if context_positions is not None:
             context_positions = context_positions.to(device=model_device)
+        if context_conditions is not None:
+            context_conditions = context_conditions.to(
+                device=model_device, dtype=model_dtype
+            )
         return self.net.prepare_latent_mixer_cache(
             context_latents=context_latents,
             context_mask=context_mask,
             context_positions=context_positions,
+            context_conditions=context_conditions,
         )
+
+    def empty_latent_mixer_cache(self, batch_size=1):
+        if not self.uses_latent_mixer:
+            return None
+        return self.net.empty_latent_mixer_cache(batch_size=batch_size)
+
+    def append_latent_mixer_cache(self, cache, **kwargs):
+        if not self.uses_latent_mixer:
+            return None
+        return self.net.append_latent_mixer_cache(cache, **kwargs)
+
+    def stack_latent_mixer_caches(self, caches):
+        if not self.uses_latent_mixer:
+            return None
+        return self.net.stack_latent_mixer_caches(caches)
 
     def velocity(
         self,
@@ -831,6 +1676,7 @@ class FlowLoss(nn.Module):
         context_mask: torch.Tensor | None = None,
         query_positions: torch.Tensor | None = None,
         context_positions: torch.Tensor | None = None,
+        context_conditions: torch.Tensor | None = None,
         latent_mixer_cache: dict[str, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         model_dtype = self.net.input_proj.weight.dtype
@@ -847,6 +1693,7 @@ class FlowLoss(nn.Module):
                 "context_mask": context_mask,
                 "query_positions": query_positions,
                 "context_positions": context_positions,
+                "context_conditions": context_conditions,
             },
             model_device,
             model_dtype,
@@ -886,6 +1733,7 @@ class FlowLoss(nn.Module):
             "context_mask": context_mask,
             "query_positions": image_positions,
             "context_positions": image_positions,
+            "context_conditions": None,
         }
 
     def forward(self, target, z, mask=None, sigma=None, image_positions=None, context_latents=None):
@@ -929,11 +1777,112 @@ class FlowLoss(nn.Module):
             "flow/v_target_rms": self._rms_stat(v_target),
             "flow/v_pred_rms": self._rms_stat(v_pred),
         }
+        if target_model.dim() == 3 and sigma is not None and token_loss.dim() == 2:
+            sigma_values = sigma.to(device=token_loss.device, dtype=torch.float32)
+            strict_context = sigma_values.unsqueeze(1) < sigma_values.unsqueeze(2)
+            context_counts = strict_context.sum(dim=-1)
+            ranks = context_counts
+            denominator = max(int(sigma_values.shape[1]) - 1, 1)
+            reveal_fractions = ranks.float() / float(denominator)
+            bucket_edges = (
+                (0.0, 0.25),
+                (0.25, 0.5),
+                (0.5, 0.75),
+                (0.75, 1.000001),
+            )
+            for lower, upper in bucket_edges:
+                bucket_mask = (reveal_fractions >= lower) & (reveal_fractions < upper)
+                if bucket_mask.any():
+                    tag = f"{int(lower * 100):02d}_{min(100, int(upper * 100)):02d}"
+                    stats[f"flow/reveal_{tag}_v_mse"] = (
+                        token_loss[bucket_mask].mean().detach().float()
+                    )
+            context_buckets = (
+                ("0", 0, 0),
+                ("1", 1, 1),
+                ("2_4", 2, 4),
+                ("5_16", 5, 16),
+                ("17_64", 17, 64),
+                ("65_plus", 65, None),
+            )
+            gate_per_token = getattr(self.net, "last_gate_abs_per_token", None)
+            query_attention_gate = getattr(
+                self.net, "last_query_attention_gate_abs_per_token", None
+            )
+            query_mlp_gate = getattr(
+                self.net, "last_query_mlp_gate_abs_per_token", None
+            )
+            content_attention_gate = getattr(
+                self.net, "last_content_attention_gate_abs_per_token", None
+            )
+            content_mlp_gate = getattr(
+                self.net, "last_content_mlp_gate_abs_per_token", None
+            )
+            attention_entropy = getattr(
+                self.net, "last_attention_entropy_per_token", None
+            )
+            attention_distance = getattr(
+                self.net, "last_attention_distance_per_token", None
+            )
+            for tag, lower, upper in context_buckets:
+                bucket_mask = context_counts >= lower
+                if upper is not None:
+                    bucket_mask &= context_counts <= upper
+                if not bucket_mask.any():
+                    continue
+                stats[f"flow/context_{tag}_v_mse"] = (
+                    token_loss[bucket_mask].mean().detach().float()
+                )
+                if (
+                    isinstance(gate_per_token, torch.Tensor)
+                    and gate_per_token.shape == token_loss.shape
+                ):
+                    stats[f"flow/context_{tag}_gate_abs"] = (
+                        gate_per_token[bucket_mask].mean().detach().float()
+                    )
+                for metric_name, metric_value in (
+                    ("query_attention_gate_abs", query_attention_gate),
+                    ("query_mlp_gate_abs", query_mlp_gate),
+                    ("content_attention_gate_abs", content_attention_gate),
+                    ("content_mlp_gate_abs", content_mlp_gate),
+                ):
+                    if (
+                        isinstance(metric_value, torch.Tensor)
+                        and metric_value.shape == token_loss.shape
+                    ):
+                        stats[f"flow/context_{tag}_{metric_name}"] = (
+                            metric_value[bucket_mask].mean().detach().float()
+                        )
+                if (
+                    isinstance(attention_entropy, torch.Tensor)
+                    and attention_entropy.shape == token_loss.shape
+                ):
+                    stats[f"flow/context_{tag}_attention_entropy"] = (
+                        attention_entropy[bucket_mask].mean().detach().float()
+                    )
+                if (
+                    isinstance(attention_distance, torch.Tensor)
+                    and attention_distance.shape == token_loss.shape
+                ):
+                    stats[f"flow/context_{tag}_attention_distance"] = (
+                        attention_distance[bucket_mask].mean().detach().float()
+                    )
         gate_stat = getattr(self.net, "last_gate_abs_mean", None)
         if gate_stat is not None:
             stats["flow/head_residual_gate"] = gate_stat.detach().float()
             if self.uses_latent_mixer:
                 stats["flow/latent_mixer_gate"] = gate_stat.detach().float()
+        for metric_name, attribute in (
+            ("content_update_rms", "last_content_update_rms_per_token"),
+            ("content_relative_update", "last_content_relative_update_per_token"),
+            ("content_query_cosine", "last_content_query_cosine_per_token"),
+        ):
+            value = getattr(self.net, attribute, None)
+            if isinstance(value, torch.Tensor):
+                stats[f"flow/{metric_name}"] = value.mean().detach().float()
+        stats["flow/nonfinite_count"] = torch.zeros(
+            (), device=loss_mean.device, dtype=torch.float32
+        )
         self.last_forward_stats = stats
         return loss_mean
 
@@ -953,6 +1902,8 @@ class FlowLoss(nn.Module):
                 return [_duplicate_value(item) for item in value]
             if isinstance(value, tuple):
                 return tuple(_duplicate_value(item) for item in value)
+            if not isinstance(value, torch.Tensor):
+                return value
             return torch.cat([value, value], dim=0)
 
         out = {}
@@ -969,16 +1920,99 @@ class FlowLoss(nn.Module):
         context_kwargs,
         *,
         context_is_paired: bool = False,
+        debug_check=None,
+        ode_step: int | None = None,
+        debug_phase: str = "",
     ) -> torch.Tensor:
         z_is_paired = z.shape[0] == x.shape[0] * 2
         if cfg == 1.0 and not z_is_paired:
-            return self.velocity(x, t, z, **context_kwargs)
+            velocity = self.velocity(x, t, z, **context_kwargs)
+            if debug_check is not None:
+                debug_check(
+                    f"{debug_phase}velocity",
+                    velocity,
+                    ode_step,
+                    {"state": x, "condition": z},
+                )
+            return velocity
         x_pair = torch.cat([x, x], dim=0)
         t_pair = torch.cat([t, t], dim=0)
         paired_context_kwargs = context_kwargs if context_is_paired else self._duplicate_context(context_kwargs)
         v_pair = self.velocity(x_pair, t_pair, z, **paired_context_kwargs)
         v_cond, v_uncond = torch.chunk(v_pair, 2, dim=0)
-        return v_uncond + float(cfg) * (v_cond - v_uncond)
+        velocity_delta = v_cond - v_uncond
+        self._record_guidance_delta(velocity_delta, context_kwargs)
+        scaled_velocity_delta = float(cfg) * velocity_delta
+        guided_velocity = v_uncond + scaled_velocity_delta
+        if debug_check is not None:
+            references = {"state": x, "condition": z}
+            debug_check(f"{debug_phase}paired_velocity", v_pair, ode_step, references)
+            debug_check(f"{debug_phase}conditional_velocity", v_cond, ode_step, references)
+            debug_check(f"{debug_phase}unconditional_velocity", v_uncond, ode_step, references)
+            debug_check(f"{debug_phase}velocity_delta", velocity_delta, ode_step, references)
+            debug_check(f"{debug_phase}scaled_velocity_delta", scaled_velocity_delta, ode_step, references)
+            debug_check(f"{debug_phase}guided_velocity", guided_velocity, ode_step, references)
+        return guided_velocity
+
+    @staticmethod
+    def _context_bucket_tag(counts: torch.Tensor, tag: str) -> torch.Tensor:
+        bounds = {
+            "0": (0, 0),
+            "1": (1, 1),
+            "2_4": (2, 4),
+            "5_16": (5, 16),
+            "17_64": (17, 64),
+            "65_plus": (65, None),
+        }
+        lower, upper = bounds[tag]
+        mask = counts >= lower
+        return mask if upper is None else mask & (counts <= upper)
+
+    def reset_guidance_diagnostics(self) -> None:
+        self._guidance_diagnostic_sums = {}
+        self._guidance_diagnostic_counts = {}
+
+    def _record_guidance_delta(self, velocity_delta, context_kwargs) -> None:
+        if velocity_delta.ndim < 2:
+            return
+        per_token = velocity_delta.detach().float().pow(2).mean(dim=-1).sqrt()
+        cache = context_kwargs.get("latent_mixer_cache")
+        context_mask = cache.get("context_mask") if isinstance(cache, dict) else None
+        if isinstance(context_mask, torch.Tensor):
+            if context_mask.shape[0] == per_token.shape[0] * 2:
+                context_mask = context_mask[: per_token.shape[0]]
+            counts = context_mask.to(dtype=torch.bool).sum(dim=-1)
+            if counts.shape[-1] == 1 and per_token.ndim == 2:
+                counts = counts.expand_as(per_token)
+        else:
+            counts = torch.zeros_like(per_token, dtype=torch.long)
+        if counts.shape != per_token.shape:
+            counts = counts.reshape(per_token.shape)
+        for tag in ("0", "1", "2_4", "5_16", "17_64", "65_plus"):
+            mask = self._context_bucket_tag(counts, tag)
+            if not mask.any():
+                continue
+            value_sum = per_token[mask].sum()
+            value_count = mask.sum().to(dtype=torch.float32)
+            self._guidance_diagnostic_sums[tag] = (
+                self._guidance_diagnostic_sums.get(tag, value_sum.new_zeros(()))
+                + value_sum
+            )
+            self._guidance_diagnostic_counts[tag] = (
+                self._guidance_diagnostic_counts.get(
+                    tag, value_count.new_zeros(())
+                )
+                + value_count
+            )
+
+    def guidance_diagnostics(self) -> dict[str, dict[str, torch.Tensor]]:
+        return {
+            tag: {
+                "sum": self._guidance_diagnostic_sums[tag],
+                "count": self._guidance_diagnostic_counts[tag],
+            }
+            for tag in self._guidance_diagnostic_sums
+        }
 
     @staticmethod
     def _scheduled_cfg(cfg: float, schedule: str | None, progress: float) -> float:
@@ -1007,10 +2041,50 @@ class FlowLoss(nn.Module):
         context_mask: torch.Tensor | None = None,
         query_positions: torch.Tensor | None = None,
         context_positions: torch.Tensor | None = None,
+        context_conditions: torch.Tensor | None = None,
+        latent_mixer_cache: dict | None = None,
+        latent_mixer_cache_is_paired: bool = False,
+        initial_noise: torch.Tensor | None = None,
+        debug_finite: bool = False,
+        debug_label: str = "",
     ):
+        def _max_abs(tensor: torch.Tensor) -> float | None:
+            finite_values = tensor[torch.isfinite(tensor)].float()
+            if not finite_values.numel():
+                return None
+            return float(finite_values.abs().max().item())
+
+        def _debug_check(
+            name: str,
+            tensor: torch.Tensor,
+            ode_step: int | None = None,
+            references: dict[str, torch.Tensor] | None = None,
+        ) -> None:
+            if not debug_finite:
+                return
+            finite = torch.isfinite(tensor)
+            if bool(finite.all()):
+                return
+            nonfinite_rows = None
+            if tensor.ndim >= 1:
+                row_finite = finite.reshape(tensor.shape[0], -1).all(dim=1)
+                nonfinite_rows = (~row_finite).nonzero(as_tuple=True)[0].detach().cpu().tolist()
+            reference_max_abs = {
+                key: _max_abs(value)
+                for key, value in (references or {}).items()
+            }
+            raise FloatingPointError(
+                "non-finite tensor during image-flow sampling: "
+                f"label={debug_label!r}, component={name!r}, ode_step={ode_step}, "
+                f"shape={tuple(tensor.shape)}, nonfinite_rows={nonfinite_rows}, "
+                f"nonfinite={int((~finite).sum().item())}/{tensor.numel()}, "
+                f"finite_max_abs={_max_abs(tensor)}, references_max_abs={reference_max_abs}"
+            )
+
         model_dtype = self.net.input_proj.weight.dtype
         model_device = self.net.input_proj.weight.device
         z = z.to(device=model_device, dtype=model_dtype)
+        _debug_check("flow_condition", z)
         if cfg != 1.0 and z.shape[0] % 2 != 0:
             raise ValueError(f"cfg != 1.0 requires paired conditional/unconditional conditions; got batch {z.shape[0]}")
 
@@ -1019,36 +2093,99 @@ class FlowLoss(nn.Module):
             raise ValueError(f"num_steps must be positive, got {steps}")
         solver = str(solver or self.solver).lower()
         x_shape = (z.shape[0] // 2, *z.shape[1:-1]) if cfg != 1.0 else z.shape[:-1]
-        x = torch.randn(*x_shape, self.in_channels, device=z.device, dtype=torch.float32) * float(temperature)
+        expected_noise_shape = (*x_shape, self.in_channels)
+        temperature = float(temperature)
+        if not math.isfinite(temperature):
+            raise ValueError(f"temperature must be finite, got {temperature}")
+        if initial_noise is None:
+            x = torch.randn(
+                *expected_noise_shape,
+                device=z.device,
+                dtype=torch.float32,
+            )
+        else:
+            if not isinstance(initial_noise, torch.Tensor):
+                raise TypeError(
+                    "initial_noise must be a torch.Tensor when provided, "
+                    f"got {type(initial_noise).__name__}"
+                )
+            if tuple(initial_noise.shape) != expected_noise_shape:
+                raise ValueError(
+                    "initial_noise must exactly match the unpaired flow-state shape "
+                    f"{expected_noise_shape}, got {tuple(initial_noise.shape)}"
+                )
+            if not initial_noise.is_floating_point():
+                raise TypeError(
+                    "initial_noise must have a floating dtype, "
+                    f"got {initial_noise.dtype}"
+                )
+            if not bool(torch.isfinite(initial_noise).all().item()):
+                raise FloatingPointError("initial_noise contains non-finite values")
+            x = initial_noise.to(device=z.device, dtype=torch.float32)
+        x = x * temperature
+        if not bool(torch.isfinite(x).all().item()):
+            raise FloatingPointError(
+                "temperature scaling produced non-finite initial_noise values"
+            )
+        _debug_check("initial_noise", x)
+        if context_latents is not None:
+            _debug_check("context_latents", context_latents)
         if self.uses_latent_mixer:
-            raw_context_kwargs = self._context_to_device(
-                {
-                    "context_latents": context_latents,
-                    "context_mask": context_mask,
+            if latent_mixer_cache is not None:
+                latent_mixer_cache = self._cache_to_device(
+                    latent_mixer_cache, z.device, z.dtype
+                )
+                query_positions = (
+                    None
+                    if query_positions is None
+                    else query_positions.to(device=z.device)
+                )
+                context_kwargs = {
                     "query_positions": query_positions,
-                    "context_positions": context_positions,
-                },
-                z.device,
-                z.dtype,
-            )
-            latent_mixer_cache = self.prepare_latent_mixer_cache(
-                context_latents=raw_context_kwargs.get("context_latents"),
-                context_mask=raw_context_kwargs.get("context_mask"),
-                context_positions=raw_context_kwargs.get("context_positions"),
-            )
-            context_kwargs = {
-                "query_positions": raw_context_kwargs.get("query_positions"),
-                "latent_mixer_cache": latent_mixer_cache,
-            }
+                    "latent_mixer_cache": latent_mixer_cache,
+                }
+            else:
+                raw_context_kwargs = self._context_to_device(
+                    {
+                        "context_latents": context_latents,
+                        "context_mask": context_mask,
+                        "query_positions": query_positions,
+                        "context_positions": context_positions,
+                        "context_conditions": context_conditions,
+                    },
+                    z.device,
+                    z.dtype,
+                )
+                latent_mixer_cache = self.prepare_latent_mixer_cache(
+                    context_latents=raw_context_kwargs.get("context_latents"),
+                    context_mask=raw_context_kwargs.get("context_mask"),
+                    context_positions=raw_context_kwargs.get("context_positions"),
+                    context_conditions=raw_context_kwargs.get(
+                        "context_conditions"
+                    ),
+                )
+                context_kwargs = {
+                    "query_positions": raw_context_kwargs.get("query_positions"),
+                    "latent_mixer_cache": latent_mixer_cache,
+                }
         else:
             context_kwargs = {}
-        context_is_paired = False
+        context_is_paired = bool(latent_mixer_cache_is_paired)
         if cfg != 1.0:
-            context_kwargs = self._duplicate_context(context_kwargs)
-            context_is_paired = True
+            if context_is_paired:
+                if context_kwargs.get("query_positions") is not None:
+                    positions = context_kwargs["query_positions"]
+                    if positions.shape[0] * 2 == z.shape[0]:
+                        context_kwargs["query_positions"] = torch.cat(
+                            [positions, positions], dim=0
+                        )
+            else:
+                context_kwargs = self._duplicate_context(context_kwargs)
+                context_is_paired = True
         times = torch.linspace(0.0, 1.0, steps + 1, device=z.device, dtype=torch.float32)
 
         for idx in range(steps):
+            _debug_check("ode_state", x, idx, {"condition": z})
             t = times[idx].expand(x_shape)
             t_next = times[idx + 1].expand(x_shape)
             dt = (times[idx + 1] - times[idx]).float()
@@ -1060,11 +2197,17 @@ class FlowLoss(nn.Module):
                 cfg_t,
                 context_kwargs,
                 context_is_paired=context_is_paired,
+                debug_check=_debug_check if debug_finite else None,
+                ode_step=idx,
+                debug_phase="predictor_",
             ).float()
+            _debug_check("guided_velocity", v, idx, {"state": x, "condition": z})
             if solver == "euler":
                 x = x + dt * v
+                _debug_check("euler_state", x, idx, {"velocity": v, "condition": z})
             elif solver == "heun":
                 x_euler = x + dt * v
+                _debug_check("heun_euler_predictor", x_euler, idx, {"velocity": v, "condition": z})
                 cfg_t_next = self._scheduled_cfg(cfg, cfg_schedule, float(times[idx + 1].item()))
                 v_next = self._guided_velocity(
                     x_euler.to(dtype=model_dtype),
@@ -1073,8 +2216,23 @@ class FlowLoss(nn.Module):
                     cfg_t_next,
                     context_kwargs,
                     context_is_paired=context_is_paired,
+                    debug_check=_debug_check if debug_finite else None,
+                    ode_step=idx,
+                    debug_phase="corrector_",
                 ).float()
+                _debug_check(
+                    "heun_corrector_velocity",
+                    v_next,
+                    idx,
+                    {"predictor_state": x_euler, "condition": z},
+                )
                 x = x + 0.5 * dt * (v + v_next)
+                _debug_check(
+                    "heun_corrected_state",
+                    x,
+                    idx,
+                    {"velocity": v, "corrector_velocity": v_next, "condition": z},
+                )
             else:
                 raise ValueError(f"Unknown image_flow_solver={solver!r}; expected heun or euler.")
 

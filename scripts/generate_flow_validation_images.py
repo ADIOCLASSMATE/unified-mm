@@ -526,6 +526,7 @@ def refine_single_stream_latents(
             token_types=selected_token_types,
             image_latents=work_latents,
             image_latent_mask=image_latent_mask,
+            image_reveal_sigma=current_sigma,
             calculate_likelihood=False,
         ).last_hidden_state
 
@@ -546,6 +547,7 @@ def refine_single_stream_latents(
                 token_types=selected_token_types,
                 image_latents=work_latents,
                 image_latent_mask=image_latent_mask,
+                image_reveal_sigma=current_sigma,
                 calculate_likelihood=False,
             ).last_hidden_state
 
@@ -653,6 +655,7 @@ def main():
             labels=labels,
             token_types=token_types,
             image_latents=image_latents,
+            flow_sigma=sigma,
             calculate_likelihood=True,
         )
         uncond_output = None
@@ -676,6 +679,7 @@ def main():
                 attention_mask=uncond_attention_mask,
                 token_types=token_types,
                 image_latents=image_latents,
+                flow_sigma=sigma,
                 calculate_likelihood=True,
                 return_logits=False,
             )
@@ -776,11 +780,19 @@ def main():
 
     target_chw = torch.stack(target_latents).float()
     target_img = decode_latents(vae, target_chw, scaling_factor)
-    full_sample_img = decode_latents(vae, torch.stack(full_sample_latents).float(), scaling_factor)
+    full_sample_img = decode_latents(
+        vae,
+        torch.stack(full_sample_latents).float(),
+        scaling_factor,
+    )
     overview_columns = [("target", target_img)]
     for time_value, latents in probe_x0_latents.items():
         if latents:
-            probe_img = decode_latents(vae, torch.stack(latents).float(), scaling_factor)
+            probe_img = decode_latents(
+                vae,
+                torch.stack(latents).float(),
+                scaling_factor,
+            )
             tag = str(time_value).replace(".", "p")
             overview_columns.append((f"flow_x0_est_{tag}", probe_img))
             save_image(probe_img, out_dir / f"flow_x0_est_{tag}.png")
@@ -806,7 +818,11 @@ def main():
                     order_strategy=strategy,
                     return_trace=True,
                 )
-            single_img = decode_latents(vae, single_latents.float(), scaling_factor)
+            single_img = decode_latents(
+                vae,
+                single_latents.float(),
+                scaling_factor,
+            )
             tag = strategy.replace("/", "_")
             save_image(make_grid(torch.stack([target_img, single_img], dim=1).flatten(0, 1), nrow=2), out_dir / f"strategy_{tag}.png")
             overview_columns.append((f"strategy_{tag}", single_img))
@@ -831,7 +847,11 @@ def main():
                         solver=args.flow_solver,
                         seed=args.seed + args.refine_seed_offset,
                     )
-                refined_img = decode_latents(vae, refined_latents.float(), scaling_factor)
+                refined_img = decode_latents(
+                    vae,
+                    refined_latents.float(),
+                    scaling_factor,
+                )
                 save_image(
                     make_grid(torch.stack([target_img, single_img, refined_img], dim=1).flatten(0, 1), nrow=3),
                     out_dir / f"strategy_{tag}_refined.png",
@@ -876,7 +896,11 @@ def main():
                     [oracle_mask[batch_idx, start:end].view(side, side) for batch_idx, start, end in spans]
                 )
                 remaining_grid = ~oracle_grid
-                oracle_img = decode_latents(vae, oracle_latents.float(), scaling_factor)
+                oracle_img = decode_latents(
+                    vae,
+                    oracle_latents.float(),
+                    scaling_factor,
+                )
                 ratio_tag = str(ratio).replace(".", "p")
                 save_image(
                     make_grid(torch.stack([target_img, oracle_img], dim=1).flatten(0, 1), nrow=2),

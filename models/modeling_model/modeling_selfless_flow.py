@@ -21,12 +21,15 @@
 
 import math
 import os
-from typing import Callable, Optional, Union
+from typing import Optional, Union
 
 import torch
 from torch import nn
 from torch.nn import functional as F
-
+from torch.nn.attention.flex_attention import (
+    BlockMask,
+    flex_attention,
+)
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
@@ -38,23 +41,39 @@ from transformers.modeling_layers import (
     GenericForTokenClassification,
     GradientCheckpointingLayer,
 )
-from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
+from transformers.modeling_outputs import (
+    BaseModelOutputWithPast,
+    CausalLMOutputWithPast,
+)
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from transformers.modeling_utils import PreTrainedModel
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple
 from transformers.utils.deprecation import deprecate_kwarg
-from transformers.utils.generic import maybe_autocast, merge_with_config_defaults
-from torch.nn.attention.flex_attention import flex_attention, BlockMask, create_block_mask, and_masks
+
 try:
     from flash_attn.ops.triton.layer_norm import rms_norm_fn as flash_rms_norm
 except Exception:
     flash_rms_norm = None
-from .image_position_utils import build_2d_sincos_position_embedding as _build_2d_sincos_position_embedding
 from .image_flow_loss import FlowLoss
+from .image_backbone import (
+    CANONICAL_IMAGE_LATENT_DIM,
+    CANONICAL_IMAGE_TOKENS,
+    image_backbone_spec,
+    resolve_model_image_backbone,
+)
+from .image_flow_position import resolve_model_flow_head_position
+from .image_position_utils import (
+    build_2d_sincos_position_embedding as _build_2d_sincos_position_embedding,
+)
+from .image_position_utils import (
+    build_row_col_position_ids,
+)
+
 try:
     from liger_kernel.ops.swiglu import LigerSiLUMulFunction  # noqa: F401
+
     liger_kernel_is_available = True
 except ImportError:
     liger_kernel_is_available = False
@@ -87,6 +106,7 @@ class ImageTokenEmbedder(nn.Module):
         initializer_range=0.02,
         init_mode="balanced",
         latent_rms=1.0,
+        backbone_variant="E2-Q1",
     ):
         super().__init__()
         self.latent_dim = int(latent_dim)
@@ -95,6 +115,10 @@ class ImageTokenEmbedder(nn.Module):
         self.initializer_range = float(initializer_range)
         self.init_mode = "balanced" if init_mode is None else str(init_mode).lower()
         self.latent_rms = float(latent_rms)
+        spec = image_backbone_spec(backbone_variant)
+        self.backbone_variant = spec.variant
+        self.observed_position_mode = spec.observed_position_mode
+        self.mask_position_mode = spec.mask_position_mode
         self.z_proj = nn.Linear(self.latent_dim, self.hidden_size, bias=True)
         pos_embed = torch.empty(self.image_tokens_per_img, self.hidden_size)
         self.register_buffer("image_pos_embed", pos_embed.clone())
@@ -113,11 +137,16 @@ class ImageTokenEmbedder(nn.Module):
             "z_proj_weight_std": float(weight_std),
             "image_pos_gain": None,
             "latent_rms": float(self.latent_rms),
+            "backbone_variant": self.backbone_variant,
+            "observed_position_mode": self.observed_position_mode,
+            "mask_position_mode": self.mask_position_mode,
         }
         if self._uses_balanced_init():
             latent_rms = max(float(self.latent_rms), 1e-6)
             component_rms = self.initializer_range / math.sqrt(2.0)
-            weight_std = component_rms / (math.sqrt(float(self.latent_dim)) * latent_rms)
+            weight_std = component_rms / (
+                math.sqrt(float(self.latent_dim)) * latent_rms
+            )
             init_stats.update(
                 {
                     "component_rms": float(component_rms),
@@ -130,9 +159,14 @@ class ImageTokenEmbedder(nn.Module):
                     init_stats["image_pos_rms"] = None
                     init_stats["image_pos_gain"] = None
                 else:
-                    image_pos_rms = self.image_pos_embed.detach().float().pow(2).mean().sqrt()
+                    image_pos_rms = (
+                        self.image_pos_embed.detach().float().pow(2).mean().sqrt()
+                    )
                     pos_gain = 0.0
-                    if torch.isfinite(image_pos_rms) and float(image_pos_rms.item()) > 0.0:
+                    if (
+                        torch.isfinite(image_pos_rms)
+                        and float(image_pos_rms.item()) > 0.0
+                    ):
                         pos_gain = float(component_rms / float(image_pos_rms.item()))
                     with torch.no_grad():
                         self.image_pos_gain.fill_(pos_gain)
@@ -179,7 +213,14 @@ class ImageTokenEmbedder(nn.Module):
         )
 
     def _uses_learned_image_pos_gain(self) -> bool:
-        return self.init_mode in {"balanced", "balanced_pos_gain", "initializer_range"}
+        uses_additive_position = (
+            self.observed_position_mode == "additive_2d"
+            or self.mask_position_mode == "additive_2d"
+        )
+        return (
+            self.init_mode in {"balanced", "balanced_pos_gain", "initializer_range"}
+            and uses_additive_position
+        )
 
     def _scale_image_pos(self, pos):
         if self.image_pos_gain is None:
@@ -192,14 +233,19 @@ class ImageTokenEmbedder(nn.Module):
             return None
         local_positions = local_positions.to(device=device, dtype=torch.long)
         if local_positions.numel() > 0:
-            if int(local_positions.min().item()) < 0 or int(local_positions.max().item()) >= self.image_tokens_per_img:
+            if (
+                int(local_positions.min().item()) < 0
+                or int(local_positions.max().item()) >= self.image_tokens_per_img
+            ):
                 raise ValueError(
                     f"image local positions must be in [0, {self.image_tokens_per_img}), "
                     f"got min={int(local_positions.min().item())}, max={int(local_positions.max().item())}"
                 )
         return local_positions
 
-    def _lookup_pos_embed(self, pos_embed: torch.Tensor, local_positions: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    def _lookup_pos_embed(
+        self, pos_embed: torch.Tensor, local_positions: torch.Tensor, dtype: torch.dtype
+    ) -> torch.Tensor:
         flat_positions = local_positions.reshape(-1)
         pos_embed = pos_embed.to(device=local_positions.device, dtype=dtype)
         values = pos_embed.index_select(0, flat_positions)
@@ -209,19 +255,41 @@ class ImageTokenEmbedder(nn.Module):
         x = latents.to(dtype=self.z_proj.weight.dtype)
         x = self.z_proj(x)
         local_positions = self._positions(local_positions, x.device)
-        if local_positions is not None:
+        if local_positions is not None and self.observed_position_mode == "additive_2d":
             pos = self._lookup_pos_embed(self.image_pos_embed, local_positions, x.dtype)
             x = x + self._scale_image_pos(pos)
         return x
 
-    def embed_mask(self, local_positions, mask_embedding):
+    def embed_mask(
+        self,
+        local_positions,
+        mask_embedding,
+        *,
+        debug_finite: bool = False,
+        debug_label: str = "",
+    ):
         local_positions = self._positions(local_positions, mask_embedding.device)
         if local_positions is None:
-            raise ValueError("local_positions must be provided when embedding image mask tokens.")
+            raise ValueError(
+                "local_positions must be provided when embedding image mask tokens."
+            )
         x = mask_embedding.to(dtype=self.z_proj.weight.dtype)
         x = x.expand(local_positions.shape + (x.shape[-1],))
-        pos = self._lookup_pos_embed(self.image_pos_embed, local_positions, x.dtype)
-        x = x + self._scale_image_pos(pos)
+        if self.mask_position_mode == "additive_2d":
+            pos = self._lookup_pos_embed(self.image_pos_embed, local_positions, x.dtype)
+            _debug_require_finite_tensor(
+                debug_finite,
+                debug_label,
+                "image_mask_embed.position_lookup",
+                pos,
+            )
+            x = x + self._scale_image_pos(pos)
+            _debug_require_finite_tensor(
+                debug_finite,
+                debug_label,
+                "image_mask_embed.mask_plus_position",
+                x,
+            )
         return x
 
     def forward(self, latents, local_positions=None):
@@ -230,7 +298,9 @@ class ImageTokenEmbedder(nn.Module):
 
 def _compute_default_rope_parameters(config: Qwen3Config, device=None):
     base = getattr(config, "rope_theta", 10000.0)
-    head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+    head_dim = getattr(
+        config, "head_dim", config.hidden_size // config.num_attention_heads
+    )
     partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
     dim = int(head_dim * partial_rotary_factor)
     inv_freq = 1.0 / (
@@ -266,8 +336,7 @@ class Qwen3RMSNorm(nn.Module):
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * \
-            torch.rsqrt(variance + self.variance_epsilon)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         return self.weight * hidden_states.to(input_dtype)
 
     def extra_repr(self):
@@ -280,17 +349,16 @@ class Qwen3MLP(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        self.gate_proj = nn.Linear(
-            self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(
-            self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(
-            self.intermediate_size, self.hidden_size, bias=False)
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
         if liger_kernel_is_available:
-            return self.down_proj(LigerSiLUMulFunction.apply(self.gate_proj(x), self.up_proj(x)))
+            return self.down_proj(
+                LigerSiLUMulFunction.apply(self.gate_proj(x), self.up_proj(x))
+            )
         else:
             down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
             return down_proj
@@ -328,7 +396,7 @@ def apply_rotary_pos_emb(X0_q, XT_q, k, cos, sin, position_ids=None, unsqueeze_d
     X0_q_embed = (X0_q * cos) + (rotate_half(X0_q) * sin)
     XT_q_embed = (XT_q * cos) + (rotate_half(XT_q) * sin) if XT_q is not None else None
     k_embed = (k * cos) + (rotate_half(k) * sin)
-    
+
     return X0_q_embed, XT_q_embed, k_embed
 
 
@@ -340,8 +408,65 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     batch, num_key_value_heads, slen, head_dim = hidden_states.shape
     if n_rep == 1:
         return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+    hidden_states = hidden_states[:, :, None, :, :].expand(
+        batch, num_key_value_heads, n_rep, slen, head_dim
+    )
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+
+def _debug_require_finite_tensor(
+    enabled: bool,
+    label: str,
+    component: str,
+    tensor: torch.Tensor | None,
+) -> None:
+    if not enabled or tensor is None:
+        return
+    finite = torch.isfinite(tensor)
+    if bool(finite.all()):
+        return
+    finite_values = tensor[finite].float()
+    nonfinite_rows = None
+    nonfinite_axis1 = None
+    nonfinite_last_dim = None
+    if tensor.ndim >= 1:
+        row_finite = finite.reshape(tensor.shape[0], -1).all(dim=1)
+        row_indices = (~row_finite).nonzero(as_tuple=True)[0].detach().cpu().tolist()
+        nonfinite_rows = {
+            "count": len(row_indices),
+            "first": row_indices[:64],
+        }
+    if tensor.ndim >= 2:
+        axis1_nonfinite = (
+            (~finite).movedim(1, 0).reshape(tensor.shape[1], -1).any(dim=1)
+        )
+        axis1_indices = (
+            axis1_nonfinite.nonzero(as_tuple=True)[0].detach().cpu().tolist()
+        )
+        nonfinite_axis1 = {
+            "count": len(axis1_indices),
+            "first": axis1_indices[:64],
+        }
+        last_nonfinite = (~finite).reshape(-1, tensor.shape[-1]).any(dim=0)
+        last_indices = last_nonfinite.nonzero(as_tuple=True)[0].detach().cpu().tolist()
+        nonfinite_last_dim = {
+            "count": len(last_indices),
+            "first": last_indices[:64],
+        }
+    finite_range = (
+        [float(finite_values.min().item()), float(finite_values.max().item())]
+        if finite_values.numel()
+        else None
+    )
+    raise FloatingPointError(
+        "non-finite tensor inside selfless-flow backbone: "
+        f"label={label!r}, component={component!r}, shape={tuple(tensor.shape)}, "
+        f"nonfinite_rows={nonfinite_rows}, "
+        f"nonfinite_axis1={nonfinite_axis1}, nonfinite_last_dim={nonfinite_last_dim}, "
+        f"nonfinite={int((~finite).sum().item())}/{tensor.numel()}, "
+        f"finite_range={finite_range}, "
+        f"finite_max_abs={float(finite_values.abs().max().item()) if finite_values.numel() else None}"
+    )
 
 
 def compute_image_local_positions(
@@ -367,10 +492,14 @@ def compute_image_local_positions(
             [
                 torch.zeros(1, device=positions.device, dtype=torch.long),
                 gaps,
-                torch.full((1,), positions.numel(), device=positions.device, dtype=torch.long),
+                torch.full(
+                    (1,), positions.numel(), device=positions.device, dtype=torch.long
+                ),
             ]
         )
-        for start_idx, end_idx in zip(boundaries[:-1].tolist(), boundaries[1:].tolist()):
+        for start_idx, end_idx in zip(
+            boundaries[:-1].tolist(), boundaries[1:].tolist()
+        ):
             span = positions[start_idx:end_idx]
             span_len = span.numel()
             if span_len > image_tokens_per_img:
@@ -399,11 +528,8 @@ def compiled_flex_attention(query, key, value, attention_mask, scaling, enable_g
         return_lse=False,
     )
 
-@torch.compile(
-    fullgraph=True,
-    mode="default",
-    dynamic=True
-)
+
+@torch.compile(fullgraph=True, mode="default", dynamic=True)
 def dynamic_flex_attention(query, key, value, attention_mask, scaling, enable_gqa):
     """自适应tokens长度的 flex_attention 包装函数"""
     return flex_attention(
@@ -417,7 +543,7 @@ def dynamic_flex_attention(query, key, value, attention_mask, scaling, enable_gq
         return_lse=False,
     )
 
-    
+
 class Qwen3Attention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
@@ -425,25 +551,41 @@ class Qwen3Attention(nn.Module):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
+        self.head_dim = getattr(
+            config, "head_dim", config.hidden_size // config.num_attention_heads
+        )
+        self.num_key_value_groups = (
+            config.num_attention_heads // config.num_key_value_heads
+        )
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
 
         self.q_proj = nn.Linear(
-            config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
+            config.hidden_size,
+            config.num_attention_heads * self.head_dim,
+            bias=config.attention_bias,
         )
         self.k_proj = nn.Linear(
-            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+            config.hidden_size,
+            config.num_key_value_heads * self.head_dim,
+            bias=config.attention_bias,
         )
         self.v_proj = nn.Linear(
-            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+            config.hidden_size,
+            config.num_key_value_heads * self.head_dim,
+            bias=config.attention_bias,
         )
         self.o_proj = nn.Linear(
-            config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
+            config.num_attention_heads * self.head_dim,
+            config.hidden_size,
+            bias=config.attention_bias,
         )
-        self.q_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # unlike olmo, only on the head dim!
-        self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # thus post q_norm does not need reshape
+        self.q_norm = Qwen3RMSNorm(
+            self.head_dim, eps=config.rms_norm_eps
+        )  # unlike olmo, only on the head dim!
+        self.k_norm = Qwen3RMSNorm(
+            self.head_dim, eps=config.rms_norm_eps
+        )  # thus post q_norm does not need reshape
 
     @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
     def forward(
@@ -456,26 +598,81 @@ class Qwen3Attention(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        debug_finite = bool(kwargs.pop("debug_finite_backbone", False))
+        debug_label = str(kwargs.pop("debug_backbone_label", ""))
+        prefix = f"layers.{self.layer_idx}.self_attn"
+        _debug_require_finite_tensor(
+            debug_finite,
+            debug_label,
+            f"{prefix}.input_x0",
+            X0_hidden_states,
+        )
         input_shape = X0_hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
-            
-        XT_query_states = self.q_norm(self.q_proj(XT_hidden_states).view(hidden_shape)).transpose(1, 2) if XT_hidden_states is not None else None
-        
-        X0_query_states = self.q_norm(self.q_proj(X0_hidden_states).view(hidden_shape)).transpose(1, 2)
-        X0_key_states = self.k_norm(self.k_proj(X0_hidden_states).view(hidden_shape)).transpose(1, 2)
-        X0_value_states = self.v_proj(X0_hidden_states).view(hidden_shape).transpose(1, 2)
+
+        XT_query_states = (
+            self.q_proj(XT_hidden_states).view(hidden_shape)
+            if XT_hidden_states is not None
+            else None
+        )
+        X0_query_states = self.q_proj(X0_hidden_states).view(hidden_shape)
+        X0_key_states = self.k_proj(X0_hidden_states).view(hidden_shape)
+        X0_value_states = self.v_proj(X0_hidden_states).view(hidden_shape)
+        _debug_require_finite_tensor(
+            debug_finite, debug_label, f"{prefix}.q_proj", X0_query_states
+        )
+        _debug_require_finite_tensor(
+            debug_finite, debug_label, f"{prefix}.k_proj", X0_key_states
+        )
+        _debug_require_finite_tensor(
+            debug_finite, debug_label, f"{prefix}.v_proj", X0_value_states
+        )
+        XT_query_states = (
+            self.q_norm(XT_query_states).transpose(1, 2)
+            if XT_query_states is not None
+            else None
+        )
+        X0_query_states = self.q_norm(X0_query_states).transpose(1, 2)
+        X0_key_states = self.k_norm(X0_key_states).transpose(1, 2)
+        X0_value_states = X0_value_states.transpose(1, 2)
+        _debug_require_finite_tensor(
+            debug_finite, debug_label, f"{prefix}.q_norm", X0_query_states
+        )
+        _debug_require_finite_tensor(
+            debug_finite, debug_label, f"{prefix}.k_norm", X0_key_states
+        )
 
         cos, sin = position_embeddings
-        X0_query_states, XT_query_states, X0_key_states,  = apply_rotary_pos_emb(X0_query_states, XT_query_states, X0_key_states, cos, sin)
+        _debug_require_finite_tensor(
+            debug_finite, debug_label, f"{prefix}.rope_cos", cos
+        )
+        _debug_require_finite_tensor(
+            debug_finite, debug_label, f"{prefix}.rope_sin", sin
+        )
+        (
+            X0_query_states,
+            XT_query_states,
+            X0_key_states,
+        ) = apply_rotary_pos_emb(
+            X0_query_states, XT_query_states, X0_key_states, cos, sin
+        )
+        _debug_require_finite_tensor(
+            debug_finite, debug_label, f"{prefix}.rotary_q", X0_query_states
+        )
+        _debug_require_finite_tensor(
+            debug_finite, debug_label, f"{prefix}.rotary_k", X0_key_states
+        )
 
         if past_key_values is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            X0_key_states, X0_value_states = past_key_values.update(X0_key_states, X0_value_states, self.layer_idx, cache_kwargs)
-        
+            X0_key_states, X0_value_states = past_key_values.update(
+                X0_key_states, X0_value_states, self.layer_idx, cache_kwargs
+            )
+
         # 检查是否需要 GQA (Grouped Query Attention)
         enable_gqa = self.config.num_attention_heads != self.config.num_key_value_heads
-        
+
         if self.training == False:
             X0_attn_output = dynamic_flex_attention(
                 query=X0_query_states,
@@ -485,15 +682,20 @@ class Qwen3Attention(nn.Module):
                 scaling=self.scaling,  # 使用预定义的缩放因子
                 enable_gqa=enable_gqa,  # 如果 kv heads 少于 q heads，需要启用
             )
-            XT_attn_output = dynamic_flex_attention(
-                query=XT_query_states,
-                key=X0_key_states,
-                value=X0_value_states,
-                attention_mask=attention_mask,  # 直接传入 BlockMask
-                scaling=self.scaling,  # 使用预定义的缩放因子
-                enable_gqa=enable_gqa,  # 如果 kv heads 少于 q heads，需要启用
-            ) if XT_query_states is not None else None
+            XT_attn_output = (
+                dynamic_flex_attention(
+                    query=XT_query_states,
+                    key=X0_key_states,
+                    value=X0_value_states,
+                    attention_mask=attention_mask,  # 直接传入 BlockMask
+                    scaling=self.scaling,  # 使用预定义的缩放因子
+                    enable_gqa=enable_gqa,  # 如果 kv heads 少于 q heads，需要启用
+                )
+                if XT_query_states is not None
+                else None
+            )
             attn_weights = None
+
         else:
             # 调用 flex_attention
             X0_attn_output = compiled_flex_attention(
@@ -504,23 +706,48 @@ class Qwen3Attention(nn.Module):
                 scaling=self.scaling,  # 使用预定义的缩放因子
                 enable_gqa=enable_gqa,  # 如果 kv heads 少于 q heads，需要启用
             )
-            XT_attn_output = compiled_flex_attention(
-                query=XT_query_states,
-                key=X0_key_states,
-                value=X0_value_states,
-                attention_mask=attention_mask,  # 直接传入 BlockMask
-                scaling=self.scaling,  # 使用预定义的缩放因子
-                enable_gqa=enable_gqa,  # 如果 kv heads 少于 q heads，需要启用
-            ) if XT_query_states is not None else None
+            XT_attn_output = (
+                compiled_flex_attention(
+                    query=XT_query_states,
+                    key=X0_key_states,
+                    value=X0_value_states,
+                    attention_mask=attention_mask,  # 直接传入 BlockMask
+                    scaling=self.scaling,  # 使用预定义的缩放因子
+                    enable_gqa=enable_gqa,  # 如果 kv heads 少于 q heads，需要启用
+                )
+                if XT_query_states is not None
+                else None
+            )
             attn_weights = None
-        
+
+        _debug_require_finite_tensor(
+            debug_finite,
+            debug_label,
+            f"{prefix}.flex_attention_output",
+            X0_attn_output,
+        )
+
         # attn_output 形状: (batch, heads, seq_len, head_dim)
         # 需要转换回 (batch, seq_len, hidden_size)
-        X0_attn_output = X0_attn_output.transpose(1, 2).reshape(*input_shape, -1).contiguous()
-        XT_attn_output = XT_attn_output.transpose(1, 2).reshape(*input_shape, -1).contiguous() if XT_attn_output is not None else None
+        X0_attn_output = (
+            X0_attn_output.transpose(1, 2).reshape(*input_shape, -1).contiguous()
+        )
+        XT_attn_output = (
+            XT_attn_output.transpose(1, 2).reshape(*input_shape, -1).contiguous()
+            if XT_attn_output is not None
+            else None
+        )
         X0_attn_output = self.o_proj(X0_attn_output)
-        XT_attn_output = self.o_proj(XT_attn_output) if XT_attn_output is not None else None
-        
+        XT_attn_output = (
+            self.o_proj(XT_attn_output) if XT_attn_output is not None else None
+        )
+        _debug_require_finite_tensor(
+            debug_finite,
+            debug_label,
+            f"{prefix}.o_proj",
+            X0_attn_output,
+        )
+
         return X0_attn_output, XT_attn_output, attn_weights
 
 
@@ -533,7 +760,9 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
 
         self.mlp = Qwen3MLP(config)
         self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = Qwen3RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
         self.attention_type = config.layer_types[layer_idx]
 
     @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
@@ -546,13 +775,19 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
         past_key_values: Optional[Cache] = None,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
+        position_embeddings: Optional[
+            tuple[torch.Tensor, torch.Tensor]
+        ] = None,  # necessary, but kept here for BC
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
         X0_residual = X0_hidden_states
         XT_residual = XT_hidden_states if XT_hidden_states is not None else None
         X0_hidden_states = self.input_layernorm(X0_hidden_states)
-        XT_hidden_states = self.input_layernorm(XT_hidden_states) if XT_hidden_states is not None else None
+        XT_hidden_states = (
+            self.input_layernorm(XT_hidden_states)
+            if XT_hidden_states is not None
+            else None
+        )
         # Self Attention
         X0_hidden_states, XT_hidden_states, _ = self.self_attn(
             X0_hidden_states=X0_hidden_states,
@@ -566,17 +801,27 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
             **kwargs,
         )
         X0_hidden_states = X0_residual + X0_hidden_states
-        XT_hidden_states = XT_residual + XT_hidden_states if XT_hidden_states is not None else None
+        XT_hidden_states = (
+            XT_residual + XT_hidden_states if XT_hidden_states is not None else None
+        )
 
         # Fully Connected
         X0_residual = X0_hidden_states
         XT_residual = XT_hidden_states if XT_hidden_states is not None else None
         X0_hidden_states = self.post_attention_layernorm(X0_hidden_states)
-        XT_hidden_states = self.post_attention_layernorm(XT_hidden_states) if XT_hidden_states is not None else None
+        XT_hidden_states = (
+            self.post_attention_layernorm(XT_hidden_states)
+            if XT_hidden_states is not None
+            else None
+        )
         X0_hidden_states = self.mlp(X0_hidden_states)
-        XT_hidden_states = self.mlp(XT_hidden_states) if XT_hidden_states is not None else None
+        XT_hidden_states = (
+            self.mlp(XT_hidden_states) if XT_hidden_states is not None else None
+        )
         X0_hidden_states = X0_residual + X0_hidden_states
-        XT_hidden_states = XT_residual + XT_hidden_states if XT_hidden_states is not None else None
+        XT_hidden_states = (
+            XT_residual + XT_hidden_states if XT_hidden_states is not None else None
+        )
         return X0_hidden_states, XT_hidden_states
 
 
@@ -610,7 +855,9 @@ class Qwen3RotaryEmbedding(nn.Module):
         super().__init__()
         # BC: "rope_type" was originally "type"
         if hasattr(config, "rope_scaling") and isinstance(config.rope_scaling, dict):
-            self.rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type"))
+            self.rope_type = config.rope_scaling.get(
+                "rope_type", config.rope_scaling.get("type")
+            )
         else:
             self.rope_type = "default"
         self.max_seq_len_cached = config.max_position_embeddings
@@ -618,7 +865,9 @@ class Qwen3RotaryEmbedding(nn.Module):
 
         self.config = config
         if self.rope_type in (None, "default"):
-            self.rope_init_fn = ROPE_INIT_FUNCTIONS.get("default", _compute_default_rope_parameters)
+            self.rope_init_fn = ROPE_INIT_FUNCTIONS.get(
+                "default", _compute_default_rope_parameters
+            )
         else:
             self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
 
@@ -629,12 +878,53 @@ class Qwen3RotaryEmbedding(nn.Module):
     @torch.no_grad()
     @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
     def forward(self, x, position_ids):
-        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
-        position_ids_expanded = position_ids[:, None, :].float()
+        if position_ids.ndim == 2:
+            inv_freq_expanded = (
+                self.inv_freq[None, :, None]
+                .float()
+                .expand(position_ids.shape[0], -1, 1)
+                .to(x.device)
+            )
+            position_ids_expanded = position_ids[:, None, :].float()
+        elif position_ids.ndim == 3 and position_ids.shape[0] == 2:
+            num_frequency_pairs = int(self.inv_freq.numel())
+            coordinate_axes = (
+                torch.arange(
+                    num_frequency_pairs,
+                    device=position_ids.device,
+                    dtype=torch.long,
+                )
+                % 2
+            )
+            selected_positions = position_ids.index_select(0, coordinate_axes).permute(
+                1, 0, 2
+            )
+            inv_freq_expanded = (
+                self.inv_freq[None, :, None]
+                .float()
+                .expand(position_ids.shape[1], -1, 1)
+                .to(x.device)
+            )
+            position_ids_expanded = selected_positions.float()
+        else:
+            raise ValueError(
+                f"position_ids must have shape [B,L] or [2,B,L], got {tuple(position_ids.shape)}"
+            )
 
-        device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
+        device_type = (
+            x.device.type
+            if isinstance(x.device.type, str) and x.device.type != "mps"
+            else "cpu"
+        )
         with torch.autocast(device_type=device_type, enabled=False):  # Force float32
-            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+            if position_ids.ndim == 2:
+                freqs = (
+                    inv_freq_expanded.float() @ position_ids_expanded.float()
+                ).transpose(1, 2)
+            else:
+                freqs = (
+                    inv_freq_expanded.float() * position_ids_expanded.float()
+                ).transpose(1, 2)
             emb = torch.cat((freqs, freqs), dim=-1)
             cos = emb.cos() * self.attention_scaling
             sin = emb.sin() * self.attention_scaling
@@ -645,39 +935,65 @@ class Qwen3RotaryEmbedding(nn.Module):
 @auto_docstring
 class Qwen3Model(Qwen3PreTrainedModel):
     def __init__(self, config: Qwen3Config):
+        backbone = resolve_model_image_backbone(config)
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        self.image_latent_dim = getattr(config, "image_latent_dim", 4)
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.image_latent_dim = int(
+            getattr(config, "image_latent_dim", CANONICAL_IMAGE_LATENT_DIM)
+        )
+        image_tokens_per_img = int(
+            getattr(config, "image_tokens_per_img", CANONICAL_IMAGE_TOKENS)
+        )
+        self.image_backbone_variant = backbone.variant
+        self.embed_tokens = nn.Embedding(
+            config.vocab_size, config.hidden_size, self.padding_idx
+        )
         self.image_token_embedder = ImageTokenEmbedder(
             latent_dim=self.image_latent_dim,
             hidden_size=config.hidden_size,
-            image_tokens_per_img=getattr(config, "image_tokens_per_img", 256),
+            image_tokens_per_img=image_tokens_per_img,
             initializer_range=getattr(config, "initializer_range", 0.02),
             init_mode=getattr(config, "image_token_embedder_init_mode", "balanced"),
             latent_rms=getattr(config, "image_token_embedder_latent_rms", 1.0),
+            backbone_variant=backbone.variant,
         )
-        self.image_input_noise_strength = float(getattr(config, "image_input_noise_strength", 1.0e-2))
-        self.image_input_noise_strength_std = float(getattr(config, "image_input_noise_strength_std", 0.0))
-        self.image_input_noise_strength_min = getattr(config, "image_input_noise_strength_min", None)
-        self.image_input_noise_strength_max = getattr(config, "image_input_noise_strength_max", None)
+        self.image_input_noise_strength = float(
+            getattr(config, "image_input_noise_strength", 1.0e-2)
+        )
+        self.image_input_noise_strength_std = float(
+            getattr(config, "image_input_noise_strength_std", 0.0)
+        )
+        self.image_input_noise_strength_min = getattr(
+            config, "image_input_noise_strength_min", None
+        )
+        self.image_input_noise_strength_max = getattr(
+            config, "image_input_noise_strength_max", None
+        )
         if self.image_input_noise_strength_min is not None:
-            self.image_input_noise_strength_min = float(self.image_input_noise_strength_min)
+            self.image_input_noise_strength_min = float(
+                self.image_input_noise_strength_min
+            )
         if self.image_input_noise_strength_max is not None:
-            self.image_input_noise_strength_max = float(self.image_input_noise_strength_max)
+            self.image_input_noise_strength_max = float(
+                self.image_input_noise_strength_max
+            )
         if (
             self.image_input_noise_strength_min is not None
             and self.image_input_noise_strength_max is not None
-            and self.image_input_noise_strength_min > self.image_input_noise_strength_max
+            and self.image_input_noise_strength_min
+            > self.image_input_noise_strength_max
         ):
             raise ValueError(
                 "image_input_noise_strength_min must be <= image_input_noise_strength_max, "
                 f"got {self.image_input_noise_strength_min} > {self.image_input_noise_strength_max}"
             )
         self.layers = nn.ModuleList(
-            [Qwen3DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [
+                Qwen3DecoderLayer(config, layer_idx)
+                for layer_idx in range(config.num_hidden_layers)
+            ]
         )
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3RotaryEmbedding(config=config)
@@ -698,7 +1014,9 @@ class Qwen3Model(Qwen3PreTrainedModel):
         return self.image_token_embedder.last_init_stats
 
     def _image_mask_token_id(self) -> int:
-        return int(getattr(self.config, "image_mask_token_id", self.config.mask_token_id))
+        return int(
+            getattr(self.config, "image_mask_token_id", self.config.mask_token_id)
+        )
 
     def _image_mask_embedding(self, device, dtype):
         token_id = self._image_mask_token_id()
@@ -736,7 +1054,11 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 device=image_latents.device,
                 dtype=torch.float32,
             ) * float(std) + float(mean)
-            min_strength = 0.0 if self.image_input_noise_strength_min is None else self.image_input_noise_strength_min
+            min_strength = (
+                0.0
+                if self.image_input_noise_strength_min is None
+                else self.image_input_noise_strength_min
+            )
             strength = strength.clamp_min(min_strength)
             if self.image_input_noise_strength_max is not None:
                 strength = strength.clamp_max(self.image_input_noise_strength_max)
@@ -750,6 +1072,8 @@ class Qwen3Model(Qwen3PreTrainedModel):
         image_latents: torch.Tensor | None,
         image_latent_mask: torch.Tensor | None,
         image_latents_are_noisy: bool = False,
+        debug_finite: bool = False,
+        debug_label: str = "",
     ) -> torch.Tensor:
         if token_types is None:
             return self.embed_tokens(input_ids)
@@ -759,10 +1083,18 @@ class Qwen3Model(Qwen3PreTrainedModel):
         image_local_positions = self.image_local_positions(token_types)
         safe_input_ids = input_ids.masked_fill(is_image, self._image_mask_token_id())
         inputs_embeds = self.embed_tokens(safe_input_ids)
+        _debug_require_finite_tensor(
+            debug_finite,
+            debug_label,
+            "input_embeddings.safe_token_lookup",
+            inputs_embeds,
+        )
 
         if is_image.any():
             if image_latents is None:
-                raise ValueError("image_latents must be provided when token_types contains image tokens.")
+                raise ValueError(
+                    "image_latents must be provided when token_types contains image tokens."
+                )
             self._validate_image_latents(image_latents)
             image_latents = image_latents.to(
                 device=input_ids.device,
@@ -770,7 +1102,9 @@ class Qwen3Model(Qwen3PreTrainedModel):
             )
             use_image_latent = is_image
             if image_latent_mask is not None:
-                image_latent_mask = image_latent_mask.to(device=input_ids.device, dtype=torch.bool)
+                image_latent_mask = image_latent_mask.to(
+                    device=input_ids.device, dtype=torch.bool
+                )
                 use_image_latent = is_image & image_latent_mask
 
             use_image_mask = is_image & ~use_image_latent
@@ -778,19 +1112,41 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 device=input_ids.device,
                 dtype=self.image_token_embedder.weight_dtype,
             )
+            _debug_require_finite_tensor(
+                debug_finite,
+                debug_label,
+                "input_embeddings.image_mask_token",
+                image_mask_embedding,
+            )
             if use_image_mask.any():
-                inputs_embeds[use_image_mask] = self.image_token_embedder.embed_mask(
+                image_mask_values = self.image_token_embedder.embed_mask(
                     image_local_positions[use_image_mask],
                     image_mask_embedding,
+                    debug_finite=debug_finite,
+                    debug_label=debug_label,
                 ).to(dtype=inputs_embeds.dtype)
+                _debug_require_finite_tensor(
+                    debug_finite,
+                    debug_label,
+                    "input_embeddings.image_mask_with_backbone_position",
+                    image_mask_values,
+                )
+                inputs_embeds[use_image_mask] = image_mask_values
             if use_image_latent.any():
                 latent_values = image_latents[use_image_latent]
                 if not image_latents_are_noisy:
                     latent_values = self._maybe_add_image_input_noise(latent_values)
-                inputs_embeds[use_image_latent] = self.image_token_embedder(
+                projected_latent_values = self.image_token_embedder(
                     latent_values,
                     image_local_positions[use_image_latent],
                 ).to(dtype=inputs_embeds.dtype)
+                _debug_require_finite_tensor(
+                    debug_finite,
+                    debug_label,
+                    "input_embeddings.observed_image_latents",
+                    projected_latent_values,
+                )
+                inputs_embeds[use_image_latent] = projected_latent_values
         elif self.training:
             dummy_latent = torch.zeros(
                 1,
@@ -798,7 +1154,9 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 device=input_ids.device,
                 dtype=self.image_token_embedder.weight_dtype,
             )
-            inputs_embeds = inputs_embeds + self.image_token_embedder(dummy_latent).sum() * 0.0
+            inputs_embeds = (
+                inputs_embeds + self.image_token_embedder(dummy_latent).sum() * 0.0
+            )
 
         return inputs_embeds
 
@@ -850,23 +1208,41 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 Whether to calculate the likelihood of the input sequence. If `True`, the model will compute the likelihood using the XT stream, which is necessary for training. If `False`, the model will only compute the hidden states for the X0 stream, which can be used for efficient decoding.
         """
         if (X0_input_ids is None) ^ (X0_inputs_embeds is not None):
-            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+            raise ValueError(
+                "You must specify exactly one of input_ids or inputs_embeds"
+            )
         if attention_mask is None:
-            raise ValueError("attention_mask must be provided for selfless sigma-causal attention.")
+            raise ValueError(
+                "attention_mask must be provided for selfless sigma-causal attention."
+            )
+
+        debug_finite_backbone = bool(kwargs.get("debug_finite_backbone", False))
+        debug_backbone_label = str(kwargs.get("debug_backbone_label", ""))
+        token_types = kwargs.get("token_types", None)
 
         if X0_inputs_embeds is None:
             X0_inputs_embeds = self._build_x0_inputs_embeds(
                 input_ids=X0_input_ids,
-                token_types=kwargs.get("token_types", None),
+                token_types=token_types,
                 image_latents=kwargs.get("image_latents", None),
                 image_latent_mask=kwargs.get("image_latent_mask", None),
-                image_latents_are_noisy=bool(kwargs.get("image_latents_are_noisy", False)),
+                image_latents_are_noisy=bool(
+                    kwargs.get("image_latents_are_noisy", False)
+                ),
+                debug_finite=debug_finite_backbone,
+                debug_label=debug_backbone_label,
             )
+        _debug_require_finite_tensor(
+            debug_finite_backbone,
+            debug_backbone_label,
+            "input_embeddings.x0",
+            X0_inputs_embeds,
+        )
 
         if self.training or calculate_likelihood:
             XT_inputs_embeds = self._build_xt_inputs_embeds(
                 input_ids=X0_input_ids,
-                token_types=kwargs.get("token_types", None),
+                token_types=token_types,
             )
         else:
             XT_inputs_embeds = None
@@ -875,20 +1251,39 @@ class Qwen3Model(Qwen3PreTrainedModel):
             past_key_values = DynamicCache(config=self.config)
 
         if cache_position is None:
-            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            past_seen_tokens = (
+                past_key_values.get_seq_length() if past_key_values is not None else 0
+            )
             cache_position = torch.arange(
-                past_seen_tokens, past_seen_tokens + X0_inputs_embeds.shape[1], device=X0_inputs_embeds.device
+                past_seen_tokens,
+                past_seen_tokens + X0_inputs_embeds.shape[1],
+                device=X0_inputs_embeds.device,
             )
 
         if position_ids is None:
-            position_ids = cache_position.unsqueeze(0)
+            if token_types is not None:
+                position_ids = build_row_col_position_ids(
+                    token_types.to(device=X0_inputs_embeds.device),
+                    self.image_token_embedder.image_tokens_per_img,
+                )
+            else:
+                position_ids = cache_position.unsqueeze(0)
 
         X0_hidden_states = X0_inputs_embeds
         XT_hidden_states = XT_inputs_embeds
 
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(X0_hidden_states, position_ids)
-        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+        for component_idx, component in enumerate(position_embeddings):
+            _debug_require_finite_tensor(
+                debug_finite_backbone,
+                debug_backbone_label,
+                f"rotary_embedding.{component_idx}",
+                component,
+            )
+        for layer_idx, decoder_layer in enumerate(
+            self.layers[: self.config.num_hidden_layers]
+        ):
             X0_hidden_states, XT_hidden_states = decoder_layer(
                 X0_hidden_states,
                 XT_hidden_states,
@@ -899,6 +1294,12 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
                 **kwargs,
+            )
+            _debug_require_finite_tensor(
+                debug_finite_backbone,
+                debug_backbone_label,
+                f"layers.{layer_idx}.output_x0",
+                X0_hidden_states,
             )
 
         if self.training or calculate_likelihood:
@@ -922,6 +1323,9 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
     def __init__(self, config):
+        flow_position_spec, flow_rope_axis_dims = resolve_model_flow_head_position(
+            config
+        )
         super().__init__(config)
         self.model = Qwen3Model(config)
         self.vocab_size = config.vocab_size
@@ -932,13 +1336,17 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         self.image_flow_batch_mul = int(getattr(config, "image_flow_batch_mul", 1))
         self.image_flow_mlp_ratio = float(getattr(config, "image_flow_mlp_ratio", 1.0))
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.image_flow_condition_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=True)
+        self.image_flow_condition_proj = nn.Linear(
+            config.hidden_size, config.hidden_size, bias=True
+        )
         self.image_flow_head = FlowLoss(
             target_channels=self.image_latent_dim,
             z_channels=config.hidden_size,
             width=getattr(config, "image_flow_width", 1280),
             depth=getattr(config, "image_flow_depth", 8),
-            num_sampling_steps=str(getattr(config, "image_flow_num_sampling_steps", "50")),
+            num_sampling_steps=str(
+                getattr(config, "image_flow_num_sampling_steps", "50")
+            ),
             grad_checkpointing=getattr(config, "image_flow_grad_checkpointing", False),
             time_scale=getattr(config, "image_flow_time_scale", 1000.0),
             time_sampling=getattr(config, "image_flow_time_sampling", "logit_normal"),
@@ -950,13 +1358,38 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             mlp_ratio=self.image_flow_mlp_ratio,
             image_tokens_per_img=getattr(config, "image_tokens_per_img", 256),
             latent_mixer_heads=getattr(config, "image_flow_latent_mixer_heads", 8),
-            latent_mixer_dropout=getattr(config, "image_flow_latent_mixer_dropout", 0.0),
+            latent_mixer_dropout=getattr(
+                config, "image_flow_latent_mixer_dropout", 0.0
+            ),
             latent_mixer_zero_init_gate=getattr(
                 config,
                 "image_flow_zero_init_gate",
                 getattr(config, "image_flow_latent_mixer_zero_init_gate", True),
             ),
             head_arch=getattr(config, "image_flow_head_arch", "contextual"),
+            query_position_mode=(
+                flow_position_spec.query_position_mode
+                if flow_position_spec is not None
+                else "additive_2d"
+            ),
+            context_position_mode=(
+                flow_position_spec.context_position_mode
+                if flow_position_spec is not None
+                else "additive_2d"
+            ),
+            rope_mode=(
+                flow_position_spec.rope_mode
+                if flow_position_spec is not None
+                else "none"
+            ),
+            rope_axis_dims=flow_rope_axis_dims or (80, 80),
+            rope_rotate_value=False,
+            position_variant=(
+                flow_position_spec.variant
+                if flow_position_spec is not None
+                else "FH0"
+            ),
+            flow_head_variant=getattr(config, "image_flow_head_variant", "DF1"),
         )
 
         # Initialize weights and apply final processing
@@ -1000,7 +1433,10 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             return None
         if not self.training:
             return image_latents
-        if token_types is not None and not (token_types.to(image_latents.device) == 1).any():
+        if (
+            token_types is not None
+            and not (token_types.to(image_latents.device) == 1).any()
+        ):
             return image_latents
         return self.model._maybe_add_image_input_noise(image_latents)
 
@@ -1017,6 +1453,12 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         context_mask: torch.Tensor | None = None,
         query_positions: torch.Tensor | None = None,
         context_positions: torch.Tensor | None = None,
+        context_conditions: torch.Tensor | None = None,
+        latent_mixer_cache: dict | None = None,
+        latent_mixer_cache_is_paired: bool = False,
+        initial_noise: torch.Tensor | None = None,
+        debug_finite: bool = False,
+        debug_label: str = "",
     ) -> torch.Tensor:
         if cfg == 1.0:
             return self.image_flow_head.sample(
@@ -1030,11 +1472,21 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 context_mask=context_mask,
                 query_positions=query_positions,
                 context_positions=context_positions,
+                context_conditions=context_conditions,
+                latent_mixer_cache=latent_mixer_cache,
+                latent_mixer_cache_is_paired=latent_mixer_cache_is_paired,
+                initial_noise=initial_noise,
+                debug_finite=debug_finite,
+                debug_label=debug_label,
             )
         if z_uncond is None:
-            raise ValueError("cfg != 1.0 requires z_uncond; pass paired conditional/unconditional conditions.")
+            raise ValueError(
+                "cfg != 1.0 requires z_uncond; pass paired conditional/unconditional conditions."
+            )
         if z.shape != z_uncond.shape:
-            raise ValueError(f"z and z_uncond must have the same shape, got {tuple(z.shape)} vs {tuple(z_uncond.shape)}")
+            raise ValueError(
+                f"z and z_uncond must have the same shape, got {tuple(z.shape)} vs {tuple(z_uncond.shape)}"
+            )
         paired = torch.cat([z, z_uncond], dim=0)
         return self.image_flow_head.sample(
             paired,
@@ -1047,11 +1499,21 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             context_mask=context_mask,
             query_positions=query_positions,
             context_positions=context_positions,
+            context_conditions=context_conditions,
+            latent_mixer_cache=latent_mixer_cache,
+            latent_mixer_cache_is_paired=latent_mixer_cache_is_paired,
+            initial_noise=initial_noise,
+            debug_finite=debug_finite,
+            debug_label=debug_label,
         )
 
-    def tie_weights(self, missing_keys: set[str] | None = None, recompute_mapping: bool = True):
+    def tie_weights(
+        self, missing_keys: set[str] | None = None, recompute_mapping: bool = True
+    ):
         # Delegate standard tie (lm_head ↔ embed_tokens) to parent
-        super().tie_weights(missing_keys=missing_keys, recompute_mapping=recompute_mapping)
+        super().tie_weights(
+            missing_keys=missing_keys, recompute_mapping=recompute_mapping
+        )
 
     @can_return_tuple
     @auto_docstring
@@ -1090,7 +1552,9 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         calculate_likelihood = calculate_likelihood or labels is not None
         return_logits = bool(kwargs.pop("return_logits", True))
         model_kwargs = dict(kwargs)
-        return_raw_modality_loss = bool(model_kwargs.pop("return_raw_modality_loss", False))
+        return_raw_modality_loss = bool(
+            model_kwargs.pop("return_raw_modality_loss", False)
+        )
         return_loss_tuple = bool(model_kwargs.pop("return_loss_tuple", False))
         return_raw_loss_tuple = bool(model_kwargs.pop("return_raw_loss_tuple", False))
         image_loss_mask_arg = model_kwargs.pop("image_loss_mask", None)
@@ -1102,8 +1566,15 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             )
         else:
             context_image_latents = clean_image_latents
-        image_latents_for_model = context_image_latents if context_image_latents is not None else clean_image_latents
-        if context_image_latents is not None and context_image_latents is not clean_image_latents:
+        image_latents_for_model = (
+            context_image_latents
+            if context_image_latents is not None
+            else clean_image_latents
+        )
+        if (
+            context_image_latents is not None
+            and context_image_latents is not clean_image_latents
+        ):
             model_kwargs["image_latents_are_noisy"] = True
         outputs: BaseModelOutputWithPast = self.model(
             X0_input_ids=X0_input_ids,
@@ -1119,7 +1590,11 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         )
 
         hidden_states = outputs.last_hidden_state
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        slice_indices = (
+            slice(-logits_to_keep, None)
+            if isinstance(logits_to_keep, int)
+            else logits_to_keep
+        )
 
         token_types = model_kwargs.get("token_types", None)
         logits = None
@@ -1133,7 +1608,12 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 text_mask = (token_types == 0) | (token_types == 2)
                 image_mask = token_types == 1
                 if image_loss_mask_arg is not None:
-                    image_loss_mask = image_loss_mask_arg.to(device=hidden_states.device, dtype=torch.bool) & image_mask
+                    image_loss_mask = (
+                        image_loss_mask_arg.to(
+                            device=hidden_states.device, dtype=torch.bool
+                        )
+                        & image_mask
+                    )
                 else:
                     image_loss_mask = image_mask
 
@@ -1155,7 +1635,9 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
 
                 if image_flat_mask.any():
                     if image_latents is None:
-                        raise ValueError("image_latents must be provided for continuous image flow loss.")
+                        raise ValueError(
+                            "image_latents must be provided for continuous image flow loss."
+                        )
                     if image_latents.shape[-1] != self.image_latent_dim:
                         raise ValueError(
                             f"image_latents last dimension ({image_latents.shape[-1]}) must match "
@@ -1163,12 +1645,16 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                         )
                     flow_sigma = model_kwargs.get("flow_sigma", None)
                     if flow_sigma is not None:
-                        flow_sigma = flow_sigma.to(device=hidden_states.device, dtype=torch.float32)
+                        flow_sigma = flow_sigma.to(
+                            device=hidden_states.device, dtype=torch.float32
+                        )
                     image_latents = clean_image_latents.to(hidden_states.device)
                     if context_image_latents is None:
                         context_image_latents_for_loss = image_latents
                     else:
-                        context_image_latents_for_loss = context_image_latents.to(hidden_states.device)
+                        context_image_latents_for_loss = context_image_latents.to(
+                            hidden_states.device
+                        )
                     uses_latent_mixer = bool(
                         getattr(self.image_flow_head, "uses_latent_mixer", True)
                     )
@@ -1179,14 +1665,14 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                     span_positions = []
 
                     for batch_idx in range(token_types.shape[0]):
-                        image_indices = image_loss_mask[batch_idx].nonzero(as_tuple=True)[0]
+                        image_indices = image_loss_mask[batch_idx].nonzero(
+                            as_tuple=True
+                        )[0]
                         if image_indices.numel() == 0:
                             continue
                         split_points = (
-                            (image_indices[1:] != image_indices[:-1] + 1)
-                            .nonzero(as_tuple=True)[0]
-                            + 1
-                        )
+                            image_indices[1:] != image_indices[:-1] + 1
+                        ).nonzero(as_tuple=True)[0] + 1
                         runs = torch.tensor_split(image_indices, split_points.tolist())
                         for run in runs:
                             if run.numel() == 0:
@@ -1209,9 +1695,15 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                             span_positions.append(positions)
 
                     if not span_targets:
-                        dummy_target = torch.zeros(1, self.image_latent_dim, device=hidden_states.device)
-                        dummy_hidden = self._prepare_image_flow_condition(flat_hidden[:1])
-                        image_loss = self.image_flow_head(dummy_target, dummy_hidden) * 0.0
+                        dummy_target = torch.zeros(
+                            1, self.image_latent_dim, device=hidden_states.device
+                        )
+                        dummy_hidden = self._prepare_image_flow_condition(
+                            flat_hidden[:1]
+                        )
+                        image_loss = (
+                            self.image_flow_head(dummy_target, dummy_hidden) * 0.0
+                        )
                     else:
                         lengths = {int(target.shape[0]) for target in span_targets}
                         if len(lengths) == 1:
@@ -1223,16 +1715,30 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                             )
                             image_conditions = torch.stack(span_conditions, dim=0)
                             image_sigmas = torch.stack(span_sigmas, dim=0)
-                            image_positions_for_flow = torch.stack(span_positions, dim=0)
+                            image_positions_for_flow = torch.stack(
+                                span_positions, dim=0
+                            )
                             if self.image_flow_batch_mul > 1:
-                                image_targets = image_targets.repeat(self.image_flow_batch_mul, 1, 1)
+                                image_targets = image_targets.repeat(
+                                    self.image_flow_batch_mul, 1, 1
+                                )
                                 if image_context_latents is not None:
-                                    image_context_latents = image_context_latents.repeat(
-                                        self.image_flow_batch_mul, 1, 1
+                                    image_context_latents = (
+                                        image_context_latents.repeat(
+                                            self.image_flow_batch_mul, 1, 1
+                                        )
                                     )
-                                image_conditions = image_conditions.repeat(self.image_flow_batch_mul, 1, 1)
-                                image_sigmas = image_sigmas.repeat(self.image_flow_batch_mul, 1)
-                                image_positions_for_flow = image_positions_for_flow.repeat(self.image_flow_batch_mul, 1)
+                                image_conditions = image_conditions.repeat(
+                                    self.image_flow_batch_mul, 1, 1
+                                )
+                                image_sigmas = image_sigmas.repeat(
+                                    self.image_flow_batch_mul, 1
+                                )
+                                image_positions_for_flow = (
+                                    image_positions_for_flow.repeat(
+                                        self.image_flow_batch_mul, 1
+                                    )
+                                )
                             image_loss = self.image_flow_head(
                                 target=image_targets,
                                 z=image_conditions,
@@ -1242,7 +1748,13 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                             )
                         else:
                             losses = []
-                            for target, context_latent, condition, sigma_span, position_span in zip(
+                            for (
+                                target,
+                                context_latent,
+                                condition,
+                                sigma_span,
+                                position_span,
+                            ) in zip(
                                 span_targets,
                                 (
                                     span_context_latents
@@ -1260,14 +1772,22 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                                 sigma_span = sigma_span.unsqueeze(0)
                                 position_span = position_span.unsqueeze(0)
                                 if self.image_flow_batch_mul > 1:
-                                    target = target.repeat(self.image_flow_batch_mul, 1, 1)
+                                    target = target.repeat(
+                                        self.image_flow_batch_mul, 1, 1
+                                    )
                                     if context_latent is not None:
                                         context_latent = context_latent.repeat(
                                             self.image_flow_batch_mul, 1, 1
                                         )
-                                    condition = condition.repeat(self.image_flow_batch_mul, 1, 1)
-                                    sigma_span = sigma_span.repeat(self.image_flow_batch_mul, 1)
-                                    position_span = position_span.repeat(self.image_flow_batch_mul, 1)
+                                    condition = condition.repeat(
+                                        self.image_flow_batch_mul, 1, 1
+                                    )
+                                    sigma_span = sigma_span.repeat(
+                                        self.image_flow_batch_mul, 1
+                                    )
+                                    position_span = position_span.repeat(
+                                        self.image_flow_batch_mul, 1
+                                    )
                                 losses.append(
                                     self.image_flow_head(
                                         target=target,
@@ -1279,7 +1799,9 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                                 )
                             image_loss = torch.stack(losses).mean()
                 else:
-                    dummy_target = torch.zeros(1, self.image_latent_dim, device=hidden_states.device)
+                    dummy_target = torch.zeros(
+                        1, self.image_latent_dim, device=hidden_states.device
+                    )
                     dummy_hidden = self._prepare_image_flow_condition(flat_hidden[:1])
                     image_loss = self.image_flow_head(dummy_target, dummy_hidden) * 0.0
 
@@ -1320,8 +1842,12 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         # Attach per-modality losses for logging
         if token_types is not None and loss is not None:
             per_modality_loss = {
-                "text_loss": text_loss.detach() if isinstance(text_loss, torch.Tensor) else torch.tensor(text_loss or 0.0, device=hidden_states.device),
-                "image_loss": image_loss.detach() if isinstance(image_loss, torch.Tensor) else torch.tensor(image_loss or 0.0, device=hidden_states.device),
+                "text_loss": text_loss.detach()
+                if isinstance(text_loss, torch.Tensor)
+                else torch.tensor(text_loss or 0.0, device=hidden_states.device),
+                "image_loss": image_loss.detach()
+                if isinstance(image_loss, torch.Tensor)
+                else torch.tensor(image_loss or 0.0, device=hidden_states.device),
             }
             flow_debug_stats = {
                 key: value.detach()
@@ -1336,10 +1862,15 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                     "image_loss": image_loss,
                 }
         return output
-        
+
     @torch.compile(mode="max-autotune-no-cudagraphs")
-    def loss_function(self, logits, labels, ignore_index, reduction='mean'):
-        return F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=ignore_index, reduction=reduction)
+    def loss_function(self, logits, labels, ignore_index, reduction="mean"):
+        return F.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            labels.view(-1),
+            ignore_index=ignore_index,
+            reduction=reduction,
+        )
 
     @torch.no_grad()
     def sample_image_latents_single_stream(
@@ -1351,6 +1882,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         image_latent_dim: int | None = None,
         initial_image_latents: torch.Tensor | None = None,
         initial_image_latent_mask: torch.Tensor | None = None,
+        initial_noise_bank: torch.Tensor | None = None,
         flow_temperature: float = 1.0,
         flow_cfg: float = 1.0,
         flow_cfg_schedule: str = "constant",
@@ -1359,21 +1891,60 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         parallel_rate: int = 32,
         order_strategy: str = "condition_norm",
         return_trace: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor | None, dict[str, torch.Tensor | str]] | None:
+        debug_finite: bool = False,
+    ) -> (
+        torch.Tensor | tuple[torch.Tensor | None, dict[str, torch.Tensor | str]] | None
+    ):
         from utils.utils import get_selfless_mask
 
         if not spans:
             return (None, {}) if return_trace else None
 
+        def _debug_check(
+            name: str, tensor: torch.Tensor, step: int | None = None
+        ) -> None:
+            if not debug_finite:
+                return
+            finite = torch.isfinite(tensor)
+            if bool(finite.all()):
+                return
+            finite_values = tensor[finite].float()
+            nonfinite_rows = None
+            if tensor.ndim >= 1:
+                row_finite = finite.reshape(tensor.shape[0], -1).all(dim=1)
+                nonfinite_rows = (
+                    (~row_finite).nonzero(as_tuple=True)[0].detach().cpu().tolist()
+                )
+            finite_range = (
+                [float(finite_values.min().item()), float(finite_values.max().item())]
+                if finite_values.numel()
+                else None
+            )
+            raise FloatingPointError(
+                "non-finite tensor during single-stream image generation: "
+                f"component={name!r}, generation_step={step}, "
+                f"shape={tuple(tensor.shape)}, nonfinite_rows={nonfinite_rows}, "
+                f"nonfinite={int((~finite).sum().item())}/{tensor.numel()}, "
+                f"finite_range={finite_range}"
+            )
+
         device = input_ids.device
         image_latent_dim = image_latent_dim or self.image_latent_dim
         image_tokens_per_img = int(getattr(self.config, "image_tokens_per_img", 256))
-        side = int(image_tokens_per_img ** 0.5)
+        side = int(image_tokens_per_img**0.5)
         if side * side != image_tokens_per_img:
-            raise ValueError(f"image_tokens_per_img={image_tokens_per_img} is not square")
-        selected_input_ids = torch.stack([input_ids[b] for b, _, _ in spans]).to(device=device)
-        selected_token_types = torch.stack([token_types[b] for b, _, _ in spans]).to(device=device)
-        selected_sigma = torch.stack([sigma[b] for b, _, _ in spans]).to(device=device, dtype=torch.float32)
+            raise ValueError(
+                f"image_tokens_per_img={image_tokens_per_img} is not square"
+            )
+        selected_input_ids = torch.stack([input_ids[b] for b, _, _ in spans]).to(
+            device=device
+        )
+        selected_token_types = torch.stack([token_types[b] for b, _, _ in spans]).to(
+            device=device
+        )
+        selected_sigma = torch.stack([sigma[b] for b, _, _ in spans]).to(
+            device=device, dtype=torch.float32
+        )
         work_latents = torch.zeros(
             selected_input_ids.shape[0],
             selected_input_ids.shape[1],
@@ -1381,7 +1952,39 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             device=device,
             dtype=self.image_flow_head.net.final_layer.linear.weight.dtype,
         )
-        base_image_latent_mask = torch.zeros_like(selected_token_types, dtype=torch.bool)
+        selected_initial_noise = None
+        if initial_noise_bank is not None:
+            expected_noise_shape = (
+                len(spans),
+                image_tokens_per_img,
+                image_latent_dim,
+            )
+            if not isinstance(initial_noise_bank, torch.Tensor):
+                raise TypeError(
+                    "initial_noise_bank must be a torch.Tensor when provided, "
+                    f"got {type(initial_noise_bank).__name__}"
+                )
+            if tuple(initial_noise_bank.shape) != expected_noise_shape:
+                raise ValueError(
+                    "initial_noise_bank must align with selected sample/local-token positions "
+                    f"and have shape {expected_noise_shape}, got {tuple(initial_noise_bank.shape)}"
+                )
+            if not initial_noise_bank.is_floating_point():
+                raise TypeError(
+                    "initial_noise_bank must have a floating dtype, "
+                    f"got {initial_noise_bank.dtype}"
+                )
+            if not bool(torch.isfinite(initial_noise_bank).all().item()):
+                raise FloatingPointError(
+                    "initial_noise_bank contains non-finite values"
+                )
+            selected_initial_noise = initial_noise_bank.to(
+                device=device,
+                dtype=torch.float32,
+            )
+        base_image_latent_mask = torch.zeros_like(
+            selected_token_types, dtype=torch.bool
+        )
         if initial_image_latents is not None:
             if initial_image_latents.shape[:2] != input_ids.shape:
                 raise ValueError(
@@ -1415,7 +2018,11 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         local_spans = []
         for out_idx, (batch_idx, start, end) in enumerate(spans):
             local_spans.append((out_idx, start, end))
-            original_orders.append(torch.argsort(sigma[batch_idx, start:end].to(device=device, dtype=torch.float32)))
+            original_orders.append(
+                torch.argsort(
+                    sigma[batch_idx, start:end].to(device=device, dtype=torch.float32)
+                )
+            )
 
         def _halton(index: int, base: int) -> float:
             value = 0.0
@@ -1439,7 +2046,9 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                     order.append(flat)
                 idx += 1
             if len(order) < image_tokens_per_img:
-                order.extend([flat for flat in range(image_tokens_per_img) if flat not in seen])
+                order.extend(
+                    [flat for flat in range(image_tokens_per_img) if flat not in seen]
+                )
             return torch.tensor(order, device=device, dtype=torch.long)
 
         def _spatial_uniform_order() -> torch.Tensor:
@@ -1449,7 +2058,9 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 indexing="ij",
             )
             center = (side - 1) / 2.0
-            ring = torch.maximum((yy.float() - center).abs(), (xx.float() - center).abs())
+            ring = torch.maximum(
+                (yy.float() - center).abs(), (xx.float() - center).abs()
+            )
             checker = (yy % 2) * 2 + (xx % 2)
             return torch.argsort((ring * 4.0 + checker.float()).flatten())
 
@@ -1479,8 +2090,11 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             device=device,
             dtype=torch.float32,
         )
+        reveal_fraction = torch.zeros_like(generation_score)
         for sample_idx, start, _ in local_spans:
-            initial_filled = base_image_latent_mask[sample_idx, start : start + image_tokens_per_img]
+            initial_filled = base_image_latent_mask[
+                sample_idx, start : start + image_tokens_per_img
+            ]
             if initial_filled.any():
                 filled[sample_idx] = initial_filled
                 generated[sample_idx, initial_filled] = work_latents[
@@ -1492,13 +2106,48 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         next_image_order = torch.zeros(len(spans), device=device, dtype=torch.float32)
         k = max(1, int(parallel_rate))
         order_strategy = str(order_strategy or "condition_norm").lower()
-        replay_original_sigma = order_strategy in {"sigma", "sigma_replay", "causal_sigma"}
-        def _condition(hidden_values: torch.Tensor, local_positions: torch.Tensor) -> torch.Tensor:
+        replay_original_sigma = order_strategy in {
+            "sigma",
+            "sigma_replay",
+            "causal_sigma",
+        }
+
+        def _condition(
+            hidden_values: torch.Tensor, local_positions: torch.Tensor
+        ) -> torch.Tensor:
             return self._prepare_image_flow_condition(hidden_values)
 
-        def _flow_context(sample_indices: torch.Tensor, local_positions: torch.Tensor) -> dict[str, torch.Tensor]:
+        def _flow_context(
+            sample_indices: torch.Tensor, local_positions: torch.Tensor
+        ) -> dict[str, torch.Tensor]:
             if not bool(getattr(self.image_flow_head, "uses_latent_mixer", True)):
                 return {}
+            if dynamic_flow_head:
+                sample_index_list = (
+                    sample_indices.detach().to(device="cpu").tolist()
+                )
+                selected_caches = [
+                    flow_content_caches_cond[int(sample_idx)]
+                    for sample_idx in sample_index_list
+                ]
+                cache_is_paired = False
+                if use_flow_cfg:
+                    selected_caches.extend(
+                        flow_content_caches_uncond[int(sample_idx)]
+                        for sample_idx in sample_index_list
+                    )
+                    cache_is_paired = True
+                return {
+                    "query_positions": local_positions.to(
+                        device=device, dtype=torch.long
+                    ),
+                    "latent_mixer_cache": (
+                        self.image_flow_head.stack_latent_mixer_caches(
+                            selected_caches
+                        )
+                    ),
+                    "latent_mixer_cache_is_paired": cache_is_paired,
+                }
             sample_index_list = sample_indices.detach().to(device="cpu").tolist()
             visible_positions_per_row = []
             max_visible = 0
@@ -1534,7 +2183,9 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                     continue
                 sample_idx_int = int(sample_idx_value)
                 start = local_spans[sample_idx_int][1]
-                span_latents = work_latents[sample_idx_int, start : start + image_tokens_per_img]
+                span_latents = work_latents[
+                    sample_idx_int, start : start + image_tokens_per_img
+                ]
                 context_latents[row_idx, :count] = span_latents[visible_positions]
                 context_mask[row_idx, 0, :count] = True
                 context_positions[row_idx, :count] = visible_positions
@@ -1557,10 +2208,27 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 if visible_context.any():
                     start_order = max(
                         start_order,
-                        float(selected_sigma[sample_idx, visible_context].max().item() + 1.0),
+                        float(
+                            selected_sigma[sample_idx, visible_context].max().item()
+                            + 1.0
+                        ),
                     )
-                next_image_order[sample_idx] = start_order
-                current_sigma[sample_idx, start:end] = start_order + image_tokens_per_img
+                current_sigma[sample_idx, start:end] = (
+                    start_order + image_tokens_per_img
+                )
+                initial_positions = filled[sample_idx].nonzero(as_tuple=True)[0]
+                if initial_positions.numel() > 0:
+                    current_sigma[sample_idx, start + initial_positions] = (
+                        start_order
+                        + torch.arange(
+                            initial_positions.numel(),
+                            device=device,
+                            dtype=current_sigma.dtype,
+                        )
+                    )
+                next_image_order[sample_idx] = start_order + float(
+                    initial_positions.numel()
+                )
         fill_counter = torch.ones(len(spans), device=device, dtype=torch.long)
         step_idx = 1
         fixed_orders = {
@@ -1571,16 +2239,65 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         }
         latent_level_strategies = {"latent_proj_cosine"}
         use_flow_cfg = flow_cfg != 1.0
+        dynamic_flow_head = bool(
+            getattr(self.image_flow_head.net, "dynamic_content", False)
+        )
+        if dynamic_flow_head and k != 1:
+            raise ValueError(
+                "DF1 incremental content-cache generation requires "
+                "parallel_rate=1."
+            )
+        if dynamic_flow_head and order_strategy in latent_level_strategies:
+            raise ValueError(
+                "DF1 generation does not support speculative "
+                "latent-level candidate scoring."
+            )
+        if dynamic_flow_head and bool(filled.any().item()):
+            raise ValueError(
+                "DF1 incremental generation currently requires an empty "
+                "initial image-latent prefix."
+            )
+        flow_content_caches_cond = (
+            [
+                self.image_flow_head.empty_latent_mixer_cache(batch_size=1)
+                for _ in spans
+            ]
+            if dynamic_flow_head
+            else None
+        )
+        flow_content_caches_uncond = (
+            [
+                self.image_flow_head.empty_latent_mixer_cache(batch_size=1)
+                for _ in spans
+            ]
+            if dynamic_flow_head and use_flow_cfg
+            else None
+        )
+        flow_cache_peak_bytes = 0
+        flow_cache_divergence_sum = (
+            [0.0] * len(self.image_flow_head.net.blocks)
+            if dynamic_flow_head
+            else []
+        )
+        flow_cache_divergence_count = 0
         boi_token_id = getattr(self.config, "boi_token_id", None)
         if use_flow_cfg and boi_token_id is None:
-            raise ValueError("flow_cfg != 1.0 requires config.boi_token_id for image-uncond attention masks.")
-        image_uncond_rows = torch.ones(
-            selected_input_ids.shape[0],
-            device=device,
-            dtype=torch.bool,
-        ) if use_flow_cfg else None
+            raise ValueError(
+                "flow_cfg != 1.0 requires config.boi_token_id for image-uncond attention masks."
+            )
+        image_uncond_rows = (
+            torch.ones(
+                selected_input_ids.shape[0],
+                device=device,
+                dtype=torch.bool,
+            )
+            if use_flow_cfg
+            else None
+        )
 
         while not filled.all():
+            _debug_check("current_sigma", current_sigma, step_idx)
+            _debug_check("work_latents_before_backbone", work_latents, step_idx)
             attention_mask = get_selfless_mask(
                 sigma=current_sigma,
                 seq_len=selected_input_ids.shape[1],
@@ -1599,15 +2316,21 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 )
             image_latent_mask = base_image_latent_mask.clone()
             for sample_idx, start, _ in local_spans:
-                image_latent_mask[sample_idx, start : start + image_tokens_per_img] = filled[sample_idx]
+                image_latent_mask[sample_idx, start : start + image_tokens_per_img] = (
+                    filled[sample_idx]
+                )
             hidden = self.model(
                 X0_input_ids=selected_input_ids,
                 attention_mask=attention_mask,
                 token_types=selected_token_types,
                 image_latents=work_latents,
                 image_latent_mask=image_latent_mask,
+                image_reveal_sigma=current_sigma,
                 calculate_likelihood=False,
+                debug_finite_backbone=debug_finite,
+                debug_backbone_label=f"conditional_generation_step={step_idx}",
             ).last_hidden_state
+            _debug_check("conditional_backbone_hidden", hidden, step_idx)
             uncond_hidden = None
             if use_flow_cfg:
                 uncond_hidden = self.model(
@@ -1616,8 +2339,12 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                     token_types=selected_token_types,
                     image_latents=work_latents,
                     image_latent_mask=image_latent_mask,
+                    image_reveal_sigma=current_sigma,
                     calculate_likelihood=False,
+                    debug_finite_backbone=debug_finite,
+                    debug_backbone_label=f"unconditional_generation_step={step_idx}",
                 ).last_hidden_state
+                _debug_check("unconditional_backbone_hidden", uncond_hidden, step_idx)
 
             fill_local_positions = []
             if order_strategy in latent_level_strategies:
@@ -1660,6 +2387,14 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                     cfg_schedule=flow_cfg_schedule,
                     solver=flow_solver,
                     num_steps=flow_num_steps,
+                    initial_noise=(
+                        selected_initial_noise[
+                            all_sample_indices,
+                            all_local_positions,
+                        ]
+                        if selected_initial_noise is not None
+                        else None
+                    ),
                     **_flow_context(all_sample_indices, all_local_positions),
                 ).to(work_latents.dtype)
                 projected = self.image_token_embedder(
@@ -1692,20 +2427,37 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                     if order_strategy in {"sigma", "sigma_replay", "causal_sigma"}:
                         order = original_orders[sample_idx]
                         positions = order[~filled[sample_idx, order]][:fill_count]
-                        scores = -sigma[spans[sample_idx][0], spans[sample_idx][1] : spans[sample_idx][2]].to(
-                            device=device, dtype=torch.float32
-                        )[positions]
+                        scores = -sigma[
+                            spans[sample_idx][0],
+                            spans[sample_idx][1] : spans[sample_idx][2],
+                        ].to(device=device, dtype=torch.float32)[positions]
                     elif order_strategy == "random":
                         remaining = remaining_mask.nonzero(as_tuple=True)[0]
-                        positions = remaining[torch.randperm(remaining.numel(), device=device)[:fill_count]]
-                        scores = torch.ones(fill_count, device=device, dtype=torch.float32)
+                        positions = remaining[
+                            torch.randperm(remaining.numel(), device=device)[
+                                :fill_count
+                            ]
+                        ]
+                        scores = torch.ones(
+                            fill_count, device=device, dtype=torch.float32
+                        )
                     elif order_strategy in fixed_orders:
                         order = fixed_orders[order_strategy]
                         positions = order[~filled[sample_idx, order]][:fill_count]
-                        scores = torch.arange(fill_count, 0, -1, device=device, dtype=torch.float32)
-                    elif order_strategy in {"condition_norm", "hidden_norm", "confidence"}:
-                        span_hidden = hidden[sample_idx, start : start + image_tokens_per_img]
-                        all_scores = span_hidden.detach().float().pow(2).mean(dim=-1).sqrt()
+                        scores = torch.arange(
+                            fill_count, 0, -1, device=device, dtype=torch.float32
+                        )
+                    elif order_strategy in {
+                        "condition_norm",
+                        "hidden_norm",
+                        "confidence",
+                    }:
+                        span_hidden = hidden[
+                            sample_idx, start : start + image_tokens_per_img
+                        ]
+                        all_scores = (
+                            span_hidden.detach().float().pow(2).mean(dim=-1).sqrt()
+                        )
                         all_scores = all_scores.masked_fill(~remaining_mask, -torch.inf)
                         scores, positions = torch.topk(all_scores, k=fill_count, dim=-1)
                     else:
@@ -1736,12 +2488,23 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                     hidden[sample_indices, seq_positions],
                     local_positions_for_condition,
                 )
+                _debug_check("conditional_flow_condition", z, step_idx)
                 z_uncond = None
                 if use_flow_cfg:
                     z_uncond = _condition(
                         uncond_hidden[sample_indices, seq_positions],
                         local_positions_for_condition,
                     )
+                    _debug_check("unconditional_flow_condition", z_uncond, step_idx)
+                flow_context = _flow_context(
+                    sample_indices,
+                    local_positions_for_condition,
+                )
+                for context_name, context_value in flow_context.items():
+                    if isinstance(context_value, torch.Tensor):
+                        _debug_check(
+                            f"flow_context.{context_name}", context_value, step_idx
+                        )
                 pred = Qwen3ForCausalLM.sample_image_flow_with_cfg(
                     self,
                     z,
@@ -1751,20 +2514,54 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                     cfg_schedule=flow_cfg_schedule,
                     solver=flow_solver,
                     num_steps=flow_num_steps,
-                    **_flow_context(sample_indices, local_positions_for_condition),
+                    initial_noise=(
+                        selected_initial_noise[
+                            sample_indices,
+                            local_positions_for_condition,
+                        ]
+                        if selected_initial_noise is not None
+                        else None
+                    ),
+                    **flow_context,
+                    debug_finite=debug_finite,
+                    debug_label=(
+                        f"single_stream_generation_step={step_idx},"
+                        f"sample_indices={sample_indices.detach().cpu().tolist()},"
+                        f"local_positions={local_positions_for_condition.detach().cpu().tolist()}"
+                    ),
                 ).to(work_latents.dtype)
+                _debug_check("flow_prediction", pred, step_idx)
 
             cursor = 0
-            for sample_idx, local_positions, local_scores, local_chunks in fill_local_positions:
+            condition_cursor = 0
+            for (
+                sample_idx,
+                local_positions,
+                local_scores,
+                local_chunks,
+            ) in fill_local_positions:
                 count = local_positions.numel()
                 if local_chunks is None:
-                    chunk = pred[cursor:cursor + count]
+                    chunk = pred[cursor : cursor + count]
                     cursor += count
                 else:
                     chunk = local_chunks
+                condition_chunk = z[
+                    condition_cursor : condition_cursor + count
+                ]
+                uncond_condition_chunk = (
+                    z_uncond[condition_cursor : condition_cursor + count]
+                    if z_uncond is not None
+                    else None
+                )
+                condition_cursor += count
                 start = local_spans[sample_idx][1]
                 work_latents[sample_idx, start + local_positions] = chunk
                 generated[sample_idx, local_positions] = chunk
+                _debug_check("generated_chunk", chunk, step_idx)
+                reveal_fraction[sample_idx, local_positions] = float(
+                    filled[sample_idx].sum().item()
+                ) / float(max(image_tokens_per_img - 1, 1))
                 filled[sample_idx, local_positions] = True
                 if not replay_original_sigma:
                     new_sigma = next_image_order[sample_idx] + torch.arange(
@@ -1782,11 +2579,80 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                     dtype=generation_order.dtype,
                 )
                 generation_step[sample_idx, local_positions] = step_idx
-                generation_score[sample_idx, local_positions] = local_scores.to(generation_score.dtype)
+                generation_score[sample_idx, local_positions] = local_scores.to(
+                    generation_score.dtype
+                )
                 fill_counter[sample_idx] += count
+                if dynamic_flow_head:
+                    if count != 1:
+                        raise AssertionError(
+                            "DF1 cache commit must append one token at a time."
+                        )
+                    flow_content_caches_cond[sample_idx] = (
+                        self.image_flow_head.append_latent_mixer_cache(
+                            flow_content_caches_cond[sample_idx],
+                            context_latents=chunk,
+                            context_conditions=condition_chunk,
+                            context_positions=local_positions,
+                        )
+                    )
+                    if use_flow_cfg:
+                        flow_content_caches_uncond[sample_idx] = (
+                            self.image_flow_head.append_latent_mixer_cache(
+                                flow_content_caches_uncond[sample_idx],
+                                context_latents=chunk,
+                                context_conditions=uncond_condition_chunk,
+                                context_positions=local_positions,
+                            )
+                        )
+                        for layer_idx, (cond_layer, uncond_layer) in enumerate(
+                            zip(
+                                flow_content_caches_cond[sample_idx]["layers"],
+                                flow_content_caches_uncond[sample_idx]["layers"],
+                            )
+                        ):
+                            delta = (
+                                cond_layer["k"][:, :, -1]
+                                .detach()
+                                .float()
+                                .sub(
+                                    uncond_layer["k"][:, :, -1]
+                                    .detach()
+                                    .float()
+                                )
+                                .pow(2)
+                                .mean()
+                                .sqrt()
+                            )
+                            flow_cache_divergence_sum[layer_idx] += float(
+                                delta.item()
+                            )
+                        flow_cache_divergence_count += 1
+                    cache_bytes = 0
+                    for branch_cache in (
+                        [flow_content_caches_cond[sample_idx]]
+                        + (
+                            [flow_content_caches_uncond[sample_idx]]
+                            if use_flow_cfg
+                            else []
+                        )
+                    ):
+                        for layer_cache in branch_cache["layers"]:
+                            cache_bytes += (
+                                layer_cache["k"].numel()
+                                * layer_cache["k"].element_size()
+                                + layer_cache["v"].numel()
+                                * layer_cache["v"].element_size()
+                            )
+                    flow_cache_peak_bytes = max(
+                        flow_cache_peak_bytes, cache_bytes
+                    )
             step_idx += 1
 
-        generated = generated.view(len(spans), side, side, image_latent_dim).permute(0, 3, 1, 2)
+        generated = generated.view(len(spans), side, side, image_latent_dim).permute(
+            0, 3, 1, 2
+        )
+        _debug_check("final_generated_latents", generated, step_idx)
         if return_trace:
             trace = {
                 "order_strategy": order_strategy,
@@ -1794,11 +2660,28 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 "generation_order": generation_order.view(len(spans), side, side),
                 "generation_step": generation_step.view(len(spans), side, side),
                 "generation_score": generation_score.view(len(spans), side, side),
+                "reveal_fraction": reveal_fraction.view(len(spans), side, side),
+                "flow_head_variant": getattr(
+                    self.image_flow_head, "flow_head_variant", "DF1"
+                ),
+                "flow_content_cache_peak_bytes_per_sample": int(
+                    flow_cache_peak_bytes
+                ),
+                "flow_cfg_content_cache_divergence_by_layer": (
+                    [
+                        value / max(flow_cache_divergence_count, 1)
+                        for value in flow_cache_divergence_sum
+                    ]
+                    if dynamic_flow_head and use_flow_cfg
+                    else None
+                ),
             }
             return generated, trace
         return generated
 
-    def _sample_from_logits(self, logits: torch.Tensor, temperature: float) -> tuple[torch.Tensor, torch.Tensor]:
+    def _sample_from_logits(
+        self, logits: torch.Tensor, temperature: float
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if temperature < 1e-6:
             probs = torch.softmax(logits, dim=-1)
             next_token = logits.argmax(dim=-1)
@@ -1835,10 +2718,16 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         eoi_token_id = getattr(self.config, "eoi_token_id", None)
         image_mask_token_id = getattr(self.config, "image_mask_token_id", None)
         image_tokens_per_img = int(getattr(self.config, "image_tokens_per_img", 256))
-        image_latent_dim = int(getattr(self, "image_latent_dim", getattr(self.config, "image_latent_dim", 4)))
-        side = int(image_tokens_per_img ** 0.5)
+        image_latent_dim = int(
+            getattr(
+                self, "image_latent_dim", getattr(self.config, "image_latent_dim", 4)
+            )
+        )
+        side = int(image_tokens_per_img**0.5)
         if side * side != image_tokens_per_img:
-            raise ValueError(f"image_tokens_per_img={image_tokens_per_img} is not square")
+            raise ValueError(
+                f"image_tokens_per_img={image_tokens_per_img} is not square"
+            )
 
         latent_dtype = torch.float32
         flow_head = getattr(self, "image_flow_head", None)
@@ -1888,7 +2777,9 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             image_latents = torch.cat(
                 [
                     image_latents,
-                    torch.zeros(n, image_latent_dim, device=device, dtype=image_latents.dtype),
+                    torch.zeros(
+                        n, image_latent_dim, device=device, dtype=image_latents.dtype
+                    ),
                 ],
                 dim=0,
             )
@@ -1933,13 +2824,17 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 flow_cfg_schedule=flow_cfg_schedule,
                 flow_solver=flow_solver,
                 flow_num_steps=flow_num_steps,
-                parallel_rate=image_parallel_rate if image_parallel_rate is not None else 32,
+                parallel_rate=image_parallel_rate
+                if image_parallel_rate is not None
+                else 32,
                 order_strategy=image_order_strategy or decode_strategy,
             )
             if generated is None:
                 return
             image_chw = generated[0].to(device=device, dtype=image_latents.dtype)
-            flat_image = image_chw.permute(1, 2, 0).reshape(image_tokens_per_img, image_latent_dim)
+            flat_image = image_chw.permute(1, 2, 0).reshape(
+                image_tokens_per_img, image_latent_dim
+            )
             image_latents[image_start:image_end] = flat_image
             image_latent_mask[image_start:image_end] = True
             generated_images.append(image_chw)
@@ -1950,7 +2845,9 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 torch.tensor([self.config.mask_token_id], device=device),
                 torch.tensor([0], device=device, dtype=torch.uint8),
             )
-            hidden = self.model(**model_kwargs_for_current_seq()).last_hidden_state[0, -1]
+            hidden = self.model(**model_kwargs_for_current_seq()).last_hidden_state[
+                0, -1
+            ]
             text_logits = self.lm_head(hidden.unsqueeze(0))
             next_token, _ = self._sample_from_logits(text_logits, temperature)
             next_token = next_token.item()
@@ -2000,7 +2897,19 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         return seq, token_types, image_latents, generated_image_latents, image_spans
 
     @torch.no_grad()
-    def generate(self, prompt_ids, gen_length, num_response=1, prompt_task='ar', block_size=4, temperature=1.0, ratio=None, parallel_rate=None, decode_strategy='confidence', **kwargs):
+    def generate(
+        self,
+        prompt_ids,
+        gen_length,
+        num_response=1,
+        prompt_task="ar",
+        block_size=4,
+        temperature=1.0,
+        ratio=None,
+        parallel_rate=None,
+        decode_strategy="confidence",
+        **kwargs,
+    ):
         if prompt_ids.dim() == 1:
             prompt_ids = prompt_ids.unsqueeze(0)
         base_prompts = prompt_ids.to(self.device)
@@ -2049,11 +2958,23 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         pad_id = getattr(self.config, "eos_token_id", None)
         if pad_id is None:
             pad_id = 0
-        output = torch.full((num_response, max_len), pad_id, device=self.device, dtype=torch.long)
-        raw_output = torch.full((num_response, max_len), pad_id, device=self.device, dtype=torch.long)
-        output_token_types = torch.full((num_response, max_len), 3, device=self.device, dtype=torch.uint8)
-        image_latent_dim = int(getattr(self, "image_latent_dim", getattr(self.config, "image_latent_dim", 4)))
-        latent_dtype = aligned_image_latents[0].dtype if aligned_image_latents else torch.float32
+        output = torch.full(
+            (num_response, max_len), pad_id, device=self.device, dtype=torch.long
+        )
+        raw_output = torch.full(
+            (num_response, max_len), pad_id, device=self.device, dtype=torch.long
+        )
+        output_token_types = torch.full(
+            (num_response, max_len), 3, device=self.device, dtype=torch.uint8
+        )
+        image_latent_dim = int(
+            getattr(
+                self, "image_latent_dim", getattr(self.config, "image_latent_dim", 4)
+            )
+        )
+        latent_dtype = (
+            aligned_image_latents[0].dtype if aligned_image_latents else torch.float32
+        )
         output_image_latents = torch.zeros(
             num_response,
             max_len,
@@ -2063,14 +2984,18 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         )
         for i, seq in enumerate(seqs):
             token_types = type_seqs[i]
-            raw_output[i, :seq.shape[0]] = seq
-            output_token_types[i, :token_types.shape[0]] = token_types
-            output[i, :seq.shape[0]] = seq
-            output_image_latents[i, :aligned_image_latents[i].shape[0]] = aligned_image_latents[i]
+            raw_output[i, : seq.shape[0]] = seq
+            output_token_types[i, : token_types.shape[0]] = token_types
+            output[i, : seq.shape[0]] = seq
+            output_image_latents[i, : aligned_image_latents[i].shape[0]] = (
+                aligned_image_latents[i]
+            )
 
-        max_images = max((images.shape[0] for images in generated_image_latents), default=0)
+        max_images = max(
+            (images.shape[0] for images in generated_image_latents), default=0
+        )
         image_tokens_per_img = int(getattr(self.config, "image_tokens_per_img", 256))
-        side = int(image_tokens_per_img ** 0.5)
+        side = int(image_tokens_per_img**0.5)
         generated_image_output = torch.zeros(
             num_response,
             max_images,
@@ -2095,86 +3020,113 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 output_image_spans[i, :count] = image_spans[i]
 
         return {
-            'seq': output,
-            'raw_seq': raw_output,
-            'token_types': output_token_types,
-            'image_latents': output_image_latents,
-            'generated_image_latents': generated_image_output,
-            'image_spans': output_image_spans,
-            'image_counts': image_counts,
-            'parallel_rate': 0.0,
+            "seq": output,
+            "raw_seq": raw_output,
+            "token_types": output_token_types,
+            "image_latents": output_image_latents,
+            "generated_image_latents": generated_image_output,
+            "image_spans": output_image_spans,
+            "image_counts": image_counts,
+            "parallel_rate": 0.0,
         }
-        
+
     @torch.no_grad()
-    def speculative_generate(self, prompt_ids, gen_length, num_response=1, prompt_task='ar', block_size=4, temperature=1.0, ratio=None, parallel_rate=None):
+    def speculative_generate(
+        self,
+        prompt_ids,
+        gen_length,
+        num_response=1,
+        prompt_task="ar",
+        block_size=4,
+        temperature=1.0,
+        ratio=None,
+        parallel_rate=None,
+    ):
         from utils.utils import get_selfless_mask
-        
+
         # 1. 初始化
         if prompt_ids.dim() == 1:
             prompt_ids = prompt_ids.unsqueeze(0)
         prompt_ids = prompt_ids.repeat(num_response, 1)
-        
+
         prompt_len = prompt_ids.shape[-1]
         prefix = prompt_ids.to(self.device)
-        
+
         # 初始化全局 Sigma
         max_seq_len = prompt_len + gen_length + block_size
-        sigma = torch.zeros((num_response, max_seq_len), dtype=torch.float32, device=self.device)
-        
+        sigma = torch.zeros(
+            (num_response, max_seq_len), dtype=torch.float32, device=self.device
+        )
+
         # Context 的 Sigma 设置
-        if prompt_task == 'ar':
+        if prompt_task == "ar":
             sigma[:, :prompt_len] = torch.arange(0, prompt_len, device=self.device)
-        elif prompt_task in {'random_sigma', 'random'}:
-            sigma[:, :prompt_len] = torch.rand(num_response, prompt_len, device=self.device)
+        elif prompt_task in {"random_sigma", "random"}:
+            sigma[:, :prompt_len] = torch.rand(
+                num_response, prompt_len, device=self.device
+            )
         else:
             raise ValueError(f"Invalid prompt task: {prompt_task}")
 
-        global_step = 0 
+        global_step = 0
         generated_tokens = 0
-        end_token_id = getattr(self.config, 'eos_token_id', None)
+        end_token_id = getattr(self.config, "eos_token_id", None)
 
         while prefix.shape[-1] < prompt_len + gen_length:
             curr_len = prefix.shape[-1]
             curr_block_size = min(block_size, prompt_len + gen_length - curr_len)
-            if curr_block_size <= 0: break
+            if curr_block_size <= 0:
+                break
             seq_len = curr_len + curr_block_size
-            block_order = torch.arange(curr_len, seq_len, device=self.device, dtype=sigma.dtype)
+            block_order = torch.arange(
+                curr_len, seq_len, device=self.device, dtype=sigma.dtype
+            )
             sigma[:, curr_len:seq_len] = block_order.unsqueeze(0)
-            
+
             # ==============================================================
             # Phase 1: Draft
             # ==============================================================
-            draft_seq = torch.full((num_response, seq_len), self.config.mask_token_id, device=self.device)
+            draft_seq = torch.full(
+                (num_response, seq_len), self.config.mask_token_id, device=self.device
+            )
             draft_seq[:, :curr_len] = prefix
-            
-            draft_sigma = sigma.clone() 
+
+            draft_sigma = sigma.clone()
             # 保持 float32 以确保精度
-            draft_token_probs = torch.zeros((num_response, curr_block_size), dtype=torch.float32, device=self.device)
+            draft_token_probs = torch.zeros(
+                (num_response, curr_block_size), dtype=torch.float32, device=self.device
+            )
             draft_inner_order = float(curr_len)
-            
+
             while draft_seq[:, curr_len:].eq(self.config.mask_token_id).any():
-                attention_mask = get_selfless_mask(sigma=draft_sigma[:, :seq_len], seq_len=seq_len, device=self.device)
-                
-                logits = self(draft_seq, attention_mask=attention_mask, calculate_likelihood=True).logits
-                
+                attention_mask = get_selfless_mask(
+                    sigma=draft_sigma[:, :seq_len], seq_len=seq_len, device=self.device
+                )
+
+                logits = self(
+                    draft_seq, attention_mask=attention_mask, calculate_likelihood=True
+                ).logits
+
                 if temperature < 1e-6:
                     probs = torch.softmax(logits, dim=-1)
                     next_token = logits.argmax(dim=-1)
                 else:
                     probs = torch.softmax(logits / temperature, dim=-1)
-                    next_token = torch.multinomial(probs.reshape(-1, probs.size(-1)), 1).view(num_response, -1)
-                
+                    next_token = torch.multinomial(
+                        probs.reshape(-1, probs.size(-1)), 1
+                    ).view(num_response, -1)
+
                 conf = probs.gather(-1, next_token.unsqueeze(-1)).squeeze(-1)
                 valid_mask = draft_seq.eq(self.config.mask_token_id)
                 masked_conf = conf.masked_fill(~valid_mask, -1.0)
-                
+
                 if parallel_rate is not None:
                     k_p = max(1, int(parallel_rate))
                     topk_values, topk_indices = torch.topk(masked_conf, k=k_p, dim=-1)
                     fill_mask = torch.zeros_like(masked_conf, dtype=torch.bool)
                     fill_mask.scatter_(1, topk_indices, topk_values > -0.5)
                 elif ratio is not None:
-                    fill_mask = (masked_conf >= ratio)
+                    fill_mask = masked_conf >= ratio
                     rows_with_no_fill = ~(fill_mask.any(dim=-1))
                     rows_still_have_mask = valid_mask.any(dim=-1)
                     rows_need_fallback = rows_with_no_fill & rows_still_have_mask
@@ -2183,39 +3135,51 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                         fill_mask[rows_need_fallback, fallback_cols] = True
                 else:
                     fill_mask = torch.zeros_like(masked_conf, dtype=torch.bool)
-                    fill_mask.scatter_(1, masked_conf.argmax(dim=-1, keepdim=True), True)
-                
+                    fill_mask.scatter_(
+                        1, masked_conf.argmax(dim=-1, keepdim=True), True
+                    )
+
                 rows, cols = fill_mask.nonzero(as_tuple=True)
                 draft_seq[rows, cols] = next_token[rows, cols]
-                
+
                 block_cols = cols - curr_len
                 valid_updates = (block_cols >= 0) & (block_cols < curr_block_size)
                 if valid_updates.any():
                     r_ = rows[valid_updates]
-                    c_ = cols[valid_updates] 
+                    c_ = cols[valid_updates]
                     bc_ = block_cols[valid_updates]
                     # 【修复点】：显式转换 dtype，解决 BFloat16 -> Float32 赋值报错
-                    draft_token_probs[r_, bc_] = conf[r_, c_].to(dtype=draft_token_probs.dtype)
+                    draft_token_probs[r_, bc_] = conf[r_, c_].to(
+                        dtype=draft_token_probs.dtype
+                    )
 
                 draft_sigma[rows, cols] = draft_inner_order
                 draft_inner_order += 1.0
-            
+
             draft_tokens = draft_seq[:, curr_len:]
 
             # ==============================================================
             # Phase 2: Verify
             # ==============================================================
             verify_sigma = sigma.clone()
-            
-            block_ar_sigmas = torch.arange(curr_len, seq_len, device=self.device, dtype=sigma.dtype)
-            
+
+            block_ar_sigmas = torch.arange(
+                curr_len, seq_len, device=self.device, dtype=sigma.dtype
+            )
+
             verify_sigma[:, curr_len:seq_len] = block_ar_sigmas.unsqueeze(0)
-            
-            verify_attention_mask = get_selfless_mask(sigma=verify_sigma[:, :seq_len], seq_len=seq_len, device=self.device)
-            
-            verify_outputs = self(draft_seq, attention_mask=verify_attention_mask, calculate_likelihood=True)
+
+            verify_attention_mask = get_selfless_mask(
+                sigma=verify_sigma[:, :seq_len], seq_len=seq_len, device=self.device
+            )
+
+            verify_outputs = self(
+                draft_seq,
+                attention_mask=verify_attention_mask,
+                calculate_likelihood=True,
+            )
             verify_logits = verify_outputs.logits[:, curr_len:, :]
-            
+
             if temperature < 1e-6:
                 target_probs = torch.softmax(verify_logits, dim=-1)
             else:
@@ -2224,45 +3188,55 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             # ==============================================================
             # Phase 3: Accept / Reject
             # ==============================================================
-            target_token_probs = target_probs.gather(-1, draft_tokens.unsqueeze(-1)).squeeze(-1)
-            
+            target_token_probs = target_probs.gather(
+                -1, draft_tokens.unsqueeze(-1)
+            ).squeeze(-1)
+
             # 【优化点】：统一转换为 float32 进行除法运算，保证稳定性
-            acc_ratios = target_token_probs.to(torch.float32) / (draft_token_probs + 1e-10)
+            acc_ratios = target_token_probs.to(torch.float32) / (
+                draft_token_probs + 1e-10
+            )
             accept_mask = torch.rand_like(acc_ratios) < acc_ratios
-            
+
             num_accepted = accept_mask.cumprod(dim=1).sum(dim=1).long()
-            safe_n = num_accepted.min().item() 
-            
+            safe_n = num_accepted.min().item()
+
             prefix = torch.cat([prefix, draft_tokens[:, :safe_n]], dim=1)
-            
-            accepted_sigmas = torch.arange(curr_len, curr_len + safe_n, device=self.device, dtype=sigma.dtype)
-            sigma[:, curr_len : curr_len+safe_n] = accepted_sigmas.unsqueeze(0)
-            
+
+            accepted_sigmas = torch.arange(
+                curr_len, curr_len + safe_n, device=self.device, dtype=sigma.dtype
+            )
+            sigma[:, curr_len : curr_len + safe_n] = accepted_sigmas.unsqueeze(0)
+
             global_step += safe_n
             generated_tokens += safe_n
-            
+
             if safe_n < curr_block_size:
                 resampled_token = torch.multinomial(target_probs[:, safe_n, :], 1)
                 prefix = torch.cat([prefix, resampled_token], dim=1)
-                
-                sigma[:, curr_len+safe_n] = float(curr_len + safe_n)
-                
+
+                sigma[:, curr_len + safe_n] = float(curr_len + safe_n)
+
                 global_step += 1
                 generated_tokens += 1
-                
+
             if end_token_id is not None:
                 new_part = prefix[:, curr_len:]
                 if (new_part == end_token_id).any(dim=-1).all():
                     break
-                    
-        parallel_rate_metric = (generated_tokens / num_response) / (global_step + 1e-6) if global_step > 0 else 0.0
-            
-        return {
-            'seq': prefix,
-            'parallel_rate': parallel_rate_metric
-        }
-    
-class Qwen3ForSequenceClassification(GenericForSequenceClassification, Qwen3PreTrainedModel):
+
+        parallel_rate_metric = (
+            (generated_tokens / num_response) / (global_step + 1e-6)
+            if global_step > 0
+            else 0.0
+        )
+
+        return {"seq": prefix, "parallel_rate": parallel_rate_metric}
+
+
+class Qwen3ForSequenceClassification(
+    GenericForSequenceClassification, Qwen3PreTrainedModel
+):
     pass
 
 
@@ -2271,7 +3245,9 @@ class Qwen3ForTokenClassification(GenericForTokenClassification, Qwen3PreTrained
 
 
 class Qwen3ForQuestionAnswering(GenericForQuestionAnswering, Qwen3PreTrainedModel):
-    base_model_prefix = "transformer"  # For BC, where `transformer` was used instead of `model`
+    base_model_prefix = (
+        "transformer"  # For BC, where `transformer` was used instead of `model`
+    )
 
 
 __all__ = [

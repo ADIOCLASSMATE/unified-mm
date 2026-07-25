@@ -790,6 +790,33 @@ class SelflessFlowBehaviorTest(unittest.TestCase):
         self.assertEqual(loss.dim(), 0)
         self.assertIn("flow/v_mse", head.last_forward_stats)
 
+    def test_image_flow_head_accepts_validated_initial_noise_and_scales_temperature(self):
+        head = FlowLoss(
+            target_channels=4,
+            z_channels=8,
+            depth=1,
+            width=8,
+            num_sampling_steps="2",
+            time_sampling="uniform",
+        )
+        z = torch.randn(3, 8)
+        initial_noise = torch.arange(12, dtype=torch.float32).view(3, 4)
+
+        sample = head.sample(
+            z,
+            temperature=0.25,
+            cfg=1.0,
+            initial_noise=initial_noise,
+        )
+        self.assertTrue(torch.allclose(sample, initial_noise * 0.25))
+
+        with self.assertRaisesRegex(ValueError, "exactly match"):
+            head.sample(z, initial_noise=torch.zeros(2, 4))
+        bad_noise = initial_noise.clone()
+        bad_noise[1, 2] = float("nan")
+        with self.assertRaisesRegex(FloatingPointError, "non-finite"):
+            head.sample(z, initial_noise=bad_noise)
+
     def test_causal_lm_keeps_multimodal_logging_fields_in_model_output_mapping(self):
         from accelerate.utils.operations import convert_to_fp32
 
@@ -1007,6 +1034,7 @@ class SelflessFlowBehaviorTest(unittest.TestCase):
         dummy = types.SimpleNamespace(image_flow_head=head)
         z = torch.ones(3, latent_dim)
         z_uncond = torch.full_like(z, 2.0)
+        initial_noise = torch.arange(12, dtype=torch.float32).view(3, latent_dim)
 
         out = Qwen3ForCausalLM.sample_image_flow_with_cfg(
             dummy,
@@ -1016,6 +1044,7 @@ class SelflessFlowBehaviorTest(unittest.TestCase):
             cfg=3.0,
             solver="euler",
             num_steps=7,
+            initial_noise=initial_noise,
         )
 
         self.assertEqual(tuple(out.shape), (3, latent_dim))
@@ -1025,8 +1054,56 @@ class SelflessFlowBehaviorTest(unittest.TestCase):
         self.assertEqual(call["temperature"], 0.7)
         self.assertEqual(call["solver"], "euler")
         self.assertEqual(call["num_steps"], 7)
+        self.assertTrue(torch.equal(call["context_kwargs"]["initial_noise"], initial_noise))
         self.assertTrue(torch.equal(call["z"][:3], z))
         self.assertTrue(torch.equal(call["z"][3:], z_uncond))
+
+    def test_spatial_halton_uses_sample_and_local_token_aligned_initial_noise(self):
+        latent_dim = 4
+        hidden_size = 8
+        dummy = types.SimpleNamespace(
+            config=types.SimpleNamespace(image_tokens_per_img=4, boi_token_id=11),
+            model=FakeInnerModel(hidden_size=hidden_size),
+            image_flow_head=FakeImageFlowHead(latent_dim=latent_dim),
+            _prepare_image_flow_condition=lambda hidden: hidden,
+        )
+        input_ids = torch.tensor([[10, 11, 7, 7, 7, 7, 12, 13]])
+        token_types = torch.tensor([[0, 2, 1, 1, 1, 1, 2, 2]])
+        sigma = torch.tensor([[0, 1, 4, 5, 3, 6, 2, 7]])
+        spans = [(0, 2, 6)]
+        initial_noise_bank = torch.arange(16, dtype=torch.float32).view(1, 4, 4)
+
+        with patch(
+            "utils.utils.get_selfless_mask",
+            side_effect=lambda sigma, seq_len, device, **kwargs: sigma.detach().clone(),
+        ):
+            _, trace = Qwen3ForCausalLM.sample_image_latents_single_stream(
+                dummy,
+                input_ids=input_ids,
+                token_types=token_types,
+                sigma=sigma,
+                spans=spans,
+                image_latent_dim=latent_dim,
+                initial_noise_bank=initial_noise_bank,
+                parallel_rate=1,
+                order_strategy="spatial_halton",
+                return_trace=True,
+            )
+
+        generated_position_order = torch.argsort(trace["generation_order"].flatten())
+        observed_noise = torch.cat(
+            [
+                call["context_kwargs"]["initial_noise"]
+                for call in dummy.image_flow_head.sample_calls
+            ],
+            dim=0,
+        )
+        self.assertTrue(
+            torch.equal(
+                observed_noise,
+                initial_noise_bank[0, generated_position_order],
+            )
+        )
 
     def test_single_stream_helper_uses_single_stream_masks_and_original_sigma(self):
         latent_dim = 4

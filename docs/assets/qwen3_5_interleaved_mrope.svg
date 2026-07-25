@@ -1,0 +1,154 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="900" viewBox="0 0 1440 900" role="img" aria-labelledby="title desc">
+  <title id="title">Qwen3.5 interleaved multimodal RoPE for static images</title>
+  <desc id="desc">Diagram of Qwen3.5 temporal, height, and width coordinates, interleaved frequency allocation, and the static-image reduction to two-dimensional spatial relations.</desc>
+  <defs>
+    <style>
+      .bg { fill: #f7f8fc; }
+      .panel { fill: #ffffff; stroke: #d9deea; stroke-width: 2; }
+      .title { font: 700 34px Inter, "Noto Sans SC", Arial, sans-serif; fill: #172033; }
+      .subtitle { font: 400 17px Inter, "Noto Sans SC", Arial, sans-serif; fill: #5b6475; }
+      .h2 { font: 700 23px Inter, "Noto Sans SC", Arial, sans-serif; fill: #172033; }
+      .body { font: 400 16px Inter, "Noto Sans SC", Arial, sans-serif; fill: #333c4f; }
+      .small { font: 400 13px Inter, "Noto Sans SC", Arial, sans-serif; fill: #5b6475; }
+      .mono { font: 600 14px "JetBrains Mono", "SFMono-Regular", Consolas, monospace; fill: #263247; }
+      .mono-small { font: 600 12px "JetBrains Mono", "SFMono-Regular", Consolas, monospace; fill: #263247; }
+      .token { fill: #eef2ff; stroke: #7c8fe8; stroke-width: 1.5; }
+      .image-cell { fill: #f8fbff; stroke: #8ba7c9; stroke-width: 1.3; }
+      .callout { fill: #eefbf5; stroke: #58a881; stroke-width: 1.5; }
+      .warn { fill: #fff8e8; stroke: #e2a93b; stroke-width: 1.5; }
+      .t { fill: #6f5bd3; }
+      .h { fill: #1f9d8b; }
+      .w { fill: #e97855; }
+      .axisText { font: 700 15px Inter, Arial, sans-serif; fill: white; text-anchor: middle; dominant-baseline: middle; }
+      .arrow { stroke: #657086; stroke-width: 2.2; fill: none; marker-end: url(#arrow); }
+      .soft-arrow { stroke: #9aa4b7; stroke-width: 1.7; fill: none; marker-end: url(#arrowSoft); }
+    </style>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,5 L0,10 z" fill="#657086"/>
+    </marker>
+    <marker id="arrowSoft" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,5 L0,10 z" fill="#9aa4b7"/>
+    </marker>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="4" stdDeviation="7" flood-color="#172033" flood-opacity="0.10"/>
+    </filter>
+  </defs>
+
+  <rect class="bg" width="1440" height="900"/>
+  <text id="titleText" class="title" x="44" y="58">Qwen3.5：Interleaved T/H/W MRoPE</text>
+  <text class="subtitle" x="44" y="88">静态图片的 T 坐标恒定，因此 image-image 相对相位退化为 H/W 二维空间关系</text>
+
+  <rect class="panel" x="40" y="116" width="650" height="548" rx="20" filter="url(#shadow)"/>
+  <text class="h2" x="70" y="158">1. 按模态解释共享坐标槽</text>
+
+  <text class="body" x="70" y="198">文本 token：三个 rotary 槽都复制同一 1D 位置</text>
+  <g transform="translate(70,216)">
+    <rect class="token" x="0" y="0" width="138" height="62" rx="12"/>
+    <text class="mono" x="69" y="25" text-anchor="middle">text p</text>
+    <text class="mono-small" x="69" y="46" text-anchor="middle">(T,H,W)=(p,p,p)</text>
+    <rect class="token" x="154" y="0" width="138" height="62" rx="12"/>
+    <text class="mono" x="223" y="25" text-anchor="middle">text p+1</text>
+    <text class="mono-small" x="223" y="46" text-anchor="middle">(p+1,p+1,p+1)</text>
+    <path class="soft-arrow" d="M300,31 L354,31"/>
+    <rect class="warn" x="365" y="2" width="208" height="58" rx="12"/>
+    <text class="body" x="469" y="25" text-anchor="middle">三轴相等</text>
+    <text class="small" x="469" y="46" text-anchor="middle">严格退化为 pretrained 1D RoPE</text>
+  </g>
+
+  <text class="body" x="70" y="320">静态 image span：以当前序列位置为 anchor a</text>
+  <g transform="translate(70,342)">
+    <rect class="image-cell" x="0" y="0" width="170" height="66" rx="8"/>
+    <rect class="image-cell" x="174" y="0" width="170" height="66" rx="8"/>
+    <rect class="image-cell" x="348" y="0" width="170" height="66" rx="8"/>
+    <rect class="image-cell" x="0" y="70" width="170" height="66" rx="8"/>
+    <rect class="image-cell" x="174" y="70" width="170" height="66" rx="8"/>
+    <rect class="image-cell" x="348" y="70" width="170" height="66" rx="8"/>
+    <rect class="image-cell" x="0" y="140" width="170" height="66" rx="8"/>
+    <rect class="image-cell" x="174" y="140" width="170" height="66" rx="8"/>
+    <rect class="image-cell" x="348" y="140" width="170" height="66" rx="8"/>
+    <text class="mono-small" x="85" y="29" text-anchor="middle">(a, a+0, a+0)</text>
+    <text class="small" x="85" y="50" text-anchor="middle">r=0, c=0</text>
+    <text class="mono-small" x="259" y="29" text-anchor="middle">(a, a+0, a+1)</text>
+    <text class="small" x="259" y="50" text-anchor="middle">r=0, c=1</text>
+    <text class="mono-small" x="433" y="29" text-anchor="middle">(a, a+0, a+2)</text>
+    <text class="small" x="433" y="50" text-anchor="middle">r=0, c=2</text>
+    <text class="mono-small" x="85" y="99" text-anchor="middle">(a, a+1, a+0)</text>
+    <text class="small" x="85" y="120" text-anchor="middle">r=1, c=0</text>
+    <text class="mono-small" x="259" y="99" text-anchor="middle">(a, a+1, a+1)</text>
+    <text class="small" x="259" y="120" text-anchor="middle">r=1, c=1</text>
+    <text class="mono-small" x="433" y="99" text-anchor="middle">(a, a+1, a+2)</text>
+    <text class="small" x="433" y="120" text-anchor="middle">r=1, c=2</text>
+    <text class="mono-small" x="85" y="169" text-anchor="middle">(a, a+2, a+0)</text>
+    <text class="small" x="85" y="190" text-anchor="middle">r=2, c=0</text>
+    <text class="mono-small" x="259" y="169" text-anchor="middle">(a, a+2, a+1)</text>
+    <text class="small" x="259" y="190" text-anchor="middle">r=2, c=1</text>
+    <text class="mono-small" x="433" y="169" text-anchor="middle">(a, a+2, a+2)</text>
+    <text class="small" x="433" y="190" text-anchor="middle">r=2, c=2</text>
+  </g>
+  <rect class="callout" x="70" y="572" width="558" height="62" rx="12"/>
+  <text class="body" x="349" y="597" text-anchor="middle">同一张静态图内 ΔT = 0</text>
+  <text class="small" x="349" y="620" text-anchor="middle">attention 的视觉相对相位主要由 ΔH、ΔW 决定</text>
+
+  <rect class="panel" x="716" y="116" width="684" height="548" rx="20" filter="url(#shadow)"/>
+  <text class="h2" x="746" y="158">2. Rotary 频率对按 T/H/W 交错</text>
+  <text class="body" x="746" y="193">Qwen3.5-9B 配置示例：partial rotary = 0.25，32 个 frequency pairs</text>
+
+  <g transform="translate(746,218)">
+    <g transform="translate(0,0)"><rect class="t" width="45" height="48" rx="8"/><text class="axisText" x="22.5" y="24">T</text><text class="small" x="22.5" y="67" text-anchor="middle">0</text></g>
+    <g transform="translate(49,0)"><rect class="h" width="45" height="48" rx="8"/><text class="axisText" x="22.5" y="24">H</text><text class="small" x="22.5" y="67" text-anchor="middle">1</text></g>
+    <g transform="translate(98,0)"><rect class="w" width="45" height="48" rx="8"/><text class="axisText" x="22.5" y="24">W</text><text class="small" x="22.5" y="67" text-anchor="middle">2</text></g>
+    <g transform="translate(147,0)"><rect class="t" width="45" height="48" rx="8"/><text class="axisText" x="22.5" y="24">T</text><text class="small" x="22.5" y="67" text-anchor="middle">3</text></g>
+    <g transform="translate(196,0)"><rect class="h" width="45" height="48" rx="8"/><text class="axisText" x="22.5" y="24">H</text><text class="small" x="22.5" y="67" text-anchor="middle">4</text></g>
+    <g transform="translate(245,0)"><rect class="w" width="45" height="48" rx="8"/><text class="axisText" x="22.5" y="24">W</text><text class="small" x="22.5" y="67" text-anchor="middle">5</text></g>
+    <text class="h2" x="319" y="34">…</text>
+    <g transform="translate(356,0)"><rect class="t" width="45" height="48" rx="8"/><text class="axisText" x="22.5" y="24">T</text><text class="small" x="22.5" y="67" text-anchor="middle">30</text></g>
+    <g transform="translate(405,0)"><rect class="h" width="45" height="48" rx="8"/><text class="axisText" x="22.5" y="24">H</text><text class="small" x="22.5" y="67" text-anchor="middle">31</text></g>
+    <rect class="warn" x="475" y="-4" width="155" height="58" rx="10"/>
+    <text class="mono-small" x="552" y="21" text-anchor="middle">mrope_section</text>
+    <text class="mono" x="552" y="43" text-anchor="middle">[11, 11, 10]</text>
+  </g>
+
+  <text class="body" x="746" y="330">每个 frequency pair 只读取对应坐标，再生成 cos/sin：</text>
+  <g transform="translate(746,350)">
+    <rect class="token" x="0" y="0" width="130" height="62" rx="12"/>
+    <text class="mono" x="65" y="27" text-anchor="middle">Q, K</text>
+    <text class="small" x="65" y="49" text-anchor="middle">head vectors</text>
+    <path class="arrow" d="M138,31 L190,31"/>
+    <rect class="warn" x="200" y="0" width="218" height="62" rx="12"/>
+    <text class="mono-small" x="309" y="24" text-anchor="middle">θᵢ · pos_axis(i)</text>
+    <text class="small" x="309" y="47" text-anchor="middle">axis(i)=T/H/W interleaved</text>
+    <path class="arrow" d="M426,31 L478,31"/>
+    <rect class="callout" x="488" y="0" width="145" height="62" rx="12"/>
+    <text class="mono" x="560" y="27" text-anchor="middle">Q′, K′</text>
+    <text class="small" x="560" y="49" text-anchor="middle">rotated</text>
+  </g>
+
+  <g transform="translate(746,444)">
+    <rect class="panel" x="0" y="0" width="300" height="164" rx="14"/>
+    <text class="body" x="20" y="32">相对 attention geometry</text>
+    <text class="mono" x="20" y="65">score(q,k) depends on</text>
+    <text class="mono" x="20" y="92">(ΔT, ΔH, ΔW)</text>
+    <text class="small" x="20" y="124">Q/K 旋转；V 与 residual 不旋转</text>
+    <text class="small" x="20" y="147">visibility 仍由 attention mask 决定</text>
+    <rect class="callout" x="324" y="0" width="310" height="164" rx="14"/>
+    <text class="body" x="344" y="32">静态图片为什么可视作 2D</text>
+    <text class="mono" x="344" y="65">ΔT = 0</text>
+    <text class="mono" x="344" y="92">ΔH = r_q − r_k</text>
+    <text class="mono" x="344" y="119">ΔW = c_q − c_k</text>
+    <text class="small" x="344" y="147">T 轴保留，但对同图空间关系不贡献相位差</text>
+  </g>
+
+  <rect x="40" y="690" width="1360" height="154" rx="18" fill="#172033"/>
+  <text x="70" y="730" style="font:700 22px Inter,'Noto Sans SC',Arial,sans-serif;fill:#ffffff">我们真正借鉴的原则</text>
+  <text x="70" y="766" style="font:400 17px Inter,'Noto Sans SC',Arial,sans-serif;fill:#dce3f2">共享多轴坐标槽 · 文本轴相等以兼容 1D · 视觉 token 使用真实网格 · 坐标只作用于 Q/K phase</text>
+  <text x="70" y="802" style="font:400 15px Inter,'Noto Sans SC',Arial,sans-serif;fill:#aeb9cf">不是照搬 Qwen3.5 的视觉塔、T/H/W 语义、partial rotary ratio、patch merger 或 backbone。</text>
+  <g transform="translate(1125,718)">
+    <circle class="t" cx="12" cy="12" r="12"/><text class="axisText" x="12" y="12">T</text>
+    <circle class="h" cx="12" cy="47" r="12"/><text class="axisText" x="12" y="47">H</text>
+    <circle class="w" cx="12" cy="82" r="12"/><text class="axisText" x="12" y="82">W</text>
+    <text x="34" y="17" style="font:400 14px Inter,Arial,sans-serif;fill:#dce3f2">temporal</text>
+    <text x="34" y="52" style="font:400 14px Inter,Arial,sans-serif;fill:#dce3f2">height</text>
+    <text x="34" y="87" style="font:400 14px Inter,Arial,sans-serif;fill:#dce3f2">width</text>
+  </g>
+  <text class="small" x="40" y="878">Source: Hugging Face Transformers Qwen3.5 implementation and Qwen/Qwen3.5-9B config (accessed 2026-07-20).</text>
+</svg>

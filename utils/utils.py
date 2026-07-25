@@ -95,6 +95,13 @@ def load_model_tokenizer(
     logger=None,
     model_dtype: torch.dtype = torch.bfloat16,
 ):
+    from models.modeling_model.image_backbone import resolve_image_backbone_config
+    from models.modeling_model.image_flow_position import (
+        resolve_flow_head_position_config,
+    )
+
+    backbone = resolve_image_backbone_config(config)
+    flow_position, _ = resolve_flow_head_position_config(config)
     if model_dtype not in {torch.bfloat16, torch.float32}:
         raise ValueError(
             "model_dtype must be torch.bfloat16 or torch.float32, "
@@ -197,12 +204,21 @@ def load_model_tokenizer(
         "image_flow_grad_checkpointing", "image_flow_time_scale",
         "image_flow_time_sampling", "image_flow_logit_mean", "image_flow_logit_std",
         "image_flow_time_eps", "image_flow_time_uniform_mix", "image_flow_solver",
-        "image_flow_mlp_ratio",
+        "image_flow_mlp_ratio", "image_flow_head_arch", "image_flow_head_variant", "image_flow_zero_init_gate",
+        "image_flow_latent_mixer_heads", "image_flow_latent_mixer_dropout",
+        "image_flow_latent_mixer_zero_init_gate",
+        "image_flow_position_variant",
+        "image_flow_query_position_mode",
+        "image_flow_context_position_mode",
+        "image_flow_rope_mode",
+        "image_flow_rope_axis_dims",
+        "image_flow_rope_rotate_value",
         "image_input_noise_strength", "image_input_noise_strength_std",
         "image_input_noise_strength_min", "image_input_noise_strength_max",
         "image_uncond_prob",
         "image_token_embedder_init_mode",
         "image_token_embedder_latent_rms",
+        "image_backbone_variant",
     )
 
     if config.training.from_scratch:
@@ -334,6 +350,22 @@ def load_model_tokenizer(
                         f"Initialized newly added image mask token id={image_mask_token_id} "
                         f"from text mask token id={mask_token_id}"
                     )
+
+    if hasattr(model, "image_token_embedder"):
+        actual_variant = str(model.image_token_embedder.backbone_variant)
+        if actual_variant != backbone.variant:
+            raise ValueError(
+                "image_backbone_variant was not propagated into the loaded model: "
+                f"expected={backbone.variant!r}, actual={actual_variant!r}"
+            )
+    if flow_position is not None and hasattr(model, "image_flow_head"):
+        actual_flow_variant = str(model.image_flow_head.net.position_variant)
+        if actual_flow_variant != flow_position.variant:
+            raise ValueError(
+                "image_flow_position_variant was not propagated into the "
+                f"loaded model: expected={flow_position.variant!r}, "
+                f"actual={actual_flow_variant!r}"
+            )
     
     # 启用 Gradient Checkpointing
     if config.training.get("use_gradient_checkpointing", True):
@@ -389,11 +421,30 @@ def save_checkpoint(model, config, accelerator, global_step):
 
     if accelerator.is_main_process:
         meta_file = save_path / "metadata.json"
+        metadata = {
+            "global_step": global_step,
+            "model_config": OmegaConf.to_container(config.model, resolve=True),
+        }
+        if str(config.experiment.get("ablation_phase", "screen")) == "confirmation":
+            metadata["confirmation_provenance"] = {
+                "path": str(config.experiment.confirmation_provenance_path),
+                "sha256": str(config.experiment.confirmation_provenance_sha256),
+                "declaration_sha256": str(
+                    config.experiment.confirmation_protocol.declaration_sha256
+                ),
+            }
+        elif str(config.experiment.get("ablation_phase", "")) == "mask_position_q_factor":
+            declaration = config.experiment.q_factor_protocol
+            metadata["q_factor_provenance"] = {
+                "path": str(config.experiment.q_factor_provenance_path),
+                "sha256": str(config.experiment.q_factor_provenance_sha256),
+                "declaration_sha256": str(declaration.declaration_sha256),
+                "study_manifest_sha256": str(declaration.study_manifest_sha256),
+                "config_contract_sha256": str(declaration.config_contract_sha256),
+                "source_manifest_sha256": str(declaration.source_manifest_sha256),
+            }
         with open(meta_file, "w+") as f:
-            json.dump({
-                "global_step": global_step,
-                "model_config": config.model.to_dict() if hasattr(config.model, "to_dict") else {}
-            }, f, indent=4)
+            json.dump(metadata, f, indent=4)
       
         
 def save_hf_model(model, tokenizer, config, accelerator, global_step):
@@ -410,6 +461,12 @@ def save_hf_model(model, tokenizer, config, accelerator, global_step):
             state_dict=state_dict,
             safe_serialization=True
         )
+        if str(config.experiment.get("ablation_phase", "screen")) == "confirmation":
+            provenance_path = Path(str(config.experiment.confirmation_provenance_path))
+            shutil.copy2(provenance_path, save_path / provenance_path.name)
+        elif str(config.experiment.get("ablation_phase", "")) == "mask_position_q_factor":
+            provenance_path = Path(str(config.experiment.q_factor_provenance_path))
+            shutil.copy2(provenance_path, save_path / provenance_path.name)
     tokenizer.save_pretrained(save_path)
 
 

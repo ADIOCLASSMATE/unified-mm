@@ -37,7 +37,23 @@ from utils.dataset_utils import get_dataloaders
 from utils.selfless_utils import SelflessSampler
 from utils.wsd_schedule import get_wsd_schedule
 from models.logging import set_verbosity_info, set_verbosity_error
-
+from models.modeling_model.image_backbone import resolve_image_backbone_config
+from models.modeling_model.image_flow_position import (
+    resolve_flow_head_position_config,
+)
+from scripts.archive.image_backbone_ablation.image_embedder_confirmation_protocol import (
+    build_training_provenance,
+    is_confirmation_config,
+    load_and_validate_training_provenance,
+    stable_named_seed,
+    write_training_provenance,
+)
+from scripts.archive.image_backbone_ablation.image_mask_position_ablation_protocol import (
+    build_q_factor_training_provenance,
+    is_q_factor_config,
+    load_and_validate_q_factor_training_provenance,
+    write_q_factor_training_provenance,
+)
 from utils.utils import get_config, flatten_omega_conf, get_selfless_mask, log_grad_norm, AverageMeter, save_checkpoint, save_hf_model
 from models.modeling_model.modeling_selfless_flow import Qwen3ForCausalLM as FlowQwen3ForCausalLM
 
@@ -46,6 +62,8 @@ _VAE_CACHE = None
 
 
 def load_model_tokenizer(config: OmegaConf, logger=None):
+    backbone = resolve_image_backbone_config(config)
+    flow_position, _ = resolve_flow_head_position_config(config)
     tokenizer = AutoTokenizer.from_pretrained(config.model.model_path, fix_mistral_regex=True)
     mask_token = "<|mdm_mask|>"
     if mask_token in tokenizer.get_vocab():
@@ -91,14 +109,21 @@ def load_model_tokenizer(config: OmegaConf, logger=None):
         "image_flow_grad_checkpointing", "image_flow_time_scale",
         "image_flow_time_sampling", "image_flow_logit_mean", "image_flow_logit_std",
         "image_flow_time_eps", "image_flow_time_uniform_mix", "image_flow_solver",
-        "image_flow_mlp_ratio", "image_flow_head_arch", "image_flow_zero_init_gate",
+        "image_flow_mlp_ratio", "image_flow_head_arch", "image_flow_head_variant", "image_flow_zero_init_gate",
         "image_flow_latent_mixer_heads", "image_flow_latent_mixer_dropout",
         "image_flow_latent_mixer_zero_init_gate",
+        "image_flow_position_variant",
+        "image_flow_query_position_mode",
+        "image_flow_context_position_mode",
+        "image_flow_rope_mode",
+        "image_flow_rope_axis_dims",
+        "image_flow_rope_rotate_value",
         "image_input_noise_strength", "image_input_noise_strength_std",
         "image_input_noise_strength_min", "image_input_noise_strength_max",
         "image_uncond_prob",
         "image_token_embedder_init_mode",
         "image_token_embedder_latent_rms",
+        "image_backbone_variant",
     )
 
     model_config = AutoConfig.from_pretrained(config.model.model_path, trust_remote_code=True)
@@ -150,6 +175,21 @@ def load_model_tokenizer(config: OmegaConf, logger=None):
                         f"from text mask token id={mask_token_id}"
                     )
 
+    actual_variant = str(model.image_token_embedder.backbone_variant)
+    if actual_variant != backbone.variant:
+        raise ValueError(
+            "image_backbone_variant was not propagated into the training model: "
+            f"expected={backbone.variant!r}, actual={actual_variant!r}"
+        )
+    if flow_position is not None:
+        actual_flow_variant = str(model.image_flow_head.net.position_variant)
+        if actual_flow_variant != flow_position.variant:
+            raise ValueError(
+                "image_flow_position_variant was not propagated into the "
+                f"training model: expected={flow_position.variant!r}, "
+                f"actual={actual_flow_variant!r}"
+            )
+
     if config.training.get("use_gradient_checkpointing", True):
         model.gradient_checkpointing_enable()
         model.config.use_cache = False
@@ -183,6 +223,46 @@ def _special_token_ids(config):
     if image_mask_token_id is not None:
         ids["image_mask"] = int(image_mask_token_id)
     return ids
+
+
+def _uses_paired_image_initialization(config) -> bool:
+    return (
+        is_confirmation_config(config)
+        or is_q_factor_config(config)
+    )
+
+
+def _initialize_confirmation_special_tokens(model, config) -> None:
+    """Make trainable special-token rows independent of architecture construction RNG."""
+
+    if not _uses_paired_image_initialization(config):
+        return
+    embedding = model.model.embed_tokens.weight
+    initializer_range = float(getattr(model.config, "initializer_range", 0.02))
+    token_ids = _special_token_ids(config)
+    with torch.no_grad():
+        for name, token_id in sorted(token_ids.items()):
+            if name == "image_mask":
+                continue
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed(
+                stable_named_seed(int(config.training.seed), f"special_token.{name}")
+            )
+            value = torch.randn(
+                embedding.shape[1],
+                generator=generator,
+                dtype=torch.float32,
+            ).mul_(initializer_range)
+            embedding[int(token_id)].copy_(
+                value.to(device=embedding.device, dtype=embedding.dtype)
+            )
+        if "image_mask" in token_ids:
+            embedding[int(token_ids["image_mask"])].copy_(
+                embedding[int(token_ids["mask"])]
+            )
+    _log_info(
+        "Applied paired-ablation module-keyed initialization to special-token rows"
+    )
 
 
 def _apply_image_flow_warmup_freeze(model, config):
@@ -289,18 +369,26 @@ def _reinitialize_image_modules(model, config):
         return False
 
     reset_modules = []
+
+    def run_reset(name, callback):
+        if _uses_paired_image_initialization(config):
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(
+                    stable_named_seed(int(config.training.seed), f"image_module.{name}")
+                )
+                callback()
+        else:
+            callback()
+        reset_modules.append(name)
+
     if hasattr(model, "image_flow_head") and hasattr(model.image_flow_head, "net"):
-        model.image_flow_head.net.initialize_weights()
-        reset_modules.append("image_flow_head")
+        run_reset("image_flow_head", model.image_flow_head.net.initialize_weights)
     if hasattr(model, "reset_image_token_embedder"):
-        model.reset_image_token_embedder()
-        reset_modules.append("image_token_embedder")
+        run_reset("image_token_embedder", model.reset_image_token_embedder)
     elif hasattr(model, "image_token_embedder") and hasattr(model.image_token_embedder, "_reset_parameters"):
-        model.image_token_embedder._reset_parameters()
-        reset_modules.append("image_token_embedder")
+        run_reset("image_token_embedder", model.image_token_embedder._reset_parameters)
     if hasattr(model, "_reset_image_flow_condition_proj"):
-        model._reset_image_flow_condition_proj()
-        reset_modules.append("image_flow_condition_proj")
+        run_reset("image_flow_condition_proj", model._reset_image_flow_condition_proj)
 
     _log_info(
         "Reinitialized image modules after loading the base model: "
@@ -542,6 +630,12 @@ def _save_ema_hf_model(ema_model, tokenizer, config, accelerator, global_step) -
     save_path = Path(config.experiment.output_dir) / f"hf_model-{global_step}-ema"
     ema_model.save_pretrained(save_path, safe_serialization=True)
     tokenizer.save_pretrained(save_path)
+    if is_confirmation_config(config):
+        provenance_path = Path(str(config.experiment.confirmation_provenance_path))
+        shutil.copy2(provenance_path, save_path / provenance_path.name)
+    elif is_q_factor_config(config):
+        provenance_path = Path(str(config.experiment.q_factor_provenance_path))
+        shutil.copy2(provenance_path, save_path / provenance_path.name)
     logger.info(f"Saved EMA HF model to {save_path}")
 
 
@@ -631,6 +725,7 @@ def main():
     logger.info("Loading tokenizer and model")
     model, tokenizer = load_model_tokenizer(config=config, logger=logger)
 
+    _initialize_confirmation_special_tokens(model, config)
     reinitialized_image_modules = _reinitialize_image_modules(model, config)
     flow_adapter = config.model.get("pretrained_image_flow_adapter", None)
     if reinitialized_image_modules and not _is_disabled_path(flow_adapter):
@@ -751,6 +846,75 @@ def main():
     seq_len = config.dataset.preprocessing.max_seq_length
     
     train_dataloader, val_dataloader = get_dataloaders(config, tokenizer)
+
+    if is_confirmation_config(config):
+        provenance_path = (
+            Path(config.experiment.output_dir) / "confirmation_training_provenance.json"
+        )
+        if accelerator.is_main_process:
+            if provenance_path.exists():
+                raise FileExistsError(
+                    f"Refusing to overwrite confirmation provenance: {provenance_path}"
+                )
+            provenance = build_training_provenance(
+                config=config,
+                model=model,
+                train_loader=train_dataloader,
+                special_token_ids=_special_token_ids(config),
+            )
+            write_training_provenance(provenance_path, provenance)
+        accelerator.wait_for_everyone()
+        expected_provenance = json.loads(
+            provenance_path.read_text(encoding="utf-8")
+        )
+        provenance_digest = str(expected_provenance.get("provenance_sha256", ""))
+        load_and_validate_training_provenance(
+            provenance_path,
+            expected_sha256=provenance_digest,
+            variant_id=str(config.experiment.ablation_id),
+            seed=int(config.training.seed),
+        )
+        config.experiment.confirmation_provenance_path = str(provenance_path)
+        config.experiment.confirmation_provenance_sha256 = provenance_digest
+        logger.info(
+            "Bound confirmation training provenance "
+            f"sha256={provenance_digest}"
+        )
+    elif is_q_factor_config(config):
+        provenance_path = (
+            Path(config.experiment.output_dir) / "q_factor_training_provenance.json"
+        )
+        if accelerator.is_main_process:
+            if provenance_path.exists():
+                raise FileExistsError(
+                    f"Refusing to overwrite Q-factor provenance: {provenance_path}"
+                )
+            provenance = build_q_factor_training_provenance(
+                config=config,
+                model=model,
+                train_loader=train_dataloader,
+                special_token_ids=_special_token_ids(config),
+                accelerator=accelerator,
+            )
+            write_q_factor_training_provenance(provenance_path, provenance)
+        accelerator.wait_for_everyone()
+        expected_provenance = json.loads(
+            provenance_path.read_text(encoding="utf-8")
+        )
+        provenance_digest = str(expected_provenance.get("provenance_sha256", ""))
+        load_and_validate_q_factor_training_provenance(
+            provenance_path,
+            expected_sha256=provenance_digest,
+            variant_id=str(config.experiment.ablation_id),
+            seed=int(config.training.seed),
+            config=config,
+        )
+        config.experiment.q_factor_provenance_path = str(provenance_path)
+        config.experiment.q_factor_provenance_sha256 = provenance_digest
+        logger.info(
+            "Bound Q-factor training provenance "
+            f"sha256={provenance_digest}"
+        )
 
     ##################################
     #       Prepare accelerator     #
@@ -878,6 +1042,9 @@ def main():
         ema_model.eval()
 
     train_iter = iter(initial_train_dataloader)
+    training_runtime_started_at = time.time()
+    if accelerator.device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(accelerator.device)
 
     # Accumulators for per-modality loss across gradient-accumulation micro-batches.
     # Reset after each optimizer step (sync_gradients=True).
@@ -998,6 +1165,18 @@ def main():
 
             model_output = model(**forward_kwargs)
             loss = model_output.loss
+            if not bool(torch.isfinite(loss.detach()).all().item()):
+                flow_stats = getattr(model_output, "flow_debug_stats", None) or {}
+                compact_stats = {
+                    key: float(value.detach().float().cpu().item())
+                    for key, value in flow_stats.items()
+                    if isinstance(value, torch.Tensor) and value.numel() == 1
+                }
+                raise FloatingPointError(
+                    "non-finite training loss at the first detected forward: "
+                    f"global_step={global_step}, loss={loss.detach()}, "
+                    f"flow_stats={compact_stats}"
+                )
 
             # Track per-modality loss across micro-batches
             per_mod = getattr(model_output, "per_modality_loss", None)
@@ -1075,6 +1254,7 @@ def main():
                     "train_ppl": math.exp(global_avg_loss.item()),
                     "lr": lr_scheduler.get_last_lr()[0],
                     "samples/sec/gpu": samples_per_second_per_gpu,
+                    "tokens/sec/gpu": samples_per_second_per_gpu * L,
                     "batch_time": batch_time_m.val,
                 }
                 if ema_model is not None:
@@ -1087,6 +1267,16 @@ def main():
                     logs["pack/padding_tokens"] = padding_tokens
                     logs["pack/padding_ratio"] = padding_tokens / max(1, config.training.batch_size * packed_len)
                     logs["pack/seq_len"] = packed_len
+                    logs["valid_tokens/sec/gpu"] = (
+                        samples_per_second_per_gpu
+                        * valid_tokens
+                        / max(1, config.training.batch_size)
+                    )
+                    logs["image_tokens/sec/gpu"] = (
+                        samples_per_second_per_gpu
+                        * image_tokens
+                        / max(1, config.training.batch_size)
+                    )
 
                 # Per-modality loss (accumulated across all micro-batches)
                 if is_multimodal:
@@ -1175,7 +1365,54 @@ def main():
             if global_step >= config.training.max_train_steps:
                 break
 
+    training_runtime_elapsed = time.time() - training_runtime_started_at
+    if accelerator.device.type == "cuda":
+        local_runtime = torch.tensor(
+            [
+                float(torch.cuda.max_memory_allocated(accelerator.device)),
+                float(torch.cuda.max_memory_reserved(accelerator.device)),
+                float(training_runtime_elapsed),
+            ],
+            device=accelerator.device,
+            dtype=torch.float64,
+        )
+    else:
+        local_runtime = torch.tensor(
+            [0.0, 0.0, float(training_runtime_elapsed)],
+            device=accelerator.device,
+            dtype=torch.float64,
+        )
+    gathered_runtime = accelerator.gather(local_runtime).reshape(-1, 3)
+    runtime_max = gathered_runtime.max(dim=0).values
     accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        runtime_payload = {
+            "schema": "selfless_training_runtime_metrics_v1",
+            "ablation_id": str(config.experiment.get("ablation_id", "")),
+            "global_step": int(global_step),
+            "world_size": int(accelerator.num_processes),
+            "total_batch_size": int(total_batch_size),
+            "training_wall_seconds": float(runtime_max[2].item()),
+            "train_samples_per_second": float(
+                global_step
+                * total_batch_size
+                / max(float(runtime_max[2].item()), 1e-12)
+            ),
+            "peak_cuda_allocated_bytes_per_rank": int(
+                runtime_max[0].item()
+            ),
+            "peak_cuda_reserved_bytes_per_rank": int(
+                runtime_max[1].item()
+            ),
+        }
+        runtime_path = (
+            Path(config.experiment.output_dir)
+            / "training_runtime_metrics.json"
+        )
+        runtime_path.write_text(
+            json.dumps(runtime_payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
     if bool(config.experiment.get("save_final", True)):
         active_ema_model = ema_model if ema_started else None
         save_hf_model(model, tokenizer, config, accelerator, "final")
@@ -1529,7 +1766,6 @@ def _save_validation_flow_images(
             probe_times = [float(value) for value in probe_config]
         probe_times = [min(1.0 - 1.0e-4, max(1.0e-4, value)) for value in probe_times]
         scaling_factor = float(config.experiment.get("validation_vae_scaling_factor", 0.2325))
-
         side = int(image_tokens_per_img ** 0.5)
         if side * side != image_tokens_per_img:
             logger.warning(f"Skipping validation image decode; image_tokens_per_img={image_tokens_per_img} is not square.")
@@ -1656,13 +1892,16 @@ def _save_validation_flow_images(
             if latents
         }
         raw_target_latents = torch.stack(target_latents)
+        vae_pred_latents = raw_pred_latents
+        vae_probe_x0_latents = raw_probe_x0_latents
+        vae_target_latents = raw_target_latents
         vae_dtype = next(vae.parameters()).dtype
-        decoded_pred = vae.decode(raw_pred_latents.to(dtype=vae_dtype) / scaling_factor).float().clamp(-1, 1)
+        decoded_pred = vae.decode(vae_pred_latents.to(dtype=vae_dtype) / scaling_factor).float().clamp(-1, 1)
         decoded_probe_x0 = {
             time_value: vae.decode(latents.to(dtype=vae_dtype) / scaling_factor).float().clamp(-1, 1)
-            for time_value, latents in raw_probe_x0_latents.items()
+            for time_value, latents in vae_probe_x0_latents.items()
         }
-        decoded_target = vae.decode(raw_target_latents.to(dtype=vae_dtype) / scaling_factor).float().clamp(-1, 1)
+        decoded_target = vae.decode(vae_target_latents.to(dtype=vae_dtype) / scaling_factor).float().clamp(-1, 1)
 
         from torchvision.utils import make_grid, save_image
 
@@ -1717,8 +1956,9 @@ def _save_validation_flow_images(
             comparison_tiles = []
             comparison_names = []
             for order_strategy, (single_stream_latents, single_stream_trace) in single_stream_results.items():
+                vae_single_stream_latents = single_stream_latents
                 decoded_single_stream = vae.decode(
-                    single_stream_latents.to(dtype=vae_dtype) / scaling_factor
+                    vae_single_stream_latents.to(dtype=vae_dtype) / scaling_factor
                 ).float().clamp(-1, 1)
                 strategy_tag = str(order_strategy).replace("/", "_")
                 log_prefix = f"val/single_stream/{strategy_tag}"
@@ -1820,9 +2060,26 @@ def _validate_multimodal(model, val_dataloader, accelerator, global_step, config
     local_total_tokens = torch.tensor(0.0, device=accelerator.device)
     local_text_tokens = torch.tensor(0.0, device=accelerator.device)
     local_image_tokens = torch.tensor(0.0, device=accelerator.device)
+    local_flow_stat_sums = {}
+    local_flow_stat_counts = {}
     saved_validation_images = False
+    diagnostic_batches = int(
+        config.experiment.get("flow_head_attention_diagnostic_batches", 0)
+        if config is not None
+        else 0
+    )
+    unwrapped_model = accelerator.unwrap_model(model)
+    diagnostic_head = getattr(
+        getattr(unwrapped_model, "image_flow_head", None),
+        "net",
+        None,
+    )
 
-    for batch in val_dataloader:
+    for validation_batch_idx, batch in enumerate(val_dataloader):
+        if hasattr(diagnostic_head, "set_attention_diagnostics"):
+            diagnostic_head.set_attention_diagnostics(
+                validation_batch_idx < diagnostic_batches
+            )
         input_ids = batch["input_ids"].contiguous().to(accelerator.device)
         token_types = batch["token_types"].to(accelerator.device)
         sigma = batch["sigma"].to(accelerator.device)
@@ -1853,6 +2110,22 @@ def _validate_multimodal(model, val_dataloader, accelerator, global_step, config
             flow_sigma=sigma,
             calculate_likelihood=True,
         )
+        flow_stats = getattr(output, "flow_debug_stats", None) or {}
+        for key, value in flow_stats.items():
+            if not isinstance(value, torch.Tensor) or value.numel() != 1:
+                continue
+            scalar = value.detach().to(device=accelerator.device, dtype=torch.float32)
+            if not bool(torch.isfinite(scalar).all().item()):
+                raise FloatingPointError(
+                    "non-finite validation flow diagnostic: "
+                    f"global_step={global_step}, key={key!r}, value={scalar}"
+                )
+            local_flow_stat_sums[key] = local_flow_stat_sums.get(
+                key, torch.tensor(0.0, device=accelerator.device)
+            ) + scalar
+            local_flow_stat_counts[key] = local_flow_stat_counts.get(
+                key, torch.tensor(0.0, device=accelerator.device)
+            ) + 1.0
         if not saved_validation_images and image_latents is not None and image_mask.any():
             _save_validation_flow_images(
                 model=model,
@@ -1876,6 +2149,9 @@ def _validate_multimodal(model, val_dataloader, accelerator, global_step, config
         else:
             local_weighted_loss += output.loss.detach() * n_valid
             local_total_tokens += n_valid
+
+    if hasattr(diagnostic_head, "set_attention_diagnostics"):
+        diagnostic_head.set_attention_diagnostics(False)
 
     # Reduce across ranks: sum of weighted losses and token counts
     global_total_tokens = accelerator.reduce(local_total_tokens, reduction="sum")
@@ -1917,9 +2193,38 @@ def _validate_multimodal(model, val_dataloader, accelerator, global_step, config
     if global_image_tokens.item() > 0:
         avg_image = (global_weighted_image / global_image_tokens).item()
         logs["val/loss_image_flow"] = avg_image
+    for key in sorted(local_flow_stat_sums):
+        global_sum = accelerator.reduce(local_flow_stat_sums[key], reduction="sum")
+        global_count = accelerator.reduce(
+            local_flow_stat_counts[key], reduction="sum"
+        )
+        logs[f"val/{key}"] = (global_sum / global_count.clamp_min(1.0)).item()
 
     if accelerator.is_main_process:
         accelerator.log(logs, step=global_step)
+        if config is not None:
+            metrics_path = (
+                Path(config.experiment.output_dir)
+                / f"validation_metrics_step_{int(global_step)}.json"
+            )
+            metrics_path.parent.mkdir(parents=True, exist_ok=True)
+            metrics_path.write_text(
+                json.dumps(
+                    {
+                        "schema": "selfless_flow_validation_metrics_v1",
+                        "global_step": int(global_step),
+                        "training_seed": int(config.training.seed),
+                        "ablation_id": str(
+                            config.experiment.get("ablation_id", "")
+                        ),
+                        "metrics": logs,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
         msg = f"[Validation] Step {global_step + 1} | Loss: {avg_loss:.4f} (PPL: {ppl:.2f})"
         if "val/loss_text" in logs:
             msg += f" | Text: {logs['val/loss_text']:.4f}"

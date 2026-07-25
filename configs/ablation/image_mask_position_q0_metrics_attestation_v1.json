@@ -1,0 +1,134 @@
+{
+  "manifest_sha256": "24c668aa4dfb7fe980fbe8ae0258fd4f6c85a5519131b443873ca79a841b654b",
+  "runs": [
+    {
+      "analysis_id": "E2b-Q0",
+      "evaluation_job_name": null,
+      "evaluation_source_equivalence_sha256": null,
+      "evaluation_source_mode": "frozen_registered_source",
+      "evaluation_waiver": null,
+      "metrics_path": "output/selfless-flow-image-embedder-qf-e2b-q0-seed43/fid_is_selected_cfg3p5_ema/metrics.json",
+      "metrics_sha256": "d030d9230d66302bf0d45e582cff7b8f7ff9e6d0bc61cb666a5cb564854b5009",
+      "source_manifest_sha256": "5be769a7f2f5d01b3749844caec79044d135db0f5f54be3cfc4328aad72b0f04",
+      "training_seed": 43
+    },
+    {
+      "analysis_id": "E2b-Q0",
+      "evaluation_job_name": null,
+      "evaluation_source_equivalence_sha256": null,
+      "evaluation_source_mode": "frozen_registered_source",
+      "evaluation_waiver": null,
+      "metrics_path": "output/selfless-flow-image-embedder-qf-e2b-q0-seed44/fid_is_selected_cfg3p5_ema/metrics.json",
+      "metrics_sha256": "57a7232f20de637f48d26b6c8b09d691fa6e889d2212d658e9612872f364d778",
+      "source_manifest_sha256": "5be769a7f2f5d01b3749844caec79044d135db0f5f54be3cfc4328aad72b0f04",
+      "training_seed": 44
+    },
+    {
+      "analysis_id": "E2b-Q0",
+      "evaluation_job_name": null,
+      "evaluation_source_equivalence_sha256": null,
+      "evaluation_source_mode": "frozen_registered_source",
+      "evaluation_waiver": null,
+      "metrics_path": "output/selfless-flow-image-embedder-qf-e2b-q0-seed45/fid_is_selected_cfg3p5_ema/metrics.json",
+      "metrics_sha256": "2d13133f21eb7ff641f272d5e864906fd14bc279c40655bb95d6f56d204757fd",
+      "source_manifest_sha256": "5be769a7f2f5d01b3749844caec79044d135db0f5f54be3cfc4328aad72b0f04",
+      "training_seed": 45
+    },
+    {
+      "analysis_id": "E2-Q0",
+      "evaluation_job_name": null,
+      "evaluation_source_equivalence_sha256": null,
+      "evaluation_source_mode": "frozen_registered_source",
+      "evaluation_waiver": null,
+      "metrics_path": "output/selfless-flow-image-embedder-qf-e2-q0-seed43/fid_is_selected_cfg3p5_ema/metrics.json",
+      "metrics_sha256": "50dbfcf71bd36689fb9b5f65b37e1a13a4c171d3762681743168e8f5376155cd",
+      "source_manifest_sha256": "5be769a7f2f5d01b3749844caec79044d135db0f5f54be3cfc4328aad72b0f04",
+      "training_seed": 43
+    },
+    {
+      "analysis_id": "E2-Q0",
+      "evaluation_job_name": "imgemb-qf-e2-q0-s44-ev-fz",
+      "evaluation_source_equivalence_sha256": "0f9ac1cb13cd68b0204edfe573c823af76034671c7a7118a20b51b9dabc68a60",
+      "evaluation_source_mode": "frozen_bytecode_equivalence_waiver",
+      "evaluation_waiver": {
+        "current_source": {
+          "path": "models/modeling_model/modeling_selfless_flow.py",
+          "sha256": "e1fb61dc12bab86158912d6f85467e98974bd28645769b94f995f79370b8e5b3",
+          "size_bytes": 141449
+        },
+        "frozen_bytecode": {
+          "path": "output/image_mask_position_ablation/source_drift_waiver/frozen_modeling_selfless_flow.cpython-312.pyc",
+          "sha256": "d9ec0fa3a3ea3545a15e25ec8cbea939d480213bf722996468ae1508858b3c6f",
+          "size_bytes": 141511
+        },
+        "frozen_source": {
+          "path": "models/modeling_model/modeling_selfless_flow.py",
+          "sha256": "41e845cd5375f50edb6733985763dd81d006c8d9816a4abc14fb143c50e7fd92",
+          "size_bytes": 134243
+        },
+        "launcher": {
+          "path": "output/image_mask_position_ablation/run_q0_eval_with_source_waiver.sh",
+          "sha256": "718e488663dff5f2ead8b8dcc9ab240668f81336d42f15991d62046381f3603f",
+          "size_bytes": 865
+        },
+        "sitecustomize": {
+          "path": "output/image_mask_position_ablation/source_drift_waiver/sitecustomize.py",
+          "sha256": "5af599f5f9b5f63e407c43cf146c265a4ae771b4b8d4622eb311e693eee99c47",
+          "size_bytes": 8485
+        },
+        "waiver": {
+          "path": "output/image_mask_position_ablation/source_drift_waiver/evaluation_source_equivalence.json",
+          "sha256": "0f9ac1cb13cd68b0204edfe573c823af76034671c7a7118a20b51b9dabc68a60",
+          "size_bytes": 1906
+        }
+      },
+      "metrics_path": "output/selfless-flow-image-embedder-qf-e2-q0-seed44/fid_is_selected_cfg3p5_ema/metrics.json",
+      "metrics_sha256": "dcc42c111b37b59d9e0168027b1dd374b33f4e02a692d6a5946bdba66f283005",
+      "source_manifest_sha256": "5be769a7f2f5d01b3749844caec79044d135db0f5f54be3cfc4328aad72b0f04",
+      "training_seed": 44
+    },
+    {
+      "analysis_id": "E2-Q0",
+      "evaluation_job_name": "imgemb-qf-e2-q0-s45-ev-fz",
+      "evaluation_source_equivalence_sha256": "0f9ac1cb13cd68b0204edfe573c823af76034671c7a7118a20b51b9dabc68a60",
+      "evaluation_source_mode": "frozen_bytecode_equivalence_waiver",
+      "evaluation_waiver": {
+        "current_source": {
+          "path": "models/modeling_model/modeling_selfless_flow.py",
+          "sha256": "e1fb61dc12bab86158912d6f85467e98974bd28645769b94f995f79370b8e5b3",
+          "size_bytes": 141449
+        },
+        "frozen_bytecode": {
+          "path": "output/image_mask_position_ablation/source_drift_waiver/frozen_modeling_selfless_flow.cpython-312.pyc",
+          "sha256": "d9ec0fa3a3ea3545a15e25ec8cbea939d480213bf722996468ae1508858b3c6f",
+          "size_bytes": 141511
+        },
+        "frozen_source": {
+          "path": "models/modeling_model/modeling_selfless_flow.py",
+          "sha256": "41e845cd5375f50edb6733985763dd81d006c8d9816a4abc14fb143c50e7fd92",
+          "size_bytes": 134243
+        },
+        "launcher": {
+          "path": "output/image_mask_position_ablation/run_q0_eval_with_source_waiver.sh",
+          "sha256": "718e488663dff5f2ead8b8dcc9ab240668f81336d42f15991d62046381f3603f",
+          "size_bytes": 865
+        },
+        "sitecustomize": {
+          "path": "output/image_mask_position_ablation/source_drift_waiver/sitecustomize.py",
+          "sha256": "5af599f5f9b5f63e407c43cf146c265a4ae771b4b8d4622eb311e693eee99c47",
+          "size_bytes": 8485
+        },
+        "waiver": {
+          "path": "output/image_mask_position_ablation/source_drift_waiver/evaluation_source_equivalence.json",
+          "sha256": "0f9ac1cb13cd68b0204edfe573c823af76034671c7a7118a20b51b9dabc68a60",
+          "size_bytes": 1906
+        }
+      },
+      "metrics_path": "output/selfless-flow-image-embedder-qf-e2-q0-seed45/fid_is_selected_cfg3p5_ema/metrics.json",
+      "metrics_sha256": "71f1df77187417533697e89bd53426c53e816b947a8a371d6d149c6171fa3118",
+      "source_manifest_sha256": "5be769a7f2f5d01b3749844caec79044d135db0f5f54be3cfc4328aad72b0f04",
+      "training_seed": 45
+    }
+  ],
+  "schema": "selfless_flow_image_mask_position_q0_metrics_attestation_v1"
+}

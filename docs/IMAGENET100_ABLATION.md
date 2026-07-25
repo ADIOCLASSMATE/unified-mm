@@ -1,6 +1,7 @@
 # ImageNet-100 Architecture Ablation: Protocol and Results
 
-Status: final 10K evaluation, 2026-07-19.
+Status: final 10K evaluation; original architecture results completed
+2026-07-19, flow-head position follow-up closed 2026-07-24.
 
 This is the authoritative document for the balanced ImageNet-100 comparison
 between Selfless-Flow, its flow-head variants, and Qwen-Show-O. It replaces the
@@ -194,15 +195,34 @@ the same parameter count, ratio 4.5 also beats width 1936 by 0.4911 FID and
 keeping the residual stream aligned to the 1280-wide backbone than on widening
 the residual stream with ratio 1.0.
 
-The next controlled architecture ablation should keep the current best
-token-only scale (width 1280, depth 8, ratio 4.5) and add only the fixed 2D
-sine/cosine query-position feature used by the contextual head. This remains a
-strictly pointwise MAR/NextStep-style head: it introduces no attention,
-clean-latent context, learned position parameters, or token-to-token
-communication. It isolates whether the remaining 0.4294 FID gap comes from
-explicit spatial identity rather than cross-attention. Evaluation must remain
-fixed at the baseline-selected CFG 3.5; no architecture-specific CFG sweep is
-permitted.
+The formerly proposed “token-only ratio-4.5 + fixed query position” cell was
+not run and is now closed rather than left as pending work. Subsequent
+backbone experiments selected `E2-Q1`, and the dedicated contextual-head
+position screen below found no position-only change that beat its baseline.
+The remaining architecture question is therefore not whether to rescue a
+pointwise MLP with one more position feature, but whether clean content should
+be a dynamically updated stream inside the flow tower.
+
+### Retained dynamic dual-stream flow-head baselines
+
+The completed static-position and dynamic dual-stream screens have been
+archived. New training uses the shared-attention/shared-MLP dynamic content
+architecture `DF1` and exposes only two complete position contracts:
+
+| Baseline | Position contract | FID ↓ | IS ↑ |
+| --- | --- | ---: | ---: |
+| **DF1-FH0** | additive query/content; no flow-head RoPE | **23.5699** | **64.7787** |
+| **DF1-FH4** | no additive position; row/column 2D RoPE | **23.0230** | **64.6608** |
+
+`DF1-FH0` is the default and `DF1-FH4` is the pure-RoPE alternative. All other
+architecture/position cells are historical evidence rather than runtime
+options.
+
+The active contract is documented in
+[`SELFLESS_FLOW_HEAD_BASELINE.md`](SELFLESS_FLOW_HEAD_BASELINE.md). Full
+matrices and artifacts are preserved in
+[`archive/SELFLESS_FLOW_DUAL_STREAM_FLOW_HEAD_ABLATION_PROPOSAL_HISTORICAL.md`](archive/SELFLESS_FLOW_DUAL_STREAM_FLOW_HEAD_ABLATION_PROPOSAL_HISTORICAL.md)
+and `output/flow_head_ablation/relocation_manifest.json`.
 
 ### EMA versus non-EMA diagnostic
 

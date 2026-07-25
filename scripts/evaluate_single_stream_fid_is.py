@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 import argparse
+from collections.abc import Mapping
+from datetime import timedelta
+import hashlib
 import json
 import math
 import os
 from pathlib import Path
+import time
 
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
@@ -39,6 +43,29 @@ from scripts.generate_flow_validation_images import (  # noqa: E402
     load_model_state,
     load_vae,
 )
+from scripts.archive.image_backbone_ablation.image_embedder_ablation_matrix import (  # noqa: E402
+    training_protocol_metadata,
+    validate_ablation_config,
+)
+from scripts.archive.image_backbone_ablation.image_embedder_confirmation_protocol import (  # noqa: E402
+    file_sha256,
+    is_confirmation_config,
+    load_and_validate_training_provenance,
+)
+from scripts.archive.image_backbone_ablation.image_mask_position_ablation_matrix import (  # noqa: E402
+    validate_q_factor_config,
+)
+from scripts.archive.image_backbone_ablation.image_mask_position_ablation_protocol import (  # noqa: E402
+    is_q_factor_config,
+    load_and_validate_q_factor_training_provenance,
+    q_factor_config_contract,
+    validate_q_factor_declaration,
+)
+from models.modeling_model.image_backbone import (  # noqa: E402
+    CANONICAL_IMAGE_GRID_SIDE,
+    CANONICAL_IMAGE_LATENT_DIM,
+    image_backbone_spec,
+)
 from utils.dataset_utils import get_dataloaders  # noqa: E402
 from utils.utils import load_model_tokenizer  # noqa: E402
 
@@ -50,6 +77,136 @@ DEFAULT_INCEPTION_WEIGHTS = (
     / "inception"
     / "weights-inception-2015-12-05-6726825d.pth"
 )
+
+EVALUATOR_RNG_SEED_MODULUS = 2**63
+DEFAULT_PROCESS_GROUP_TIMEOUT_SECONDS = 2 * 60 * 60
+CANONICAL_NOISE_MANIFEST_SCHEMA = "canonical_image_flow_noise_manifest_v1"
+ORDERED_EVAL_SAMPLE_MANIFEST_SCHEMA = "ordered_image_embedder_eval_samples_v1"
+
+
+def canonical_json_sha256(payload: object) -> str:
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+EVALUATOR_RNG_CONTRACT = {
+    "schema": "canonical_image_flow_initial_noise_v1",
+    "canonical_shape": [
+        CANONICAL_IMAGE_GRID_SIDE,
+        CANONICAL_IMAGE_GRID_SIDE,
+        CANONICAL_IMAGE_LATENT_DIM,
+    ],
+    "canonical_layout": "HWC",
+    "distribution": "torch.randn_standard_normal",
+    "dtype": "torch.float32",
+    "device": "cpu",
+    "generator": "torch.Generator(device='cpu')",
+    "seed_derivation": {
+        "formula": "(evaluation_seed + global_sample_index) mod 2**63",
+        "modulus": EVALUATOR_RNG_SEED_MODULUS,
+    },
+    "flattening": "row_major_[16,16,16]_to_[256,16]",
+    "temperature_application": (
+        "FlowLoss.sample multiplies validated packed initial_noise by temperature"
+    ),
+    "independence": [
+        "architecture",
+        "batch_partition",
+        "distributed_rank",
+        "strategy",
+    ],
+    "per_sample_digest": (
+        "sha256(canonical tensor header JSON + newline + contiguous C-order bytes)"
+    ),
+    "noise_manifest_schema": CANONICAL_NOISE_MANIFEST_SCHEMA,
+    "sample_manifest_schema": ORDERED_EVAL_SAMPLE_MANIFEST_SCHEMA,
+}
+EVALUATOR_RNG_CONTRACT_SHA256 = canonical_json_sha256(EVALUATOR_RNG_CONTRACT)
+
+
+def canonical_tensor_sha256(tensor: torch.Tensor) -> str:
+    tensor = tensor.detach().to(device="cpu").contiguous()
+    header = {
+        "dtype": str(tensor.dtype),
+        "shape": [int(value) for value in tensor.shape],
+    }
+    digest = hashlib.sha256()
+    digest.update(
+        json.dumps(
+            header,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+    )
+    digest.update(b"\n")
+    digest.update(tensor.numpy().tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def canonical_image_flow_initial_noise(
+    evaluation_seed: int,
+    global_sample_index: int,
+) -> torch.Tensor:
+    global_sample_index = int(global_sample_index)
+    if global_sample_index < 0:
+        raise ValueError(
+            f"global_sample_index must be nonnegative, got {global_sample_index}"
+        )
+    sample_seed = (
+        int(evaluation_seed) + global_sample_index
+    ) % EVALUATOR_RNG_SEED_MODULUS
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(sample_seed)
+    return torch.randn(
+        (
+            CANONICAL_IMAGE_GRID_SIDE,
+            CANONICAL_IMAGE_GRID_SIDE,
+            CANONICAL_IMAGE_LATENT_DIM,
+        ),
+        generator=generator,
+        device="cpu",
+        dtype=torch.float32,
+    )
+
+
+def build_canonical_initial_noise_bank(
+    global_sample_indices: list[int],
+    *,
+    evaluation_seed: int,
+) -> tuple[torch.Tensor, list[dict[str, object]]]:
+    if not global_sample_indices:
+        raise ValueError("global_sample_indices must be nonempty")
+    normalized_indices = [int(value) for value in global_sample_indices]
+    if len(set(normalized_indices)) != len(normalized_indices):
+        raise ValueError(
+            f"global_sample_indices must be unique, got {normalized_indices}"
+        )
+    canonical = torch.stack(
+        [
+            canonical_image_flow_initial_noise(evaluation_seed, global_index)
+            for global_index in normalized_indices
+        ],
+        dim=0,
+    )
+    records = [
+        {
+            "global_sample_index": global_index,
+            "canonical_noise_sha256": canonical_tensor_sha256(noise),
+        }
+        for global_index, noise in zip(normalized_indices, canonical)
+    ]
+    flattened = canonical.reshape(
+        int(canonical.shape[0]),
+        CANONICAL_IMAGE_GRID_SIDE * CANONICAL_IMAGE_GRID_SIDE,
+        CANONICAL_IMAGE_LATENT_DIM,
+    )
+    return flattened, records
 
 
 def parse_args():
@@ -133,8 +290,37 @@ def parse_args():
             "and 10 deterministic IS splits are used."
         ),
     )
+    parser.add_argument(
+        "--require_image_embedder_ablation_protocol",
+        action="store_true",
+        help=(
+            "Fail before model loading unless every image-embedder architecture "
+            "ranking control is set to its preregistered value. This is stricter "
+            "than --require_official_protocol, which is also required."
+        ),
+    )
+    parser.add_argument(
+        "--debug_finite_generation",
+        action="store_true",
+        help="Debug only: check backbone, CFG conditions, context, and every flow ODE step for non-finite values.",
+    )
     parser.add_argument("--no_progress", action="store_true")
     return parser.parse_args()
+
+
+def evaluation_process_group_timeout_seconds() -> int:
+    timeout_seconds = int(
+        os.environ.get(
+            "EVAL_PROCESS_GROUP_TIMEOUT_SECONDS",
+            DEFAULT_PROCESS_GROUP_TIMEOUT_SECONDS,
+        )
+    )
+    if timeout_seconds <= 0:
+        raise ValueError(
+            "EVAL_PROCESS_GROUP_TIMEOUT_SECONDS must be positive, "
+            f"got {timeout_seconds}"
+        )
+    return timeout_seconds
 
 
 def init_distributed(requested_device: str):
@@ -166,7 +352,12 @@ def init_distributed(requested_device: str):
 
     if distributed and not dist.is_initialized():
         backend = "nccl" if device.type == "cuda" else "gloo"
-        dist.init_process_group(backend=backend)
+        dist.init_process_group(
+            backend=backend,
+            timeout=timedelta(
+                seconds=evaluation_process_group_timeout_seconds()
+            ),
+        )
     return distributed, rank, world_size, local_rank, device
 
 
@@ -279,6 +470,106 @@ def get_base_dataset_and_indices(loader_dataset):
     return loader_dataset, None
 
 
+def ordered_eval_sample_records(
+    loader_dataset,
+    *,
+    batch_offset: int,
+    spans: list[tuple[int, int, int]],
+    global_sample_indices: list[int],
+) -> list[dict[str, int]]:
+    if len(spans) != len(global_sample_indices):
+        raise ValueError(
+            "spans and global_sample_indices must have the same length, got "
+            f"{len(spans)} and {len(global_sample_indices)}"
+        )
+    base_dataset, subset_indices = get_base_dataset_and_indices(loader_dataset)
+    if not hasattr(base_dataset, "img_ids"):
+        raise ValueError(
+            "confirmation evaluation pairing requires a dataset with img_ids"
+        )
+
+    records = []
+    for (batch_row, _, _), global_sample_index in zip(
+        spans,
+        global_sample_indices,
+    ):
+        loader_row = int(batch_offset) + int(batch_row)
+        base_row = (
+            int(subset_indices[loader_row])
+            if subset_indices is not None
+            else loader_row
+        )
+        if base_row < 0 or base_row >= len(base_dataset):
+            raise IndexError(
+                f"evaluation dataset row {base_row} is outside [0, {len(base_dataset)})"
+            )
+        image_id = int(base_dataset.img_ids[base_row].item())
+        records.append(
+            {
+                "global_sample_index": int(global_sample_index),
+                "image_id": image_id,
+            }
+        )
+    return records
+
+
+def _gather_object_records(local_records: list[dict[str, object]]) -> list[dict[str, object]]:
+    if not (dist.is_available() and dist.is_initialized()):
+        return list(local_records)
+    gathered: list[list[dict[str, object]] | None] = [
+        None for _ in range(dist.get_world_size())
+    ]
+    dist.all_gather_object(gathered, local_records)
+    return [record for rank_records in gathered for record in (rank_records or [])]
+
+
+def evaluation_pairing_manifest_hashes(
+    *,
+    local_noise_records: list[dict[str, object]],
+    local_sample_records: list[dict[str, object]],
+    evaluation_seed: int,
+    expected_samples: int,
+) -> dict[str, object]:
+    expected_indices = list(range(int(expected_samples)))
+
+    noise_records = sorted(
+        _gather_object_records(local_noise_records),
+        key=lambda record: int(record["global_sample_index"]),
+    )
+    sample_records = sorted(
+        _gather_object_records(local_sample_records),
+        key=lambda record: int(record["global_sample_index"]),
+    )
+    for label, records in (
+        ("canonical noise", noise_records),
+        ("ordered evaluation sample", sample_records),
+    ):
+        actual_indices = [int(record["global_sample_index"]) for record in records]
+        if actual_indices != expected_indices:
+            raise RuntimeError(
+                f"{label} manifest must contain each global sample index exactly once; "
+                f"expected {len(expected_indices)} ordered indices, got "
+                f"{len(actual_indices)} records with prefix={actual_indices[:16]}"
+            )
+
+    noise_payload = {
+        "schema": CANONICAL_NOISE_MANIFEST_SCHEMA,
+        "evaluation_seed": int(evaluation_seed),
+        "records": noise_records,
+    }
+    sample_payload = {
+        "schema": ORDERED_EVAL_SAMPLE_MANIFEST_SCHEMA,
+        "records": sample_records,
+    }
+    return {
+        "canonical_noise_manifest_schema": CANONICAL_NOISE_MANIFEST_SCHEMA,
+        "canonical_noise_manifest_sha256": canonical_json_sha256(noise_payload),
+        "ordered_eval_sample_manifest_schema": ORDERED_EVAL_SAMPLE_MANIFEST_SCHEMA,
+        "ordered_eval_sample_manifest_sha256": canonical_json_sha256(sample_payload),
+        "paired_sample_count": len(expected_indices),
+    }
+
+
 def source_paths_for_spans(loader_dataset, batch_offset: int, spans, imagenet_train_dir: Path):
     base_dataset, subset_indices = get_base_dataset_and_indices(loader_dataset)
     if not hasattr(base_dataset, "img_ids") or not hasattr(base_dataset, "source_paths"):
@@ -320,9 +611,58 @@ def load_real_images(paths, transform, device):
     return torch.stack(images, dim=0).to(device=device, dtype=torch.float32)
 
 
-def finite_or_none(value: float) -> float | None:
+def require_finite_metric_scalar(value: float, *, label: str) -> float:
     value = float(value)
-    return value if math.isfinite(value) else None
+    if not math.isfinite(value):
+        raise FloatingPointError(
+            f"non-finite formal evaluation scalar invalidates FID/IS: {label}={value}"
+        )
+    return value
+
+
+def require_finite_metric_tensor(tensor: torch.Tensor, *, label: str) -> None:
+    finite = torch.isfinite(tensor)
+    if bool(finite.all()):
+        return
+    finite_values = tensor[finite].float()
+    finite_range = (
+        [float(finite_values.min().item()), float(finite_values.max().item())]
+        if finite_values.numel()
+        else None
+    )
+    raise FloatingPointError(
+        "non-finite tensor invalidates formal FID/IS: "
+        f"label={label!r}, shape={tuple(tensor.shape)}, "
+        f"nonfinite={int((~finite).sum().item())}/{tensor.numel()}, "
+        f"finite_range={finite_range}"
+    )
+
+
+def require_finite_generated_latents(
+    latents: torch.Tensor,
+    *,
+    strategy: str,
+    rank: int,
+    batch_idx: int,
+    global_indices: list[int],
+) -> None:
+    finite = torch.isfinite(latents)
+    if bool(finite.all()):
+        return
+    nonfinite = int((~finite).sum().item())
+    total = int(latents.numel())
+    finite_values = latents[finite].float()
+    finite_range = (
+        [float(finite_values.min().item()), float(finite_values.max().item())]
+        if finite_values.numel()
+        else None
+    )
+    raise FloatingPointError(
+        "non-finite generated image latents invalidate formal FID/IS: "
+        f"strategy={strategy!r}, rank={rank}, batch_idx={batch_idx}, "
+        f"global_indices={global_indices}, nonfinite={nonfinite}/{total}, "
+        f"finite_range={finite_range}"
+    )
 
 
 def checkpoint_weight_dtypes(model_path: str | Path) -> list[str]:
@@ -370,6 +710,384 @@ def validate_strategies(strategies: list[str], allow_sigma_strategies: bool) -> 
             f"{found}. These strategies require training/data sigma. "
             "Pass --allow_sigma_strategies only for debugging."
         )
+
+
+def validate_image_embedder_ablation_protocol(
+    args: argparse.Namespace,
+    strategies: list[str],
+    *,
+    world_size: int,
+) -> None:
+    """Fail fast when an architecture-ranking evaluation drifts from its contract."""
+
+    expected = {
+        "require_official_protocol": True,
+        "device": "cuda",
+        "model_dtype": "bf16",
+        "seed": 42,
+        "batch_size": 512,
+        "samples": 10_000,
+        "split": "val",
+        "sampling_steps": "100",
+        "temperature": 1.0,
+        "cfg": 3.5,
+        "cfg_schedule": "constant",
+        "flow_solver": "heun",
+        "parallel_rate": 1,
+        "vae_dtype": "fp32",
+        "fid_feature": 2048,
+        "is_splits": 10,
+        "adapter": "none",
+        "model_state": "",
+        "ema_state": "",
+        "allow_sigma_strategies": False,
+    }
+    actual = {
+        key: str(getattr(args, key)) if key == "sampling_steps" else getattr(args, key)
+        for key in expected
+    }
+    mismatches = [
+        f"{key}={actual[key]!r} (expected {value!r})"
+        for key, value in expected.items()
+        if actual[key] != value
+    ]
+    if int(world_size) != 8:
+        mismatches.append(f"world_size={world_size!r} (expected 8)")
+    if strategies != ["spatial_halton"]:
+        mismatches.append(
+            f"strategies={strategies!r} (expected ['spatial_halton'])"
+        )
+    if mismatches:
+        raise ValueError(
+            "Image-embedder ablation evaluation protocol drifted: "
+            + "; ".join(mismatches)
+        )
+
+
+def _compact_q_factor_provenance(provenance: dict[str, object]) -> dict[str, object]:
+    initial_state = provenance["initial_state"]
+    train_data = provenance["train_data"]
+    declaration = provenance["q_factor_declaration"]
+    return {
+        "schema": provenance["schema"],
+        "q_factor_id": provenance["q_factor_id"],
+        "parent_ablation_id": provenance["parent_ablation_id"],
+        "training_seed": int(provenance["training_seed"]),
+        "architecture": provenance["architecture"],
+        "provenance_sha256": provenance["provenance_sha256"],
+        "q_factor_declaration_sha256": provenance[
+            "q_factor_declaration_sha256"
+        ],
+        "study_manifest_sha256": provenance["study_manifest_sha256"],
+        "parent_summary_sha256": provenance["parent_summary_sha256"],
+        "config_contract_sha256": provenance["config_contract_sha256"],
+        "config_contract": declaration["config_contract"],
+        "runtime_source_manifest_sha256": provenance[
+            "runtime_source_manifest_sha256"
+        ],
+        "initial_state": {
+            "contract": initial_state["contract"],
+            "image_modules": {
+                key: initial_state["image_modules"][key]
+                for key in (
+                    "parameter_count",
+                    "parameter_schema_sha256",
+                    "state_sha256",
+                )
+            },
+            "special_token_names_and_ids": initial_state[
+                "special_token_names_and_ids"
+            ],
+            "special_token_rows_sha256": initial_state[
+                "special_token_rows_sha256"
+            ],
+        },
+        "train_data": {
+            key: train_data[key]
+            for key in (
+                "contract",
+                "dataloader_shuffle_seed",
+                "initial_generator_state_sha256",
+                "dataloader_base_seed",
+                "dataset_length",
+                "epoch0_ordered_sample_identity_sha256",
+                "augmentation_contract",
+                "epoch0_augmentation_decisions_sha256",
+                "augmentation_seed",
+                "latent_hflip_probability",
+                "batch_size_per_rank",
+                "total_batch_size",
+                "drop_last",
+                "num_workers",
+                "persistent_workers",
+                "input_files",
+            )
+        },
+        "base_model_manifest_sha256": provenance["base_model"][
+            "manifest_sha256"
+        ],
+        "runtime_context": provenance["runtime_context"],
+    }
+
+
+def _distributed_file_sha256(path: Path) -> str:
+    if not dist.is_initialized():
+        return file_sha256(path)
+    payload = [file_sha256(path) if dist.get_rank() == 0 else None]
+    dist.broadcast_object_list(payload, src=0)
+    if not isinstance(payload[0], str):
+        raise RuntimeError(f"failed to broadcast SHA256 for {path}")
+    return payload[0]
+
+
+def image_embedder_training_artifacts(
+    config,
+    *,
+    config_path: str,
+    model_path: str,
+) -> dict[str, object]:
+    """Validate and describe the final training evidence used by formal eval."""
+
+    q_factor = is_q_factor_config(config)
+    if q_factor:
+        validate_q_factor_config(config)
+    else:
+        validate_ablation_config(config)
+    final_global_step = int(config.training.max_train_steps)
+    run_dir = Path(config_path).parent
+    checkpoint_dir = run_dir / f"checkpoint-{final_global_step}"
+    metadata_path = checkpoint_dir / "metadata.json"
+    ema_state_path = checkpoint_dir / "ema_state.pt"
+    hf_weights_path = Path(model_path) / "model.safetensors"
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"Missing or invalid final checkpoint metadata: {metadata_path}"
+        ) from exc
+    if metadata.get("global_step") != final_global_step:
+        raise ValueError(
+            f"Final checkpoint global_step={metadata.get('global_step')!r}; "
+            f"expected {final_global_step}"
+        )
+    if q_factor:
+        expected_model_config = OmegaConf.to_container(config.model, resolve=True)
+        if metadata.get("model_config") != expected_model_config:
+            raise ValueError(
+                "Final Q-factor checkpoint model config does not match the resolved "
+                "training config"
+            )
+    missing = [
+        str(path)
+        for path in (ema_state_path, hf_weights_path)
+        if not path.is_file() or path.stat().st_size <= 0
+    ]
+    if missing:
+        raise ValueError(f"Missing final EMA/HF training artifacts: {missing}")
+    protocol = training_protocol_metadata(
+        config,
+        final_global_step=final_global_step,
+    )
+    protocol["artifacts"] = {
+        "checkpoint_metadata_path": str(metadata_path),
+        "ema_state_path": str(ema_state_path),
+        "ema_state_size_bytes": int(ema_state_path.stat().st_size),
+        "hf_model_weights_path": str(hf_weights_path),
+        "hf_model_weights_size_bytes": int(hf_weights_path.stat().st_size),
+    }
+    if q_factor:
+        protocol["artifacts"].update(
+            {
+                "checkpoint_metadata_sha256": file_sha256(metadata_path),
+                "ema_state_sha256": _distributed_file_sha256(ema_state_path),
+                "hf_model_weights_sha256": _distributed_file_sha256(hf_weights_path),
+            }
+        )
+    if is_confirmation_config(config):
+        variant_id = str(config.experiment.ablation_id)
+        training_seed = int(config.training.seed)
+        provenance_path = Path(
+            str(config.experiment.get("confirmation_provenance_path", ""))
+        )
+        provenance_sha256 = str(
+            config.experiment.get("confirmation_provenance_sha256", "")
+        )
+        declaration_sha256 = str(
+            config.experiment.confirmation_protocol.declaration_sha256
+        )
+        expected_checkpoint_binding = {
+            "path": str(provenance_path),
+            "sha256": provenance_sha256,
+            "declaration_sha256": declaration_sha256,
+        }
+        if metadata.get("confirmation_provenance") != expected_checkpoint_binding:
+            raise ValueError(
+                "Final checkpoint confirmation provenance binding does not match config: "
+                f"expected={expected_checkpoint_binding!r}, "
+                f"actual={metadata.get('confirmation_provenance')!r}"
+            )
+
+        provenance = load_and_validate_training_provenance(
+            provenance_path,
+            expected_sha256=provenance_sha256,
+            variant_id=variant_id,
+            seed=training_seed,
+        )
+        hf_provenance_path = Path(model_path) / provenance_path.name
+        hf_provenance = load_and_validate_training_provenance(
+            hf_provenance_path,
+            expected_sha256=provenance_sha256,
+            variant_id=variant_id,
+            seed=training_seed,
+        )
+        if hf_provenance != provenance:
+            raise ValueError(
+                "HF confirmation provenance copy differs from the training provenance"
+            )
+
+        initial_state = provenance["initial_state"]
+        train_data = provenance["train_data"]
+        compact_provenance = {
+            "schema": provenance["schema"],
+            "ablation_id": provenance["ablation_id"],
+            "training_seed": int(provenance["training_seed"]),
+            "provenance_sha256": provenance["provenance_sha256"],
+            "confirmation_declaration_sha256": provenance[
+                "confirmation_declaration_sha256"
+            ],
+            "space_to_depth_factor": int(provenance["space_to_depth_factor"]),
+            "initial_state": {
+                "contract": initial_state["contract"],
+                "image_modules": {
+                    key: initial_state["image_modules"][key]
+                    for key in (
+                        "parameter_count",
+                        "parameter_schema_sha256",
+                        "state_sha256",
+                    )
+                },
+                "special_token_names_and_ids": initial_state[
+                    "special_token_names_and_ids"
+                ],
+                "special_token_rows_sha256": initial_state[
+                    "special_token_rows_sha256"
+                ],
+            },
+            "train_data": {
+                key: train_data[key]
+                for key in (
+                    "contract",
+                    "dataloader_shuffle_seed",
+                    "initial_generator_state_sha256",
+                    "dataloader_base_seed",
+                    "dataset_length",
+                    "epoch0_ordered_sample_identity_sha256",
+                    "augmentation_contract",
+                    "epoch0_augmentation_decisions_sha256",
+                    "augmentation_seed",
+                    "latent_hflip_probability",
+                    "batch_size_per_rank",
+                    "total_batch_size",
+                    "drop_last",
+                    "num_workers",
+                    "persistent_workers",
+                    "input_files",
+                )
+            },
+            "base_model_manifest_sha256": provenance["base_model"][
+                "manifest_sha256"
+            ],
+            "runtime_source_manifest_sha256": provenance["runtime_source"][
+                "manifest_sha256"
+            ],
+        }
+        confirmation_metadata = protocol.get("confirmation")
+        if not isinstance(confirmation_metadata, dict):
+            raise ValueError(
+                "confirmation training protocol metadata was not constructed"
+            )
+        confirmation_metadata["provenance"] = compact_provenance
+        protocol["artifacts"].update(
+            {
+                "confirmation_provenance_path": str(provenance_path),
+                "confirmation_hf_provenance_path": str(hf_provenance_path),
+            }
+        )
+    elif q_factor:
+        variant_id = str(config.experiment.ablation_id)
+        training_seed = int(config.training.seed)
+        provenance_path = Path(
+            str(config.experiment.get("q_factor_provenance_path", ""))
+        )
+        provenance_sha256 = str(
+            config.experiment.get("q_factor_provenance_sha256", "")
+        )
+        declaration = validate_q_factor_declaration(
+            OmegaConf.to_container(
+                config.experiment.q_factor_protocol,
+                resolve=True,
+            ),
+            variant_id=variant_id,
+            seed=training_seed,
+            config_contract=q_factor_config_contract(config),
+        )
+        expected_checkpoint_binding = {
+            "path": str(provenance_path),
+            "sha256": provenance_sha256,
+            "declaration_sha256": declaration["declaration_sha256"],
+            "study_manifest_sha256": declaration["study_manifest_sha256"],
+            "config_contract_sha256": declaration["config_contract_sha256"],
+            "source_manifest_sha256": declaration["source_manifest_sha256"],
+        }
+        if metadata.get("q_factor_provenance") != expected_checkpoint_binding:
+            raise ValueError(
+                "Final checkpoint Q-factor provenance binding does not match config: "
+                f"expected={expected_checkpoint_binding!r}, "
+                f"actual={metadata.get('q_factor_provenance')!r}"
+            )
+
+        provenance = load_and_validate_q_factor_training_provenance(
+            provenance_path,
+            expected_sha256=provenance_sha256,
+            variant_id=variant_id,
+            seed=training_seed,
+            config=config,
+        )
+        hf_provenance_path = Path(model_path) / provenance_path.name
+        hf_provenance = load_and_validate_q_factor_training_provenance(
+            hf_provenance_path,
+            expected_sha256=provenance_sha256,
+            variant_id=variant_id,
+            seed=training_seed,
+            config=config,
+        )
+        if hf_provenance != provenance:
+            raise ValueError(
+                "HF Q-factor provenance copy differs from the training provenance"
+            )
+
+        q_factor_metadata = {
+            "declaration_sha256": declaration["declaration_sha256"],
+            "study_manifest_sha256": declaration["study_manifest_sha256"],
+            "parent_summary_sha256": declaration["parent_summary_sha256"],
+            "config_contract_sha256": declaration["config_contract_sha256"],
+            "source_manifest_sha256": declaration["source_manifest_sha256"],
+            "evaluator_rng_contract_sha256": declaration[
+                "evaluator_rng_contract_sha256"
+            ],
+            "dataloader_shuffle_seed": int(config.training.dataloader_shuffle_seed),
+            "provenance_path": str(provenance_path),
+            "provenance_sha256": provenance_sha256,
+            "provenance": _compact_q_factor_provenance(provenance),
+        }
+        protocol["q_factor"] = q_factor_metadata
+        protocol["artifacts"].update(
+            {
+                "q_factor_provenance_path": str(provenance_path),
+                "q_factor_hf_provenance_path": str(hf_provenance_path),
+            }
+        )
+    return protocol
 
 
 def resolve_inception_weights_path(path: str) -> str | None:
@@ -506,8 +1224,30 @@ def main():
     if not strategies:
         raise ValueError("--strategies must contain at least one strategy")
     validate_strategies(strategies, args.allow_sigma_strategies)
+    if args.require_image_embedder_ablation_protocol:
+        validate_image_embedder_ablation_protocol(
+            args,
+            strategies,
+            world_size=world_size,
+        )
 
     config = OmegaConf.load(args.config)
+    if args.require_image_embedder_ablation_protocol and args.debug_finite_generation:
+        raise ValueError("debug generation flags are forbidden by the formal ablation protocol")
+    confirmation_protocol = config.experiment.get("confirmation_protocol", None)
+    canonical_pairing_enabled = (
+        str(config.experiment.get("ablation_phase", "")).strip().lower()
+        == "confirmation"
+        or confirmation_protocol is not None
+        or is_q_factor_config(config)
+    )
+    training_protocol = None
+    if args.require_image_embedder_ablation_protocol:
+        training_protocol = image_embedder_training_artifacts(
+            config,
+            config_path=args.config,
+            model_path=args.model_path_override or str(config.model.model_path),
+        )
     if args.model_path_override:
         config.model.model_path = args.model_path_override
     config.training.batch_size = int(args.batch_size)
@@ -539,6 +1279,18 @@ def main():
         print(f"Loading EMA state: {args.ema_state or 'none'}")
     ema_state_report = load_ema_state(model, args.ema_state)
     model = model.to(device).eval()
+    if hasattr(model.image_flow_head, "reset_guidance_diagnostics"):
+        model.image_flow_head.reset_guidance_diagnostics()
+    total_parameter_count = sum(parameter.numel() for parameter in model.parameters())
+    trainable_parameter_count = sum(
+        parameter.numel() for parameter in model.parameters() if parameter.requires_grad
+    )
+    image_embedder_parameter_count = sum(
+        parameter.numel() for parameter in model.image_token_embedder.parameters()
+    )
+    flow_head_parameter_count = sum(
+        parameter.numel() for parameter in model.image_flow_head.parameters()
+    )
     parameter_dtypes = sorted(
         {str(parameter.dtype) for parameter in model.parameters() if parameter.is_floating_point()}
     )
@@ -553,7 +1305,6 @@ def main():
         print("Loading KL16 VAE...")
     vae = load_vae(config, device, args.vae_dtype)
     scaling_factor = float(config.experiment.validation_vae_scaling_factor)
-
     if is_main_process(rank):
         print(f"Loading {args.split} dataloader...")
     train_loader, val_loader = get_dataloaders(config, tokenizer)
@@ -567,6 +1318,20 @@ def main():
     side = int(image_tokens ** 0.5)
     if side * side != image_tokens:
         raise ValueError(f"image_tokens_per_img={image_tokens} is not a square grid")
+    if canonical_pairing_enabled:
+        canonical_shape = (
+            CANONICAL_IMAGE_GRID_SIDE,
+            CANONICAL_IMAGE_GRID_SIDE,
+            CANONICAL_IMAGE_LATENT_DIM,
+        )
+        expected_canonical_shape = tuple(
+            EVALUATOR_RNG_CONTRACT["canonical_shape"]
+        )
+        if canonical_shape != expected_canonical_shape:
+            raise ValueError(
+                "confirmation evaluation requires canonical image-flow noise shape "
+                f"{expected_canonical_shape}, got {canonical_shape}"
+            )
 
     inception_weights_path = resolve_inception_weights_path(args.inception_weights_path)
     real_stats_path = str(
@@ -633,6 +1398,10 @@ def main():
             "latent_mse_sum": 0.0,
             "latent_rms_sum": 0.0,
             "count": 0,
+            "generation_wall_seconds": 0.0,
+            "flow_content_cache_peak_bytes_per_sample": 0.0,
+            "flow_cfg_cache_divergence_sum": None,
+            "flow_cfg_cache_divergence_count": 0,
         }
         for strategy in strategies
     }
@@ -649,6 +1418,8 @@ def main():
     batches_seen = 0
     batches_with_complete_spans = 0
     selected_span_batches = 0
+    local_noise_manifest_records: list[dict[str, object]] = []
+    local_eval_sample_manifest_records: list[dict[str, object]] = []
     first_batch_debug = None
     first_complete_span_debug = None
     iterator = tqdm(loader, desc="single-stream FID/IS", dynamic_ncols=True, disable=not progress)
@@ -700,8 +1471,33 @@ def main():
         spans = selected
         selected_span_batches += 1
 
+        initial_noise_bank = None
+        if canonical_pairing_enabled:
+            initial_noise_bank, noise_records = build_canonical_initial_noise_bank(
+                selected_global_indices,
+                evaluation_seed=int(args.seed),
+            )
+            local_noise_manifest_records.extend(noise_records)
+            local_eval_sample_manifest_records.extend(
+                ordered_eval_sample_records(
+                    loader.dataset,
+                    batch_offset=batch_offset,
+                    spans=spans,
+                    global_sample_indices=selected_global_indices,
+                )
+            )
+
         target_latents = span_latents_to_chw(image_latents, spans, side)
-        target_images = metric_images(decode_latents(vae, target_latents.float(), scaling_factor))
+        decoded_target_images = decode_latents(
+            vae,
+            target_latents.float(),
+            scaling_factor,
+        )
+        require_finite_metric_tensor(
+            decoded_target_images,
+            label=f"decoded_target_images.rank{rank}.batch{batch_idx}",
+        )
+        target_images = metric_images(decoded_target_images)
         if shared_real_payload is not None:
             real_images = None
         elif args.real_source == "imagenet_original":
@@ -710,7 +1506,15 @@ def main():
         else:
             real_images = target_images
         if real_moments is not None:
+            require_finite_metric_tensor(
+                real_images,
+                label=f"real_images.rank{rank}.batch{batch_idx}",
+            )
             real_features, _ = extract_inception_features(inception, real_images)
+            require_finite_metric_tensor(
+                real_features,
+                label=f"real_features.rank{rank}.batch{batch_idx}",
+            )
             real_moments.update(real_features)
         if args.save_images:
             save_indexed_images(target_images.cpu(), out_dir / "target_decoded", selected_global_indices)
@@ -719,12 +1523,16 @@ def main():
 
         for strategy_idx, strategy in enumerate(strategies):
             torch.manual_seed(int(args.seed) + batch_idx * 1009 + strategy_idx * 131071 + rank * 1_000_003)
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            generation_started = time.perf_counter()
             single_latents, trace = model.sample_image_latents_single_stream(
                 input_ids=input_ids,
                 token_types=token_types,
                 sigma=sigma,
                 spans=spans,
                 image_latent_dim=image_latents.shape[-1],
+                initial_noise_bank=initial_noise_bank,
                 flow_temperature=float(args.temperature),
                 flow_cfg=float(args.cfg),
                 flow_cfg_schedule=str(args.cfg_schedule),
@@ -732,12 +1540,42 @@ def main():
                 parallel_rate=int(args.parallel_rate),
                 order_strategy=str(strategy),
                 return_trace=True,
+                debug_finite=bool(args.debug_finite_generation),
             )
-            generated_images = metric_images(decode_latents(vae, single_latents.float(), scaling_factor))
+            require_finite_generated_latents(
+                single_latents,
+                strategy=str(strategy),
+                rank=rank,
+                batch_idx=batch_idx,
+                global_indices=selected_global_indices,
+            )
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            generation_elapsed = time.perf_counter() - generation_started
+            decoded_generated_images = decode_latents(
+                vae,
+                single_latents.float(),
+                scaling_factor,
+            )
+            require_finite_metric_tensor(
+                decoded_generated_images,
+                label=(
+                    f"decoded_generated_images.{strategy}.rank{rank}.batch{batch_idx}"
+                ),
+            )
+            generated_images = metric_images(decoded_generated_images)
             state = metrics[strategy]
             fake_features, fake_logits = extract_inception_features(
                 inception,
                 generated_images,
+            )
+            require_finite_metric_tensor(
+                fake_features,
+                label=f"fake_features.{strategy}.rank{rank}.batch{batch_idx}",
+            )
+            require_finite_metric_tensor(
+                fake_logits,
+                label=f"fake_logits.{strategy}.rank{rank}.batch{batch_idx}",
             )
             state["fake_moments"].update(fake_features)
             if state["score_moments"] is None:
@@ -755,8 +1593,31 @@ def main():
             state["latent_mse_sum"] += float(F.mse_loss(single_latents.float(), target_latents.float()).item()) * count
             state["latent_rms_sum"] += float(single_latents.float().pow(2).mean().sqrt().item()) * count
             state["count"] += count
+            state["generation_wall_seconds"] += generation_elapsed
             if trace and isinstance(trace.get("generation_step"), torch.Tensor):
                 state["generation_step_max"] = float(trace["generation_step"].float().max().item())
+            if trace:
+                state["flow_content_cache_peak_bytes_per_sample"] = max(
+                    float(state["flow_content_cache_peak_bytes_per_sample"]),
+                    float(
+                        trace.get(
+                            "flow_content_cache_peak_bytes_per_sample", 0
+                        )
+                    ),
+                )
+                cache_divergence = trace.get(
+                    "flow_cfg_content_cache_divergence_by_layer"
+                )
+                if isinstance(cache_divergence, list):
+                    if state["flow_cfg_cache_divergence_sum"] is None:
+                        state["flow_cfg_cache_divergence_sum"] = [
+                            0.0
+                        ] * len(cache_divergence)
+                    for layer_idx, value in enumerate(cache_divergence):
+                        state["flow_cfg_cache_divergence_sum"][layer_idx] += (
+                            float(value) * count
+                        )
+                    state["flow_cfg_cache_divergence_count"] += count
             if args.save_images:
                 save_indexed_images(generated_images.cpu(), out_dir / str(strategy), selected_global_indices)
 
@@ -802,6 +1663,16 @@ def main():
             f"found {total_generated}. Debug: "
             + json.dumps(debug, sort_keys=True)
         )
+
+    pairing_manifests = None
+    if canonical_pairing_enabled:
+        pairing_manifests = evaluation_pairing_manifest_hashes(
+            local_noise_records=local_noise_manifest_records,
+            local_sample_records=local_eval_sample_manifest_records,
+            evaluation_seed=int(args.seed),
+            expected_samples=int(args.samples),
+        )
+    guidance_diagnostics = {}
 
     if real_moments is not None:
         real_moments.all_reduce_()
@@ -859,16 +1730,79 @@ def main():
         device,
     )
 
+    backbone = image_backbone_spec(config.model.image_backbone_variant)
     results = {
         "official_protocol": official_protocol,
+        "implementation_contracts": {
+            "evaluator_rng_contract": EVALUATOR_RNG_CONTRACT,
+            "evaluator_rng_contract_sha256": EVALUATOR_RNG_CONTRACT_SHA256,
+            "canonical_initial_noise_enabled": bool(canonical_pairing_enabled),
+            **(pairing_manifests or {}),
+        },
         "metric_protocol": {
             "fid_reducer": "symmetric_eigendecomposition",
             "is_split_assignment": "contiguous_by_global_sample_index",
             "is_std": "population",
             "is_splits": int(args.is_splits),
         },
+        "mechanism_diagnostics": {
+            "conditional_unconditional_velocity_delta_rms_by_context": (
+                guidance_diagnostics
+            ),
+            "generated_latent_finite_rate": 1.0,
+        },
         "config": args.config,
         "model_path": str(config.model.model_path),
+        "training_protocol": training_protocol,
+        "architecture": {
+            "ablation_id": str(config.experiment.get("ablation_id", "")) or None,
+            "parent_ablation_id": (
+                str(config.experiment.get("parent_ablation_id", "")) or None
+            ),
+            "image_backbone_variant": backbone.variant,
+            "image_rope": "row_col_2d",
+            "image_layout": (
+                f"{int(side)}x{int(side)}x{int(config.model.image_latent_dim)}"
+            ),
+            "image_grid_side": int(side),
+            "image_tokens_per_img": int(image_tokens),
+            "image_latent_dim": int(config.model.image_latent_dim),
+            "padded_sequence_length": int(config.dataset.params.pad_to_length),
+            "flow_head": {
+                "arch": str(config.model.get("image_flow_head_arch", "contextual")),
+                "variant": str(
+                    config.model.get("image_flow_head_variant", "DF1")
+                ),
+                "depth": int(config.model.get("image_flow_depth", 8)),
+                "width": int(config.model.get("image_flow_width", 1280)),
+                "mlp_ratio": float(config.model.get("image_flow_mlp_ratio", 1.0)),
+                "latent_mixer_heads": int(
+                    config.model.get("image_flow_latent_mixer_heads", 8)
+                ),
+                "latent_mixer_dropout": float(
+                    config.model.get("image_flow_latent_mixer_dropout", 0.0)
+                ),
+                "zero_init_gate": bool(
+                    config.model.get("image_flow_latent_mixer_zero_init_gate", True)
+                ),
+                "position_contract": (
+                    model.image_flow_head.net.position_contract()
+                    if hasattr(model.image_flow_head.net, "position_contract")
+                    else None
+                ),
+                "cache_contract": (
+                    model.image_flow_head.net.cache_contract()
+                    if hasattr(model.image_flow_head.net, "cache_contract")
+                    else None
+                ),
+            },
+        },
+        "parameters": {
+            "total": int(total_parameter_count),
+            "trainable": int(trainable_parameter_count),
+            "image_embedder": int(image_embedder_parameter_count),
+            "flow_head": int(flow_head_parameter_count),
+        },
         "precision_protocol": {
             "schema": "flow_eval_precision_v1",
             "model_dtype": str(args.model_dtype),
@@ -939,6 +1873,27 @@ def main():
         global_latent_mse_sum = reduce_sum(state["latent_mse_sum"], device)
         global_latent_rms_sum = reduce_sum(state["latent_rms_sum"], device)
         global_generation_step_max = reduce_max(state.get("generation_step_max"), device)
+        global_generation_wall_seconds = reduce_max(
+            state.get("generation_wall_seconds"),
+            device,
+        )
+        global_flow_cache_peak_bytes = reduce_max(
+            state.get("flow_content_cache_peak_bytes_per_sample", 0.0),
+            device,
+        )
+        local_cache_divergence = state.get("flow_cfg_cache_divergence_sum")
+        global_cache_divergence = (
+            [
+                reduce_sum(value, device)
+                for value in local_cache_divergence
+            ]
+            if isinstance(local_cache_divergence, list)
+            else None
+        )
+        global_cache_divergence_count = reduce_sum(
+            float(state.get("flow_cfg_cache_divergence_count", 0)),
+            device,
+        )
         if global_count != int(args.samples):
             raise RuntimeError(
                 f"strategy={strategy!r} generated count={global_count}; "
@@ -957,21 +1912,70 @@ def main():
                 else None
             )
             is_mean, is_std, is_per_split = state["score_moments"].compute()
+            fid_metric = (
+                require_finite_metric_scalar(
+                    fid_value,
+                    label=f"strategies.{strategy}.fid",
+                )
+                if fid_value is not None
+                else None
+            )
+            is_metric = require_finite_metric_scalar(
+                is_mean,
+                label=f"strategies.{strategy}.inception_score_mean",
+            )
+            is_std_metric = require_finite_metric_scalar(
+                is_std,
+                label=f"strategies.{strategy}.inception_score_std",
+            )
+            is_split_metrics = [
+                require_finite_metric_scalar(
+                    value,
+                    label=f"strategies.{strategy}.inception_score_splits[{index}]",
+                )
+                for index, value in enumerate(is_per_split)
+            ]
+            latent_mse_metric = require_finite_metric_scalar(
+                global_latent_mse_sum / global_count,
+                label=f"strategies.{strategy}.latent_mse_to_target",
+            )
+            latent_rms_metric = require_finite_metric_scalar(
+                global_latent_rms_sum / global_count,
+                label=f"strategies.{strategy}.latent_rms",
+            )
+            wall_metric = require_finite_metric_scalar(
+                global_generation_wall_seconds,
+                label=f"strategies.{strategy}.generation_wall_seconds",
+            )
+            if wall_metric <= 0.0:
+                raise FloatingPointError(
+                    f"formal evaluation wall time must be positive, got {wall_metric}"
+                )
             results["strategies"][strategy] = {
                 "count": int(global_count),
-                "fid": (
-                    finite_or_none(fid_value)
-                    if fid_value is not None
+                "fid": fid_metric,
+                "inception_score_mean": is_metric,
+                "inception_score_std": is_std_metric,
+                "inception_score_splits": is_split_metrics,
+                "latent_mse_to_target": latent_mse_metric,
+                "latent_rms": latent_rms_metric,
+                "generation_step_max": global_generation_step_max,
+                "generation_wall_seconds": wall_metric,
+                "generation_samples_per_second": global_count / wall_metric,
+                "flow_content_cache_peak_bytes_per_sample": int(
+                    global_flow_cache_peak_bytes
+                ),
+                "flow_content_cache_peak_mib_per_sample": (
+                    global_flow_cache_peak_bytes / (1024.0 * 1024.0)
+                ),
+                "flow_cfg_content_cache_divergence_by_layer": (
+                    [
+                        value / max(global_cache_divergence_count, 1.0)
+                        for value in global_cache_divergence
+                    ]
+                    if global_cache_divergence is not None
                     else None
                 ),
-                "inception_score_mean": finite_or_none(is_mean),
-                "inception_score_std": finite_or_none(is_std),
-                "inception_score_splits": [
-                    finite_or_none(value) for value in is_per_split
-                ],
-                "latent_mse_to_target": global_latent_mse_sum / global_count,
-                "latent_rms": global_latent_rms_sum / global_count,
-                "generation_step_max": global_generation_step_max,
             }
 
     if is_main_process(rank):

@@ -199,11 +199,75 @@ def test_reinitialize_image_modules_resets_random_image_weights():
     )
 
 
+def test_confirmation_module_keyed_initialization_ignores_prior_rng_consumption():
+    first = Qwen3ForCausalLM(tiny_qwen3_config())
+    second = Qwen3ForCausalLM(tiny_qwen3_config())
+    confirmation = OmegaConf.create(
+        {
+            "experiment": {"ablation_phase": "confirmation"},
+            "training": {"seed": 43},
+            "model": {"reinitialize_image_modules": True},
+        }
+    )
+
+    torch.manual_seed(1)
+    torch.rand(1000)
+    assert _reinitialize_image_modules(first, confirmation)
+    torch.manual_seed(999)
+    torch.rand(17)
+    assert _reinitialize_image_modules(second, confirmation)
+
+    first_state = {
+        name: value
+        for name, value in first.named_parameters()
+        if name.startswith(
+            ("image_flow_head.", "image_flow_condition_proj.", "image_token_embedder.")
+        )
+    }
+    second_state = {
+        name: value
+        for name, value in second.named_parameters()
+        if name.startswith(
+            ("image_flow_head.", "image_flow_condition_proj.", "image_token_embedder.")
+        )
+    }
+    assert first_state.keys() == second_state.keys()
+    for name in first_state:
+        assert torch.equal(first_state[name], second_state[name]), name
+
+
+def test_confirmation_common_projector_initialization_is_paired_across_layouts():
+    unpacked_config = tiny_qwen3_config()
+    packed_config = tiny_qwen3_config()
+    packed_config.image_latent_dim = 16
+    packed_config.image_tokens_per_img = 1
+    unpacked = Qwen3ForCausalLM(unpacked_config)
+    packed = Qwen3ForCausalLM(packed_config)
+    confirmation = OmegaConf.create(
+        {
+            "experiment": {"ablation_phase": "confirmation"},
+            "training": {"seed": 44},
+            "model": {"reinitialize_image_modules": True},
+        }
+    )
+    _reinitialize_image_modules(unpacked, confirmation)
+    _reinitialize_image_modules(packed, confirmation)
+    assert torch.equal(
+        unpacked.image_flow_condition_proj.weight,
+        packed.image_flow_condition_proj.weight,
+    )
+    assert torch.equal(
+        unpacked.image_flow_condition_proj.bias,
+        packed.image_flow_condition_proj.bias,
+    )
+
+
 def test_image_token_embedder_uses_fixed_2d_sincos_positions():
     embedder = ImageTokenEmbedder(latent_dim=4, hidden_size=8, image_tokens_per_img=4)
     state_keys = set(embedder.state_dict().keys())
 
     assert "image_pos_embed.weight" not in state_keys
+    assert "image_stage_embed" not in state_keys
     assert "flow_pos_embed" not in state_keys
     assert embedder.image_pos_embed.shape == (4, 8)
 
@@ -259,6 +323,7 @@ def test_balanced_pos_gain_scales_image_pos():
         image_tokens_per_img=4,
         init_mode="balanced",
         latent_rms=1.0,
+        backbone_variant="E2b-Q0",
     )
     positions = torch.arange(4)
     zeros_latent = torch.zeros(4, 4)

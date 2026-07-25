@@ -1,0 +1,37 @@
+{
+  "schema": "selfless_flow_image_mask_position_legacy_q1_equivalence_v1",
+  "historical_implementation": {
+    "git_blob": "00d1215378daa7d37657e86a5912666668ed9956",
+    "path": "models/modeling_model/modeling_selfless_flow.py",
+    "raw_sha256": "cfd4056dff1e51478165fe46f21d28a4310f779193500efc3011e13c6e2bb164",
+    "size_bytes": 133356,
+    "runtime_source_manifest_sha256": "c1568c6aac70a442092901716a0220cc0bbf998b0a95c88d673a4e9fa8e05048"
+  },
+  "q0_registered_implementation": {
+    "git_blob": "a3ca758658681aa10d499df3d182584f1be77202",
+    "path": "models/modeling_model/modeling_selfless_flow.py",
+    "raw_sha256": "41e845cd5375f50edb6733985763dd81d006c8d9816a4abc14fb143c50e7fd92",
+    "size_bytes": 134243,
+    "runtime_source_manifest_sha256": "5be769a7f2f5d01b3749844caec79044d135db0f5f54be3cfc4328aad72b0f04"
+  },
+  "diff_evidence": {
+    "classification": "q1_semantics_preserving_mask_mode_gate_only",
+    "changed_lines": 48,
+    "insertions": 34,
+    "deletions": 14,
+    "legacy_behavior": "unconditional_position_lookup_and_add",
+    "q1_behavior": "the_same_position_lookup_and_add_guarded_by_additive_2d",
+    "missing_field_default": "additive_2d"
+  },
+  "bitwise_regression": {
+    "nodeid": "tests/test_image_mask_position_mode.py::test_legacy_and_explicit_q1_are_bitwise_identical_for_mask_x0_and_xt",
+    "test_file_sha256": "f8080e05dc4c4c1e147a6524ed1ec5b39fa567c837d0e53f8dfab5e2ffd2c66c"
+  },
+  "claims": {
+    "effective_mask_position_mode": "additive_2d",
+    "formal_q_factor": false,
+    "post_hoc_amendment": true,
+    "same_source_training_with_q0": false
+  },
+  "report_sha256": "cf979c11d3df5bb8cca14d4858e87538307882c469464c4085acde2657cedbe8"
+}
