@@ -4,7 +4,9 @@ Status: **completed and archived**
 
 Final runtime set: **E2-Q1 / E2-Q0 / E2b-Q0**
 
-Default for new training: **E2-Q1**
+Standalone-backbone historical default: **E2-Q1**
+
+Current joint-system default: **E2-Q0 + DF1-FH4**
 
 Last updated: 2026-07-23
 
@@ -15,7 +17,7 @@ Backbone 消融已经收敛。代码、配置和后续实验只允许以下三�
 
 | Variant | Observed latent additive 2D position | Mask-query additive 2D position | Image RoPE | 角色 |
 | --- | ---: | ---: | --- | --- |
-| **E2-Q1** | 无 | 有 | row/column 2D | **默认**；复用旧 E2 的三 seed 结果 |
+| **E2-Q1** | 无 | 有 | row/column 2D | **本轮历史默认**；复用旧 E2 的三 seed 结果 |
 | **E2-Q0** | 无 | 无 | row/column 2D | 简洁性 control |
 | **E2b-Q0** | 有 | 无 | row/column 2D | observed-position control；三者中 IS 最高 |
 
@@ -27,17 +29,28 @@ Backbone 消融已经收敛。代码、配置和后续实验只允许以下三�
 - 直接使用 square latent token grid；
 - 使用同一 contextual flow head 架构和训练/评测协议。
 
-新训练默认 `E2-Q1`。以后 caption、flow head、noise、sampling 等其他消融只能在
-这三个 backbone 上进行，不再自由组合 position/stage/layout 开关。
-下一轮 flow-head architecture 实验定义在
+本轮独立 backbone 消融当时默认 `E2-Q1`。后续 matched `3×2` joint screen 已在
+`DF1-FH0/FH4` 上重新训练三个 runtime backbone，并把新训练默认更新为
+`E2-Q0 + DF1-FH4`。以后 caption、noise、sampling 等其他消融以该 joint-system
+默认开始；backbone 仍只能从这三个离散接口中选择，不再自由组合
+position/stage/layout 开关。
+随后完成的 flow-head architecture 实验定义在
 [`SELFLESS_FLOW_DUAL_STREAM_FLOW_HEAD_ABLATION_PROPOSAL.md`](SELFLESS_FLOW_DUAL_STREAM_FLOW_HEAD_ABLATION_PROPOSAL.md)，
-其主矩阵固定使用 `E2-Q1`。
+其当时的主矩阵固定使用 `E2-Q1`。
+
+最终联合决定见
+[`SELFLESS_FLOW_BACKBONE_FLOW_HEAD_JOINT_ABLATION.md`](SELFLESS_FLOW_BACKBONE_FLOW_HEAD_JOINT_ABLATION.md)；
+其中的 system-level 结论 supersede 本文的独立 backbone 默认，但不改变本文历史数据。
 
 旧 Q1 不重新训练：`E2-Q1` 直接复用旧 `E2` 的 seeds 43/44/45。历史上误启动的
 fresh Q1 作业已停止，不进入任何汇总。`E2b-Q1` 仅作为历史 Q1 control 留在原始证据
 中，不是受支持的 runtime variant。
 
-## 2. 为什么最终默认 E2-Q1
+2026-07-26 归档收紧时，4 个既无 final model 也无 metrics 的已停止运行被裁剪；
+其配置、provenance、日志、验证记录与 checkpoint metadata 保留在
+`output/image_backbone_ablation/evidence/pruned_partial_runs/`，完整运行未改动。
+
+## 2. 为什么本轮独立消融当时默认 E2-Q1
 
 需要区分两个层次的结论：
 
@@ -196,7 +209,7 @@ Q0 与 reused Q1 来自冻结的不同 source revision，因此这两个差值�
 
 ```yaml
 model:
-  image_backbone_variant: "E2-Q1"  # E2-Q1 | E2-Q0 | E2b-Q0
+  image_backbone_variant: "E2-Q0"  # current default; E2-Q1 | E2-Q0 | E2b-Q0
 ```
 
 旧 checkpoint 兼容只允许三种精确映射：

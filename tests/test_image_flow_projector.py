@@ -40,7 +40,8 @@ def test_image_projectors_use_normal_init_with_nextstep_mlp_ratio():
     assert model.image_token_embedder.init_mode == "balanced"
     assert not hasattr(model.image_token_embedder, "z_proj_ln")
     assert not any("z_proj_ln" in name for name in model.state_dict())
-    assert isinstance(model.image_token_embedder.image_pos_gain, torch.nn.Parameter)
+    assert model.image_token_embedder.backbone_variant == "E2-Q0"
+    assert model.image_token_embedder.image_pos_gain is None
     assert isinstance(model.image_flow_condition_proj, torch.nn.Linear)
     assert not torch.allclose(model.image_token_embedder.z_proj.weight, torch.zeros_like(model.image_token_embedder.z_proj.weight))
     assert not torch.allclose(model.image_flow_condition_proj.weight, torch.eye(config.hidden_size))
@@ -72,7 +73,8 @@ def test_default_image_token_embedder_uses_balanced_init_without_post_norm():
 
     assert embedder.init_mode == "balanced"
     assert not hasattr(embedder, "z_proj_ln")
-    assert isinstance(embedder.image_pos_gain, torch.nn.Parameter)
+    assert embedder.backbone_variant == "E2-Q0"
+    assert embedder.image_pos_gain is None
 
 
 def test_image_flow_mlp_ratio_can_widen_resblocks():
@@ -294,6 +296,7 @@ def test_image_token_embedder_rebuilds_fixed_positions_on_reset():
 
 def test_image_token_embedder_uses_balanced_pos_gain_init():
     config = tiny_qwen3_config()
+    config.image_backbone_variant = "E2-Q1"
     config.image_token_embedder_init_mode = "balanced"
     config.image_token_embedder_latent_rms = 1.0
     model = Qwen3ForCausalLM(config)
@@ -374,6 +377,7 @@ def test_legacy_flow_pos_embed_key_is_unexpected():
 
 def test_balanced_image_pos_gain_round_trips_with_pretrained_save():
     config = tiny_qwen3_config()
+    config.image_backbone_variant = "E2-Q1"
     config.image_token_embedder_init_mode = "balanced"
     config.image_token_embedder_latent_rms = 1.0
     model = Qwen3ForCausalLM(config)

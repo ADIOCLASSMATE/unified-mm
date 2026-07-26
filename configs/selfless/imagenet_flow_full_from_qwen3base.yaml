@@ -42,7 +42,7 @@ model:
     continuous_image_latents: true
     image_tokens_per_img: 256
     image_latent_dim: 16
-    image_backbone_variant: "E2-Q1"
+    image_backbone_variant: "E2-Q0"
     image_token_embedder_init_mode: "balanced"
     image_token_embedder_latent_rms: 1.0
     image_generation_head_type: "flow"
@@ -63,7 +63,7 @@ model:
     image_flow_latent_mixer_heads: 8
     image_flow_latent_mixer_dropout: 0.0
     image_flow_latent_mixer_zero_init_gate: true
-    image_flow_position_variant: "FH0"
+    image_flow_position_variant: "FH4"
     image_flow_rope_axis_dims: [80, 80]
     image_flow_rope_rotate_value: false
     image_input_noise_strength: 1.0e-2

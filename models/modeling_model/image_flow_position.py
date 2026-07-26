@@ -46,7 +46,7 @@ FLOW_HEAD_POSITION_SPECS = {
 }
 SUPPORTED_FLOW_HEAD_POSITION_VARIANTS = tuple(FLOW_HEAD_POSITION_SPECS)
 BASELINE_FLOW_HEAD_POSITION_VARIANTS = SUPPORTED_FLOW_HEAD_POSITION_VARIANTS
-DEFAULT_FLOW_HEAD_POSITION_VARIANT = "FH0"
+DEFAULT_FLOW_HEAD_POSITION_VARIANT = "FH4"
 
 _SPEC_BY_MODES = {
     (
@@ -197,10 +197,10 @@ def resolve_model_flow_head_position(
         return None, None
 
     head_dim = _head_dim(model_config)
-    # Legacy/third-party additive-only configs may use toy head dimensions that
-    # cannot be split into two non-empty rotary axes.  Preserve that inactive
-    # FH0 path, while every explicitly declared FH contract (and every RoPE
-    # system) remains subject to the strict dimension validator below.
+    # Legacy/third-party toy configs may use head dimensions that cannot be
+    # split into two non-empty rotary axes. Preserve their implicit FH0
+    # compatibility path; the production-sized implicit default and every
+    # explicit position contract still use the selected baseline below.
     explicit_position_contract = bool(present)
     axis_dims = (
         validate_flow_rope_axis_dims(
@@ -282,7 +282,12 @@ def resolve_model_flow_head_position(
                 f"system: {modes}."
             )
     else:
-        spec = FLOW_HEAD_POSITION_SPECS[DEFAULT_FLOW_HEAD_POSITION_VARIANT]
+        implicit_variant = (
+            DEFAULT_FLOW_HEAD_POSITION_VARIANT
+            if axis_dims is not None
+            else "FH0"
+        )
+        spec = FLOW_HEAD_POSITION_SPECS[implicit_variant]
 
     if spec.uses_rope and axis_dims is None:
         raise ValueError(

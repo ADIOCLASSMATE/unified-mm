@@ -214,15 +214,27 @@ architecture `DF1` and exposes only two complete position contracts:
 | **DF1-FH0** | additive query/content; no flow-head RoPE | **23.5699** | **64.7787** |
 | **DF1-FH4** | no additive position; row/column 2D RoPE | **23.0230** | **64.6608** |
 
-`DF1-FH0` is the default and `DF1-FH4` is the pure-RoPE alternative. All other
-architecture/position cells are historical evidence rather than runtime
-options.
+The subsequent fresh seed-42 `3×2` backbone × flow-position screen produced:
+
+| Backbone | DF1-FH0 FID / IS | DF1-FH4 FID / IS |
+| --- | ---: | ---: |
+| `E2-Q1` | 23.6951 / 63.1674 | **22.9488** / 64.1835 |
+| `E2-Q0` | 23.3717 / 63.9328 | **23.0140 / 64.9737** |
+| `E2b-Q0` | 23.6768 / 64.1476 | 23.0166 / 64.8187 |
+
+All three FH4 cells entered the preregistered quality-noninferior set. The
+conceptual/scaling tie-break therefore selected **`E2-Q0 + DF1-FH4`** as the
+current default: no additive absolute image positions in either tower, with
+row/column 2D RoPE in both attention stacks. FH0 remains a runtime option and
+the faster implementation reference.
 
 The active contract is documented in
 [`SELFLESS_FLOW_HEAD_BASELINE.md`](SELFLESS_FLOW_HEAD_BASELINE.md). Full
 matrices and artifacts are preserved in
 [`archive/SELFLESS_FLOW_DUAL_STREAM_FLOW_HEAD_ABLATION_PROPOSAL_HISTORICAL.md`](archive/SELFLESS_FLOW_DUAL_STREAM_FLOW_HEAD_ABLATION_PROPOSAL_HISTORICAL.md)
 and `output/flow_head_ablation/relocation_manifest.json`.
+The final joint decision and its six-cell evidence are documented in
+[`SELFLESS_FLOW_BACKBONE_FLOW_HEAD_JOINT_ABLATION.md`](SELFLESS_FLOW_BACKBONE_FLOW_HEAD_JOINT_ABLATION.md).
 
 ### EMA versus non-EMA diagnostic
 
@@ -288,15 +300,18 @@ output/selfless-flow-ablation-imagenet100-80ep/
   fid_is_nonema_cfg_local_bf16/cfg_3p0/metrics.json
   fid_is_nonema_cfg_local_bf16/cfg_4p0/metrics.json
 
-output/selfless-flow-token-mlp-ablation-imagenet100-80ep/
+output/flow_head_ablation/token_mlp_screen/runs/
+  selfless-flow-token-mlp-ablation-imagenet100-80ep/
   hf_model-final-ema/model.safetensors
   fid_is_selected_cfg3p5_ema/metrics.json
 
-output/selfless-flow-token-mlp-param-matched-ablation-imagenet100-80ep/
+output/flow_head_ablation/token_mlp_screen/runs/
+  selfless-flow-token-mlp-param-matched-ablation-imagenet100-80ep/
   hf_model-final-ema/model.safetensors
   fid_is_selected_cfg3p5_ema/metrics.json
 
-output/selfless-flow-token-mlp-width1936-ablation-imagenet100-80ep/
+output/flow_head_ablation/token_mlp_screen/runs/
+  selfless-flow-token-mlp-width1936-ablation-imagenet100-80ep/
   hf_model-final-ema/model.safetensors
   fid_is_selected_cfg3p5_ema/metrics.json
 

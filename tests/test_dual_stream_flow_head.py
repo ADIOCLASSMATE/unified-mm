@@ -8,6 +8,10 @@ import torch
 from models.modeling_model.image_flow_loss import FlowLoss
 from models.modeling_model.image_flow_position import FLOW_HEAD_POSITION_SPECS
 from models.modeling_model.modeling_selfless_flow import Qwen3ForCausalLM
+from pretrain.train_selfless_flow import (
+    _validation_flat_query_mixer_context,
+    _validation_sequence_mixer_context,
+)
 
 BASELINE_CELLS = (("DF1", "FH0"), ("DF1", "FH4"))
 
@@ -187,6 +191,63 @@ def test_shared_content_noise_is_sampled_once_and_reused():
     image_latents_for_model = shared
     context_image_latents_for_loss = shared.to(shared.device)
     assert image_latents_for_model is context_image_latents_for_loss
+
+
+def test_periodic_validation_supplies_df1_content_conditions():
+    torch.manual_seed(7)
+    target = torch.randn(4, 4)
+    conditions = torch.randn(4, 8)
+    sigma = torch.tensor([3.0, 0.0, 2.0, 1.0])
+    positions = torch.arange(4)
+
+    flat = _validation_flat_query_mixer_context(
+        target,
+        sigma,
+        positions,
+        conditions,
+    )
+    assert flat["context_conditions"].shape == (4, 4, 8)
+    for query_idx in range(4):
+        torch.testing.assert_close(
+            flat["context_conditions"][query_idx],
+            conditions,
+        )
+
+    for position in ("FH0", "FH4"):
+        sampled = _flow("DF1", position).eval().sample(
+            conditions,
+            num_steps=1,
+            **flat,
+        )
+        assert sampled.shape == target.shape
+        assert torch.isfinite(sampled).all()
+
+
+def test_periodic_validation_probe_context_preserves_token_conditions():
+    torch.manual_seed(8)
+    target = torch.randn(4, 4)
+    conditions = torch.randn(4, 8)
+    sigma = torch.tensor([3.0, 0.0, 2.0, 1.0])
+    positions = torch.arange(4)
+    sequence = _validation_sequence_mixer_context(
+        target,
+        sigma,
+        positions,
+        conditions,
+    )
+    assert sequence["context_conditions"].shape == (1, 4, 8)
+    torch.testing.assert_close(
+        sequence["context_conditions"][0],
+        conditions,
+    )
+    velocity = _flow("DF1", "FH4").eval().velocity(
+        torch.randn(1, 4, 4),
+        torch.full((1, 4), 0.5),
+        conditions.unsqueeze(0),
+        **sequence,
+    )
+    assert velocity.shape == (1, 4, 4)
+    assert torch.isfinite(velocity).all()
 
 
 @pytest.mark.parametrize("variant,position", BASELINE_CELLS)

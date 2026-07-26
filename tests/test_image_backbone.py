@@ -43,8 +43,8 @@ def _tiny_qwen_config(**overrides):
     return config
 
 
-def test_supported_backbones_are_closed_and_default_to_e2_q1():
-    assert DEFAULT_IMAGE_BACKBONE_VARIANT == "E2-Q1"
+def test_supported_backbones_are_closed_and_default_to_e2_q0():
+    assert DEFAULT_IMAGE_BACKBONE_VARIANT == "E2-Q0"
     assert SUPPORTED_IMAGE_BACKBONE_VARIANTS == ("E2-Q1", "E2-Q0", "E2b-Q0")
     assert {
         key: (spec.observed_position_mode, spec.mask_position_mode)

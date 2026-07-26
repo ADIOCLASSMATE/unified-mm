@@ -135,7 +135,7 @@ training:
     save_image_flow_adapter: true
 
 evaluation:
-    checkpoint: "output/selfless-flow-token-mlp-ablation-imagenet100-80ep/hf_model-final-ema"
+    checkpoint: "output/flow_head_ablation/token_mlp_screen/runs/selfless-flow-token-mlp-ablation-imagenet100-80ep/hf_model-final-ema"
     model_dtype: "bf16"
     samples: 10000
     batch_size: 512

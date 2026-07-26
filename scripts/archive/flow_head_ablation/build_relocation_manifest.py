@@ -12,6 +12,21 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 ARCHIVE_ROOT = REPO_ROOT / "output" / "flow_head_ablation"
 STATIC_ROOT = ARCHIVE_ROOT / "static_position_screen"
 DYNAMIC_ROOT = ARCHIVE_ROOT / "dynamic_dual_stream_screen"
+TOKEN_MLP_ROOT = ARCHIVE_ROOT / "token_mlp_screen"
+PRUNED_EVIDENCE_PATH = (
+    STATIC_ROOT
+    / "evidence"
+    / "pruned_partial_runs"
+    / "pruning_manifest_20260726.json"
+)
+PRUNED_STATIC_RUN_NAMES = (
+    "selfless-flow-fhpos-fh0-s43",
+    "selfless-flow-fhpos-fh0-s44",
+    "selfless-flow-fhpos-fh0-s45",
+    "selfless-flow-fhpos-fh1-s43",
+    "selfless-flow-fhpos-fh1-s44",
+    "selfless-flow-fhpos-fh1-s45",
+)
 FINAL_DECISION_PATH = DYNAMIC_ROOT / "evidence" / "final_decision.json"
 AMENDED_SUMMARY_PATH = (
     DYNAMIC_ROOT / "evidence" / "amended_quality_only_summary.json"
@@ -183,17 +198,24 @@ def main() -> None:
     dynamic_runs = sorted(
         path for path in (DYNAMIC_ROOT / "runs").iterdir() if path.is_dir()
     )
-    if len(static_runs) != 11:
+    token_mlp_runs = sorted(
+        path for path in (TOKEN_MLP_ROOT / "runs").iterdir() if path.is_dir()
+    )
+    if len(static_runs) != 5:
         raise RuntimeError(
-            f"Expected 11 archived static-position runs, found {len(static_runs)}"
+            f"Expected 5 retained static-position runs, found {len(static_runs)}"
         )
     if len(dynamic_runs) != 6:
         raise RuntimeError(
             f"Expected 6 archived dynamic runs, found {len(dynamic_runs)}"
         )
+    if len(token_mlp_runs) != 3:
+        raise RuntimeError(
+            f"Expected 3 archived token-MLP runs, found {len(token_mlp_runs)}"
+        )
 
     relocations = []
-    for run_dir in (*static_runs, *dynamic_runs):
+    for run_dir in (*static_runs, *dynamic_runs, *token_mlp_runs):
         relocations.append(
             {
                 "original": f"output/{run_dir.name}",
@@ -201,6 +223,16 @@ def main() -> None:
                 "kind": "run_directory",
             }
         )
+    relocations.extend(
+        {
+            "original": f"output/{run_name}",
+            "archived": relative(
+                STATIC_ROOT / "evidence" / "pruned_partial_runs" / run_name
+            ),
+            "kind": "pruned_run_evidence",
+        }
+        for run_name in PRUNED_STATIC_RUN_NAMES
+    )
     relocations.extend(
         [
             {
@@ -280,6 +312,7 @@ def main() -> None:
         / "evidence"
         / "dual_stream_flow_head_position_cuda_smoke.json",
         FINAL_DECISION_PATH,
+        PRUNED_EVIDENCE_PATH,
     ]
     for path in evidence_files:
         if not path.is_file():
@@ -310,12 +343,17 @@ def main() -> None:
     )
     static_inventory = directory_inventory(STATIC_ROOT)
     dynamic_inventory = directory_inventory(DYNAMIC_ROOT)
+    token_mlp_inventory = directory_inventory(TOKEN_MLP_ROOT)
     data_inventory = {
         "file_count": (
-            static_inventory["file_count"] + dynamic_inventory["file_count"]
+            static_inventory["file_count"]
+            + dynamic_inventory["file_count"]
+            + token_mlp_inventory["file_count"]
         ),
         "size_bytes": (
-            static_inventory["size_bytes"] + dynamic_inventory["size_bytes"]
+            static_inventory["size_bytes"]
+            + dynamic_inventory["size_bytes"]
+            + token_mlp_inventory["size_bytes"]
         ),
     }
 
@@ -326,7 +364,8 @@ def main() -> None:
             "raw_evidence_mutated": False,
             "recorded_legacy_paths_remain_inside_raw_evidence": True,
             "path_resolution": "apply relocations by longest matching original prefix",
-            "all_checkpoints_preserved": True,
+            "completed_run_checkpoints_preserved": True,
+            "stopped_partial_runs_pruned": True,
             "active_baseline_runs_are_archived_with_the_full_matrix": True,
             "sampling_efficiency_is_gate": False,
             "active_runtime_imports_archive": False,
@@ -334,6 +373,8 @@ def main() -> None:
         "counts": {
             "static_run_directories": len(static_runs),
             "dynamic_run_directories": len(dynamic_runs),
+            "token_mlp_run_directories": len(token_mlp_runs),
+            "pruned_partial_run_directories": len(PRUNED_STATIC_RUN_NAMES),
             "relocations": len(relocations),
             "archived_code_files": len(code_files),
             "archived_data_files": data_inventory["file_count"],
@@ -342,7 +383,10 @@ def main() -> None:
         "relocations": relocations,
         "evidence_files": [bind_file(path) for path in evidence_files],
         "code_files": [bind_file(path) for path in sorted(set(code_files))],
-        "run_bindings": [bind_run(path) for path in (*static_runs, *dynamic_runs)],
+        "run_bindings": [
+            bind_run(path)
+            for path in (*static_runs, *dynamic_runs, *token_mlp_runs)
+        ],
     }
     OUTPUT_PATH.write_text(
         json.dumps(payload, indent=2, sort_keys=True) + "\n",

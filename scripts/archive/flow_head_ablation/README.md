@@ -7,6 +7,12 @@ the exact runtime source snapshot used by the completed flow-head studies.
 Historical `DF0`, `DF2`, and `FH1/FH2/FH3` names in this tree are evidence, not
 supported configuration values.
 
+Completed token-only and parameter-matched MLP runs are consolidated under
+`output/flow_head_ablation/token_mlp_screen/`. Stopped static-position
+confirmation runs with no final model or metrics were pruned on 2026-07-26;
+their configs, provenance, logs, validation records, and checkpoint metadata
+remain under `static_position_screen/evidence/pruned_partial_runs/`.
+
 The active implementation supports only `DF1-FH0` and `DF1-FH4`; see
 `docs/SELFLESS_FLOW_HEAD_BASELINE.md`.
 

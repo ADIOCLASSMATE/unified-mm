@@ -226,10 +226,7 @@ def _special_token_ids(config):
 
 
 def _uses_paired_image_initialization(config) -> bool:
-    return (
-        is_confirmation_config(config)
-        or is_q_factor_config(config)
-    )
+    return is_confirmation_config(config) or is_q_factor_config(config)
 
 
 def _initialize_confirmation_special_tokens(model, config) -> None:
@@ -1705,6 +1702,73 @@ def _log_wandb_validation_images(accelerator, image_paths: dict[str, Path], glob
         accelerator.log(logs, step=global_step)
 
 
+def _validation_sequence_mixer_context(
+    target: torch.Tensor,
+    span_sigma: torch.Tensor,
+    local_positions: torch.Tensor,
+    conditions: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    sequence_length = target.shape[0]
+    if conditions.shape[0] != sequence_length:
+        raise ValueError(
+            "validation content conditions must align with target tokens, "
+            f"got target={tuple(target.shape)}, conditions={tuple(conditions.shape)}"
+        )
+    sigma_row = span_sigma.to(
+        device=target.device,
+        dtype=torch.float32,
+    ).unsqueeze(0)
+    positions = local_positions.to(
+        device=target.device,
+        dtype=torch.long,
+    ).unsqueeze(0)
+    return {
+        "context_latents": target.unsqueeze(0),
+        "context_mask": sigma_row.unsqueeze(1) < sigma_row.unsqueeze(2),
+        "query_positions": positions,
+        "context_positions": positions,
+        "context_conditions": conditions.to(device=target.device).unsqueeze(0),
+    }
+
+
+def _validation_flat_query_mixer_context(
+    target: torch.Tensor,
+    span_sigma: torch.Tensor,
+    local_positions: torch.Tensor,
+    conditions: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    query_count = target.shape[0]
+    if conditions.shape[0] != query_count:
+        raise ValueError(
+            "validation content conditions must align with target tokens, "
+            f"got target={tuple(target.shape)}, conditions={tuple(conditions.shape)}"
+        )
+    sigma_values = span_sigma.to(
+        device=target.device,
+        dtype=torch.float32,
+    )
+    positions = local_positions.to(
+        device=target.device,
+        dtype=torch.long,
+    )
+    return {
+        "context_latents": target.unsqueeze(0)
+        .expand(query_count, -1, -1)
+        .contiguous(),
+        "context_mask": (
+            sigma_values.unsqueeze(0) < sigma_values.unsqueeze(1)
+        ).unsqueeze(1),
+        "query_positions": positions,
+        "context_positions": positions.unsqueeze(0)
+        .expand(query_count, -1)
+        .contiguous(),
+        "context_conditions": conditions.to(device=target.device)
+        .unsqueeze(0)
+        .expand(query_count, -1, -1)
+        .contiguous(),
+    }
+
+
 @torch.no_grad()
 def _save_validation_flow_images(
     model,
@@ -1779,35 +1843,6 @@ def _save_validation_flow_images(
         target_latents = []
         selected_spans = spans[:sample_count]
 
-        def _sequence_mixer_context(
-            target: torch.Tensor,
-            span_sigma: torch.Tensor,
-            local_positions: torch.Tensor,
-        ) -> dict[str, torch.Tensor]:
-            sigma_row = span_sigma.to(device=target.device, dtype=torch.float32).unsqueeze(0)
-            positions = local_positions.to(device=target.device, dtype=torch.long).unsqueeze(0)
-            return {
-                "context_latents": target.unsqueeze(0),
-                "context_mask": sigma_row.unsqueeze(1) < sigma_row.unsqueeze(2),
-                "query_positions": positions,
-                "context_positions": positions,
-            }
-
-        def _flat_query_mixer_context(
-            target: torch.Tensor,
-            span_sigma: torch.Tensor,
-            local_positions: torch.Tensor,
-        ) -> dict[str, torch.Tensor]:
-            query_count = target.shape[0]
-            sigma_values = span_sigma.to(device=target.device, dtype=torch.float32)
-            positions = local_positions.to(device=target.device, dtype=torch.long)
-            return {
-                "context_latents": target.unsqueeze(0).expand(query_count, -1, -1).contiguous(),
-                "context_mask": (sigma_values.unsqueeze(0) < sigma_values.unsqueeze(1)).unsqueeze(1),
-                "query_positions": positions,
-                "context_positions": positions.unsqueeze(0).expand(query_count, -1).contiguous(),
-            }
-
         for b, start, end in selected_spans:
             local_positions = torch.arange(
                 end - start,
@@ -1826,10 +1861,20 @@ def _save_validation_flow_images(
                 cfg=1.0,
                 cfg_schedule="constant",
                 solver=flow_solver,
-                **_flat_query_mixer_context(target, span_sigma, local_positions),
+                **_validation_flat_query_mixer_context(
+                    target,
+                    span_sigma,
+                    local_positions,
+                    z,
+                ),
             )
             target = target.to(dtype=pred.dtype)
-            sequence_context = _sequence_mixer_context(target, span_sigma, local_positions)
+            sequence_context = _validation_sequence_mixer_context(
+                target,
+                span_sigma,
+                local_positions,
+                z,
+            )
             for time_value in probe_times:
                 t = torch.full(
                     (target.shape[0],),

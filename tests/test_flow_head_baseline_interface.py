@@ -2,6 +2,7 @@ import pytest
 from omegaconf import OmegaConf
 
 from models.modeling_model.image_flow_position import (
+    DEFAULT_FLOW_HEAD_POSITION_VARIANT,
     FLOW_HEAD_POSITION_SPECS,
     SUPPORTED_FLOW_HEAD_POSITION_VARIANTS,
     resolve_flow_head_position_config,
@@ -25,6 +26,7 @@ def _config(position: str):
 
 
 def test_active_position_interface_contains_only_the_two_df1_baselines():
+    assert DEFAULT_FLOW_HEAD_POSITION_VARIANT == "FH4"
     assert SUPPORTED_FLOW_HEAD_POSITION_VARIANTS == ("FH0", "FH4")
     assert {
         name: (
@@ -37,6 +39,14 @@ def test_active_position_interface_contains_only_the_two_df1_baselines():
         "FH0": ("additive_2d", "additive_2d", "none"),
         "FH4": ("none", "none", "row_col_2d"),
     }
+
+
+def test_production_sized_implicit_contract_defaults_to_fh4():
+    config = _config("FH4")
+    del config.model.image_flow_position_variant
+    spec, axis_dims = resolve_flow_head_position_config(config)
+    assert spec == FLOW_HEAD_POSITION_SPECS["FH4"]
+    assert axis_dims == (80, 80)
 
 
 @pytest.mark.parametrize("position", SUPPORTED_FLOW_HEAD_POSITION_VARIANTS)

@@ -13,7 +13,7 @@ only. It does not authorize implementation, training, or evaluation jobs.
    fully-from-scratch training 的优势？
 
 核心实验是一个 `caption payload × backbone initialization` 的 `2×2` factorial。
-四个 cell 固定 `image_backbone_variant=E2-Q1` 和默认 `DF1-FH0` flow head，只改变
+四个 cell 固定 `image_backbone_variant=E2-Q0` 和默认 `DF1-FH4` flow head，只改变
 条件文本与 Qwen backbone 初始化。最重要的统计量不是某个 cell 的单次 FID，而是
 caption 收益在 pretrained 与 scratch 下是否存在稳定 interaction。
 
@@ -24,7 +24,7 @@ caption 收益在 pretrained 与 scratch 下是否存在稳定 interaction。
 ```text
 Image-backbone ablation archive
     -> flow-head screens archived
-    -> freeze DF1-FH0 as the factorial baseline
+    -> freeze E2-Q0 + DF1-FH4 as the factorial baseline
     -> caption × initialization ablation
 ```
 
@@ -32,20 +32,20 @@ Image-backbone ablation archive
 
 1. [`SELFLESS_FLOW_IMAGE_TOKEN_EMBEDDER_ABLATION_PROPOSAL.md`](SELFLESS_FLOW_IMAGE_TOKEN_EMBEDDER_ABLATION_PROPOSAL.md)
    已归档结果，并把 runtime 收敛为 `E2-Q1 / E2-Q0 / E2b-Q0`；主实验固定默认
-   `E2-Q1`；
+   `E2-Q0`；
 2. [`SELFLESS_FLOW_HEAD_BASELINE.md`](SELFLESS_FLOW_HEAD_BASELINE.md)
    已固定 active runtime 为 `DF1-FH0 / DF1-FH4`，本 factorial 使用默认
-   `DF1-FH0`；
-3. `image_backbone_variant=E2-Q1`、flow-head architecture/position mode、
+   `DF1-FH4`；
+3. `image_backbone_variant=E2-Q0`、flow-head architecture/position mode、
    flow-head depth/width 和
    inference protocol 已写入 immutable architecture manifest；
 4. manifest 包含 config digest、代码 commit、选择指标、训练 seeds 和有效 checkpoint；
 5. 四个数据/初始化 cell 都从该 architecture manifest 构造，禁止为任一 cell 单独修改
    架构或 flow head。
 
-`E2-Q0` 和 `E2b-Q0` 只允许用于独立的 backbone-robustness replication；不能并入主
+`E2-Q1` 和 `E2b-Q0` 只允许用于独立的 backbone-robustness replication；不能并入主
 `2×2` 形成事后挑选。不得恢复 stage、S2D、sequence-1D image RoPE 或独立
-observed/mask-position 开关。`DF1-FH4` 同样只能作为单独、完整复制四个 cell 的
+observed/mask-position 开关。`DF1-FH0` 同样只能作为单独、完整复制四个 cell 的
 flow-head robustness replication，不能在主 `2×2` 内逐 cell 挑选。旧 E2-Q1 的
 backbone confirmation 不重训；这里的四个 cell 因为改变
 caption/initialization/data protocol，仍是新的正式训练。

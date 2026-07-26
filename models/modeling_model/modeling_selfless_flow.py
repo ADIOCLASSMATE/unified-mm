@@ -106,7 +106,7 @@ class ImageTokenEmbedder(nn.Module):
         initializer_range=0.02,
         init_mode="balanced",
         latent_rms=1.0,
-        backbone_variant="E2-Q1",
+        backbone_variant="E2-Q0",
     ):
         super().__init__()
         self.latent_dim = int(latent_dim)

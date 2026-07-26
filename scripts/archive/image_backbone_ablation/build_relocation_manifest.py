@@ -13,6 +13,17 @@ ARCHIVE_ROOT = REPO_ROOT / "output" / "image_backbone_ablation"
 RUNS_ROOT = ARCHIVE_ROOT / "runs"
 EVIDENCE_ROOT = ARCHIVE_ROOT / "evidence"
 OUTPUT_PATH = ARCHIVE_ROOT / "relocation_manifest.json"
+PRUNED_EVIDENCE_PATH = (
+    EVIDENCE_ROOT
+    / "pruned_partial_runs"
+    / "pruning_manifest_20260726.json"
+)
+PRUNED_RUN_NAMES = (
+    "selfless-flow-image-embedder-e6-seed44",
+    "selfless-flow-image-embedder-qf-e2-q1-seed43",
+    "selfless-flow-image-embedder-qf-e2-q1-seed44",
+    "selfless-flow-image-embedder-qf-e2-q1-seed45",
+)
 
 
 def sha256(path: Path) -> str:
@@ -39,8 +50,8 @@ def main() -> None:
     run_dirs = sorted(
         path for path in RUNS_ROOT.glob("selfless-flow-image-embedder-*") if path.is_dir()
     )
-    if len(run_dirs) != 47:
-        raise RuntimeError(f"Expected 47 archived run directories, found {len(run_dirs)}")
+    if len(run_dirs) != 43:
+        raise RuntimeError(f"Expected 43 retained run directories, found {len(run_dirs)}")
 
     relocations = [
         {
@@ -63,6 +74,16 @@ def main() -> None:
                 "kind": "evidence_directory",
             },
         ]
+    )
+    relocations.extend(
+        {
+            "original": f"output/{run_name}",
+            "archived": relative(
+                EVIDENCE_ROOT / "pruned_partial_runs" / run_name
+            ),
+            "kind": "pruned_run_evidence",
+        }
+        for run_name in PRUNED_RUN_NAMES
     )
 
     evidence_files = [
@@ -92,6 +113,7 @@ def main() -> None:
         / "configs"
         / "ablation"
         / "image_mask_position_q0_metrics_attestation_v1.json",
+        PRUNED_EVIDENCE_PATH,
     ]
     for path in evidence_files:
         if not path.is_file():
@@ -123,9 +145,12 @@ def main() -> None:
             "recorded_legacy_paths_remain_inside_raw_evidence": True,
             "path_resolution": "apply relocations by longest matching original prefix",
             "old_q1_training_reused_not_rerun": True,
+            "completed_run_artifacts_preserved": True,
+            "stopped_partial_runs_pruned": True,
         },
         "counts": {
             "run_directories": len(run_dirs),
+            "pruned_partial_run_directories": len(PRUNED_RUN_NAMES),
             "relocations": len(relocations),
         },
         "relocations": relocations,
