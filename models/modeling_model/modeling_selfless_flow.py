@@ -60,12 +60,7 @@ from .image_flow_loss import FlowLoss
 from .image_backbone import (
     CANONICAL_IMAGE_LATENT_DIM,
     CANONICAL_IMAGE_TOKENS,
-    image_backbone_spec,
-    resolve_model_image_backbone,
-)
-from .image_flow_position import resolve_model_flow_head_position
-from .image_position_utils import (
-    build_2d_sincos_position_embedding as _build_2d_sincos_position_embedding,
+    validate_model_image_layout,
 )
 from .image_position_utils import (
     build_row_col_position_ids,
@@ -104,96 +99,30 @@ class ImageTokenEmbedder(nn.Module):
         hidden_size,
         image_tokens_per_img=256,
         initializer_range=0.02,
-        init_mode="balanced",
-        latent_rms=1.0,
-        backbone_variant="E2-Q0",
     ):
         super().__init__()
         self.latent_dim = int(latent_dim)
         self.hidden_size = int(hidden_size)
         self.image_tokens_per_img = int(image_tokens_per_img)
         self.initializer_range = float(initializer_range)
-        self.init_mode = "balanced" if init_mode is None else str(init_mode).lower()
-        self.latent_rms = float(latent_rms)
-        spec = image_backbone_spec(backbone_variant)
-        self.backbone_variant = spec.variant
-        self.observed_position_mode = spec.observed_position_mode
-        self.mask_position_mode = spec.mask_position_mode
         self.z_proj = nn.Linear(self.latent_dim, self.hidden_size, bias=True)
-        pos_embed = torch.empty(self.image_tokens_per_img, self.hidden_size)
-        self.register_buffer("image_pos_embed", pos_embed.clone())
-        if self._uses_learned_image_pos_gain():
-            self.image_pos_gain = nn.Parameter(torch.ones(()))
-        else:
-            self.register_parameter("image_pos_gain", None)
         self.last_init_stats = None
         self._reset_parameters()
 
     def _reset_parameters(self):
-        self._reset_position_buffers()
-        weight_std = self.initializer_range
+        # Finalized pure-2D projection initialization.
+        weight_std = self.initializer_range / math.sqrt(
+            2.0 * float(self.latent_dim)
+        )
         init_stats = {
-            "init_mode": self.init_mode,
+            "init_mode": "pure_2d",
             "z_proj_weight_std": float(weight_std),
-            "image_pos_gain": None,
-            "latent_rms": float(self.latent_rms),
-            "backbone_variant": self.backbone_variant,
-            "observed_position_mode": self.observed_position_mode,
-            "mask_position_mode": self.mask_position_mode,
+            "additive_image_position": False,
         }
-        if self._uses_balanced_init():
-            latent_rms = max(float(self.latent_rms), 1e-6)
-            component_rms = self.initializer_range / math.sqrt(2.0)
-            weight_std = component_rms / (
-                math.sqrt(float(self.latent_dim)) * latent_rms
-            )
-            init_stats.update(
-                {
-                    "component_rms": float(component_rms),
-                    "z_proj_weight_std": float(weight_std),
-                    "latent_rms": float(latent_rms),
-                }
-            )
-            if self.image_pos_gain is not None:
-                if self.image_pos_embed.is_meta or self.image_pos_gain.is_meta:
-                    init_stats["image_pos_rms"] = None
-                    init_stats["image_pos_gain"] = None
-                else:
-                    image_pos_rms = (
-                        self.image_pos_embed.detach().float().pow(2).mean().sqrt()
-                    )
-                    pos_gain = 0.0
-                    if (
-                        torch.isfinite(image_pos_rms)
-                        and float(image_pos_rms.item()) > 0.0
-                    ):
-                        pos_gain = float(component_rms / float(image_pos_rms.item()))
-                    with torch.no_grad():
-                        self.image_pos_gain.fill_(pos_gain)
-                    init_stats["image_pos_rms"] = float(image_pos_rms.item())
-                    init_stats["image_pos_gain"] = float(pos_gain)
-        elif self.image_pos_gain is not None:
-            if self.image_pos_gain.is_meta:
-                init_stats["image_pos_gain"] = None
-            else:
-                with torch.no_grad():
-                    self.image_pos_gain.fill_(1.0)
-                init_stats["image_pos_gain"] = 1.0
 
         _normal_init_fp32_(self.z_proj.weight, mean=0.0, std=float(weight_std))
         nn.init.zeros_(self.z_proj.bias)
         self.last_init_stats = init_stats
-
-    def _reset_position_buffers(self):
-        device = self.z_proj.weight.device
-        if device.type == "meta":
-            device = None
-        pos_embed = _build_2d_sincos_position_embedding(
-            self.image_tokens_per_img,
-            self.hidden_size,
-            device=device,
-        )
-        self.image_pos_embed = pos_embed.clone()
 
     def _reset_image_slots(self):
         self._reset_parameters()
@@ -202,98 +131,23 @@ class ImageTokenEmbedder(nn.Module):
     def weight_dtype(self):
         return self.z_proj.weight.dtype
 
-    def _uses_balanced_init(self) -> bool:
-        if self.init_mode in {"default", "standard", "normal", ""}:
-            return False
-        if self.init_mode in {"balanced", "balanced_pos_gain", "initializer_range"}:
-            return True
-        raise ValueError(
-            f"Unknown image_token_embedder_init_mode={self.init_mode!r}; "
-            "expected default or balanced."
-        )
-
-    def _uses_learned_image_pos_gain(self) -> bool:
-        uses_additive_position = (
-            self.observed_position_mode == "additive_2d"
-            or self.mask_position_mode == "additive_2d"
-        )
-        return (
-            self.init_mode in {"balanced", "balanced_pos_gain", "initializer_range"}
-            and uses_additive_position
-        )
-
-    def _scale_image_pos(self, pos):
-        if self.image_pos_gain is None:
-            return pos
-        gain = self.image_pos_gain.to(device=pos.device, dtype=pos.dtype)
-        return pos * gain
-
-    def _positions(self, local_positions, device):
-        if local_positions is None:
-            return None
-        local_positions = local_positions.to(device=device, dtype=torch.long)
-        if local_positions.numel() > 0:
-            if (
-                int(local_positions.min().item()) < 0
-                or int(local_positions.max().item()) >= self.image_tokens_per_img
-            ):
-                raise ValueError(
-                    f"image local positions must be in [0, {self.image_tokens_per_img}), "
-                    f"got min={int(local_positions.min().item())}, max={int(local_positions.max().item())}"
-                )
-        return local_positions
-
-    def _lookup_pos_embed(
-        self, pos_embed: torch.Tensor, local_positions: torch.Tensor, dtype: torch.dtype
-    ) -> torch.Tensor:
-        flat_positions = local_positions.reshape(-1)
-        pos_embed = pos_embed.to(device=local_positions.device, dtype=dtype)
-        values = pos_embed.index_select(0, flat_positions)
-        return values.reshape(local_positions.shape + (self.hidden_size,))
-
-    def embed_latents(self, latents, local_positions=None):
+    def embed_latents(self, latents):
         x = latents.to(dtype=self.z_proj.weight.dtype)
-        x = self.z_proj(x)
-        local_positions = self._positions(local_positions, x.device)
-        if local_positions is not None and self.observed_position_mode == "additive_2d":
-            pos = self._lookup_pos_embed(self.image_pos_embed, local_positions, x.dtype)
-            x = x + self._scale_image_pos(pos)
-        return x
+        return self.z_proj(x)
 
     def embed_mask(
         self,
-        local_positions,
+        shape,
         mask_embedding,
         *,
         debug_finite: bool = False,
         debug_label: str = "",
     ):
-        local_positions = self._positions(local_positions, mask_embedding.device)
-        if local_positions is None:
-            raise ValueError(
-                "local_positions must be provided when embedding image mask tokens."
-            )
         x = mask_embedding.to(dtype=self.z_proj.weight.dtype)
-        x = x.expand(local_positions.shape + (x.shape[-1],))
-        if self.mask_position_mode == "additive_2d":
-            pos = self._lookup_pos_embed(self.image_pos_embed, local_positions, x.dtype)
-            _debug_require_finite_tensor(
-                debug_finite,
-                debug_label,
-                "image_mask_embed.position_lookup",
-                pos,
-            )
-            x = x + self._scale_image_pos(pos)
-            _debug_require_finite_tensor(
-                debug_finite,
-                debug_label,
-                "image_mask_embed.mask_plus_position",
-                x,
-            )
-        return x
+        return x.expand(tuple(shape) + (x.shape[-1],))
 
-    def forward(self, latents, local_positions=None):
-        return self.embed_latents(latents, local_positions=local_positions)
+    def forward(self, latents):
+        return self.embed_latents(latents)
 
 
 def _compute_default_rope_parameters(config: Qwen3Config, device=None):
@@ -559,6 +413,18 @@ class Qwen3Attention(nn.Module):
         )
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
+        gate_mode = str(
+            getattr(config, "backbone_attention_output_gate", "none")
+        ).strip().lower()
+        if gate_mode not in {"none", "per_head_identity_sigmoid"}:
+            raise ValueError(
+                "backbone_attention_output_gate must be one of "
+                "{'none', 'per_head_identity_sigmoid'}, "
+                f"got {gate_mode!r}."
+            )
+        self.backbone_attention_output_gate = gate_mode
+        self.backbone_attention_gate_scale = 2.0
+        self.last_gate_stats: dict[str, torch.Tensor] = {}
 
         self.q_proj = nn.Linear(
             config.hidden_size,
@@ -586,6 +452,141 @@ class Qwen3Attention(nn.Module):
         self.k_norm = Qwen3RMSNorm(
             self.head_dim, eps=config.rms_norm_eps
         )  # thus post q_norm does not need reshape
+        if self.backbone_attention_output_gate != "none":
+            # nn.Linear initializes its weight randomly. Restore the CPU RNG after
+            # construction so enabling the identity gate cannot perturb the
+            # initialization of any pre-existing downstream module.
+            with torch.random.fork_rng(devices=[]):
+                self.attn_output_gate_proj = nn.Linear(
+                    config.hidden_size,
+                    config.num_attention_heads,
+                    bias=False,
+                )
+            self.reset_attention_output_gate()
+        else:
+            self.attn_output_gate_proj = None
+
+    def reset_attention_output_gate(self) -> None:
+        if self.attn_output_gate_proj is None:
+            return
+        with torch.no_grad():
+            nn.init.zeros_(self.attn_output_gate_proj.weight)
+
+    @staticmethod
+    def _gate_summary(
+        gate: torch.Tensor,
+        *,
+        prefix: str,
+    ) -> dict[str, torch.Tensor]:
+        values = gate.detach().float()
+        return {
+            f"{prefix}/mean": values.mean(),
+            f"{prefix}/std": values.std(unbiased=False),
+            f"{prefix}/mean_abs_delta": (values - 1.0).abs().mean(),
+            f"{prefix}/saturation_low": (values < 0.1).float().mean(),
+            f"{prefix}/saturation_high": (values > 1.9).float().mean(),
+        }
+
+    @staticmethod
+    def _masked_gate_mean(
+        gate: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor | None:
+        mask = mask.to(device=gate.device, dtype=torch.bool)
+        if not bool(mask.any()):
+            return None
+        return gate.detach().float()[mask].mean()
+
+    def _record_gate_stats(
+        self,
+        gate: torch.Tensor,
+        *,
+        stream: str,
+        token_types: torch.Tensor | None,
+        flow_sigma: torch.Tensor | None,
+        detailed: bool,
+    ) -> None:
+        self.last_gate_stats.update(self._gate_summary(gate, prefix=stream))
+        if not detailed or token_types is None:
+            return
+
+        token_types = token_types.to(device=gate.device)
+        for token_type, label in (
+            (0, "text"),
+            (1, "image"),
+            (2, "special"),
+            (3, "padding"),
+        ):
+            value = self._masked_gate_mean(gate, token_types.eq(token_type))
+            if value is not None:
+                self.last_gate_stats[f"{stream}/{label}/mean"] = value
+
+        if flow_sigma is None:
+            return
+        flow_sigma = flow_sigma.to(device=gate.device, dtype=torch.float32)
+        if tuple(flow_sigma.shape) != tuple(token_types.shape):
+            raise ValueError(
+                "flow_sigma must align with token_types when detailed backbone "
+                f"gate statistics are requested: {tuple(flow_sigma.shape)} != "
+                f"{tuple(token_types.shape)}."
+            )
+        image_mask = token_types.eq(1)
+        positive_inf = torch.full_like(flow_sigma, torch.inf)
+        negative_inf = torch.full_like(flow_sigma, -torch.inf)
+        row_min = torch.where(image_mask, flow_sigma, positive_inf).amin(
+            dim=1, keepdim=True
+        )
+        row_max = torch.where(image_mask, flow_sigma, negative_inf).amax(
+            dim=1, keepdim=True
+        )
+        relative_order = (flow_sigma - row_min) / (row_max - row_min).clamp_min(
+            1.0e-12
+        )
+        for quartile in range(4):
+            lower = quartile / 4.0
+            upper = (quartile + 1) / 4.0
+            if quartile == 3:
+                quartile_mask = image_mask & relative_order.ge(lower)
+            else:
+                quartile_mask = (
+                    image_mask
+                    & relative_order.ge(lower)
+                    & relative_order.lt(upper)
+                )
+            value = self._masked_gate_mean(gate, quartile_mask)
+            if value is not None:
+                self.last_gate_stats[
+                    f"{stream}/image_order_q{quartile + 1}/mean"
+                ] = value
+
+    def _apply_attention_output_gate(
+        self,
+        attention_output: torch.Tensor | None,
+        hidden_states: torch.Tensor | None,
+        *,
+        stream: str,
+        token_types: torch.Tensor | None,
+        flow_sigma: torch.Tensor | None,
+        record_stats: bool,
+        detailed_stats: bool,
+    ) -> torch.Tensor | None:
+        if attention_output is None or hidden_states is None:
+            return attention_output
+        if self.attn_output_gate_proj is None:
+            return attention_output
+        gate = (
+            torch.sigmoid(self.attn_output_gate_proj(hidden_states))
+            * self.backbone_attention_gate_scale
+        )
+        if record_stats:
+            self._record_gate_stats(
+                gate,
+                stream=stream,
+                token_types=token_types,
+                flow_sigma=flow_sigma,
+                detailed=detailed_stats,
+            )
+        return attention_output * gate.transpose(1, 2).unsqueeze(-1)
 
     @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
     def forward(
@@ -600,6 +601,14 @@ class Qwen3Attention(nn.Module):
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         debug_finite = bool(kwargs.pop("debug_finite_backbone", False))
         debug_label = str(kwargs.pop("debug_backbone_label", ""))
+        record_gate_stats = bool(
+            kwargs.pop("record_backbone_gate_stats", False)
+        )
+        detailed_gate_stats = (
+            str(kwargs.pop("backbone_gate_stats_level", "summary")).strip().lower()
+            == "detailed"
+        )
+        self.last_gate_stats = {}
         prefix = f"layers.{self.layer_idx}.self_attn"
         _debug_require_finite_tensor(
             debug_finite,
@@ -673,7 +682,7 @@ class Qwen3Attention(nn.Module):
         # 检查是否需要 GQA (Grouped Query Attention)
         enable_gqa = self.config.num_attention_heads != self.config.num_key_value_heads
 
-        if self.training == False:
+        if not self.training:
             X0_attn_output = dynamic_flex_attention(
                 query=X0_query_states,
                 key=X0_key_states,
@@ -725,6 +734,25 @@ class Qwen3Attention(nn.Module):
             debug_label,
             f"{prefix}.flex_attention_output",
             X0_attn_output,
+        )
+
+        X0_attn_output = self._apply_attention_output_gate(
+            X0_attn_output,
+            X0_hidden_states,
+            stream="x0",
+            token_types=kwargs.get("token_types", None),
+            flow_sigma=kwargs.get("flow_sigma", None),
+            record_stats=record_gate_stats,
+            detailed_stats=detailed_gate_stats,
+        )
+        XT_attn_output = self._apply_attention_output_gate(
+            XT_attn_output,
+            XT_hidden_states,
+            stream="xt",
+            token_types=kwargs.get("token_types", None),
+            flow_sigma=kwargs.get("flow_sigma", None),
+            record_stats=record_gate_stats,
+            detailed_stats=detailed_gate_stats,
         )
 
         # attn_output 形状: (batch, heads, seq_len, head_dim)
@@ -935,7 +963,7 @@ class Qwen3RotaryEmbedding(nn.Module):
 @auto_docstring
 class Qwen3Model(Qwen3PreTrainedModel):
     def __init__(self, config: Qwen3Config):
-        backbone = resolve_model_image_backbone(config)
+        validate_model_image_layout(config)
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -946,7 +974,6 @@ class Qwen3Model(Qwen3PreTrainedModel):
         image_tokens_per_img = int(
             getattr(config, "image_tokens_per_img", CANONICAL_IMAGE_TOKENS)
         )
-        self.image_backbone_variant = backbone.variant
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, self.padding_idx
         )
@@ -955,40 +982,10 @@ class Qwen3Model(Qwen3PreTrainedModel):
             hidden_size=config.hidden_size,
             image_tokens_per_img=image_tokens_per_img,
             initializer_range=getattr(config, "initializer_range", 0.02),
-            init_mode=getattr(config, "image_token_embedder_init_mode", "balanced"),
-            latent_rms=getattr(config, "image_token_embedder_latent_rms", 1.0),
-            backbone_variant=backbone.variant,
         )
         self.image_input_noise_strength = float(
             getattr(config, "image_input_noise_strength", 1.0e-2)
         )
-        self.image_input_noise_strength_std = float(
-            getattr(config, "image_input_noise_strength_std", 0.0)
-        )
-        self.image_input_noise_strength_min = getattr(
-            config, "image_input_noise_strength_min", None
-        )
-        self.image_input_noise_strength_max = getattr(
-            config, "image_input_noise_strength_max", None
-        )
-        if self.image_input_noise_strength_min is not None:
-            self.image_input_noise_strength_min = float(
-                self.image_input_noise_strength_min
-            )
-        if self.image_input_noise_strength_max is not None:
-            self.image_input_noise_strength_max = float(
-                self.image_input_noise_strength_max
-            )
-        if (
-            self.image_input_noise_strength_min is not None
-            and self.image_input_noise_strength_max is not None
-            and self.image_input_noise_strength_min
-            > self.image_input_noise_strength_max
-        ):
-            raise ValueError(
-                "image_input_noise_strength_min must be <= image_input_noise_strength_max, "
-                f"got {self.image_input_noise_strength_min} > {self.image_input_noise_strength_max}"
-            )
         self.layers = nn.ModuleList(
             [
                 Qwen3DecoderLayer(config, layer_idx)
@@ -1001,7 +998,19 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
         # Initialize weights and apply final processing
         self.post_init()
+        self.reset_backbone_attention_output_gates()
         self.reset_image_token_embedder()
+
+    def reset_backbone_attention_output_gates(self) -> None:
+        for layer in self.layers:
+            layer.self_attn.reset_attention_output_gate()
+
+    def backbone_attention_gate_stats(self) -> dict[str, torch.Tensor]:
+        stats: dict[str, torch.Tensor] = {}
+        for layer_idx, layer in enumerate(self.layers):
+            for name, value in layer.self_attn.last_gate_stats.items():
+                stats[f"backbone_gate/layer_{layer_idx:02d}/{name}"] = value
+        return stats
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -1042,28 +1051,10 @@ class Qwen3Model(Qwen3PreTrainedModel):
             )
 
     def _maybe_add_image_input_noise(self, image_latents: torch.Tensor) -> torch.Tensor:
-        mean = self.image_input_noise_strength
-        std = self.image_input_noise_strength_std
-        if not self.training or (mean <= 0.0 and std <= 0.0):
+        strength = self.image_input_noise_strength
+        if not self.training or strength <= 0.0:
             return image_latents
-        if std <= 0.0:
-            strength = float(mean)
-        else:
-            strength = torch.randn(
-                image_latents.shape[:-1] + (1,),
-                device=image_latents.device,
-                dtype=torch.float32,
-            ) * float(std) + float(mean)
-            min_strength = (
-                0.0
-                if self.image_input_noise_strength_min is None
-                else self.image_input_noise_strength_min
-            )
-            strength = strength.clamp_min(min_strength)
-            if self.image_input_noise_strength_max is not None:
-                strength = strength.clamp_max(self.image_input_noise_strength_max)
-            strength = strength.to(dtype=image_latents.dtype)
-        return image_latents + torch.randn_like(image_latents) * strength
+        return image_latents + torch.randn_like(image_latents) * float(strength)
 
     def _build_x0_inputs_embeds(
         self,
@@ -1120,7 +1111,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
             )
             if use_image_mask.any():
                 image_mask_values = self.image_token_embedder.embed_mask(
-                    image_local_positions[use_image_mask],
+                    image_local_positions[use_image_mask].shape,
                     image_mask_embedding,
                     debug_finite=debug_finite,
                     debug_label=debug_label,
@@ -1138,7 +1129,6 @@ class Qwen3Model(Qwen3PreTrainedModel):
                     latent_values = self._maybe_add_image_input_noise(latent_values)
                 projected_latent_values = self.image_token_embedder(
                     latent_values,
-                    image_local_positions[use_image_latent],
                 ).to(dtype=inputs_embeds.dtype)
                 _debug_require_finite_tensor(
                     debug_finite,
@@ -1179,7 +1169,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 dtype=self.image_token_embedder.weight_dtype,
             )
             inputs_embeds[is_image] = self.image_token_embedder.embed_mask(
-                image_local_positions[is_image],
+                image_local_positions[is_image].shape,
                 image_mask_embedding,
             ).to(dtype=inputs_embeds.dtype)
         return inputs_embeds
@@ -1323,18 +1313,11 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
     def __init__(self, config):
-        flow_position_spec, flow_rope_axis_dims = resolve_model_flow_head_position(
-            config
-        )
         super().__init__(config)
         self.model = Qwen3Model(config)
         self.vocab_size = config.vocab_size
         self.image_latent_dim = getattr(config, "image_latent_dim", 4)
-        self.unified_head = False
-        self.lambda_image = getattr(config, "lambda_image", 0.5)
-        self.lambda_text = getattr(config, "lambda_text", 1.0)
         self.image_flow_batch_mul = int(getattr(config, "image_flow_batch_mul", 1))
-        self.image_flow_mlp_ratio = float(getattr(config, "image_flow_mlp_ratio", 1.0))
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.image_flow_condition_proj = nn.Linear(
             config.hidden_size, config.hidden_size, bias=True
@@ -1355,45 +1338,18 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             time_eps=getattr(config, "image_flow_time_eps", 1.0e-4),
             uniform_mix=getattr(config, "image_flow_time_uniform_mix", 0.1),
             solver=getattr(config, "image_flow_solver", "heun"),
-            mlp_ratio=self.image_flow_mlp_ratio,
             image_tokens_per_img=getattr(config, "image_tokens_per_img", 256),
-            latent_mixer_heads=getattr(config, "image_flow_latent_mixer_heads", 8),
-            latent_mixer_dropout=getattr(
-                config, "image_flow_latent_mixer_dropout", 0.0
-            ),
-            latent_mixer_zero_init_gate=getattr(
-                config,
-                "image_flow_zero_init_gate",
-                getattr(config, "image_flow_latent_mixer_zero_init_gate", True),
-            ),
-            head_arch=getattr(config, "image_flow_head_arch", "contextual"),
-            query_position_mode=(
-                flow_position_spec.query_position_mode
-                if flow_position_spec is not None
-                else "additive_2d"
-            ),
-            context_position_mode=(
-                flow_position_spec.context_position_mode
-                if flow_position_spec is not None
-                else "additive_2d"
-            ),
-            rope_mode=(
-                flow_position_spec.rope_mode
-                if flow_position_spec is not None
-                else "none"
-            ),
-            rope_axis_dims=flow_rope_axis_dims or (80, 80),
-            rope_rotate_value=False,
-            position_variant=(
-                flow_position_spec.variant
-                if flow_position_spec is not None
-                else "FH0"
-            ),
-            flow_head_variant=getattr(config, "image_flow_head_variant", "DF1"),
         )
 
         # Initialize weights and apply final processing
         self.post_init()
+        self.reset_backbone_attention_output_gates()
+        self.reset_image_modules()
+
+    def reset_backbone_attention_output_gates(self) -> None:
+        self.model.reset_backbone_attention_output_gates()
+
+    def reset_image_modules(self) -> None:
         self.image_flow_head.net.initialize_weights()
         self.reset_image_token_embedder()
         self._reset_image_flow_condition_proj()
@@ -1543,7 +1499,8 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 Attention mask for selfless sigma-causal attention. The mask should be designed such that
                 query positions can only attend to key/value positions with lower sigma.
             labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
-                Labels for language modeling. Tokens with labels set to -100 will be ignored when computing the loss.
+                Enables training loss. With `token_types`, the finalized
+                image-flow path computes loss only for image spans.
             image_latents (`torch.FloatTensor` of shape `(batch_size, sequence_length, image_latent_dim)`, *optional*):
                 Continuous VAE latent tokens aligned with `token_types == 1` positions.
             calculate_likelihood (`bool`, *optional*, defaults to `False`):
@@ -1552,11 +1509,6 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         calculate_likelihood = calculate_likelihood or labels is not None
         return_logits = bool(kwargs.pop("return_logits", True))
         model_kwargs = dict(kwargs)
-        return_raw_modality_loss = bool(
-            model_kwargs.pop("return_raw_modality_loss", False)
-        )
-        return_loss_tuple = bool(model_kwargs.pop("return_loss_tuple", False))
-        return_raw_loss_tuple = bool(model_kwargs.pop("return_raw_loss_tuple", False))
         image_loss_mask_arg = model_kwargs.pop("image_loss_mask", None)
         clean_image_latents = image_latents
         if inputs_embeds is None:
@@ -1605,7 +1557,6 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         if labels is not None:
             if token_types is not None:
                 token_types = token_types.to(hidden_states.device)
-                text_mask = (token_types == 0) | (token_types == 2)
                 image_mask = token_types == 1
                 if image_loss_mask_arg is not None:
                     image_loss_mask = (
@@ -1618,20 +1569,8 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                     image_loss_mask = image_mask
 
                 flat_hidden = hidden_states.view(-1, hidden_states.size(-1))
-                flat_labels = labels.view(-1)
                 image_local_positions = self.image_local_positions(token_types)
-                flat_image_positions = image_local_positions.view(-1)
-
-                text_flat_mask = text_mask.view(-1)
                 image_flat_mask = image_loss_mask.view(-1)
-
-                text_loss = flat_hidden.sum() * 0.0
-                valid_text_mask = text_flat_mask & (flat_labels != -100)
-                if valid_text_mask.any():
-                    text_logits = self.lm_head(flat_hidden[valid_text_mask])
-                    text_loss = F.cross_entropy(
-                        text_logits, flat_labels[valid_text_mask], ignore_index=-100
-                    )
 
                 if image_flat_mask.any():
                     if image_latents is None:
@@ -1655,9 +1594,6 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                         context_image_latents_for_loss = context_image_latents.to(
                             hidden_states.device
                         )
-                    uses_latent_mixer = bool(
-                        getattr(self.image_flow_head, "uses_latent_mixer", True)
-                    )
                     span_targets = []
                     span_context_latents = []
                     span_conditions = []
@@ -1679,10 +1615,9 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                                 continue
                             positions = image_local_positions[batch_idx, run]
                             span_targets.append(image_latents[batch_idx, run])
-                            if uses_latent_mixer:
-                                span_context_latents.append(
-                                    context_image_latents_for_loss[batch_idx, run]
-                                )
+                            span_context_latents.append(
+                                context_image_latents_for_loss[batch_idx, run]
+                            )
                             span_conditions.append(
                                 self._prepare_image_flow_condition(
                                     hidden_states[batch_idx, run]
@@ -1708,10 +1643,8 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                         lengths = {int(target.shape[0]) for target in span_targets}
                         if len(lengths) == 1:
                             image_targets = torch.stack(span_targets, dim=0)
-                            image_context_latents = (
-                                torch.stack(span_context_latents, dim=0)
-                                if uses_latent_mixer
-                                else None
+                            image_context_latents = torch.stack(
+                                span_context_latents, dim=0
                             )
                             image_conditions = torch.stack(span_conditions, dim=0)
                             image_sigmas = torch.stack(span_sigmas, dim=0)
@@ -1756,11 +1689,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                                 position_span,
                             ) in zip(
                                 span_targets,
-                                (
-                                    span_context_latents
-                                    if uses_latent_mixer
-                                    else [None] * len(span_targets)
-                                ),
+                                span_context_latents,
                                 span_conditions,
                                 span_sigmas,
                                 span_positions,
@@ -1805,31 +1734,11 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                     dummy_hidden = self._prepare_image_flow_condition(flat_hidden[:1])
                     image_loss = self.image_flow_head(dummy_target, dummy_hidden) * 0.0
 
-                loss = self.lambda_text * text_loss + self.lambda_image * image_loss
+                loss = image_loss
             else:
                 loss = self.loss_function(
                     logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=-100
                 )
-
-        if return_loss_tuple:
-            if token_types is not None and loss is not None:
-                text_loss_value = (
-                    text_loss.detach()
-                    if isinstance(text_loss, torch.Tensor)
-                    else torch.tensor(text_loss or 0.0, device=hidden_states.device)
-                )
-                image_loss_value = (
-                    image_loss.detach()
-                    if isinstance(image_loss, torch.Tensor)
-                    else torch.tensor(image_loss or 0.0, device=hidden_states.device)
-                )
-                return loss, text_loss_value, image_loss_value
-            return (loss,)
-
-        if return_raw_loss_tuple:
-            if token_types is not None and loss is not None:
-                return loss, text_loss, image_loss
-            return (loss,)
 
         output = CausalLMOutputWithPast(
             loss=loss,
@@ -1839,28 +1748,21 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             attentions=outputs.attentions,
         )
         output["last_hidden_state"] = hidden_states
-        # Attach per-modality losses for logging
+        gate_stats_fn = getattr(
+            self.model,
+            "backbone_attention_gate_stats",
+            None,
+        )
+        backbone_gate_stats = gate_stats_fn() if gate_stats_fn is not None else {}
+        if backbone_gate_stats:
+            output["backbone_gate_stats"] = backbone_gate_stats
         if token_types is not None and loss is not None:
-            per_modality_loss = {
-                "text_loss": text_loss.detach()
-                if isinstance(text_loss, torch.Tensor)
-                else torch.tensor(text_loss or 0.0, device=hidden_states.device),
-                "image_loss": image_loss.detach()
-                if isinstance(image_loss, torch.Tensor)
-                else torch.tensor(image_loss or 0.0, device=hidden_states.device),
-            }
             flow_debug_stats = {
                 key: value.detach()
                 for key, value in self.image_flow_head.last_forward_stats.items()
                 if isinstance(value, torch.Tensor)
             }
-            output["per_modality_loss"] = per_modality_loss
             output["flow_debug_stats"] = flow_debug_stats
-            if return_raw_modality_loss:
-                output["raw_per_modality_loss"] = {
-                    "text_loss": text_loss,
-                    "image_loss": image_loss,
-                }
         return output
 
     @torch.compile(mode="max-autotune-no-cudagraphs")
@@ -1888,8 +1790,8 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         flow_cfg_schedule: str = "constant",
         flow_solver: str | None = None,
         flow_num_steps: int | None = None,
-        parallel_rate: int = 32,
-        order_strategy: str = "condition_norm",
+        parallel_rate: int = 1,
+        order_strategy: str = "spatial_halton",
         return_trace: bool = False,
         debug_finite: bool = False,
     ) -> (
@@ -2105,7 +2007,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         current_sigma = selected_sigma.clone()
         next_image_order = torch.zeros(len(spans), device=device, dtype=torch.float32)
         k = max(1, int(parallel_rate))
-        order_strategy = str(order_strategy or "condition_norm").lower()
+        order_strategy = str(order_strategy or "spatial_halton").lower()
         replay_original_sigma = order_strategy in {
             "sigma",
             "sigma_replay",
@@ -2120,80 +2022,30 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         def _flow_context(
             sample_indices: torch.Tensor, local_positions: torch.Tensor
         ) -> dict[str, torch.Tensor]:
-            if not bool(getattr(self.image_flow_head, "uses_latent_mixer", True)):
-                return {}
-            if dynamic_flow_head:
-                sample_index_list = (
-                    sample_indices.detach().to(device="cpu").tolist()
-                )
-                selected_caches = [
-                    flow_content_caches_cond[int(sample_idx)]
+            sample_index_list = (
+                sample_indices.detach().to(device="cpu").tolist()
+            )
+            selected_caches = [
+                flow_content_caches_cond[int(sample_idx)]
+                for sample_idx in sample_index_list
+            ]
+            cache_is_paired = False
+            if use_flow_cfg:
+                selected_caches.extend(
+                    flow_content_caches_uncond[int(sample_idx)]
                     for sample_idx in sample_index_list
-                ]
-                cache_is_paired = False
-                if use_flow_cfg:
-                    selected_caches.extend(
-                        flow_content_caches_uncond[int(sample_idx)]
-                        for sample_idx in sample_index_list
-                    )
-                    cache_is_paired = True
-                return {
-                    "query_positions": local_positions.to(
-                        device=device, dtype=torch.long
-                    ),
-                    "latent_mixer_cache": (
-                        self.image_flow_head.stack_latent_mixer_caches(
-                            selected_caches
-                        )
-                    ),
-                    "latent_mixer_cache_is_paired": cache_is_paired,
-                }
-            sample_index_list = sample_indices.detach().to(device="cpu").tolist()
-            visible_positions_per_row = []
-            max_visible = 0
-            for sample_idx_value in sample_index_list:
-                sample_idx_int = int(sample_idx_value)
-                visible_positions = filled[sample_idx_int].nonzero(as_tuple=True)[0]
-                visible_positions_per_row.append(visible_positions)
-                max_visible = max(max_visible, int(visible_positions.numel()))
-
-            batch_rows = len(sample_index_list)
-            context_latents = work_latents.new_zeros(
-                batch_rows,
-                max_visible,
-                image_latent_dim,
-            )
-            context_mask = torch.zeros(
-                batch_rows,
-                1,
-                max_visible,
-                device=device,
-                dtype=torch.bool,
-            )
-            context_positions = torch.zeros(
-                batch_rows,
-                max_visible,
-                device=device,
-                dtype=torch.long,
-            )
-            for row_idx, sample_idx_value in enumerate(sample_index_list):
-                visible_positions = visible_positions_per_row[row_idx]
-                count = int(visible_positions.numel())
-                if count == 0:
-                    continue
-                sample_idx_int = int(sample_idx_value)
-                start = local_spans[sample_idx_int][1]
-                span_latents = work_latents[
-                    sample_idx_int, start : start + image_tokens_per_img
-                ]
-                context_latents[row_idx, :count] = span_latents[visible_positions]
-                context_mask[row_idx, 0, :count] = True
-                context_positions[row_idx, :count] = visible_positions
+                )
+                cache_is_paired = True
             return {
-                "context_latents": context_latents,
-                "context_mask": context_mask,
-                "query_positions": local_positions.to(device=device, dtype=torch.long),
-                "context_positions": context_positions,
+                "query_positions": local_positions.to(
+                    device=device, dtype=torch.long
+                ),
+                "latent_mixer_cache": (
+                    self.image_flow_head.stack_latent_mixer_caches(
+                        selected_caches
+                    )
+                ),
+                "latent_mixer_cache_is_paired": cache_is_paired,
             }
 
         if not replay_original_sigma:
@@ -2239,45 +2091,36 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         }
         latent_level_strategies = {"latent_proj_cosine"}
         use_flow_cfg = flow_cfg != 1.0
-        dynamic_flow_head = bool(
-            getattr(self.image_flow_head.net, "dynamic_content", False)
-        )
-        if dynamic_flow_head and k != 1:
+        if k != 1:
             raise ValueError(
-                "DF1 incremental content-cache generation requires "
+                "Incremental content-cache generation requires "
                 "parallel_rate=1."
             )
-        if dynamic_flow_head and order_strategy in latent_level_strategies:
+        if order_strategy in latent_level_strategies:
             raise ValueError(
-                "DF1 generation does not support speculative "
+                "Dynamic flow generation does not support speculative "
                 "latent-level candidate scoring."
             )
-        if dynamic_flow_head and bool(filled.any().item()):
+        if bool(filled.any().item()):
             raise ValueError(
-                "DF1 incremental generation currently requires an empty "
+                "Incremental generation requires an empty "
                 "initial image-latent prefix."
             )
-        flow_content_caches_cond = (
-            [
-                self.image_flow_head.empty_latent_mixer_cache(batch_size=1)
-                for _ in spans
-            ]
-            if dynamic_flow_head
-            else None
-        )
+        flow_content_caches_cond = [
+            self.image_flow_head.empty_latent_mixer_cache(batch_size=1)
+            for _ in spans
+        ]
         flow_content_caches_uncond = (
             [
                 self.image_flow_head.empty_latent_mixer_cache(batch_size=1)
                 for _ in spans
             ]
-            if dynamic_flow_head and use_flow_cfg
+            if use_flow_cfg
             else None
         )
         flow_cache_peak_bytes = 0
-        flow_cache_divergence_sum = (
-            [0.0] * len(self.image_flow_head.net.blocks)
-            if dynamic_flow_head
-            else []
+        flow_cache_divergence_sum = [0.0] * len(
+            self.image_flow_head.net.blocks
         )
         flow_cache_divergence_count = 0
         boi_token_id = getattr(self.config, "boi_token_id", None)
@@ -2583,70 +2426,69 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                     generation_score.dtype
                 )
                 fill_counter[sample_idx] += count
-                if dynamic_flow_head:
-                    if count != 1:
-                        raise AssertionError(
-                            "DF1 cache commit must append one token at a time."
-                        )
-                    flow_content_caches_cond[sample_idx] = (
+                if count != 1:
+                    raise AssertionError(
+                        "Dynamic flow cache commit must append one token at a "
+                        "time."
+                    )
+                flow_content_caches_cond[sample_idx] = (
+                    self.image_flow_head.append_latent_mixer_cache(
+                        flow_content_caches_cond[sample_idx],
+                        context_latents=chunk,
+                        context_conditions=condition_chunk,
+                        context_positions=local_positions,
+                    )
+                )
+                if use_flow_cfg:
+                    flow_content_caches_uncond[sample_idx] = (
                         self.image_flow_head.append_latent_mixer_cache(
-                            flow_content_caches_cond[sample_idx],
+                            flow_content_caches_uncond[sample_idx],
                             context_latents=chunk,
-                            context_conditions=condition_chunk,
+                            context_conditions=uncond_condition_chunk,
                             context_positions=local_positions,
                         )
                     )
-                    if use_flow_cfg:
-                        flow_content_caches_uncond[sample_idx] = (
-                            self.image_flow_head.append_latent_mixer_cache(
-                                flow_content_caches_uncond[sample_idx],
-                                context_latents=chunk,
-                                context_conditions=uncond_condition_chunk,
-                                context_positions=local_positions,
-                            )
-                        )
-                        for layer_idx, (cond_layer, uncond_layer) in enumerate(
-                            zip(
-                                flow_content_caches_cond[sample_idx]["layers"],
-                                flow_content_caches_uncond[sample_idx]["layers"],
-                            )
-                        ):
-                            delta = (
-                                cond_layer["k"][:, :, -1]
-                                .detach()
-                                .float()
-                                .sub(
-                                    uncond_layer["k"][:, :, -1]
-                                    .detach()
-                                    .float()
-                                )
-                                .pow(2)
-                                .mean()
-                                .sqrt()
-                            )
-                            flow_cache_divergence_sum[layer_idx] += float(
-                                delta.item()
-                            )
-                        flow_cache_divergence_count += 1
-                    cache_bytes = 0
-                    for branch_cache in (
-                        [flow_content_caches_cond[sample_idx]]
-                        + (
-                            [flow_content_caches_uncond[sample_idx]]
-                            if use_flow_cfg
-                            else []
+                    for layer_idx, (cond_layer, uncond_layer) in enumerate(
+                        zip(
+                            flow_content_caches_cond[sample_idx]["layers"],
+                            flow_content_caches_uncond[sample_idx]["layers"],
                         )
                     ):
-                        for layer_cache in branch_cache["layers"]:
-                            cache_bytes += (
-                                layer_cache["k"].numel()
-                                * layer_cache["k"].element_size()
-                                + layer_cache["v"].numel()
-                                * layer_cache["v"].element_size()
+                        delta = (
+                            cond_layer["k"][:, :, -1]
+                            .detach()
+                            .float()
+                            .sub(
+                                uncond_layer["k"][:, :, -1]
+                                .detach()
+                                .float()
                             )
-                    flow_cache_peak_bytes = max(
-                        flow_cache_peak_bytes, cache_bytes
+                            .pow(2)
+                            .mean()
+                            .sqrt()
+                        )
+                        flow_cache_divergence_sum[layer_idx] += float(
+                            delta.item()
+                        )
+                    flow_cache_divergence_count += 1
+                cache_bytes = 0
+                branch_caches = [flow_content_caches_cond[sample_idx]]
+                if use_flow_cfg:
+                    branch_caches.append(
+                        flow_content_caches_uncond[sample_idx]
                     )
+                for branch_cache in branch_caches:
+                    for layer_cache in branch_cache["layers"]:
+                        cache_bytes += (
+                            layer_cache["k"].numel()
+                            * layer_cache["k"].element_size()
+                            + layer_cache["v"].numel()
+                            * layer_cache["v"].element_size()
+                        )
+                flow_cache_peak_bytes = max(
+                    flow_cache_peak_bytes,
+                    cache_bytes,
+                )
             step_idx += 1
 
         generated = generated.view(len(spans), side, side, image_latent_dim).permute(
@@ -2661,9 +2503,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 "generation_step": generation_step.view(len(spans), side, side),
                 "generation_score": generation_score.view(len(spans), side, side),
                 "reveal_fraction": reveal_fraction.view(len(spans), side, side),
-                "flow_head_variant": getattr(
-                    self.image_flow_head, "flow_head_variant", "DF1"
-                ),
+                "flow_head_architecture": "dynamic_dual_stream_pure_2d",
                 "flow_content_cache_peak_bytes_per_sample": int(
                     flow_cache_peak_bytes
                 ),
@@ -2672,7 +2512,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                         value / max(flow_cache_divergence_count, 1)
                         for value in flow_cache_divergence_sum
                     ]
-                    if dynamic_flow_head and use_flow_cfg
+                    if use_flow_cfg
                     else None
                 ),
             }
@@ -2826,8 +2666,8 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 flow_num_steps=flow_num_steps,
                 parallel_rate=image_parallel_rate
                 if image_parallel_rate is not None
-                else 32,
-                order_strategy=image_order_strategy or decode_strategy,
+                else 1,
+                order_strategy=image_order_strategy or "spatial_halton",
             )
             if generated is None:
                 return
@@ -2928,8 +2768,14 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         flow_cfg_schedule = str(kwargs.pop("flow_cfg_schedule", "constant"))
         flow_solver = kwargs.pop("flow_solver", None)
         flow_num_steps = kwargs.pop("flow_num_steps", None)
-        image_parallel_rate = kwargs.pop("image_parallel_rate", parallel_rate)
-        image_order_strategy = kwargs.pop("image_order_strategy", decode_strategy)
+        image_parallel_rate = kwargs.pop(
+            "image_parallel_rate",
+            parallel_rate if parallel_rate is not None else 1,
+        )
+        image_order_strategy = kwargs.pop(
+            "image_order_strategy",
+            "spatial_halton",
+        )
         for i in range(num_response):
             seq, token_types, image_latents, image_chw, spans = self._generate_one(
                 prompt_ids=base_prompts[i],

@@ -6,14 +6,12 @@ from omegaconf import OmegaConf
 from transformers import Qwen3Config
 
 from models.modeling_model.image_backbone import (
-    DEFAULT_IMAGE_BACKBONE_VARIANT,
-    IMAGE_BACKBONE_SPECS,
-    SUPPORTED_IMAGE_BACKBONE_VARIANTS,
-    resolve_image_backbone_config,
-    resolve_model_image_backbone,
+    pure_2d_position_contract,
+    validate_image_data_layout,
+    validate_model_image_layout,
 )
 from models.modeling_model.image_position_utils import (
-    build_2d_sincos_position_embedding,
+    build_local_row_col_rope,
     build_row_col_position_ids,
 )
 from models.modeling_model.modeling_selfless_flow import (
@@ -23,7 +21,7 @@ from models.modeling_model.modeling_selfless_flow import (
 from utils.dataset_imagenet_flow_cache import ImageNetFlowCacheDataset
 
 
-def _tiny_qwen_config(**overrides):
+def _tiny_qwen_config():
     config = Qwen3Config(
         vocab_size=32,
         hidden_size=8,
@@ -38,190 +36,107 @@ def _tiny_qwen_config(**overrides):
     config.image_tokens_per_img = 4
     config.image_latent_dim = 4
     config.image_input_noise_strength = 0.0
-    for key, value in overrides.items():
-        setattr(config, key, value)
     return config
 
 
-def test_supported_backbones_are_closed_and_default_to_e2_q0():
-    assert DEFAULT_IMAGE_BACKBONE_VARIANT == "E2-Q0"
-    assert SUPPORTED_IMAGE_BACKBONE_VARIANTS == ("E2-Q1", "E2-Q0", "E2b-Q0")
-    assert {
-        key: (spec.observed_position_mode, spec.mask_position_mode)
-        for key, spec in IMAGE_BACKBONE_SPECS.items()
-    } == {
-        "E2-Q1": ("none", "additive_2d"),
-        "E2-Q0": ("none", "none"),
-        "E2b-Q0": ("additive_2d", "none"),
+def test_position_contract_is_fixed_pure_2d():
+    assert pure_2d_position_contract() == {
+        "schema": "selfless_pure_2d_position_v1",
+        "backbone": {
+            "image_qk_rotary": "row_col_2d",
+            "text_qk_rotary": "qwen_sequence_1d",
+            "additive_image_position": False,
+        },
+        "flow_head": {
+            "architecture": "dynamic_dual_stream",
+            "image_qk_rotary": "row_col_2d",
+            "rotate_value": False,
+            "additive_image_position": False,
+        },
     }
 
 
-@pytest.mark.parametrize("variant", SUPPORTED_IMAGE_BACKBONE_VARIANTS)
-def test_new_training_config_emits_only_backbone_variant(variant):
+def test_model_and_dataset_layouts_must_match():
+    assert validate_model_image_layout(
+        {"image_tokens_per_img": 256, "image_latent_dim": 16}
+    ) == (256, 16)
+    with pytest.raises(ValueError, match="square"):
+        validate_model_image_layout(
+            {"image_tokens_per_img": 255, "image_latent_dim": 16}
+        )
+
     config = OmegaConf.create(
         {
             "model": {
-                "image_backbone_variant": variant,
                 "image_tokens_per_img": 256,
                 "image_latent_dim": 16,
             },
             "dataset": {
                 "params": {
                     "image_tokens_per_img": 256,
-                    "image_latent_dim": 16,
+                    "image_latent_dim": 8,
                 }
             },
         }
     )
-    spec = resolve_image_backbone_config(config)
-    assert spec.variant == variant
-    assert set(config.model) == {
-        "image_backbone_variant",
-        "image_tokens_per_img",
-        "image_latent_dim",
-    }
-    assert "image_space_to_depth_factor" not in config.dataset.params
+    with pytest.raises(ValueError, match="must match"):
+        validate_image_data_layout(config)
 
 
-@pytest.mark.parametrize(
-    ("legacy", "expected"),
-    [
-        (
-            {
-                "image_query_stage_mode": "none",
-                "image_observed_position_mode": "none",
-                "image_rope_mode": "row_col_2d",
-                "image_space_to_depth_factor": 1,
-            },
-            "E2-Q1",
-        ),
-        (
-            {
-                "image_query_stage_mode": "none",
-                "image_observed_position_mode": "none",
-                "image_mask_position_mode": "none",
-                "image_rope_mode": "row_col_2d",
-                "image_space_to_depth_factor": 1,
-            },
-            "E2-Q0",
-        ),
-        (
-            {
-                "image_query_stage_mode": "none",
-                "image_observed_position_mode": "additive_2d",
-                "image_mask_position_mode": "none",
-                "image_rope_mode": "row_col_2d",
-                "image_space_to_depth_factor": 1,
-            },
-            "E2b-Q0",
-        ),
-    ],
-)
-def test_exact_legacy_checkpoints_migrate_to_retained_variant(legacy, expected):
-    config = _tiny_qwen_config(**legacy)
-    spec = resolve_model_image_backbone(config)
-    assert spec.variant == expected
-    assert config.image_backbone_variant == expected
-    for key in legacy:
-        assert not hasattr(config, key)
+def test_row_col_ids_preserve_text_and_layout_image_grid():
+    token_types = torch.tensor([[0, 2, 1, 1, 1, 1, 2, 0]])
+    ids = build_row_col_position_ids(token_types, image_tokens_per_img=4)
+    assert ids[:, 0].tolist() == [
+        [0, 1, 2, 2, 3, 3, 4, 5],
+        [0, 1, 2, 3, 2, 3, 4, 5],
+    ]
 
 
-@pytest.mark.parametrize(
-    "retired",
-    [
-        {"image_query_stage_mode": "fixed_sincos"},
-        {
-            "image_query_stage_mode": "none",
-            "image_observed_position_mode": "none",
-            "image_rope_mode": "sequence_1d",
-        },
-        {
-            "image_query_stage_mode": "none",
-            "image_observed_position_mode": "none",
-            "image_rope_mode": "row_col_2d",
-            "image_space_to_depth_factor": 2,
-        },
-        {
-            "image_query_stage_mode": "none",
-            "image_observed_position_mode": "additive_2d",
-            "image_mask_position_mode": "additive_2d",
-            "image_rope_mode": "row_col_2d",
-        },
-    ],
-)
-def test_retired_architectures_are_rejected(retired):
-    with pytest.raises(ValueError, match="retired image-backbone architecture"):
-        resolve_model_image_backbone(_tiny_qwen_config(**retired))
-
-
-def test_old_knobs_cannot_be_combined_with_new_enum():
-    config = _tiny_qwen_config(
-        image_backbone_variant="E2-Q1",
-        image_query_stage_mode="none",
+def test_local_rope_uses_row_and_column_coordinates():
+    positions = torch.tensor([[0, 1, 2, 3]])
+    cos, sin = build_local_row_col_rope(
+        positions,
+        image_tokens_per_img=4,
+        head_dim=4,
+        axis_dims=(2, 2),
     )
-    with pytest.raises(ValueError, match="cannot be combined"):
-        resolve_model_image_backbone(config)
+    assert cos.shape == sin.shape == (1, 4, 4)
+    assert torch.equal(cos[:, 0], torch.ones_like(cos[:, 0]))
+    assert torch.equal(sin[:, 0], torch.zeros_like(sin[:, 0]))
+    assert not torch.equal(cos[:, 1], cos[:, 2])
 
 
-@pytest.mark.parametrize("variant", SUPPORTED_IMAGE_BACKBONE_VARIANTS)
-def test_model_and_embedder_persist_only_variant(variant):
-    config = _tiny_qwen_config(image_backbone_variant=variant)
-    model = Qwen3Model(config).eval()
-    assert model.image_backbone_variant == variant
-    assert model.image_token_embedder.backbone_variant == variant
-    assert model.config.image_backbone_variant == variant
-    for key in (
+def test_embedder_has_projection_only_and_no_position_parameters():
+    embedder = ImageTokenEmbedder(
+        latent_dim=4,
+        hidden_size=8,
+        image_tokens_per_img=4,
+    )
+    assert set(embedder.state_dict()) == {"z_proj.weight", "z_proj.bias"}
+    assert embedder.last_init_stats["additive_image_position"] is False
+    assert embedder(torch.zeros(5, 4)).shape == (5, 8)
+    assert "positions" not in inspect.signature(embedder.forward).parameters
+
+
+def test_qwen_model_exposes_no_architecture_ablation_state():
+    model = Qwen3Model(_tiny_qwen_config())
+    state_names = set(model.state_dict())
+    assert not any("image_pos" in name for name in state_names)
+    assert not any("flow_pos" in name for name in state_names)
+    for retired in (
+        "image_backbone_variant",
         "image_query_stage_mode",
         "image_observed_position_mode",
         "image_mask_position_mode",
         "image_rope_mode",
-        "image_space_to_depth_factor",
     ):
-        assert not hasattr(model.config, key)
+        assert not hasattr(model, retired)
 
 
-def test_three_embedder_variants_apply_only_the_retained_position_choices():
-    mask = torch.zeros(8)
-    positions = torch.arange(4)
-    latents = torch.zeros(4, 4)
-    embedders = {
-        variant: ImageTokenEmbedder(
-            latent_dim=4,
-            hidden_size=8,
-            image_tokens_per_img=4,
-            backbone_variant=variant,
-        ).eval()
-        for variant in SUPPORTED_IMAGE_BACKBONE_VARIANTS
-    }
-    for embedder in embedders.values():
-        with torch.no_grad():
-            embedder.z_proj.weight.zero_()
-            embedder.z_proj.bias.zero_()
-            if embedder.image_pos_gain is not None:
-                embedder.image_pos_gain.fill_(1.0)
-
-    e2_q1 = embedders["E2-Q1"]
-    e2_q0 = embedders["E2-Q0"]
-    e2b_q0 = embedders["E2b-Q0"]
-    assert e2_q1.image_pos_gain is not None
-    assert e2_q0.image_pos_gain is None
-    assert e2b_q0.image_pos_gain is not None
-    assert torch.count_nonzero(e2_q1.embed_latents(latents, positions)) == 0
-    assert torch.count_nonzero(e2_q0.embed_latents(latents, positions)) == 0
-    assert torch.count_nonzero(e2b_q0.embed_latents(latents, positions)) > 0
-    assert torch.count_nonzero(e2_q1.embed_mask(positions, mask)) > 0
-    assert torch.count_nonzero(e2_q0.embed_mask(positions, mask)) == 0
-    assert torch.count_nonzero(e2b_q0.embed_mask(positions, mask)) == 0
-
-
-def test_stage_and_s2d_are_absent_from_active_signatures():
-    assert "coordinate_stride" not in inspect.signature(
-        build_2d_sincos_position_embedding
-    ).parameters
-    assert "image_coordinate_stride" not in inspect.signature(
-        build_row_col_position_ids
-    ).parameters
-    assert "image_space_to_depth_factor" not in inspect.signature(
-        ImageNetFlowCacheDataset
-    ).parameters
-    assert "stages" not in inspect.signature(ImageTokenEmbedder.embed_mask).parameters
+def test_dataset_signature_has_no_retired_layout_or_mode_switches():
+    parameters = inspect.signature(ImageNetFlowCacheDataset).parameters
+    assert "image_space_to_depth_factor" not in parameters
+    assert "condition_payload" not in parameters
+    assert "caption_sequence_modes" not in parameters
+    assert "caption_prefix" not in parameters
+    assert "label_text" not in parameters

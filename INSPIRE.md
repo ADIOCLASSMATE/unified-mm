@@ -4,7 +4,7 @@
 
 - Repository: `/inspire/hdd/global_user/wanjiaxin-253108030048/code/unified-mm`
 - Shared user root: `/inspire/hdd/global_user/wanjiaxin-253108030048`
-- ImageNet-100 data: `public/datasets/imagenet_ablation_100c_balanced`
+- Full ImageNet latent cache: `public/datasets/imagenet_full`
 
 ## Official dataset mount
 
@@ -23,7 +23,9 @@ not implicitly mount the official dataset.
 ## Resources
 
 - Use `dev-wjx` for single-GPU micro-batch/smoke checks when it is running.
-- Formal ImageNet-100 training and FID/IS evaluation use 8×H100.
+- Formal training and FID/IS evaluation use 8×H100.
+- Evaluation uses 512 samples per H100, exposed by the evaluator as global
+  batch 4096 on eight ranks.
 - GPU Job priority is 4.
 - Default project: `随机序语言建模-统一自回归与掩码扩散的随机顺序生成框架`.
 - The main project permits at most 16 concurrent GPUs, so submit at most two

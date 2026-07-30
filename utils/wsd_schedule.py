@@ -1,5 +1,4 @@
 import math
-from functools import partial
 from torch.optim.lr_scheduler import LambdaLR
 
 def get_wsd_schedule(

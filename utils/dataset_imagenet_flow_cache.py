@@ -4,16 +4,12 @@ Cache-backed ImageNet latent dataset for unified image-flow training.
 The cache is the merged tensor produced by the VAE encoder:
     {"latents": [N, image_tokens, latent_dim], "img_ids": [N], ...}
 
-This loader supports three explicit image-side conditioning modes:
-    image_only:   <|boi|> image <|eoi|> <eos>
-    class_image:  class_name <|boi|> image <|eoi|> <eos>
-    caption_image:
-        T2I: task_prefix caption <|boi|> image <|eoi|> <eos>
-        I2T: task_prefix <|boi|> image <|eoi|> caption <eos>
-
-Pure text batches are handled separately by TextArrowDataset.
+This loader supports exactly two conditioning modes:
+    class:    class_name <|boi|> image <|eoi|> <eos>
+    caption:  fixed_T2I_prefix caption <|boi|> image <|eoi|> <eos>
 """
 
+import hashlib
 import json
 import random
 from functools import partial
@@ -26,33 +22,10 @@ from torch.utils.data import DataLoader, Dataset, Subset
 from models.modeling_model.image_backbone import (
     validate_direct_latent_cache_shape,
 )
+from utils.multimodal_segment_packing import collate_segment_packed
 
 
-DEFAULT_CAPTION_T2I_PREFIXES = [
-    "Generate an image matching this caption:",
-    "Create an image described by this caption:",
-    "Draw a realistic image for this caption:",
-    "Produce an image that follows this description:",
-    "Render the scene described here:",
-    "Create a visual scene from this caption:",
-    "Generate a picture based on this description:",
-    "Make an image that matches the following caption:",
-    "Turn this caption into an image:",
-    "Synthesize an image for this visual description:",
-]
-
-DEFAULT_CAPTION_I2T_PREFIXES = [
-    "Describe this image in one detailed caption.",
-    "Write a detailed caption for this image.",
-    "Summarize the visual content of this image.",
-    "Provide a natural-language caption for this image.",
-    "Describe the main subject, setting, and visible details.",
-    "Write one caption that explains what is visible in this image.",
-    "Describe this picture clearly and naturally.",
-    "Create a caption for the image shown here.",
-    "State what this image shows in a detailed caption.",
-    "Caption this image with the important visual details.",
-]
+DEFAULT_CAPTION_PREFIX = "Generate an image matching this description:"
 
 
 class ImageNetFlowCacheDataset(Dataset):
@@ -73,23 +46,27 @@ class ImageNetFlowCacheDataset(Dataset):
         caption_text_key: str = "recaption_short",
         caption_path_key: str = "path",
         caption_id_key: str = "id",
-        caption_sequence_modes: Optional[Sequence[str]] = None,
-        caption_t2i_prefixes: Optional[Sequence[str]] = None,
-        caption_i2t_prefixes: Optional[Sequence[str]] = None,
-        caption_missing_policy: str = "error",
-        caption_max_tokens: int = 192,
         cache_caption_tokens: bool = False,
         max_seq_length: Optional[int] = None,
+        model_context_length: Optional[int] = None,
+        caption_manifest_sha256: Optional[str] = None,
         max_samples: int = -1,
         seed: int = 42,
         latent_hflip_prob: float = 0.0,
-        label_text: bool = True,
     ):
         self.cache_path = Path(cache_path)
         if not self.cache_path.exists():
             raise FileNotFoundError(self.cache_path)
 
-        obj = torch.load(self.cache_path, map_location="cpu")
+        # Memory-map the merged latent cache so distributed ranks and
+        # persistent workers reuse OS pages instead of copying the full
+        # ImageNet tensor into every process.
+        obj = torch.load(
+            self.cache_path,
+            map_location="cpu",
+            mmap=True,
+            weights_only=True,
+        )
         self.latents = obj["latents"]
         self.img_ids = obj.get("img_ids", torch.arange(self.latents.shape[0]))
         if max_samples is not None and max_samples > 0:
@@ -111,13 +88,15 @@ class ImageNetFlowCacheDataset(Dataset):
         self.image_tokens_per_img = int(image_tokens_per_img)
         self.image_latent_dim = int(image_latent_dim)
         self.max_seq_length = int(max_seq_length) if max_seq_length else None
+        self.model_context_length = (
+            int(model_context_length) if model_context_length else 32768
+        )
         self.seed = int(seed)
         # DataLoader workers keep their own Dataset object, so a plain Python
         # integer would become stale when persistent_workers=True.  Tensor
         # storage remains shared after the Dataset is sent to workers, which
         # lets the training process advance the epoch without recreating them.
         self._epoch_state = torch.zeros((), dtype=torch.int64).share_memory_()
-        self.label_text = bool(label_text)
         self.latent_hflip_prob = float(latent_hflip_prob)
         if not 0.0 <= self.latent_hflip_prob <= 1.0:
             raise ValueError(f"latent_hflip_prob must be in [0, 1], got {latent_hflip_prob}")
@@ -136,67 +115,36 @@ class ImageNetFlowCacheDataset(Dataset):
         self.caption_text_key = str(caption_text_key)
         self.caption_path_key = str(caption_path_key)
         self.caption_id_key = str(caption_id_key)
-        self.caption_missing_policy = str(caption_missing_policy or "error").lower()
-        self.caption_max_tokens = int(caption_max_tokens or 0)
+        self.caption_manifest_sha256 = (
+            str(caption_manifest_sha256).strip().lower()
+            if caption_manifest_sha256
+            else None
+        )
         self.cache_caption_tokens = bool(cache_caption_tokens)
         self.text_cache: Dict[str, torch.Tensor] = {}
         self.sequence_cache: Dict[str, Dict[str, torch.Tensor]] = {}
 
         if conditioning_mode is None:
-            if caption_jsonl:
-                conditioning_mode = "caption_image"
-            elif manifest_jsonl and synset_mapping_path:
-                conditioning_mode = "class_image"
-            else:
-                conditioning_mode = "image_only"
-        self.conditioning_mode = str(conditioning_mode).lower()
-        if self.conditioning_mode not in {"image_only", "class_image", "caption_image"}:
+            conditioning_mode = "caption" if caption_jsonl else "class"
+        self.conditioning_mode = str(conditioning_mode).strip().lower()
+        if self.conditioning_mode not in {"class", "caption"}:
             raise ValueError(
                 f"Unknown conditioning_mode={conditioning_mode!r}; "
-                "expected image_only, class_image, or caption_image."
+                "expected 'class' or 'caption'."
             )
 
-        if self.conditioning_mode == "class_image":
-            if not self.synsets:
-                raise ValueError("conditioning_mode='class_image' requires manifest_jsonl with synset values.")
-            if not self.synset_names:
-                raise ValueError("conditioning_mode='class_image' requires synset_mapping_path.")
-
-        self.caption_sequence_modes = self._normalize_caption_modes(caption_sequence_modes)
-        self.caption_t2i_prefixes = self._normalize_prefixes(
-            caption_t2i_prefixes,
-            DEFAULT_CAPTION_T2I_PREFIXES,
-            "caption_t2i_prefixes",
-        )
-        self.caption_i2t_prefixes = self._normalize_prefixes(
-            caption_i2t_prefixes,
-            DEFAULT_CAPTION_I2T_PREFIXES,
-            "caption_i2t_prefixes",
-        )
+        if not self.synsets:
+            raise ValueError("class/caption conditioning requires manifest_jsonl")
+        if self.conditioning_mode == "class" and not self.synset_names:
+            raise ValueError("conditioning_mode='class' requires synset_mapping_path")
         self.captions: Dict[int, str] = {}
-        if self.conditioning_mode == "caption_image":
+        if self.conditioning_mode == "caption":
             if not caption_jsonl:
-                raise ValueError("conditioning_mode='caption_image' requires caption_jsonl.")
+                raise ValueError("conditioning_mode='caption' requires caption_jsonl")
+            self._validate_caption_manifest_digest(caption_jsonl)
             self.captions = self._load_captions(caption_jsonl)
             if not self.captions:
                 raise ValueError(f"No captions matched cache img_ids from {caption_jsonl}.")
-
-        self.fixed_length = None
-        if self.conditioning_mode == "image_only":
-            self.fixed_length = 1 + self.image_tokens_per_img + 2
-            if self.label_text:
-                fixed_labels = [self.boi_id] + [-100] * self.image_tokens_per_img + [-100, self.eos_id]
-            else:
-                fixed_labels = [-100] * self.fixed_length
-            self.fixed_input_ids = torch.tensor(
-                [self.boi_id] + [self.mask_id] * self.image_tokens_per_img + [self.eoi_id, self.eos_id],
-                dtype=torch.long,
-            )
-            self.fixed_token_types = torch.tensor(
-                [2] + [1] * self.image_tokens_per_img + [2, 2],
-                dtype=torch.uint8,
-            )
-            self.fixed_labels = torch.tensor(fixed_labels, dtype=torch.long)
 
     def _load_manifest(self, manifest_jsonl: Optional[str]) -> Tuple[Dict[int, str], Dict[int, str]]:
         if not manifest_jsonl:
@@ -212,6 +160,10 @@ class ImageNetFlowCacheDataset(Dataset):
                     continue
                 row = json.loads(line)
                 img_id = int(row["img_id"])
+                if img_id in synsets:
+                    raise ValueError(
+                        f"duplicate img_id={img_id} in manifest {path}"
+                    )
                 synsets[img_id] = str(row.get("synset", ""))
                 source_path = row.get("source_path")
                 if source_path:
@@ -236,33 +188,34 @@ class ImageNetFlowCacheDataset(Dataset):
                 names[synset] = (class_name, class_names or class_name)
         return names
 
-    def _normalize_caption_modes(self, modes: Optional[Sequence[str]]) -> List[str]:
-        if modes is None:
-            return ["t2i", "i2t"]
-        normalized = [str(mode).lower() for mode in modes if str(mode).strip()]
-        if not normalized:
-            raise ValueError("caption_sequence_modes must not be empty.")
-        invalid = [mode for mode in normalized if mode not in {"t2i", "i2t"}]
-        if invalid:
-            raise ValueError(f"Unsupported caption_sequence_modes={invalid}; expected t2i and/or i2t.")
-        return normalized
-
-    def _normalize_prefixes(
-        self,
-        prefixes: Optional[Sequence[str]],
-        default_prefixes: Sequence[str],
-        field_name: str,
-    ) -> List[str]:
-        source = default_prefixes if prefixes is None else prefixes
-        normalized = [str(prefix).strip() for prefix in source if str(prefix).strip()]
-        if not normalized:
-            raise ValueError(f"{field_name} must not be empty.")
-        return normalized
-
     def _caption_jsonl_paths(self, caption_jsonl: str | Sequence[str]) -> List[Path]:
         if isinstance(caption_jsonl, (str, Path)):
             return [Path(caption_jsonl)]
         return [Path(path) for path in caption_jsonl]
+
+    def _validate_caption_manifest_digest(
+        self,
+        caption_jsonl: str | Sequence[str],
+    ) -> None:
+        if not self.caption_manifest_sha256:
+            return
+        paths = self._caption_jsonl_paths(caption_jsonl)
+        if len(paths) != 1:
+            raise ValueError(
+                "caption_manifest_sha256 requires exactly one frozen caption "
+                f"manifest, got {paths}"
+            )
+        digest = hashlib.sha256()
+        with paths[0].open("rb") as handle:
+            for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+                digest.update(chunk)
+        actual = digest.hexdigest()
+        if actual != self.caption_manifest_sha256:
+            raise ValueError(
+                "caption manifest digest mismatch: "
+                f"expected={self.caption_manifest_sha256}, actual={actual}, "
+                f"path={paths[0]}"
+            )
 
     def _relative_image_path(self, path: str) -> str:
         parts = Path(path).parts
@@ -286,10 +239,20 @@ class ImageNetFlowCacheDataset(Dataset):
                         continue
                     row_path = row.get(self.caption_path_key)
                     if row_path:
-                        captions_by_path[self._relative_image_path(str(row_path))] = caption
+                        relative_path = self._relative_image_path(str(row_path))
+                        if relative_path in captions_by_path:
+                            raise ValueError(
+                                f"duplicate caption path={relative_path!r} in {path}"
+                            )
+                        captions_by_path[relative_path] = caption
                     row_id = row.get(self.caption_id_key)
                     if row_id:
-                        captions_by_id[str(row_id)] = caption
+                        normalized_id = str(row_id)
+                        if normalized_id in captions_by_id:
+                            raise ValueError(
+                                f"duplicate caption id={normalized_id!r} in {path}"
+                            )
+                        captions_by_id[normalized_id] = caption
         return captions_by_path, captions_by_id
 
     def _load_captions(self, caption_jsonl: str | Sequence[str]) -> Dict[int, str]:
@@ -299,9 +262,24 @@ class ImageNetFlowCacheDataset(Dataset):
         for img_id_tensor in self.img_ids:
             img_id = int(img_id_tensor.item())
             rel_path = self.source_paths.get(img_id)
-            caption = captions_by_path.get(rel_path or "")
-            if caption is None and rel_path:
-                caption = captions_by_id.get(Path(rel_path).stem)
+            caption_by_path = captions_by_path.get(rel_path or "")
+            caption_by_id = (
+                captions_by_id.get(Path(rel_path).stem) if rel_path else None
+            )
+            if (
+                caption_by_path is not None
+                and caption_by_id is not None
+                and caption_by_path != caption_by_id
+            ):
+                raise ValueError(
+                    f"caption path/id conflict for img_id={img_id}, "
+                    f"path={rel_path!r}"
+                )
+            caption = (
+                caption_by_path
+                if caption_by_path is not None
+                else caption_by_id
+            )
             if caption is None:
                 if len(missing) < 5:
                     missing.append(rel_path or str(img_id))
@@ -309,20 +287,10 @@ class ImageNetFlowCacheDataset(Dataset):
             captions[img_id] = caption
 
         missing_count = int(self.img_ids.numel()) - len(captions)
-        if missing_count and self.caption_missing_policy == "error":
+        if missing_count:
             raise ValueError(
                 f"Missing {missing_count} captions for cache img_ids. "
-                f"Examples: {missing}. Use matching caption_jsonl or set caption_missing_policy='fallback_class'."
-            )
-        if missing_count and self.caption_missing_policy == "fallback_class":
-            for img_id_tensor in self.img_ids:
-                img_id = int(img_id_tensor.item())
-                if img_id not in captions:
-                    captions[img_id] = self._class_name_for_img_id(img_id)
-        elif missing_count:
-            raise ValueError(
-                f"Unknown caption_missing_policy={self.caption_missing_policy!r}; "
-                "expected error or fallback_class."
+                f"Examples: {missing}. Use a caption manifest matching the cache."
             )
         return captions
 
@@ -359,26 +327,46 @@ class ImageNetFlowCacheDataset(Dataset):
         idx: int,
         current_epoch: Optional[int] = None,
     ) -> torch.Tensor:
-        if self.latent_hflip_prob <= 0.0:
-            return latents
-        if current_epoch is None:
-            current_epoch = self.epoch
-        idx = int(idx)
-        if self.augmentation_index_mask is not None:
-            if idx < 0 or idx >= int(self.augmentation_index_mask.numel()) or not bool(self.augmentation_index_mask[idx]):
-                return latents
-        elif self.augmentation_train_size is not None and idx >= self.augmentation_train_size:
-            return latents
-        rng = random.Random(
-            self.seed + current_epoch * 1_000_003 + int(idx) * 9_176 + 13_579
-        )
-        if rng.random() >= self.latent_hflip_prob:
+        if not self._latent_hflip_applied(idx, current_epoch):
             return latents
         return latents.view(
             self.canonical_latent_side,
             self.canonical_latent_side,
             self.canonical_image_latent_dim,
         ).flip(1).reshape_as(latents)
+
+    def _latent_hflip_applied(
+        self,
+        idx: int,
+        current_epoch: Optional[int] = None,
+    ) -> bool:
+        if self.latent_hflip_prob <= 0.0:
+            return False
+        if current_epoch is None:
+            current_epoch = self.epoch
+        idx = int(idx)
+        if self.augmentation_index_mask is not None:
+            if idx < 0 or idx >= int(self.augmentation_index_mask.numel()) or not bool(self.augmentation_index_mask[idx]):
+                return False
+        elif self.augmentation_train_size is not None and idx >= self.augmentation_train_size:
+            return False
+        rng = random.Random(
+            self.seed + current_epoch * 1_000_003 + int(idx) * 9_176 + 13_579
+        )
+        return rng.random() < self.latent_hflip_prob
+
+    def _stable_sample_seed(
+        self,
+        idx: int,
+        current_epoch: int,
+        purpose: str,
+    ) -> int:
+        payload = (
+            f"{self.seed}:{int(current_epoch)}:{int(idx)}:{str(purpose)}"
+        ).encode("utf-8")
+        return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") & (
+            (1 << 63) - 1
+        )
 
     def _apply_latent_layout(self, latents: torch.Tensor) -> torch.Tensor:
         return latents.reshape(self.image_tokens_per_img, self.image_latent_dim)
@@ -409,15 +397,11 @@ class ImageNetFlowCacheDataset(Dataset):
         suffix_len = int(suffix_ids.numel())
         if prefix_len + suffix_len <= available_text:
             return prefix_ids, suffix_ids
-
-        if prefix_len and not suffix_len:
-            return prefix_ids[:available_text], suffix_ids
-        if suffix_len and not prefix_len:
-            return prefix_ids, suffix_ids[:available_text]
-
-        keep_prefix = min(prefix_len, available_text)
-        keep_suffix = max(0, available_text - keep_prefix)
-        return prefix_ids[:keep_prefix], suffix_ids[:keep_suffix]
+        raise ValueError(
+            "Serialized text exceeds max_seq_length; caption truncation is not "
+            f"supported: text_tokens={prefix_len + suffix_len}, "
+            f"available_text={available_text}."
+        )
 
     def _make_sequence_tensors(self, prefix_ids: torch.Tensor, suffix_ids: torch.Tensor) -> Dict[str, torch.Tensor]:
         prefix_ids, suffix_ids = self._fit_text_ids(prefix_ids, suffix_ids)
@@ -444,22 +428,7 @@ class ImageNetFlowCacheDataset(Dataset):
                 torch.tensor([2], dtype=torch.uint8),
             ]
         )
-        if self.label_text:
-            labels = torch.cat(
-                [
-                    prefix_ids,
-                    torch.tensor(
-                        [self.boi_id]
-                        + [-100] * self.image_tokens_per_img
-                        + [-100],
-                        dtype=torch.long,
-                    ),
-                    suffix_ids,
-                    torch.tensor([self.eos_id], dtype=torch.long),
-                ]
-            )
-        else:
-            labels = torch.full_like(input_ids, -100)
+        labels = torch.full_like(input_ids, -100)
         return {
             "input_ids": input_ids,
             "token_types": token_types,
@@ -485,93 +454,77 @@ class ImageNetFlowCacheDataset(Dataset):
             self.sequence_cache[class_name] = cached
         return cached
 
-    def _caption_mode_for_sample(
-        self,
-        idx: int,
-        current_epoch: Optional[int] = None,
-    ) -> str:
-        if current_epoch is None:
-            current_epoch = self.epoch
-        mode_idx = (
-            int(idx) * 1103515245 + current_epoch * 1_000_003 + self.seed
-        ) % len(self.caption_sequence_modes)
-        return self.caption_sequence_modes[mode_idx]
-
-    def _caption_prefix_for_sample(
-        self,
-        idx: int,
-        mode: str,
-        current_epoch: Optional[int] = None,
-    ) -> str:
-        if current_epoch is None:
-            current_epoch = self.epoch
-        prefixes = self.caption_i2t_prefixes if mode == "i2t" else self.caption_t2i_prefixes
-        prefix_idx = (
-            int(idx) * 214013
-            + current_epoch * 2_654_435_761
-            + self.seed * 17
-            + (1 if mode == "i2t" else 0)
-        ) % len(prefixes)
-        return prefixes[prefix_idx]
-
-    def _caption_ids_for_img_id(self, img_id: int) -> torch.Tensor:
+    def _caption_sequence_tensors(self, img_id: int) -> Dict[str, torch.Tensor]:
         caption = self.captions.get(int(img_id))
         if caption is None:
-            if self.caption_missing_policy == "fallback_class":
-                caption = self._class_name_for_img_id(int(img_id))
-            else:
-                raise KeyError(f"No caption for img_id={img_id}")
-        ids = self._text_ids(caption, cache=self.cache_caption_tokens)
-        if self.caption_max_tokens > 0:
-            ids = ids[: self.caption_max_tokens]
-        return ids
-
-    def _caption_sequence_tensors(
-        self,
-        idx: int,
-        img_id: int,
-        current_epoch: Optional[int] = None,
-    ) -> Dict[str, torch.Tensor]:
-        if current_epoch is None:
-            current_epoch = self.epoch
-        mode = self._caption_mode_for_sample(idx, current_epoch)
-        prefix = self._caption_prefix_for_sample(idx, mode, current_epoch)
-        caption_ids = self._caption_ids_for_img_id(img_id)
-        prefix_ids = self._text_ids(prefix)
-        if mode == "i2t":
-            return self._make_sequence_tensors(prefix_ids, caption_ids)
-        text_ids = torch.cat([prefix_ids, caption_ids])
-        return self._make_sequence_tensors(text_ids, torch.empty(0, dtype=torch.long))
+            raise KeyError(f"No caption for img_id={img_id}")
+        serialized_prompt = f"{DEFAULT_CAPTION_PREFIX} {caption}"
+        cached = (
+            self.sequence_cache.get(serialized_prompt)
+            if self.cache_caption_tokens
+            else None
+        )
+        if cached is not None:
+            return cached
+        sequence = self._make_sequence_tensors(
+            self._text_ids(
+                serialized_prompt,
+                cache=self.cache_caption_tokens,
+            ),
+            torch.empty(0, dtype=torch.long),
+        )
+        if self.cache_caption_tokens:
+            self.sequence_cache[serialized_prompt] = sequence
+        return sequence
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         # Capture one shared epoch value so every stochastic choice for this
         # sample uses the same epoch even if the parent advances immediately.
         current_epoch = self.epoch
+        hflip_applied = self._latent_hflip_applied(int(idx), current_epoch)
         latents = self._augment_latents(self.latents[idx], int(idx), current_epoch)
         latents = self._apply_latent_layout(latents)
-        if self.conditioning_mode == "image_only":
-            return {
-                "input_ids": self.fixed_input_ids,
-                "token_types": self.fixed_token_types,
-                "labels": self.fixed_labels,
-                "image_latents": latents,
-                "prompt_len": torch.tensor(0, dtype=torch.long),
-                "suffix_len": torch.tensor(0, dtype=torch.long),
-                "image_start": torch.tensor(1, dtype=torch.long),
-            }
-
         img_id = int(self.img_ids[idx].item())
-        if self.conditioning_mode == "class_image":
+        reveal_seed = self._stable_sample_seed(
+            int(idx), current_epoch, "image_reveal_order"
+        )
+        cfg_dropout_seed = self._stable_sample_seed(
+            int(idx), current_epoch, "cfg_dropout"
+        )
+        if self.conditioning_mode == "class":
             sequence = self._class_sequence_tensors(img_id)
         else:
-            sequence = self._caption_sequence_tensors(int(idx), img_id, current_epoch)
+            sequence = self._caption_sequence_tensors(img_id)
 
         length = int(sequence["input_ids"].numel())
         if self.max_seq_length is not None and length > self.max_seq_length:
             raise ValueError(
                 f"ImageNetFlowCacheDataset item length {length} exceeds max_seq_length={self.max_seq_length}. "
-                "Increase max_seq_length or reduce caption_max_tokens."
+                "Increase max_seq_length."
             )
+        if (
+            self.model_context_length is not None
+            and length > self.model_context_length
+        ):
+            raise ValueError(
+                f"Serialized sample length {length} exceeds model context "
+                f"window {self.model_context_length} for img_id={img_id}."
+            )
+        token_ids_sha256 = hashlib.sha256(
+            sequence["input_ids"].contiguous().numpy().tobytes()
+        ).hexdigest()
+        augmentation_sha256 = hashlib.sha256(
+            json.dumps(
+                {
+                    "epoch": int(current_epoch),
+                    "hflip": bool(hflip_applied),
+                    "img_id": img_id,
+                    "sample_index": int(idx),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
 
         return {
             "input_ids": sequence["input_ids"],
@@ -581,6 +534,15 @@ class ImageNetFlowCacheDataset(Dataset):
             "prompt_len": sequence["prompt_len"],
             "suffix_len": sequence["suffix_len"],
             "image_start": sequence["image_start"],
+            "img_id": torch.tensor(img_id, dtype=torch.long),
+            "sample_index": torch.tensor(int(idx), dtype=torch.long),
+            "serialized_length": torch.tensor(length, dtype=torch.long),
+            "token_ids_sha256": token_ids_sha256,
+            "augmentation_sha256": augmentation_sha256,
+            "reveal_seed": torch.tensor(reveal_seed, dtype=torch.long),
+            "cfg_dropout_seed": torch.tensor(
+                cfg_dropout_seed, dtype=torch.long
+            ),
         }
 
 
@@ -589,42 +551,6 @@ def collate_imagenet_flow_cache(
     pad_to_length: Optional[int] = None,
     pad_to_multiple_of: Optional[int] = None,
 ) -> Dict[str, torch.Tensor]:
-    first = batch[0]
-    if first["image_start"].item() == 1 and first["input_ids"].shape[0] == first["image_latents"].shape[0] + 3:
-        bsz = len(batch)
-        image_tokens = first["image_latents"].shape[0]
-        latent_dim = first["image_latents"].shape[-1]
-        latent_dtype = first["image_latents"].dtype
-        seq_len = image_tokens + 3
-
-        input_ids = first["input_ids"].unsqueeze(0).expand(bsz, seq_len).clone()
-        token_types = first["token_types"].unsqueeze(0).expand(bsz, seq_len).clone()
-        labels = first["labels"].unsqueeze(0).expand(bsz, seq_len).clone()
-        image_latents = torch.zeros(bsz, seq_len, latent_dim, dtype=latent_dtype)
-        image_latents[:, 1 : 1 + image_tokens] = torch.stack(
-            [item["image_latents"] for item in batch],
-            dim=0,
-        )
-
-        sigma = torch.empty(bsz, seq_len, dtype=torch.long)
-        sigma[:, 0] = 0
-        sigma[:, 1 + image_tokens] = 1
-        sigma[:, 2 + image_tokens] = image_tokens + 2
-        order = torch.rand(bsz, image_tokens).argsort(dim=-1)
-        sigma[:, 1 : 1 + image_tokens] = 2 + order
-
-        return {
-            "input_ids": input_ids,
-            "token_types": token_types,
-            "sigma": sigma,
-            "labels": labels,
-            "image_latents": image_latents,
-            "pack_stats": torch.tensor(
-                [bsz * seq_len, bsz * image_tokens, 0, seq_len],
-                dtype=torch.long,
-            ),
-        }
-
     batch_max_len = max(item["input_ids"].shape[0] for item in batch)
     max_len = pad_to_length or batch_max_len
     if pad_to_multiple_of and max_len % pad_to_multiple_of:
@@ -778,8 +704,8 @@ def _load_explicit_split_indices(
 ) -> Tuple[List[int], List[int]]:
     """Resolve a shared split manifest by image id.
 
-    This keeps continuous-flow and discrete-VQ ablations on exactly the same
-    train/validation members even when their packed cache row orders differ.
+    This keeps training and evaluation on exactly the declared members even
+    when cache row order differs.
     """
 
     path = Path(split_manifest_jsonl)
@@ -863,17 +789,15 @@ def build_imagenet_flow_cache_dataloaders(config, tokenizer):
         caption_text_key=params.get("caption_text_key", "recaption_short"),
         caption_path_key=params.get("caption_path_key", "path"),
         caption_id_key=params.get("caption_id_key", "id"),
-        caption_sequence_modes=params.get("caption_sequence_modes", None),
-        caption_t2i_prefixes=params.get("caption_t2i_prefixes", None),
-        caption_i2t_prefixes=params.get("caption_i2t_prefixes", None),
-        caption_missing_policy=params.get("caption_missing_policy", "error"),
-        caption_max_tokens=params.get("caption_max_tokens", 192),
         cache_caption_tokens=params.get("cache_caption_tokens", False),
         max_seq_length=params.get("max_seq_length", config.dataset.preprocessing.max_seq_length),
+        model_context_length=params.get("model_context_length", None),
+        caption_manifest_sha256=params.get(
+            "caption_manifest_sha256", None
+        ),
         max_samples=params.get("max_samples", -1),
         seed=config.training.seed,
         latent_hflip_prob=params.get("latent_hflip_prob", 0.0),
-        label_text=params.get("label_text", True),
     )
 
     val_ratio = params.get("val_ratio", 0.001)
@@ -906,11 +830,51 @@ def build_imagenet_flow_cache_dataloaders(config, tokenizer):
         pad_to_length = params.get("max_seq_length", config.dataset.preprocessing.max_seq_length)
     pad_to_multiple_of = params.get("pad_to_multiple_of", None)
 
-    collate_fn = partial(
+    packing = params.get("packing", None)
+    packing_enabled = bool(
+        packing is not None and packing.get("enabled", False)
+    )
+    unpacked_collate_fn = partial(
         collate_imagenet_flow_cache,
         pad_to_length=pad_to_length,
         pad_to_multiple_of=pad_to_multiple_of,
     )
+    if packing_enabled:
+        algorithm = str(
+            packing.get(
+                "algorithm", "deterministic_best_fit_decreasing"
+            )
+        )
+        if algorithm != "deterministic_best_fit_decreasing":
+            raise ValueError(
+                f"unsupported packing algorithm={algorithm!r}"
+            )
+        overflow_policy = str(
+            packing.get(
+                "overflow_policy", "dedicated_round_up_128"
+            )
+        )
+        if overflow_policy != "dedicated_round_up_128":
+            raise ValueError(
+                f"unsupported overflow_policy={overflow_policy!r}"
+            )
+        train_collate_fn = partial(
+            collate_segment_packed,
+            nominal_capacity=int(
+                packing.get("nominal_capacity", 2048)
+            ),
+            overflow_multiple=128,
+            image_uncond_prob=float(
+                config.model.get("image_uncond_prob", 0.0)
+            ),
+        )
+    else:
+        train_collate_fn = unpacked_collate_fn
+
+    # Packing is a training throughput optimization. Validation and generation
+    # operate on one logical sample per physical row so that loss, positions,
+    # sample ordering, and generated images cannot accidentally mix segments.
+    val_collate_fn = unpacked_collate_fn
 
     train_generator = build_training_data_generator(config)
 
@@ -921,7 +885,7 @@ def build_imagenet_flow_cache_dataloaders(config, tokenizer):
         num_workers=config.training.dataloader_workers,
         pin_memory=True,
         drop_last=True,
-        collate_fn=collate_fn,
+        collate_fn=train_collate_fn,
         persistent_workers=config.training.dataloader_workers > 0,
         generator=train_generator,
     )
@@ -932,7 +896,7 @@ def build_imagenet_flow_cache_dataloaders(config, tokenizer):
         num_workers=config.training.dataloader_workers,
         pin_memory=True,
         drop_last=False,
-        collate_fn=collate_fn,
+        collate_fn=val_collate_fn,
         persistent_workers=config.training.dataloader_workers > 0,
     )
     return train_loader, val_loader

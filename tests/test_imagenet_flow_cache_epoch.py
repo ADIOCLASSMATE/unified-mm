@@ -7,8 +7,12 @@ from utils.dataset_imagenet_flow_cache import ImageNetFlowCacheDataset
 class _Tokenizer:
     eos_token_id = 14
     _token_ids = {
-        "epochzero": 100,
-        "epochone": 101,
+        "Generate": 100,
+        "an": 101,
+        "image": 104,
+        "matching": 105,
+        "this": 106,
+        "description:": 107,
         "test": 102,
         "caption": 103,
     }
@@ -45,10 +49,8 @@ def test_epoch_updates_reach_persistent_workers_for_augmentation_and_caption(tmp
         image_tokens_per_img=4,
         image_latent_dim=1,
         manifest_jsonl=str(manifest_path),
-        conditioning_mode="caption_image",
+        conditioning_mode="caption",
         caption_jsonl=str(captions_path),
-        caption_sequence_modes=["t2i"],
-        caption_t2i_prefixes=["epochzero", "epochone"],
         latent_hflip_prob=0.5,
         seed=2,
         max_seq_length=16,
@@ -77,4 +79,4 @@ def test_epoch_updates_reach_persistent_workers_for_augmentation_and_caption(tmp
     assert torch.equal(epoch_zero["image_latents"][0], expected_flipped)
     assert torch.equal(epoch_one["image_latents"][0], latents[0])
     assert epoch_zero["input_ids"][0, 0].item() == 100
-    assert epoch_one["input_ids"][0, 0].item() == 101
+    assert epoch_one["input_ids"][0, 0].item() == 100

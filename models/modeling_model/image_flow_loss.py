@@ -8,7 +8,6 @@ from torch.utils.checkpoint import checkpoint
 
 from .image_position_utils import (
     apply_local_row_col_rope,
-    build_2d_sincos_position_embedding,
 )
 
 
@@ -85,8 +84,6 @@ class ContextualFlowBlock(nn.Module):
         num_heads=8,
         mlp_ratio=2.0,
         dropout=0.0,
-        rope_mode="none",
-        rope_axis_dims=(80, 80),
         image_tokens_per_img=256,
     ):
         super().__init__()
@@ -99,9 +96,13 @@ class ContextualFlowBlock(nn.Module):
         if self.channels % self.num_heads != 0:
             raise ValueError(f"channels={channels} must be divisible by num_heads={num_heads}")
         self.head_dim = self.channels // self.num_heads
+        if self.head_dim % 4:
+            raise ValueError(
+                "Pure row/column RoPE requires per-head dimension divisible "
+                f"by 4, got {self.head_dim}."
+            )
         self.scale = self.head_dim ** -0.5
-        self.rope_mode = str(rope_mode)
-        self.rope_axis_dims = tuple(int(item) for item in rope_axis_dims)
+        self.rope_axis_dims = (self.head_dim // 2, self.head_dim // 2)
         self.image_tokens_per_img = int(image_tokens_per_img)
 
         self.cross_q_norm = nn.LayerNorm(self.channels, eps=1e-6)
@@ -156,14 +157,10 @@ class ContextualFlowBlock(nn.Module):
             )
         return context_mask
 
-    def _maybe_apply_rope(self, x, positions):
-        if self.rope_mode == "none":
-            return x
-        if self.rope_mode != "row_col_2d":
-            raise ValueError(f"Unknown flow-head rope_mode={self.rope_mode!r}.")
+    def _apply_rope(self, x, positions):
         if positions is None:
             raise ValueError(
-                "row_col_2d flow-head RoPE requires explicit local positions."
+                "Pure-2D flow-head RoPE requires explicit local positions."
             )
         return apply_local_row_col_rope(
             x,
@@ -175,13 +172,13 @@ class ContextualFlowBlock(nn.Module):
     def prepare_cross_cache(self, context_hidden, context_positions=None):
         context_hidden = self.cross_kv_norm(context_hidden)
         k = self._split_heads(self.cross_k(context_hidden))
-        k = self._maybe_apply_rope(k, context_positions)
+        k = self._apply_rope(k, context_positions)
         v = self._split_heads(self.cross_v(context_hidden))
         return {
             "k": k,
             "v": v,
             "context_positions": context_positions,
-            "k_rotation_count": int(self.rope_mode != "none"),
+            "k_rotation_count": 1,
         }
 
     def _record_attention_diagnostics(
@@ -258,7 +255,7 @@ class ContextualFlowBlock(nn.Module):
             return None
 
         q = self._split_heads(self.cross_q(x))
-        q = self._maybe_apply_rope(q, query_positions)
+        q = self._apply_rope(q, query_positions)
         attn_dtype = q.dtype
         k = k.to(device=x.device, dtype=attn_dtype)
         v = v.to(device=x.device, dtype=attn_dtype)
@@ -368,146 +365,9 @@ class ContextualFlowBlock(nn.Module):
         return x
 
 
-class TokenFlowBlock(nn.Module):
-    """Pointwise AdaLN-MLP block with no token-to-token communication."""
-
-    def __init__(self, channels, mlp_ratio=1.0):
-        super().__init__()
-        self.channels = int(channels)
-        self.mlp_ratio = float(mlp_ratio)
-        hidden = int(self.channels * self.mlp_ratio)
-        if hidden <= 0:
-            raise ValueError(f"mlp_ratio must produce a positive hidden size, got {mlp_ratio}")
-
-        self.mlp_norm = nn.LayerNorm(self.channels, eps=1e-6)
-        self.mlp = nn.Sequential(
-            nn.Linear(self.channels, hidden),
-            nn.SiLU(),
-            nn.Linear(hidden, self.channels),
-        )
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(self.channels, 3 * self.channels),
-        )
-        self.last_gate_abs_mean = None
-
-    def forward(self, x, y):
-        shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(y).chunk(3, dim=-1)
-        h = modulate(self.mlp_norm(x), shift_mlp, scale_mlp)
-        x = x + gate_mlp * self.mlp(h)
-        self.last_gate_abs_mean = gate_mlp.detach().float().abs().mean()
-        return x
-
-
-class TokenFlowMLPHead(nn.Module):
-    """MAR/NextStep-style flow head applied independently to each latent token.
-
-    The causal backbone condition ``c`` is the only carrier of sequence context.
-    This module contains no attention, positional mixing, or clean-latent context
-    path: each output token is a function only of its own ``x_t``, timestep, and
-    same-position backbone condition.
-    """
-
-    def __init__(
-        self,
-        in_channels,
-        model_channels,
-        out_channels,
-        z_channels,
-        num_res_blocks,
-        grad_checkpointing=False,
-        mlp_ratio=1.0,
-        zero_init_gate=True,
-    ):
-        super().__init__()
-        self.in_channels = int(in_channels)
-        self.model_channels = int(model_channels)
-        self.out_channels = int(out_channels)
-        self.num_res_blocks = int(num_res_blocks)
-        self.grad_checkpointing = bool(grad_checkpointing)
-        self.mlp_ratio = float(mlp_ratio)
-        self.zero_init_gate = bool(zero_init_gate)
-
-        self.time_embed = TimestepEmbedder(self.model_channels)
-        self.cond_embed = nn.Linear(z_channels, self.model_channels)
-        self.input_proj = nn.Linear(self.in_channels, self.model_channels)
-        self.blocks = nn.ModuleList(
-            [
-                TokenFlowBlock(
-                    self.model_channels,
-                    mlp_ratio=self.mlp_ratio,
-                )
-                for _ in range(self.num_res_blocks)
-            ]
-        )
-        self.final_layer = FinalLayer(self.model_channels, self.out_channels)
-        self.last_gate_abs_mean = None
-        self.initialize_weights()
-
-    def initialize_weights(self):
-        def _basic_init(module):
-            if isinstance(module, nn.Linear):
-                _xavier_uniform_init_fp32_(module.weight)
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0)
-            elif isinstance(module, nn.LayerNorm) and module.elementwise_affine:
-                nn.init.ones_(module.weight)
-                nn.init.zeros_(module.bias)
-
-        self.apply(_basic_init)
-        _normal_init_fp32_(self.time_embed.mlp[0].weight, std=0.02)
-        _normal_init_fp32_(self.time_embed.mlp[2].weight, std=0.02)
-
-        if self.zero_init_gate:
-            for block in self.blocks:
-                nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
-                nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
-        nn.init.constant_(self.final_layer.linear.weight, 0)
-        nn.init.constant_(self.final_layer.linear.bias, 0)
-
-    def _shape_time(self, t, batch_shape):
-        expected = int(math.prod(batch_shape))
-        if t.numel() != expected:
-            raise ValueError(
-                f"t must contain one value per latent token ({expected}), got shape {tuple(t.shape)}"
-            )
-        embedded = self.time_embed(t.to(device=self.input_proj.weight.device).reshape(-1))
-        return embedded.view(*batch_shape, self.model_channels)
-
-    def forward(self, x, t, c):
-        if x.dim() not in {2, 3}:
-            raise ValueError(f"expected [B,D] or [B,Q,D], got {tuple(x.shape)}")
-        model_dtype = self.input_proj.weight.dtype
-        model_device = self.input_proj.weight.device
-        x = x.to(device=model_device, dtype=model_dtype)
-        c = c.to(device=model_device, dtype=model_dtype)
-        batch_shape = x.shape[:-1]
-        if c.shape[:-1] != batch_shape:
-            raise ValueError(
-                f"condition batch shape must match latent batch shape {tuple(batch_shape)}, "
-                f"got {tuple(c.shape[:-1])}"
-            )
-
-        x = self.input_proj(x)
-        y = self._shape_time(t, batch_shape) + self.cond_embed(c)
-        gate_stats = []
-        if self.grad_checkpointing and not torch.jit.is_scripting():
-            for block in self.blocks:
-                x = checkpoint(block, x, y, use_reentrant=False)
-                if block.last_gate_abs_mean is not None:
-                    gate_stats.append(block.last_gate_abs_mean)
-        else:
-            for block in self.blocks:
-                x = block(x, y)
-                if block.last_gate_abs_mean is not None:
-                    gate_stats.append(block.last_gate_abs_mean)
-        self.last_gate_abs_mean = torch.stack(gate_stats).mean() if gate_stats else None
-        return self.final_layer(x, y)
-
-
 class ContextualFlowTransformerHead(nn.Module):
+    """Dynamic dual-stream flow head with fixed row/column 2D RoPE."""
+
     def __init__(
         self,
         in_channels,
@@ -516,18 +376,7 @@ class ContextualFlowTransformerHead(nn.Module):
         z_channels,
         num_res_blocks,
         grad_checkpointing=False,
-        mlp_ratio=1.0,
-        latent_mixer_heads=8,
-        latent_mixer_dropout=0.0,
-        latent_mixer_zero_init_gate=True,
         image_tokens_per_img=256,
-        query_position_mode="additive_2d",
-        context_position_mode="additive_2d",
-        rope_mode="none",
-        rope_axis_dims=(80, 80),
-        rope_rotate_value=False,
-        position_variant="FH0",
-        flow_head_variant="DF1",
         endpoint_time=1000.0,
     ):
         super().__init__()
@@ -536,55 +385,16 @@ class ContextualFlowTransformerHead(nn.Module):
         self.out_channels = out_channels
         self.num_res_blocks = num_res_blocks
         self.grad_checkpointing = grad_checkpointing
-        self.mlp_ratio = float(mlp_ratio)
-        self.num_heads = int(latent_mixer_heads)
-        self.dropout = float(latent_mixer_dropout)
-        self.zero_init_gate = bool(latent_mixer_zero_init_gate)
+        self.mlp_ratio = 1.0
+        self.num_heads = 8
+        self.dropout = 0.0
+        self.zero_init_gate = True
         self.image_tokens_per_img = int(image_tokens_per_img)
-        self.query_position_mode = str(query_position_mode)
-        self.context_position_mode = str(context_position_mode)
-        self.rope_mode = str(rope_mode)
-        self.rope_axis_dims = tuple(int(item) for item in rope_axis_dims)
-        self.rope_rotate_value = bool(rope_rotate_value)
-        self.position_variant = str(position_variant)
-        self.flow_head_variant = self._normalize_flow_head_variant(flow_head_variant)
         self.endpoint_time = float(endpoint_time)
-        self.dynamic_content = True
-        self.content_uses_mlp = True
-        if self.query_position_mode not in {"none", "additive_2d"}:
-            raise ValueError(
-                f"Unknown flow query_position_mode={self.query_position_mode!r}."
-            )
-        if self.context_position_mode not in {"none", "additive_2d"}:
-            raise ValueError(
-                f"Unknown flow context_position_mode={self.context_position_mode!r}."
-            )
-        if self.rope_mode not in {"none", "row_col_2d"}:
-            raise ValueError(f"Unknown flow rope_mode={self.rope_mode!r}.")
-        if self.rope_rotate_value:
-            raise ValueError("Flow-head RoPE never rotates V.")
-        baseline_position_contracts = {
-            "FH0": ("additive_2d", "additive_2d", "none"),
-            "FH4": ("none", "none", "row_col_2d"),
-        }
-        expected = baseline_position_contracts.get(self.position_variant)
-        actual = (
-            self.query_position_mode,
-            self.context_position_mode,
-            self.rope_mode,
-        )
-        if expected is None or actual != expected:
-            raise ValueError(
-                "DF1 position contract must be one of the retained baselines "
-                f"{baseline_position_contracts}, got "
-                f"{self.position_variant}={actual}."
-            )
 
         self.time_embed = TimestepEmbedder(model_channels)
         self.cond_embed = nn.Linear(z_channels, model_channels)
         self.input_proj = nn.Linear(in_channels, model_channels)
-        pos_embed = torch.empty(self.image_tokens_per_img, self.model_channels)
-        self.register_buffer("image_pos_embed", pos_embed.clone())
         self.blocks = nn.ModuleList(
             [
                 ContextualFlowBlock(
@@ -592,8 +402,6 @@ class ContextualFlowTransformerHead(nn.Module):
                     num_heads=self.num_heads,
                     mlp_ratio=self.mlp_ratio,
                     dropout=self.dropout,
-                    rope_mode=self.rope_mode,
-                    rope_axis_dims=self.rope_axis_dims,
                     image_tokens_per_img=self.image_tokens_per_img,
                 )
                 for _ in range(num_res_blocks)
@@ -612,16 +420,6 @@ class ContextualFlowTransformerHead(nn.Module):
         self.last_content_relative_update_per_token = None
         self.last_content_query_cosine_per_token = None
         self.initialize_weights()
-
-    @staticmethod
-    def _normalize_flow_head_variant(value):
-        normalized = str(value or "DF1").strip().upper().replace("_", "")
-        if normalized != "DF1":
-            raise ValueError(
-                f"Unsupported image_flow_head_variant={value!r}; "
-                "the active baseline interface only supports DF1."
-            )
-        return normalized
 
     def set_attention_diagnostics(self, enabled: bool) -> None:
         enabled = bool(enabled)
@@ -642,7 +440,6 @@ class ContextualFlowTransformerHead(nn.Module):
         self.apply(_basic_init)
         _normal_init_fp32_(self.time_embed.mlp[0].weight, std=0.02)
         _normal_init_fp32_(self.time_embed.mlp[2].weight, std=0.02)
-        self._reset_position_buffer()
 
         if self.zero_init_gate:
             for block in self.blocks:
@@ -652,17 +449,6 @@ class ContextualFlowTransformerHead(nn.Module):
         nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
-
-    def _reset_position_buffer(self):
-        device = self.input_proj.weight.device
-        if device.type == "meta":
-            device = None
-        pos_embed = build_2d_sincos_position_embedding(
-            self.image_tokens_per_img,
-            self.model_channels,
-            device=device,
-        )
-        self.image_pos_embed = pos_embed.clone()
 
     def _shape_time(self, t, batch_shape):
         t = t.to(device=self.input_proj.weight.device)
@@ -697,12 +483,6 @@ class ContextualFlowTransformerHead(nn.Module):
                 )
         return positions
 
-    def _lookup_pos_embed(self, positions, dtype):
-        flat_positions = positions.reshape(-1)
-        pos_embed = self.image_pos_embed.to(device=positions.device, dtype=dtype)
-        values = pos_embed.index_select(0, flat_positions)
-        return values.reshape(positions.shape + (self.model_channels,))
-
     def _ensure_sequence(self, x, positions=None):
         squeeze = False
         if x.dim() == 2:
@@ -715,23 +495,19 @@ class ContextualFlowTransformerHead(nn.Module):
         return x, positions, squeeze
 
     def position_contract(self):
+        axis_dims = self.blocks[0].rope_axis_dims
         return {
-            "schema": "selfless_flow_head_position_v1",
-            "variant": self.position_variant,
-            "A_q": int(self.query_position_mode == "additive_2d"),
-            "A_c": int(self.context_position_mode == "additive_2d"),
-            "R_f": int(self.rope_mode == "row_col_2d"),
-            "query_position_mode": self.query_position_mode,
-            "context_position_mode": self.context_position_mode,
-            "rope_mode": self.rope_mode,
-            "rope_axis_dims": list(self.rope_axis_dims),
+            "schema": "selfless_flow_head_pure_2d_v1",
+            "architecture": "dynamic_dual_stream",
+            "additive_image_position": False,
+            "rope_mode": "row_col_2d",
+            "rope_axis_dims": list(axis_dims),
             "rotate_value": False,
         }
 
     def cache_contract(self):
         return {
             "schema": "selfless_flow_head_content_cache_v1",
-            "flow_head_variant": self.flow_head_variant,
             "content_update": "shared_attention_mlp",
             "strict_context": True,
             "query_writes_cache": False,
@@ -778,12 +554,7 @@ class ContextualFlowTransformerHead(nn.Module):
             )
 
     def _initial_content_hidden(self, context_latents, context_positions):
-        content_hidden = self.input_proj(context_latents)
-        if self.context_position_mode == "additive_2d":
-            content_hidden = content_hidden + self._lookup_pos_embed(
-                context_positions, content_hidden.dtype
-            )
-        return content_hidden
+        return self.input_proj(context_latents)
 
     def _content_condition(self, context_conditions):
         embedded = self.cond_embed(context_conditions)
@@ -936,8 +707,8 @@ class ContextualFlowTransformerHead(nn.Module):
             context_mask = context_mask.to(device=model_device, dtype=torch.bool)
         if context_conditions is None:
             raise ValueError(
-                "DF1 cache construction requires context_conditions for every "
-                "content token."
+                "contextual flow cache construction requires "
+                "context_conditions for every content token."
             )
         context_conditions = context_conditions.to(
             device=model_device, dtype=model_dtype
@@ -958,8 +729,8 @@ class ContextualFlowTransformerHead(nn.Module):
         )
         if content_mask is None:
             raise ValueError(
-                "DF1 full cache construction requires an explicit strict "
-                "content mask."
+                "contextual flow cache construction requires an explicit "
+                "strict content mask."
             )
         content_mask, content_block_mask = self._build_context_block_mask(
             content_mask,
@@ -1022,7 +793,7 @@ class ContextualFlowTransformerHead(nn.Module):
                         dtype=dtype,
                     ),
                     "context_positions": empty_positions,
-                    "k_rotation_count": int(block.rope_mode != "none"),
+                    "k_rotation_count": 1,
                 }
             )
         return {
@@ -1111,7 +882,7 @@ class ContextualFlowTransformerHead(nn.Module):
                         ],
                         dim=1,
                     ),
-                    "k_rotation_count": int(block.rope_mode != "none"),
+                    "k_rotation_count": 1,
                 }
             )
         positions = torch.cat(
@@ -1173,7 +944,7 @@ class ContextualFlowTransformerHead(nn.Module):
                     "k": k,
                     "v": v,
                     "context_positions": positions,
-                    "k_rotation_count": int(block.rope_mode != "none"),
+                    "k_rotation_count": 1,
                 }
             )
         return {
@@ -1203,8 +974,6 @@ class ContextualFlowTransformerHead(nn.Module):
         batch_shape = x.shape[:-1]
         x, query_positions, squeeze = self._ensure_sequence(x, query_positions)
         x = self.input_proj(x)
-        if self.query_position_mode == "additive_2d":
-            x = x + self._lookup_pos_embed(query_positions, x.dtype)
         t = self._shape_time(t, batch_shape)
         raw_c = c
         c = self.cond_embed(raw_c)
@@ -1222,7 +991,7 @@ class ContextualFlowTransformerHead(nn.Module):
             batch_size, context_len, _ = context_latents.shape
             if x.shape[:2] != (batch_size, context_len):
                 raise ValueError(
-                    f"{self.flow_head_variant} training requires aligned content/query "
+                    "Dynamic dual-stream training requires aligned content/query "
                     f"streams, got content={tuple(context_latents.shape[:2])}, "
                     f"query={tuple(x.shape[:2])}."
             )
@@ -1252,7 +1021,7 @@ class ContextualFlowTransformerHead(nn.Module):
             )
             if content_mask is None:
                 raise ValueError(
-                    f"{self.flow_head_variant} training requires an explicit "
+                    "Dynamic dual-stream training requires an explicit "
                     "strict sigma-causal mask."
                 )
             query_stats = []
@@ -1454,7 +1223,7 @@ class ContextualFlowTransformerHead(nn.Module):
 
 
 class FlowLoss(nn.Module):
-    """Rectified-flow loss with a selectable velocity-head architecture.
+    """Rectified-flow loss with the fixed pure-2D dynamic dual-stream head.
 
     Uses the standard flow-matching convention: t=0 is noise and t=1 is data.
     """
@@ -1474,19 +1243,7 @@ class FlowLoss(nn.Module):
         time_eps=1.0e-4,
         uniform_mix=0.1,
         solver="heun",
-        mlp_ratio=1.0,
         image_tokens_per_img=256,
-        latent_mixer_heads=8,
-        latent_mixer_dropout=0.0,
-        latent_mixer_zero_init_gate=True,
-        head_arch="contextual",
-        query_position_mode="additive_2d",
-        context_position_mode="additive_2d",
-        rope_mode="none",
-        rope_axis_dims=(80, 80),
-        rope_rotate_value=False,
-        position_variant="FH0",
-        flow_head_variant="DF1",
     ):
         super().__init__()
         self.in_channels = int(target_channels)
@@ -1498,16 +1255,6 @@ class FlowLoss(nn.Module):
         self.time_eps = float(time_eps)
         self.uniform_mix = float(uniform_mix)
         self.solver = str(solver or "heun").lower()
-        self.mlp_ratio = float(mlp_ratio)
-        self.head_arch = self._normalize_head_arch(head_arch)
-        self.uses_latent_mixer = self.head_arch == "contextual"
-        self.flow_head_variant = None
-        if self.uses_latent_mixer:
-            self.flow_head_variant = (
-                ContextualFlowTransformerHead._normalize_flow_head_variant(
-                    flow_head_variant
-                )
-            )
         self._guidance_diagnostic_sums = {}
         self._guidance_diagnostic_counts = {}
         if self.num_sampling_steps <= 0:
@@ -1517,51 +1264,17 @@ class FlowLoss(nn.Module):
         if not 0.0 <= self.time_eps < 0.5:
             raise ValueError(f"time_eps must be in [0, 0.5), got {time_eps}")
 
-        if self.uses_latent_mixer:
-            self.net = ContextualFlowTransformerHead(
-                in_channels=self.in_channels,
-                model_channels=width,
-                out_channels=self.in_channels,
-                z_channels=z_channels,
-                num_res_blocks=depth,
-                grad_checkpointing=grad_checkpointing,
-                mlp_ratio=self.mlp_ratio,
-                latent_mixer_heads=latent_mixer_heads,
-                latent_mixer_dropout=latent_mixer_dropout,
-                latent_mixer_zero_init_gate=latent_mixer_zero_init_gate,
-                image_tokens_per_img=image_tokens_per_img,
-                query_position_mode=query_position_mode,
-                context_position_mode=context_position_mode,
-                rope_mode=rope_mode,
-                rope_axis_dims=rope_axis_dims,
-                rope_rotate_value=rope_rotate_value,
-                position_variant=position_variant,
-                flow_head_variant=self.flow_head_variant,
-                endpoint_time=self.time_scale,
-            )
-        else:
-            self.net = TokenFlowMLPHead(
-                in_channels=self.in_channels,
-                model_channels=width,
-                out_channels=self.in_channels,
-                z_channels=z_channels,
-                num_res_blocks=depth,
-                grad_checkpointing=grad_checkpointing,
-                mlp_ratio=self.mlp_ratio,
-                zero_init_gate=latent_mixer_zero_init_gate,
-            )
-        self.last_forward_stats = {}
-
-    @staticmethod
-    def _normalize_head_arch(head_arch: str) -> str:
-        value = str(head_arch or "contextual").strip().lower().replace("-", "_")
-        if value in {"contextual", "latent_mixer", "cross_attention", "cross_attn"}:
-            return "contextual"
-        if value in {"token_mlp", "tokenwise_mlp", "per_token", "mar", "nextstep", "no_cross_attention"}:
-            return "token_mlp"
-        raise ValueError(
-            f"Unknown image_flow_head_arch={head_arch!r}; expected contextual or token_mlp."
+        self.net = ContextualFlowTransformerHead(
+            in_channels=self.in_channels,
+            model_channels=width,
+            out_channels=self.in_channels,
+            z_channels=z_channels,
+            num_res_blocks=depth,
+            grad_checkpointing=grad_checkpointing,
+            image_tokens_per_img=image_tokens_per_img,
+            endpoint_time=self.time_scale,
         )
+        self.last_forward_stats = {}
 
     @staticmethod
     def _rms_stat(x):
@@ -1629,8 +1342,6 @@ class FlowLoss(nn.Module):
         context_positions: torch.Tensor | None = None,
         context_conditions: torch.Tensor | None = None,
     ):
-        if not self.uses_latent_mixer:
-            return None
         if context_latents is None:
             return None
         model_dtype = self.net.input_proj.weight.dtype
@@ -1652,18 +1363,12 @@ class FlowLoss(nn.Module):
         )
 
     def empty_latent_mixer_cache(self, batch_size=1):
-        if not self.uses_latent_mixer:
-            return None
         return self.net.empty_latent_mixer_cache(batch_size=batch_size)
 
     def append_latent_mixer_cache(self, cache, **kwargs):
-        if not self.uses_latent_mixer:
-            return None
         return self.net.append_latent_mixer_cache(cache, **kwargs)
 
     def stack_latent_mixer_caches(self, caches):
-        if not self.uses_latent_mixer:
-            return None
         return self.net.stack_latent_mixer_caches(caches)
 
     def velocity(
@@ -1684,8 +1389,6 @@ class FlowLoss(nn.Module):
         x_t = x_t.to(device=model_device, dtype=model_dtype)
         z = z.to(device=model_device, dtype=model_dtype)
         t = t.to(device=model_device)
-        if not self.uses_latent_mixer:
-            return self.net(x_t, self._scale_time(t), c=z)
 
         context_kwargs = self._context_to_device(
             {
@@ -1712,8 +1415,6 @@ class FlowLoss(nn.Module):
         )
 
     def _training_context(self, target, sigma, image_positions, context_latents=None):
-        if not self.uses_latent_mixer:
-            return {}
         if target.dim() != 3:
             return {}
         if context_latents is None:
@@ -1870,8 +1571,7 @@ class FlowLoss(nn.Module):
         gate_stat = getattr(self.net, "last_gate_abs_mean", None)
         if gate_stat is not None:
             stats["flow/head_residual_gate"] = gate_stat.detach().float()
-            if self.uses_latent_mixer:
-                stats["flow/latent_mixer_gate"] = gate_stat.detach().float()
+            stats["flow/latent_mixer_gate"] = gate_stat.detach().float()
         for metric_name, attribute in (
             ("content_update_rms", "last_content_update_rms_per_token"),
             ("content_relative_update", "last_content_relative_update_per_token"),
@@ -2130,46 +1830,43 @@ class FlowLoss(nn.Module):
         _debug_check("initial_noise", x)
         if context_latents is not None:
             _debug_check("context_latents", context_latents)
-        if self.uses_latent_mixer:
-            if latent_mixer_cache is not None:
-                latent_mixer_cache = self._cache_to_device(
-                    latent_mixer_cache, z.device, z.dtype
-                )
-                query_positions = (
-                    None
-                    if query_positions is None
-                    else query_positions.to(device=z.device)
-                )
-                context_kwargs = {
-                    "query_positions": query_positions,
-                    "latent_mixer_cache": latent_mixer_cache,
-                }
-            else:
-                raw_context_kwargs = self._context_to_device(
-                    {
-                        "context_latents": context_latents,
-                        "context_mask": context_mask,
-                        "query_positions": query_positions,
-                        "context_positions": context_positions,
-                        "context_conditions": context_conditions,
-                    },
-                    z.device,
-                    z.dtype,
-                )
-                latent_mixer_cache = self.prepare_latent_mixer_cache(
-                    context_latents=raw_context_kwargs.get("context_latents"),
-                    context_mask=raw_context_kwargs.get("context_mask"),
-                    context_positions=raw_context_kwargs.get("context_positions"),
-                    context_conditions=raw_context_kwargs.get(
-                        "context_conditions"
-                    ),
-                )
-                context_kwargs = {
-                    "query_positions": raw_context_kwargs.get("query_positions"),
-                    "latent_mixer_cache": latent_mixer_cache,
-                }
+        if latent_mixer_cache is not None:
+            latent_mixer_cache = self._cache_to_device(
+                latent_mixer_cache, z.device, z.dtype
+            )
+            query_positions = (
+                None
+                if query_positions is None
+                else query_positions.to(device=z.device)
+            )
+            context_kwargs = {
+                "query_positions": query_positions,
+                "latent_mixer_cache": latent_mixer_cache,
+            }
         else:
-            context_kwargs = {}
+            raw_context_kwargs = self._context_to_device(
+                {
+                    "context_latents": context_latents,
+                    "context_mask": context_mask,
+                    "query_positions": query_positions,
+                    "context_positions": context_positions,
+                    "context_conditions": context_conditions,
+                },
+                z.device,
+                z.dtype,
+            )
+            latent_mixer_cache = self.prepare_latent_mixer_cache(
+                context_latents=raw_context_kwargs.get("context_latents"),
+                context_mask=raw_context_kwargs.get("context_mask"),
+                context_positions=raw_context_kwargs.get("context_positions"),
+                context_conditions=raw_context_kwargs.get(
+                    "context_conditions"
+                ),
+            )
+            context_kwargs = {
+                "query_positions": raw_context_kwargs.get("query_positions"),
+                "latent_mixer_cache": latent_mixer_cache,
+            }
         context_is_paired = bool(latent_mixer_cache_is_paired)
         if cfg != 1.0:
             if context_is_paired:

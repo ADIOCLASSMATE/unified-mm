@@ -1,18 +1,18 @@
 experiment:
-    project: "selfless-flow-stage0-imagenet-full-from-qwen3base"
-    name: "imagenet-full-classcond-flow-from-qwen3base-8xh100-b1024"
+    project: "selfless-flow-imagenet-caption"
+    name: "imagenet-caption-flow-qwen3base-pure2d"
     wandb_project: "unified-mm"
     output_dir: "output"
     save_every: 5000
     log_every: 10
     log_grad_norm_every: 500
-    checkpoints_total_limit: 30
+    checkpoints_total_limit: 4
     save_hfmodel_every: 10000
     val_every: 1000
     validation_image_every: 2000
-    validation_image_samples: 4
+    validation_image_samples: 8
     validation_flow_temperature: 1.0
-    validation_flow_cfg: 2.0
+    validation_flow_cfg: 3.5
     validation_flow_cfg_schedule: "constant"
     validation_flow_solver: "heun"
     validation_flow_probe_times: [0.25, 0.5, 0.75, 0.95]
@@ -20,8 +20,7 @@ experiment:
     validation_save_debug_images: false
     validation_single_stream_images: true
     validation_single_stream_parallel_rate: 1
-    validation_single_stream_order_strategies:
-        - "spatial_halton"
+    validation_single_stream_order_strategies: ["spatial_halton"]
     validation_vae_module_root: "/inspire/hdd/global_user/wanjiaxin-253108030048/code/mar"
     validation_vae_path: "public/vae/mar-kl16/kl16.ckpt"
     validation_vae_scaling_factor: 0.2325
@@ -53,22 +52,32 @@ dataset:
     params:
         cache_path: "public/datasets/imagenet_full/vae_latents_mar_kl16/flow_latents_all_fp16.pt"
         manifest_jsonl: "public/datasets/imagenet_full/manifest.jsonl"
-        synset_mapping_path: "public/datasets/imagenet/LOC_synset_mapping.txt"
-        conditioning_mode: "class"
+        conditioning_mode: "caption"
+        caption_jsonl: "public/datasets/imagenet_full/captions.jsonl"
+        caption_text_key: "recaption_short"
+        caption_path_key: "path"
+        caption_id_key: "id"
+        cache_caption_tokens: false
+        model_context_length: 32768
         image_tokens_per_img: 256
         image_latent_dim: 16
-        max_seq_length: 320
-        pad_to_length: 320
-        pad_to_multiple_of: 64
+        max_seq_length: null
+        pad_to_length: null
+        pad_to_multiple_of: null
         val_ratio: 0.01
         split_strategy: "stratified"
         split_seed: 42
         latent_hflip_prob: 0.5
+        packing:
+            enabled: true
+            algorithm: "deterministic_best_fit_decreasing"
+            nominal_capacity: 2048
+            overflow_policy: "dedicated_round_up_128"
     preprocessing:
-        max_seq_length: 320
+        max_seq_length: 2048
 
 optimizer:
-    name: adamw
+    name: "adamw"
     params:
         learning_rate: 1.0e-4
         backbone_learning_rate: 2.0e-5
@@ -79,7 +88,7 @@ optimizer:
         beta1: 0.9
         beta2: 0.95
         weight_decay: 0.01
-        epsilon: 1e-8
+        epsilon: 1.0e-8
 
 lr_scheduler:
     scheduler: "wsd"
@@ -90,8 +99,8 @@ lr_scheduler:
         min_lr_scale: 0.1
 
 training:
-    batch_size: 64
-    total_batch_size: 1024
+    batch_size: 32
+    total_batch_size: 256
     mixed_precision: "bf16"
     seed: 42
     dataloader_workers: 8
@@ -109,7 +118,7 @@ training:
     save_image_flow_adapter: true
 
 evaluation:
-    checkpoint: "output/selfless-flow-stage0-imagenet-full-from-qwen3base/hf_model-final-ema"
+    checkpoint: "output/selfless-flow-imagenet-caption/hf_model-final-ema"
     model_dtype: "bf16"
     samples: 10000
     batch_size: 4096

@@ -1,114 +1,70 @@
-# Unified-MM: ImageNet-100 Architecture Ablations
+# Unified-MM
 
-This repository currently compares two Qwen3-0.6B image-generation
-architectures under one controlled ImageNet-100 training and evaluation
-protocol:
+Unified-MM 当前只维护最终选定的 Selfless-Flow 图像生成架构：
 
-- **Selfless-Flow** uses a two-stream, same-position Qwen backbone and a
-  contextual rectified-flow head over continuous KL16 image latents.
-- **Qwen-Show-O** uses the same Qwen backbone scale with Show-O-style masked
-  prediction over official MAGVITv2 image codes.
+- Qwen two-stream backbone 与 dynamic dual-stream contextual flow head；
+- backbone 和 flow head 都固定使用 row/column pure 2D RoPE；
+- 不使用 additive image position；
+- attention output gate 保留单一接口，但默认关闭；
+- ImageNet latent dataloader 只支持 `class` 与 `caption` 两种条件模式。
 
-Both models train for 35,920 optimizer steps (80 epochs) on the same balanced
-115K-image training split and are evaluated on the same 10K original-ImageNet
-validation distribution. The authoritative protocol and all reported numbers
-are in [docs/IMAGENET100_ABLATION.md](docs/IMAGENET100_ABLATION.md).
+完整的历史选择依据压缩在
+[消融结论](docs/ABLATION_CONCLUSIONS.md)；实验矩阵、proposal 和兼容接口不再
+属于运行时仓库。
 
-## Selected evaluation defaults
+## 训练
 
-The single-point launchers default to the lowest-FID settings found by the
-completed sweeps:
-
-| Architecture | Checkpoint | Selected CFG | Other fixed settings |
-| --- | --- | --- | --- |
-| Selfless-Flow | `hf_model-final-ema` | `CFG=3.5` | BF16 model, 100-step Heun, `spatial_halton`, `PARALLEL_RATE=1` |
-| Qwen-Show-O | `hf_model-final` | Show-O `s=11.75` (common `w=12.75`) | 12 MaskGIT steps, temperature 1.0 |
-
-Show-O uses `(1+s)*conditional - s*unconditional`; therefore its command-line
-`guidance_scale=s` is one lower than common CFG weight `w`.
-
-## Current pipeline
-
-Build the balanced subset from the existing full KL16 cache:
+Class-conditioned：
 
 ```bash
-bash script/ablation/build_imagenet_100c_balanced_cache.sh
-```
-
-Prepare the official Show-O MAGVITv2 tokens and cache the shared original-image
-FID distribution. Jobs that read raw ImageNet must explicitly attach dataset
-`imagenet:v1`.
-
-```bash
-bash script/ablation/prepare_qwen_showo_vq_100c.sh
-bash script/ablation/cache_imagenet100_original_fid_stats.sh
-```
-
-Train both 80-epoch ablations:
-
-```bash
-bash script/ablation/pretraining_imagenet_flow_100c_80ep.sh
-bash script/ablation/pretraining_qwen_showo_vq_100c_80ep.sh
-```
-
-Evaluate the selected defaults on all 10K validation prompts:
-
-```bash
-bash script/ablation/evaluate_imagenet_flow_100c.sh
-bash script/ablation/evaluate_qwen_showo_vq_100c.sh
-```
-
-The CFG sweep launchers remain available for explicit searches:
-
-```bash
-CFG_VALUES="1.5 2.0 2.5 3.0 3.5 4.0 4.5 5.0" \
-  bash script/ablation/evaluate_imagenet_flow_cfg_sweep_100c.sh
-
-GUIDANCE_SCALES="0.0 0.5 1.0" \
-  bash script/ablation/evaluate_qwen_showo_vq_cfg_sweep_100c.sh
-```
-
-Use a new `SWEEP_ROOT` after changing any contract-bound source, config, or
-protocol. Existing sweep roots are immutable experiment snapshots.
-
-## Repository map
-
-- `configs/ablation/`: the two active 100C training/evaluation configs.
-- `models/modeling_model/modeling_selfless_flow.py`: Selfless-Flow backbone,
-  flow objective integration, and sampler.
-- `models/modeling_model/modeling_qwen_showo.py`: Qwen-Show-O model and official
-  iterative masked sampler.
-- `pretrain/`: the two active training loops plus retained text/full-dataset
-  utilities.
-- `script/ablation/`: data preparation, training, selected evaluation, and CFG
-  sweep launchers.
-- `scripts/`: evaluators, strict validators, immutable sweep contracts, and
-  deterministic summary builders.
-- `tests/`: architecture, dataset, metric-protocol, and default-regression
-  tests.
-
-## Preserved non-default paths
-
-The full-ImageNet Selfless-Flow training path is intentionally retained, but it
-is no longer the repository default:
-
-```bash
-bash script/selfless/encode_imagenet_full_kl16_vae.sh
 bash script/selfless/pretraining_imagenet_flow_full_from_qwen3base.sh
 ```
 
-The text-only selfless adaptation path is also retained:
+Caption-conditioned 使用
+`configs/selfless/imagenet_flow_caption_from_qwen3base.yaml`：
 
 ```bash
-bash script/selfless/pretraining_text_selfless_2048.sh
+CONFIG=configs/selfless/imagenet_flow_caption_from_qwen3base.yaml \
+  bash script/selfless/pretraining_imagenet_flow_full_from_qwen3base.sh
 ```
 
-## Validation
+Caption manifest 必须完整覆盖 latent manifest；loader 不静默回退到 class，
+也不截断超出配置上下文长度的 caption。训练集可使用确定性 segment packing，
+validation 保持一条样本一行。
+
+## 评测
 
 ```bash
-PYTHONPATH=. .venv/bin/pytest -q tests
-ruff check utils/dataset_utils.py tests/test_ablation_eval_defaults.py
+bash script/selfless/evaluate_imagenet_flow.sh
 ```
 
-For platform paths, resource policy, and the mandatory official ImageNet mount,
-see [INSPIRE.md](INSPIRE.md).
+默认正式协议是 8×H100、10K samples、BF16、CFG 3.5、100-step Heun、
+`spatial_halton`。评测脚本中的 batch 是 shard 前的全局 batch；默认
+`4096 = 8 × 512`。可以通过 `NUM_GPUS`、`BATCH_SIZE_PER_GPU` 或
+`BATCH_SIZE` 显式覆盖。每个 global batch 会先按 rank 切分，再进入 dataset
+collation；各 rank 不再重复构造完整的 4096-row CPU batch。
+
+正式 FID 需要传入与目标数据分布匹配的 real-stat cache：
+
+```bash
+REAL_STATS_PATH=/path/to/inception_stats.pt \
+  bash script/selfless/evaluate_imagenet_flow.sh
+```
+
+## 代码入口
+
+- `models/modeling_model/modeling_selfless_flow.py`：two-stream backbone。
+- `models/modeling_model/image_flow_loss.py`：pure-2D dynamic flow head。
+- `utils/dataset_imagenet_flow_cache.py`：class/caption dataset 与 dataloader。
+- `utils/multimodal_segment_packing.py`：caption 变长样本 packing。
+- `scripts/evaluate_single_stream_fid_is.py`：FID/IS evaluator。
+
+## 验证
+
+```bash
+PYTHONPATH=. TORCH_COMPILE_DISABLE=1 \
+  .venv/bin/python -m pytest -q tests
+uvx ruff check models utils pretrain scripts tests
+```
+
+平台路径和资源约束见 [INSPIRE.md](INSPIRE.md)。

@@ -17,10 +17,10 @@ from transformers import Qwen3Config
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from models.modeling_model import modeling_selfless_flow as selfless_flow
-from models.modeling_model.modeling_selfless_flow import Qwen3ForCausalLM
-from pretrain import train_selfless_flow as train_flow
-from pretrain.train_selfless_flow import (
+from models.modeling_model import modeling_selfless_flow as selfless_flow  # noqa: E402
+from models.modeling_model.modeling_selfless_flow import Qwen3ForCausalLM  # noqa: E402
+from pretrain import train_selfless_flow as train_flow  # noqa: E402
+from pretrain.train_selfless_flow import (  # noqa: E402
     _create_ema_model,
     _load_ema_state_if_available,
     _load_image_flow_adapter,
@@ -100,7 +100,7 @@ def tiny_config() -> Qwen3Config:
     config.eoi_token_id = 12
     config.image_latent_dim = 4
     config.image_tokens_per_img = 4
-    config.image_flow_width = 8
+    config.image_flow_width = 32
     config.image_flow_depth = 1
     config.image_flow_num_sampling_steps = "2"
     config.image_flow_batch_mul = 1
@@ -110,8 +110,6 @@ def tiny_config() -> Qwen3Config:
     config.image_flow_time_uniform_mix = 0.0
     config.image_flow_solver = "heun"
     config.image_uncond_prob = 0.0
-    config.lambda_text = 0.1
-    config.lambda_image = 1.0
     config.use_flex_attention = False
     return config
 
@@ -187,7 +185,6 @@ def run_train_step(model, batch):
 @torch.no_grad()
 def run_validation(model, batch):
     model.eval()
-    device = batch["input_ids"].device
     output = model(
         X0_input_ids=batch["input_ids"],
         labels=batch["labels"],
@@ -214,7 +211,7 @@ def run_validation(model, batch):
         flow_temperature=1.0,
         flow_cfg=1.5,
         flow_cfg_schedule="linear",
-        parallel_rate=2,
+        parallel_rate=1,
         order_strategy="sigma",
         return_trace=True,
     )

@@ -76,7 +76,7 @@ def parse_args():
         help="Order for oracle seeding: same, sigma, random, spatial_halton, spatial_uniform, or prefix.",
     )
     parser.add_argument("--parallel_rate", type=int, default=1)
-    parser.add_argument("--strategies", default="sigma,hidden_norm")
+    parser.add_argument("--strategies", default="spatial_halton")
     parser.add_argument(
         "--refine_ratios",
         default="",
