@@ -8,6 +8,8 @@ from models.modeling_model.modeling_selfless_flow import ImageTokenEmbedder
 from utils.dataset_imagenet_flow_cache import (
     DEFAULT_CAPTION_PREFIX,
     ImageNetFlowCacheDataset,
+    POSTERIOR_CACHE_FORMAT,
+    POSTERIOR_STATS_LAYOUT,
     build_imagenet_flow_cache_dataloaders,
     collate_imagenet_flow_cache,
 )
@@ -35,13 +37,20 @@ def _write_data(tmp_path, captions=("first caption", "second caption")):
     manifest = tmp_path / "manifest.jsonl"
     mapping = tmp_path / "mapping.txt"
     caption_manifest = tmp_path / "captions.jsonl"
+    means = torch.arange(
+        len(captions) * 8,
+        dtype=torch.float16,
+    ).view(len(captions), 4, 2)
     torch.save(
         {
-            "latents": torch.arange(
-                len(captions) * 8,
-                dtype=torch.float16,
-            ).view(len(captions), 4, 2),
+            "posterior_stats": torch.cat(
+                (means, torch.zeros_like(means)), dim=-1
+            ),
             "img_ids": torch.arange(1, len(captions) + 1),
+            "metadata": {
+                "format": POSTERIOR_CACHE_FORMAT,
+                "stats_layout": POSTERIOR_STATS_LAYOUT,
+            },
         },
         cache,
     )
@@ -97,6 +106,31 @@ def _dataset(tmp_path, mode, **overrides):
     return ImageNetFlowCacheDataset(**arguments)
 
 
+def test_frozen_latent_cache_is_explicitly_rejected(tmp_path):
+    cache, manifest, mapping, _ = _write_data(tmp_path)
+    torch.save(
+        {
+            "latents": torch.zeros((2, 4, 2), dtype=torch.float16),
+            "img_ids": torch.tensor([1, 2]),
+        },
+        cache,
+    )
+    with pytest.raises(ValueError, match="no longer supported"):
+        ImageNetFlowCacheDataset(
+            cache_path=str(cache),
+            tokenizer=WordTokenizer(),
+            boi_token_id=11,
+            eoi_token_id=12,
+            mask_token_id=13,
+            eos_token_id=14,
+            image_tokens_per_img=4,
+            image_latent_dim=2,
+            manifest_jsonl=str(manifest),
+            synset_mapping_path=str(mapping),
+            conditioning_mode="class",
+        )
+
+
 def test_class_mode_serializes_class_name_only(tmp_path):
     dataset = _dataset(tmp_path, "class")
     item = dataset[0]
@@ -144,6 +178,134 @@ def test_caption_mode_requires_complete_one_to_one_membership(tmp_path):
     rows = captions.read_text(encoding="utf-8").splitlines()
     captions.write_text(rows[0] + "\n", encoding="utf-8")
     with pytest.raises(ValueError, match="Missing 1 captions"):
+        ImageNetFlowCacheDataset(
+            cache_path=str(cache),
+            tokenizer=WordTokenizer(),
+            boi_token_id=11,
+            eoi_token_id=12,
+            mask_token_id=13,
+            eos_token_id=14,
+            image_tokens_per_img=4,
+            image_latent_dim=2,
+            manifest_jsonl=str(manifest),
+            synset_mapping_path=str(mapping),
+            conditioning_mode="caption",
+            caption_jsonl=str(captions),
+        )
+
+
+def test_multicaption_rows_cycle_by_epoch_and_fix_validation_caption(tmp_path):
+    cache, manifest, mapping, captions = _write_data(
+        tmp_path,
+        captions=("legacy caption",),
+    )
+    captions.write_text(
+        json.dumps(
+            {
+                "path": "n00000001/n00000001_1.JPEG",
+                "id": "n00000001_1",
+                "recaption_short": "legacy caption",
+                "captions": [
+                    {"text": "original caption", "source": "original"},
+                    {"text": "teacher caption alpha", "source": "api"},
+                    {"text": "teacher caption beta", "source": "api"},
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    dataset = ImageNetFlowCacheDataset(
+        cache_path=str(cache),
+        tokenizer=WordTokenizer(),
+        boi_token_id=11,
+        eoi_token_id=12,
+        mask_token_id=13,
+        eos_token_id=14,
+        image_tokens_per_img=4,
+        image_latent_dim=2,
+        manifest_jsonl=str(manifest),
+        synset_mapping_path=str(mapping),
+        conditioning_mode="caption",
+        caption_jsonl=str(captions),
+        caption_list_key="captions",
+    )
+
+    dataset.set_training_indices([0])
+    selected = []
+    token_hashes = []
+    for epoch in range(3):
+        dataset.set_epoch(epoch)
+        item = dataset[0]
+        selected.append(item["caption_index"].item())
+        token_hashes.append(item["token_ids_sha256"])
+        assert item["caption_count"].item() == 3
+    assert set(selected) == {0, 1, 2}
+    assert len(set(token_hashes)) == 3
+
+    dataset.set_training_indices([])
+    dataset.set_epoch(0)
+    validation_zero = dataset[0]
+    dataset.set_epoch(11)
+    validation_later = dataset[0]
+    assert validation_zero["caption_index"].item() == 0
+    assert validation_later["caption_index"].item() == 0
+    assert (
+        validation_zero["token_ids_sha256"]
+        == validation_later["token_ids_sha256"]
+    )
+
+
+def test_multicaption_rows_reject_duplicate_text(tmp_path):
+    cache, manifest, mapping, captions = _write_data(
+        tmp_path,
+        captions=("legacy caption",),
+    )
+    captions.write_text(
+        json.dumps(
+            {
+                "path": "n00000001/n00000001_1.JPEG",
+                "captions": ["same caption", {"text": "same caption"}],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="duplicate captions"):
+        ImageNetFlowCacheDataset(
+            cache_path=str(cache),
+            tokenizer=WordTokenizer(),
+            boi_token_id=11,
+            eoi_token_id=12,
+            mask_token_id=13,
+            eos_token_id=14,
+            image_tokens_per_img=4,
+            image_latent_dim=2,
+            manifest_jsonl=str(manifest),
+            synset_mapping_path=str(mapping),
+            conditioning_mode="caption",
+            caption_jsonl=str(captions),
+        )
+
+
+def test_caption_img_id_must_match_manifest_path(tmp_path):
+    cache, manifest, mapping, captions = _write_data(
+        tmp_path,
+        captions=("first caption", "second caption"),
+    )
+    captions.write_text(
+        json.dumps(
+            {
+                "img_id": 1,
+                "id": "n00000001_2",
+                "path": "n00000001/n00000001_2.JPEG",
+                "recaption_short": "misaligned caption",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="img_id/path mismatch"):
         ImageNetFlowCacheDataset(
             cache_path=str(cache),
             tokenizer=WordTokenizer(),

@@ -10,7 +10,10 @@ from models.modeling_model.modeling_selfless_flow import Qwen3Model
 from utils.dataset_imagenet_flow_cache import (
     DEFAULT_CAPTION_PREFIX,
     ImageNetFlowCacheDataset,
+    POSTERIOR_CACHE_FORMAT,
+    POSTERIOR_STATS_LAYOUT,
     build_imagenet_flow_cache_dataloaders,
+    collate_imagenet_flow_cache,
 )
 from utils.multimodal_segment_packing import (
     collate_segment_packed,
@@ -30,12 +33,19 @@ class CharacterTokenizer:
 
 def _write_dataset_files(tmp_path: Path, captions: list[str]):
     cache = tmp_path / "latents.pt"
+    means = torch.arange(
+        len(captions) * 4 * 2, dtype=torch.float32
+    ).reshape(len(captions), 4, 2)
     torch.save(
         {
-            "latents": torch.arange(
-                len(captions) * 4 * 2, dtype=torch.float32
-            ).reshape(len(captions), 4, 2),
+            "posterior_stats": torch.cat(
+                (means, torch.zeros_like(means)), dim=-1
+            ),
             "img_ids": torch.arange(1, len(captions) + 1),
+            "metadata": {
+                "format": POSTERIOR_CACHE_FORMAT,
+                "stats_layout": POSTERIOR_STATS_LAYOUT,
+            },
         },
         cache,
     )
@@ -101,14 +111,12 @@ def test_best_fit_decreasing_and_overflow_are_deterministic():
     first = deterministic_best_fit_decreasing(
         lengths,
         img_ids,
-        nominal_capacity=12,
-        overflow_multiple=8,
+        nominal_capacity=16,
     )
     second = deterministic_best_fit_decreasing(
         lengths,
         img_ids,
-        nominal_capacity=12,
-        overflow_multiple=8,
+        nominal_capacity=16,
     )
     assert first == second
     assert sorted(index for row in first for index in row.sample_indices) == [
@@ -118,12 +126,21 @@ def test_best_fit_decreasing_and_overflow_are_deterministic():
         3,
     ]
     assert all(
-        row.overflow or row_used_length(row, lengths) <= 12 for row in first
+        row.overflow or row_used_length(row, lengths) <= 16 for row in first
     )
     overflow = [row for row in first if row.overflow]
     assert len(overflow) == 1
     assert overflow[0].sample_indices == (3,)
-    assert overflow[0].padded_length == 24
+    assert overflow[0].padded_length == 32
+
+
+def test_packing_rejects_non_power_of_two_row_length():
+    with pytest.raises(ValueError, match="power of two"):
+        deterministic_best_fit_decreasing(
+            [7, 6],
+            [1, 2],
+            nominal_capacity=12,
+        )
 
 
 def test_prompt_payload_is_not_truncated_and_overflow_keeps_hash(tmp_path):
@@ -138,11 +155,10 @@ def test_prompt_payload_is_not_truncated_and_overflow_keeps_hash(tmp_path):
     packed = collate_segment_packed(
         [item],
         nominal_capacity=2048,
-        overflow_multiple=128,
         image_uncond_prob=0.1,
     )
-    assert packed["image_count"].item() == 1
-    assert packed["pack_details"].tolist()[-1] == 1
+    assert packed["image_count"] == 1
+    assert packed["pack_details"][-1] == 1
     assert packed["sample_token_sha256"] == [item["token_ids_sha256"]]
     valid = packed["segment_ids"][0] >= 0
     assert packed["input_ids"][0, valid].tolist() == item["input_ids"].tolist()
@@ -155,7 +171,7 @@ def test_packed_mask_and_positions_are_segment_isolated(tmp_path):
         nominal_capacity=256,
         image_uncond_prob=0.0,
     )
-    assert packed["image_count"].item() == 2
+    assert packed["image_count"] == 2
     assert packed["image_span_table"].shape == (2, 5)
 
     segment_ids = packed["segment_ids"]
@@ -198,6 +214,144 @@ def test_packed_mask_and_positions_are_segment_isolated(tmp_path):
     )
 
 
+def test_packed_mask_matches_multimodal_visibility_truth_table(tmp_path):
+    dataset = _dataset(tmp_path, ["small caption", "another caption"])
+    packed = collate_segment_packed(
+        [dataset[0], dataset[1]],
+        nominal_capacity=256,
+        image_uncond_prob=0.0,
+    )
+    mask = get_selfless_mask(
+        sigma=packed["sigma"],
+        seq_len=packed["sigma"].shape[1],
+        device="cpu",
+        token_types=packed["token_types"],
+        segment_ids=packed["segment_ids"],
+        image_uncond_mask=packed["image_uncond_mask"],
+    )
+
+    def allowed(row_idx, q_idx, kv_idx):
+        value = mask.mask_mod(
+            torch.tensor(row_idx),
+            torch.tensor(0),
+            torch.tensor(q_idx),
+            torch.tensor(kv_idx),
+        )
+        return bool(value.item() if torch.is_tensor(value) else value)
+
+    # Exhaustively prove the low-level rule for every real and padded token:
+    # strict sigma order, same non-padding segment, and no diagonal.
+    row_count, physical_length = packed["sigma"].shape
+    for row_idx in range(row_count):
+        for q_idx in range(physical_length):
+            for kv_idx in range(physical_length):
+                q_segment = int(packed["segment_ids"][row_idx, q_idx])
+                kv_segment = int(packed["segment_ids"][row_idx, kv_idx])
+                expected = (
+                    q_segment >= 0
+                    and q_segment == kv_segment
+                    and int(packed["sigma"][row_idx, kv_idx])
+                    < int(packed["sigma"][row_idx, q_idx])
+                )
+                assert allowed(row_idx, q_idx, kv_idx) is expected
+
+    # Prove the multimodal role-level contract for every packed sample.
+    for row_idx, segment_id, image_start, image_end, _ in packed[
+        "image_span_table"
+    ].tolist():
+        segment_positions = (
+            packed["segment_ids"][row_idx] == segment_id
+        ).nonzero(as_tuple=True)[0].tolist()
+        boi_pos = image_start - 1
+        eoi_pos = image_end
+        eos_pos = segment_positions[-1]
+        prefix_positions = [
+            position for position in segment_positions if position < boi_pos
+        ]
+        suffix_positions = [
+            position
+            for position in segment_positions
+            if eoi_pos < position < eos_pos
+        ]
+        image_positions = list(range(image_start, image_end))
+
+        def visible_keys(q_idx):
+            return {
+                kv_idx
+                for kv_idx in range(physical_length)
+                if allowed(row_idx, q_idx, kv_idx)
+            }
+
+        # BOI is strict autoregressive text: it sees prior text, not itself.
+        assert visible_keys(boi_pos) == set(prefix_positions)
+        # EOI is ordered before all image tokens in sigma space, so it cannot
+        # attend to any image token even though it follows them physically.
+        assert visible_keys(eoi_pos) == set(prefix_positions) | {boi_pos}
+        assert not (visible_keys(eoi_pos) & set(image_positions))
+
+        for image_pos in image_positions:
+            earlier_image_positions = {
+                candidate
+                for candidate in image_positions
+                if packed["sigma"][row_idx, candidate]
+                < packed["sigma"][row_idx, image_pos]
+            }
+            assert visible_keys(image_pos) == (
+                set(prefix_positions)
+                | {boi_pos, eoi_pos}
+                | earlier_image_positions
+            )
+
+        # Any future suffix text and EOS remain strict sigma-autoregressive.
+        for text_pos in prefix_positions + suffix_positions + [eos_pos]:
+            assert text_pos not in visible_keys(text_pos)
+
+
+def test_packed_cfg_dropout_removes_only_image_text_conditioning(tmp_path):
+    item = _dataset(tmp_path, ["small caption"])[0]
+    packed = collate_segment_packed(
+        [item],
+        nominal_capacity=64,
+        image_uncond_prob=1.0,
+    )
+    mask = get_selfless_mask(
+        sigma=packed["sigma"],
+        seq_len=packed["sigma"].shape[1],
+        device="cpu",
+        token_types=packed["token_types"],
+        segment_ids=packed["segment_ids"],
+        image_uncond_mask=packed["image_uncond_mask"],
+    )
+    row_idx, _, image_start, image_end, _ = packed[
+        "image_span_table"
+    ][0].tolist()
+
+    def visible_keys(q_idx):
+        keys = set()
+        for kv_idx in range(packed["sigma"].shape[1]):
+            value = mask.mask_mod(
+                torch.tensor(row_idx),
+                torch.tensor(0),
+                torch.tensor(q_idx),
+                torch.tensor(kv_idx),
+            )
+            if bool(value.item() if torch.is_tensor(value) else value):
+                keys.add(kv_idx)
+        return keys
+
+    image_positions = list(range(image_start, image_end))
+    assert packed["image_uncond_mask"][
+        row_idx, image_start:image_end
+    ].all()
+    for image_pos in image_positions:
+        assert visible_keys(image_pos) == {
+            candidate
+            for candidate in image_positions
+            if packed["sigma"][row_idx, candidate]
+            < packed["sigma"][row_idx, image_pos]
+        }
+
+
 def test_repeated_packing_reuses_identical_pack_manifest(tmp_path):
     dataset = _dataset(tmp_path, ["a", "bb", "ccc"])
     items = [dataset[index] for index in range(3)]
@@ -206,6 +360,39 @@ def test_repeated_packing_reuses_identical_pack_manifest(tmp_path):
     assert first["pack_manifest_sha256"] == second["pack_manifest_sha256"]
     assert torch.equal(first["sigma"], second["sigma"])
     assert first["augmentation_sha256"] == second["augmentation_sha256"]
+
+
+def test_packed_and_unpacked_batches_preserve_future_ce_labels(tmp_path):
+    dataset = _dataset(tmp_path, ["a", "bb"])
+    items = [dataset[0], dataset[1]]
+    for item_index, item in enumerate(items):
+        item["labels"] = torch.arange(
+            item["input_ids"].numel(), dtype=torch.long
+        ) + 1000 * item_index
+
+    unpacked = collate_imagenet_flow_cache(items)
+    for row_index, item in enumerate(items):
+        length = item["labels"].numel()
+        assert torch.equal(
+            unpacked["labels"][row_index, :length], item["labels"]
+        )
+
+    packed = collate_segment_packed(items, nominal_capacity=64)
+    for row_index, segment_id, _, _, img_id in packed[
+        "image_span_table"
+    ].tolist():
+        item = next(
+            candidate
+            for candidate in items
+            if int(candidate["img_id"].item()) == img_id
+        )
+        segment_positions = (
+            packed["segment_ids"][row_index] == segment_id
+        ).nonzero(as_tuple=True)[0]
+        assert torch.equal(
+            packed["labels"][row_index, segment_positions],
+            item["labels"],
+        )
 
 
 def test_packing_is_train_only_and_validation_rows_stay_independent(tmp_path):
@@ -240,7 +427,7 @@ def test_packing_is_train_only_and_validation_rows_stay_independent(tmp_path):
                         "enabled": True,
                         "algorithm": "deterministic_best_fit_decreasing",
                         "nominal_capacity": 128,
-                        "overflow_policy": "dedicated_round_up_128",
+                        "overflow_policy": "dedicated_next_power_of_two",
                     },
                 },
                 "preprocessing": {"max_seq_length": 4096},
@@ -261,10 +448,12 @@ def test_packing_is_train_only_and_validation_rows_stay_independent(tmp_path):
     val_batch = next(iter(val_loader))
 
     assert "segment_ids" in train_batch
-    assert train_batch["image_count"].item() == 4
+    assert train_batch["image_count"] == 4
     assert train_batch["input_ids"].shape[0] < 4
     assert "segment_ids" not in val_batch
-    assert "position_ids" not in val_batch
+    assert "position_ids" in val_batch
+    assert "image_local_positions" in val_batch
+    assert val_batch["image_span_table"].shape == (2, 5)
     assert val_batch["input_ids"].shape[0] == 2
     assert (val_batch["token_types"] == 1).sum(dim=1).tolist() == [4, 4]
 

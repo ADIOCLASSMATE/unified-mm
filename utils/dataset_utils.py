@@ -7,7 +7,7 @@ def get_dataloaders(config, tokenizer):
             f"got dataset.class_name={dataset_class!r}."
         )
 
-    from .dataset_imagenet_flow_cache import (
+    from .imagenet_flow_dataloaders import (
         build_imagenet_flow_cache_dataloaders,
     )
 

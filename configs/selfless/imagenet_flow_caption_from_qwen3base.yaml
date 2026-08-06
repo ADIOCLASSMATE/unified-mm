@@ -50,13 +50,14 @@ model:
 dataset:
     class_name: "ImageNetFlowCacheDataset"
     params:
-        cache_path: "public/datasets/imagenet_full/vae_latents_mar_kl16/flow_latents_all_fp16.pt"
+        cache_path: "public/datasets/imagenet_full/vae_posterior_mar_kl16/posterior_stats_all_fp16.pt"
         manifest_jsonl: "public/datasets/imagenet_full/manifest.jsonl"
         conditioning_mode: "caption"
-        caption_jsonl: "public/datasets/imagenet_full/captions.jsonl"
+        caption_jsonl: "public/datasets/imagenet_full/captions/imagenet1k_train_caption_join.jsonl"
         caption_text_key: "recaption_short"
         caption_path_key: "path"
         caption_id_key: "id"
+        caption_manifest_sha256: "213b3a2cef493082ed1054a8abd8c357941ee8e2168382a58837abaa6c1b2f00"
         cache_caption_tokens: false
         model_context_length: 32768
         image_tokens_per_img: 256
@@ -67,12 +68,12 @@ dataset:
         val_ratio: 0.01
         split_strategy: "stratified"
         split_seed: 42
-        latent_hflip_prob: 0.5
         packing:
             enabled: true
             algorithm: "deterministic_best_fit_decreasing"
             nominal_capacity: 2048
-            overflow_policy: "dedicated_round_up_128"
+            overflow_policy: "dedicated_next_power_of_two"
+            audit_manifests: false
     preprocessing:
         max_seq_length: 2048
 

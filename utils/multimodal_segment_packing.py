@@ -13,6 +13,7 @@ import torch
 from models.modeling_model.image_position_utils import (
     build_row_col_position_ids,
 )
+from utils.imagenet_flow_sequence import build_selfless_sigma, scalar_int
 
 
 def canonical_sha256(value: Any) -> str:
@@ -25,14 +26,16 @@ def canonical_sha256(value: Any) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def round_up(value: int, multiple: int) -> int:
+def is_power_of_two(value: int) -> bool:
     value = int(value)
-    multiple = int(multiple)
-    if value <= 0 or multiple <= 0:
-        raise ValueError(
-            f"value and multiple must be positive, got {value}, {multiple}"
-        )
-    return ((value + multiple - 1) // multiple) * multiple
+    return value > 0 and value & (value - 1) == 0
+
+
+def next_power_of_two(value: int) -> int:
+    value = int(value)
+    if value <= 0:
+        raise ValueError(f"value must be positive, got {value}")
+    return 1 << (value - 1).bit_length()
 
 
 @dataclass(frozen=True)
@@ -58,7 +61,6 @@ def deterministic_best_fit_decreasing(
     img_ids: Sequence[int],
     *,
     nominal_capacity: int,
-    overflow_multiple: int = 128,
 ) -> list[PackedRow]:
     """Pack indivisible samples with deterministic best-fit-decreasing.
 
@@ -73,8 +75,11 @@ def deterministic_best_fit_decreasing(
             f"lengths/img_ids mismatch: {len(lengths)} != {len(img_ids)}"
         )
     capacity = int(nominal_capacity)
-    if capacity <= 0:
-        raise ValueError(f"nominal_capacity must be positive, got {capacity}")
+    if not is_power_of_two(capacity):
+        raise ValueError(
+            "nominal_capacity must be a positive power of two, "
+            f"got {capacity}"
+        )
     normalized_lengths = [int(value) for value in lengths]
     normalized_img_ids = [int(value) for value in img_ids]
     if any(length <= 0 for length in normalized_lengths):
@@ -123,7 +128,7 @@ def deterministic_best_fit_decreasing(
     rows.extend(
         PackedRow(
             (index,),
-            round_up(length, overflow_multiple),
+            next_power_of_two(length),
             True,
         )
         for index, length, _ in overflow
@@ -138,45 +143,6 @@ def deterministic_best_fit_decreasing(
     return rows
 
 
-def _segment_sigma(
-    item: Mapping[str, Any],
-    *,
-    image_tokens: int,
-) -> torch.Tensor:
-    length = int(item["input_ids"].shape[0])
-    prompt_len = int(item["prompt_len"].item())
-    suffix_len = int(item["suffix_len"].item())
-    image_start = int(item["image_start"].item())
-    eoi_pos = image_start + image_tokens
-    suffix_start = eoi_pos + 1
-    eos_pos = length - 1
-    if eoi_pos >= length or eos_pos < eoi_pos:
-        raise ValueError(
-            f"invalid image span for segment length={length}: "
-            f"start={image_start}, image_tokens={image_tokens}"
-        )
-
-    sigma = torch.empty(length, dtype=torch.long)
-    if prompt_len:
-        sigma[:prompt_len] = torch.arange(prompt_len, dtype=torch.long)
-    sigma[prompt_len] = prompt_len
-    sigma[eoi_pos] = prompt_len + 1
-
-    reveal_seed = int(item["reveal_seed"].item())
-    generator = torch.Generator()
-    generator.manual_seed(reveal_seed)
-    order = torch.rand(image_tokens, generator=generator).argsort()
-    sigma[image_start:eoi_pos] = prompt_len + 2 + order
-
-    suffix_sigma_start = prompt_len + image_tokens + 2
-    if suffix_len:
-        sigma[suffix_start:eos_pos] = (
-            suffix_sigma_start + torch.arange(suffix_len, dtype=torch.long)
-        )
-    sigma[eos_pos] = suffix_sigma_start + suffix_len
-    return sigma
-
-
 def _cfg_dropout_for_item(
     item: Mapping[str, Any],
     probability: float,
@@ -185,7 +151,7 @@ def _cfg_dropout_for_item(
         return False
     if probability >= 1.0:
         return True
-    seed = int(item["cfg_dropout_seed"].item())
+    seed = scalar_int(item, "cfg_dropout_seed")
     return random.Random(seed).random() < probability
 
 
@@ -193,20 +159,19 @@ def collate_segment_packed(
     batch: list[dict[str, Any]],
     *,
     nominal_capacity: int = 2048,
-    overflow_multiple: int = 128,
     image_uncond_prob: float = 0.0,
+    emit_audit_manifest: bool = True,
 ) -> dict[str, Any]:
     """Pack complete text-image samples into block-diagonal physical rows."""
 
     if not batch:
         raise ValueError("cannot pack an empty batch")
     lengths = [int(item["input_ids"].shape[0]) for item in batch]
-    img_ids = [int(item["img_id"].item()) for item in batch]
+    img_ids = [scalar_int(item, "img_id") for item in batch]
     rows = deterministic_best_fit_decreasing(
         lengths,
         img_ids,
         nominal_capacity=nominal_capacity,
-        overflow_multiple=overflow_multiple,
     )
     if not rows:
         raise ValueError("packing produced no rows")
@@ -246,6 +211,9 @@ def collate_segment_packed(
     image_uncond_mask = torch.zeros(
         row_count, physical_length, dtype=torch.bool
     )
+    image_local_positions = torch.full(
+        (row_count, physical_length), -1, dtype=torch.long
+    )
 
     span_rows: list[list[int]] = []
     pack_rows: list[dict[str, Any]] = []
@@ -266,7 +234,7 @@ def collate_segment_packed(
             token_types[row_index, cursor:end] = item["token_types"]
             labels[row_index, cursor:end] = item["labels"]
             segment_ids[row_index, cursor:end] = segment_id
-            sigma[row_index, cursor:end] = _segment_sigma(
+            sigma[row_index, cursor:end] = build_selfless_sigma(
                 item,
                 image_tokens=image_tokens,
             )
@@ -276,11 +244,15 @@ def collate_segment_packed(
             )
             position_ids[:, row_index, cursor:end] = local_position_ids[:, 0]
 
-            image_start = cursor + int(item["image_start"].item())
+            image_start = cursor + scalar_int(item, "image_start")
             image_end = image_start + image_tokens
             image_latents[row_index, image_start:image_end] = item[
                 "image_latents"
             ]
+            image_local_positions[row_index, image_start:image_end] = torch.arange(
+                image_tokens,
+                dtype=torch.long,
+            )
             if _cfg_dropout_for_item(item, float(image_uncond_prob)):
                 image_uncond_mask[row_index, image_start:image_end] = True
 
@@ -288,83 +260,81 @@ def collate_segment_packed(
             span_rows.append(
                 [row_index, segment_id, image_start, image_end, img_id]
             )
-            token_hash = str(item["token_ids_sha256"])
-            augmentation_hash = str(item["augmentation_sha256"])
-            sample_token_hashes.append(token_hash)
-            augmentation_hashes.append(augmentation_hash)
-            segment_records.append(
+            if emit_audit_manifest:
+                token_hash = str(item["token_ids_sha256"])
+                augmentation_hash = str(item["augmentation_sha256"])
+                sample_token_hashes.append(token_hash)
+                augmentation_hashes.append(augmentation_hash)
+                segment_records.append(
+                    {
+                        "segment_id": segment_id,
+                        "img_id": img_id,
+                        "source_index": int(sample_index),
+                        "start": cursor,
+                        "end": end,
+                        "serialized_length": length,
+                        "token_ids_sha256": token_hash,
+                        "augmentation_sha256": augmentation_hash,
+                    }
+                )
+            cursor = end
+        if emit_audit_manifest:
+            pack_rows.append(
                 {
-                    "segment_id": segment_id,
-                    "img_id": img_id,
-                    "source_index": int(sample_index),
-                    "start": cursor,
-                    "end": end,
-                    "serialized_length": length,
-                    "token_ids_sha256": token_hash,
-                    "augmentation_sha256": augmentation_hash,
+                    "row": row_index,
+                    "padded_length": row.padded_length,
+                    "used_length": cursor,
+                    "overflow": row.overflow,
+                    "segments": segment_records,
                 }
             )
-            cursor = end
-        pack_rows.append(
-            {
-                "row": row_index,
-                "padded_length": row.padded_length,
-                "used_length": cursor,
-                "overflow": row.overflow,
-                "segments": segment_records,
-            }
-        )
 
     valid_tokens = int((segment_ids >= 0).sum().item())
     image_token_count = int((token_types == 1).sum().item())
     padding_tokens = int(token_types.numel() - valid_tokens)
-    manifest_payload = {
-        "schema": "selfless_segment_pack_batch_v1",
-        "nominal_capacity": int(nominal_capacity),
-        "overflow_multiple": int(overflow_multiple),
-        "physical_length": physical_length,
-        "rows": pack_rows,
-    }
-    manifest_sha256 = canonical_sha256(manifest_payload)
-    return {
+    result = {
         "input_ids": input_ids,
         "token_types": token_types,
         "sigma": sigma,
         "position_ids": position_ids,
+        "image_local_positions": image_local_positions,
         "segment_ids": segment_ids,
         "labels": labels,
         "image_latents": image_latents,
         "image_span_table": torch.tensor(span_rows, dtype=torch.long),
         "image_uncond_mask": image_uncond_mask,
-        "valid_token_count": torch.tensor(valid_tokens, dtype=torch.long),
-        "padding_token_count": torch.tensor(
-            padding_tokens, dtype=torch.long
+        "valid_token_count": valid_tokens,
+        "padding_token_count": padding_tokens,
+        "image_count": len(batch),
+        "pack_capacity": int(nominal_capacity),
+        "sample_img_ids": img_ids,
+        "pack_stats": (
+            valid_tokens,
+            image_token_count,
+            padding_tokens,
+            physical_length,
         ),
-        "image_count": torch.tensor(len(batch), dtype=torch.long),
-        "pack_capacity": torch.tensor(
-            int(nominal_capacity), dtype=torch.long
-        ),
-        "pack_manifest_sha256": manifest_sha256,
-        "pack_manifest": manifest_payload,
-        "sample_img_ids": torch.tensor(img_ids, dtype=torch.long),
-        "sample_token_sha256": sample_token_hashes,
-        "augmentation_sha256": augmentation_hashes,
-        "pack_stats": torch.tensor(
-            [
-                valid_tokens,
-                image_token_count,
-                padding_tokens,
-                physical_length,
-            ],
-            dtype=torch.long,
-        ),
-        "pack_details": torch.tensor(
-            [
-                len(batch),
-                row_count,
-                int(nominal_capacity),
-                sum(int(row.overflow) for row in rows),
-            ],
-            dtype=torch.long,
+        "pack_details": (
+            len(batch),
+            row_count,
+            int(nominal_capacity),
+            sum(int(row.overflow) for row in rows),
         ),
     }
+    if emit_audit_manifest:
+        manifest_payload = {
+            "schema": "selfless_segment_pack_batch_v2",
+            "nominal_capacity": int(nominal_capacity),
+            "overflow_policy": "dedicated_next_power_of_two",
+            "physical_length": physical_length,
+            "rows": pack_rows,
+        }
+        result.update(
+            {
+                "pack_manifest_sha256": canonical_sha256(manifest_payload),
+                "pack_manifest": manifest_payload,
+                "sample_token_sha256": sample_token_hashes,
+                "augmentation_sha256": augmentation_hashes,
+            }
+        )
+    return result
