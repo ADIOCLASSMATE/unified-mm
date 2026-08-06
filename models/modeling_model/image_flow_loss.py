@@ -3,11 +3,12 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 from torch.utils.checkpoint import checkpoint
 
 from .image_position_utils import (
     apply_local_row_col_rope,
+    build_local_row_col_rope,
+    rotate_half,
 )
 
 
@@ -42,13 +43,26 @@ class TimestepEmbedder(nn.Module):
             nn.Linear(hidden_size, hidden_size, bias=True),
         )
         self.frequency_embedding_size = frequency_embedding_size
+        self._frequency_cache = {}
+
+    def _apply(self, fn, recurse=True):
+        self._frequency_cache.clear()
+        return super()._apply(fn, recurse=recurse)
 
     @staticmethod
-    def timestep_embedding(t, dim, max_period=10000):
+    def timestep_embedding(t, dim, max_period=10000, freqs=None):
         half = dim // 2
-        freqs = torch.exp(
-            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32, device=t.device) / half
-        )
+        if freqs is None:
+            freqs = torch.exp(
+                -math.log(max_period)
+                * torch.arange(
+                    start=0,
+                    end=half,
+                    dtype=torch.float32,
+                    device=t.device,
+                )
+                / half
+            )
         args = t[:, None].float() * freqs[None]
         embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         if dim % 2:
@@ -56,7 +70,26 @@ class TimestepEmbedder(nn.Module):
         return embedding
 
     def forward(self, t):
-        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+        cache_key = (t.device.type, t.device.index)
+        freqs = self._frequency_cache.get(cache_key)
+        if freqs is None:
+            half = self.frequency_embedding_size // 2
+            freqs = torch.exp(
+                -math.log(10000)
+                * torch.arange(
+                    start=0,
+                    end=half,
+                    dtype=torch.float32,
+                    device=t.device,
+                )
+                / half
+            )
+            self._frequency_cache[cache_key] = freqs
+        t_freq = self.timestep_embedding(
+            t,
+            self.frequency_embedding_size,
+            freqs=freqs,
+        )
         t_freq = t_freq.to(device=self.mlp[0].weight.device, dtype=self.mlp[0].weight.dtype)
         return self.mlp(t_freq)
 
@@ -157,22 +190,32 @@ class ContextualFlowBlock(nn.Module):
             )
         return context_mask
 
-    def _apply_rope(self, x, positions):
+    def _apply_rope(self, x, positions, rope=None):
         if positions is None:
             raise ValueError(
                 "Pure-2D flow-head RoPE requires explicit local positions."
             )
-        return apply_local_row_col_rope(
-            x,
-            positions,
-            image_tokens_per_img=self.image_tokens_per_img,
-            axis_dims=self.rope_axis_dims,
-        )
+        if rope is None:
+            return apply_local_row_col_rope(
+                x,
+                positions,
+                image_tokens_per_img=self.image_tokens_per_img,
+                axis_dims=self.rope_axis_dims,
+            )
+        cos, sin = rope
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
+        return x * cos + rotate_half(x) * sin
 
-    def prepare_cross_cache(self, context_hidden, context_positions=None):
+    def prepare_cross_cache(
+        self,
+        context_hidden,
+        context_positions=None,
+        context_rope=None,
+    ):
         context_hidden = self.cross_kv_norm(context_hidden)
         k = self._split_heads(self.cross_k(context_hidden))
-        k = self._apply_rope(k, context_positions)
+        k = self._apply_rope(k, context_positions, context_rope)
         v = self._split_heads(self.cross_v(context_hidden))
         return {
             "k": k,
@@ -238,8 +281,8 @@ class ContextualFlowBlock(nn.Module):
         layer_cache,
         context_mask,
         query_positions=None,
-        context_block_mask=None,
-        use_flex_attention=False,
+        query_rope=None,
+        record_stats=False,
     ):
         if layer_cache is None:
             return None
@@ -255,32 +298,18 @@ class ContextualFlowBlock(nn.Module):
             return None
 
         q = self._split_heads(self.cross_q(x))
-        q = self._apply_rope(q, query_positions)
+        q = self._apply_rope(q, query_positions, query_rope)
         attn_dtype = q.dtype
         k = k.to(device=x.device, dtype=attn_dtype)
         v = v.to(device=x.device, dtype=attn_dtype)
-        self._record_attention_diagnostics(
-            q,
-            k,
-            context_mask,
-            query_positions,
-            layer_cache.get("context_positions"),
-        )
-        if use_flex_attention:
-            out = flex_attention(
-                query=q,
-                key=k,
-                value=v,
-                score_mod=None,
-                block_mask=context_block_mask,
-                scale=self.scale,
-                enable_gqa=False,
-                return_lse=False,
+        if record_stats:
+            self._record_attention_diagnostics(
+                q,
+                k,
+                context_mask,
+                query_positions,
+                layer_cache.get("context_positions"),
             )
-            if self.dropout > 0.0 and self.training:
-                out = F.dropout(out, p=self.dropout, training=True)
-            return self.cross_out(self._merge_heads(out))
-
         context_mask = self._format_context_mask(
             context_mask,
             batch_size,
@@ -289,10 +318,7 @@ class ContextualFlowBlock(nn.Module):
             x.device,
         )
         has_context = context_mask.any(dim=-1)
-        safe_mask = context_mask
-        if not bool(has_context.all().item()):
-            safe_mask = context_mask.clone()
-            safe_mask[~has_context] = True
+        safe_mask = context_mask | (~has_context).unsqueeze(-1)
         out = F.scaled_dot_product_attention(
             q,
             k,
@@ -302,8 +328,7 @@ class ContextualFlowBlock(nn.Module):
             is_causal=False,
             scale=self.scale,
         )
-        if not bool(has_context.all().item()):
-            out = out * has_context[:, None, :, None].to(dtype=out.dtype)
+        out = out * has_context[:, None, :, None].to(dtype=out.dtype)
         return self.cross_out(self._merge_heads(out))
 
     def forward(
@@ -313,13 +338,13 @@ class ContextualFlowBlock(nn.Module):
         layer_cache=None,
         context_mask=None,
         query_positions=None,
-        context_block_mask=None,
-        use_flex_attention=False,
+        query_rope=None,
         include_mlp=True,
+        record_stats=False,
     ):
         self.last_attention_entropy_per_token = None
         self.last_attention_distance_per_token = None
-        input_x = x
+        input_x = x if record_stats else None
         (
             shift_cross,
             scale_cross,
@@ -336,8 +361,8 @@ class ContextualFlowBlock(nn.Module):
                 layer_cache,
                 context_mask,
                 query_positions=query_positions,
-                context_block_mask=context_block_mask,
-                use_flex_attention=use_flex_attention,
+                query_rope=query_rope,
+                record_stats=record_stats,
             )
             if mixed is not None:
                 x = x + gate_cross * mixed
@@ -345,23 +370,30 @@ class ContextualFlowBlock(nn.Module):
         if include_mlp:
             h = modulate(self.mlp_norm(x), shift_mlp, scale_mlp)
             x = x + gate_mlp * self.mlp(h)
-        attention_gate = gate_cross.detach().float().abs().mean(dim=-1)
-        mlp_gate = gate_mlp.detach().float().abs().mean(dim=-1)
-        gate_per_token = (
-            torch.stack([attention_gate, mlp_gate], dim=0).mean(dim=0)
-            if include_mlp
-            else attention_gate
-        )
-        self.last_attention_gate_abs_per_token = attention_gate
-        self.last_mlp_gate_abs_per_token = mlp_gate if include_mlp else None
-        self.last_gate_abs_per_token = gate_per_token
-        self.last_gate_abs_mean = gate_per_token.mean()
-        self.last_update_rms_per_token = (
-            (x.detach().float() - input_x.detach().float())
-            .pow(2)
-            .mean(dim=-1)
-            .sqrt()
-        )
+        if record_stats:
+            attention_gate = gate_cross.detach().float().abs().mean(dim=-1)
+            mlp_gate = gate_mlp.detach().float().abs().mean(dim=-1)
+            gate_per_token = (
+                torch.stack([attention_gate, mlp_gate], dim=0).mean(dim=0)
+                if include_mlp
+                else attention_gate
+            )
+            self.last_attention_gate_abs_per_token = attention_gate
+            self.last_mlp_gate_abs_per_token = mlp_gate if include_mlp else None
+            self.last_gate_abs_per_token = gate_per_token
+            self.last_gate_abs_mean = gate_per_token.mean()
+            self.last_update_rms_per_token = (
+                (x.detach().float() - input_x.detach().float())
+                .pow(2)
+                .mean(dim=-1)
+                .sqrt()
+            )
+        else:
+            self.last_attention_gate_abs_per_token = None
+            self.last_mlp_gate_abs_per_token = None
+            self.last_gate_abs_per_token = None
+            self.last_gate_abs_mean = None
+            self.last_update_rms_per_token = None
         return x
 
 
@@ -426,6 +458,29 @@ class ContextualFlowTransformerHead(nn.Module):
         for block in self.blocks:
             block.collect_attention_diagnostics = enabled
 
+    def _build_rope(self, positions, dtype):
+        block = self.blocks[0]
+        return build_local_row_col_rope(
+            positions,
+            image_tokens_per_img=self.image_tokens_per_img,
+            head_dim=block.head_dim,
+            axis_dims=block.rope_axis_dims,
+            dtype=dtype,
+        )
+
+    def _clear_stream_stats(self):
+        self.last_gate_abs_mean = None
+        self.last_gate_abs_per_token = None
+        self.last_attention_entropy_per_token = None
+        self.last_attention_distance_per_token = None
+        self.last_query_attention_gate_abs_per_token = None
+        self.last_query_mlp_gate_abs_per_token = None
+        self.last_content_attention_gate_abs_per_token = None
+        self.last_content_mlp_gate_abs_per_token = None
+        self.last_content_update_rms_per_token = None
+        self.last_content_relative_update_per_token = None
+        self.last_content_query_cosine_per_token = None
+
     def initialize_weights(self):
         def _basic_init(module):
             if isinstance(module, nn.Linear):
@@ -473,14 +528,6 @@ class ContextualFlowTransformerHead(nn.Module):
                 )
         if positions.shape != (batch_size, seq_len):
             raise ValueError(f"positions must have shape {(batch_size, seq_len)}, got {tuple(positions.shape)}")
-        if positions.numel() > 0:
-            min_pos = int(positions.min().item())
-            max_pos = int(positions.max().item())
-            if min_pos < 0 or max_pos >= self.image_tokens_per_img:
-                raise ValueError(
-                    f"flow positions must be in [0, {self.image_tokens_per_img}), "
-                    f"got min={min_pos}, max={max_pos}"
-                )
         return positions
 
     def _ensure_sequence(self, x, positions=None):
@@ -658,30 +705,6 @@ class ContextualFlowTransformerHead(nn.Module):
             )
         return context_mask
 
-    def _build_context_block_mask(self, context_mask, batch_size, query_len, context_len, device):
-        context_mask = self._format_context_mask(
-            context_mask,
-            batch_size,
-            query_len,
-            context_len,
-            device,
-        )
-        if context_mask is None:
-            return None, None
-
-        def mask_mod(b, h, q_idx, kv_idx):
-            return context_mask[b, q_idx, kv_idx]
-
-        block_mask = create_block_mask(
-            mask_mod,
-            B=batch_size,
-            H=None,
-            Q_LEN=query_len,
-            KV_LEN=context_len,
-            device=device,
-        )
-        return context_mask, block_mask
-
     def prepare_latent_mixer_cache(
         self,
         context_latents=None,
@@ -700,6 +723,7 @@ class ContextualFlowTransformerHead(nn.Module):
         context_latents = context_latents.to(device=model_device, dtype=model_dtype)
         batch_size, context_len, _ = context_latents.shape
         context_positions = self._positions(context_positions, batch_size, context_len, model_device)
+        context_rope = self._build_rope(context_positions, model_dtype)
         context_hidden = self._initial_content_hidden(
             context_latents, context_positions
         )
@@ -732,7 +756,7 @@ class ContextualFlowTransformerHead(nn.Module):
                 "contextual flow cache construction requires an explicit "
                 "strict content mask."
             )
-        content_mask, content_block_mask = self._build_context_block_mask(
+        content_mask = self._format_context_mask(
             content_mask,
             batch_size,
             context_len,
@@ -744,6 +768,7 @@ class ContextualFlowTransformerHead(nn.Module):
             layer_cache = block.prepare_cross_cache(
                 context_hidden,
                 context_positions=context_positions,
+                context_rope=context_rope,
             )
             layers.append(layer_cache)
             context_hidden = block(
@@ -752,8 +777,7 @@ class ContextualFlowTransformerHead(nn.Module):
                 layer_cache=layer_cache,
                 context_mask=content_mask,
                 query_positions=context_positions,
-                context_block_mask=content_block_mask,
-                use_flex_attention=True,
+                query_rope=context_rope,
                 include_mlp=True,
             )
         return {
@@ -771,7 +795,9 @@ class ContextualFlowTransformerHead(nn.Module):
             raise ValueError(f"batch_size must be positive, got {batch_size}.")
         device = self.input_proj.weight.device
         dtype = self.input_proj.weight.dtype
-        empty_positions = torch.empty(batch_size, 0, device=device, dtype=torch.long)
+        empty_positions = torch.empty(
+            batch_size, 0, device=device, dtype=torch.long
+        )
         layers = []
         for block in self.blocks:
             layers.append(
@@ -840,6 +866,7 @@ class ContextualFlowTransformerHead(nn.Module):
         context_positions = self._positions(
             context_positions, batch_size, 1, model_device
         )
+        context_rope = self._build_rope(context_positions, model_dtype)
         if cache is None:
             cache = self.empty_latent_mixer_cache(batch_size)
         self._validate_latent_mixer_cache(cache)
@@ -860,7 +887,9 @@ class ContextualFlowTransformerHead(nn.Module):
         for layer_idx, block in enumerate(self.blocks):
             previous_layer = cache["layers"][layer_idx]
             new_layer = block.prepare_cross_cache(
-                hidden, context_positions=context_positions
+                hidden,
+                context_positions=context_positions,
+                context_rope=context_rope,
             )
             hidden = block(
                 hidden,
@@ -868,13 +897,17 @@ class ContextualFlowTransformerHead(nn.Module):
                 layer_cache=previous_layer if previous_len else None,
                 context_mask=previous_mask,
                 query_positions=context_positions,
-                use_flex_attention=False,
+                query_rope=context_rope,
                 include_mlp=True,
             )
             updated_layers.append(
                 {
-                    "k": torch.cat([previous_layer["k"], new_layer["k"]], dim=2),
-                    "v": torch.cat([previous_layer["v"], new_layer["v"]], dim=2),
+                    "k": torch.cat(
+                        [previous_layer["k"], new_layer["k"]], dim=2
+                    ),
+                    "v": torch.cat(
+                        [previous_layer["v"], new_layer["v"]], dim=2
+                    ),
                     "context_positions": torch.cat(
                         [
                             previous_layer["context_positions"],
@@ -967,12 +1000,14 @@ class ContextualFlowTransformerHead(nn.Module):
         context_positions=None,
         context_conditions=None,
         latent_mixer_cache=None,
+        record_stats=False,
     ):
         model_dtype = self.input_proj.weight.dtype
         x = x.to(device=self.input_proj.weight.device, dtype=model_dtype)
         c = c.to(device=x.device, dtype=model_dtype)
         batch_shape = x.shape[:-1]
         x, query_positions, squeeze = self._ensure_sequence(x, query_positions)
+        query_rope = self._build_rope(query_positions, model_dtype)
         x = self.input_proj(x)
         t = self._shape_time(t, batch_shape)
         raw_c = c
@@ -1007,12 +1042,17 @@ class ContextualFlowTransformerHead(nn.Module):
             context_positions = self._positions(
                 context_positions, batch_size, context_len, x.device
             )
+            context_rope = (
+                query_rope
+                if context_positions is query_positions
+                else self._build_rope(context_positions, model_dtype)
+            )
             content = self._initial_content_hidden(
                 context_latents, context_positions
             )
-            initial_content = content
+            initial_content = content if record_stats else None
             content_y = self._content_condition(context_conditions)
-            content_mask, content_block_mask = self._build_context_block_mask(
+            content_mask = self._format_context_mask(
                 context_mask,
                 batch_size,
                 context_len,
@@ -1028,10 +1068,11 @@ class ContextualFlowTransformerHead(nn.Module):
             content_stats = []
             for block in self.blocks:
                 if self.grad_checkpointing and not torch.jit.is_scripting():
-                    def _dual_step(content_hidden, query_hidden):
+                    def _dual_step(content_hidden, query_hidden, block=block):
                         layer_cache = block.prepare_cross_cache(
                             content_hidden,
                             context_positions=context_positions,
+                            context_rope=context_rope,
                         )
                         next_content = block(
                             content_hidden,
@@ -1039,9 +1080,9 @@ class ContextualFlowTransformerHead(nn.Module):
                             layer_cache=layer_cache,
                             context_mask=content_mask,
                             query_positions=context_positions,
-                            context_block_mask=content_block_mask,
-                            use_flex_attention=True,
+                            query_rope=context_rope,
                             include_mlp=True,
+                            record_stats=record_stats,
                         )
                         next_query = block(
                             query_hidden,
@@ -1049,8 +1090,8 @@ class ContextualFlowTransformerHead(nn.Module):
                             layer_cache=layer_cache,
                             context_mask=content_mask,
                             query_positions=query_positions,
-                            context_block_mask=content_block_mask,
-                            use_flex_attention=True,
+                            query_rope=query_rope,
+                            record_stats=record_stats,
                         )
                         return next_content, next_query
 
@@ -1064,6 +1105,7 @@ class ContextualFlowTransformerHead(nn.Module):
                     layer_cache = block.prepare_cross_cache(
                         content,
                         context_positions=context_positions,
+                        context_rope=context_rope,
                     )
                     content = block(
                         content,
@@ -1071,28 +1113,33 @@ class ContextualFlowTransformerHead(nn.Module):
                         layer_cache=layer_cache,
                         context_mask=content_mask,
                         query_positions=context_positions,
-                        context_block_mask=content_block_mask,
-                        use_flex_attention=True,
+                        query_rope=context_rope,
                         include_mlp=True,
+                        record_stats=record_stats,
                     )
-                    content_stats.append(self._capture_block_stats(block))
+                    if record_stats:
+                        content_stats.append(self._capture_block_stats(block))
                     x = block(
                         x,
                         y,
                         layer_cache=layer_cache,
                         context_mask=content_mask,
                         query_positions=query_positions,
-                        context_block_mask=content_block_mask,
-                        use_flex_attention=True,
+                        query_rope=query_rope,
+                        record_stats=record_stats,
                     )
-                    query_stats.append(self._capture_block_stats(block))
-            self._publish_stream_stats(
-                query_stats,
-                content_stats,
-                content_inputs=initial_content,
-                content_outputs=content,
-                query_outputs=x,
-            )
+                    if record_stats:
+                        query_stats.append(self._capture_block_stats(block))
+            if record_stats:
+                self._publish_stream_stats(
+                    query_stats,
+                    content_stats,
+                    content_inputs=initial_content,
+                    content_outputs=content,
+                    query_outputs=x,
+                )
+            else:
+                self._clear_stream_stats()
             out = self.final_layer(x, y)
             return out.squeeze(1) if squeeze else out
 
@@ -1109,22 +1156,6 @@ class ContextualFlowTransformerHead(nn.Module):
             self._validate_latent_mixer_cache(latent_mixer_cache)
             context_layers = latent_mixer_cache.get("layers")
             context_mask = latent_mixer_cache.get("context_mask")
-        context_block_mask = None
-        use_flex_attention = (
-            bool(context_layers)
-            and context_layers[0]["k"].shape[2] > 0
-            and (self.training or use_direct_context)
-        )
-        if use_flex_attention:
-            batch_size, query_len, _ = x.shape
-            context_len = context_layers[0]["k"].shape[2]
-            context_mask, context_block_mask = self._build_context_block_mask(
-                context_mask,
-                batch_size,
-                query_len,
-                context_len,
-                x.device,
-            )
         gate_stats = []
         gate_token_stats = []
         attention_entropy_stats = []
@@ -1139,22 +1170,24 @@ class ContextualFlowTransformerHead(nn.Module):
                     layer_cache,
                     context_mask,
                     query_positions,
-                    context_block_mask,
-                    use_flex_attention,
+                    query_rope,
+                    True,
+                    record_stats,
                     use_reentrant=False,
                 )
-                if block.last_gate_abs_mean is not None:
-                    gate_stats.append(block.last_gate_abs_mean)
-                if block.last_gate_abs_per_token is not None:
-                    gate_token_stats.append(block.last_gate_abs_per_token)
-                if block.last_attention_entropy_per_token is not None:
-                    attention_entropy_stats.append(
-                        block.last_attention_entropy_per_token
-                    )
-                if block.last_attention_distance_per_token is not None:
-                    attention_distance_stats.append(
-                        block.last_attention_distance_per_token
-                    )
+                if record_stats:
+                    if block.last_gate_abs_mean is not None:
+                        gate_stats.append(block.last_gate_abs_mean)
+                    if block.last_gate_abs_per_token is not None:
+                        gate_token_stats.append(block.last_gate_abs_per_token)
+                    if block.last_attention_entropy_per_token is not None:
+                        attention_entropy_stats.append(
+                            block.last_attention_entropy_per_token
+                        )
+                    if block.last_attention_distance_per_token is not None:
+                        attention_distance_stats.append(
+                            block.last_attention_distance_per_token
+                        )
         else:
             for layer_idx, block in enumerate(self.blocks):
                 layer_cache = None if context_layers is None else context_layers[layer_idx]
@@ -1164,60 +1197,64 @@ class ContextualFlowTransformerHead(nn.Module):
                     layer_cache=layer_cache,
                     context_mask=context_mask,
                     query_positions=query_positions,
-                    context_block_mask=context_block_mask,
-                    use_flex_attention=use_flex_attention,
+                    query_rope=query_rope,
+                    record_stats=record_stats,
                 )
-                if block.last_gate_abs_mean is not None:
-                    gate_stats.append(block.last_gate_abs_mean)
-                if block.last_gate_abs_per_token is not None:
-                    gate_token_stats.append(block.last_gate_abs_per_token)
-                if block.last_attention_entropy_per_token is not None:
-                    attention_entropy_stats.append(
-                        block.last_attention_entropy_per_token
-                    )
-                if block.last_attention_distance_per_token is not None:
-                    attention_distance_stats.append(
-                        block.last_attention_distance_per_token
-                    )
-        self.last_gate_abs_mean = torch.stack(gate_stats).mean() if gate_stats else None
-        self.last_gate_abs_per_token = (
-            torch.stack(gate_token_stats).mean(dim=0)
-            if gate_token_stats
-            else None
-        )
-        self.last_attention_entropy_per_token = (
-            torch.stack(attention_entropy_stats).mean(dim=0)
-            if attention_entropy_stats
-            else None
-        )
-        self.last_attention_distance_per_token = (
-            torch.stack(attention_distance_stats).mean(dim=0)
-            if attention_distance_stats
-            else None
-        )
-        self.last_query_attention_gate_abs_per_token = self._mean_stat(
-            [
-                {
-                    "attention_gate": block.last_attention_gate_abs_per_token,
-                }
-                for block in self.blocks
-            ],
-            "attention_gate",
-        )
-        self.last_query_mlp_gate_abs_per_token = self._mean_stat(
-            [
-                {
-                    "mlp_gate": block.last_mlp_gate_abs_per_token,
-                }
-                for block in self.blocks
-            ],
-            "mlp_gate",
-        )
-        self.last_content_attention_gate_abs_per_token = None
-        self.last_content_mlp_gate_abs_per_token = None
-        self.last_content_update_rms_per_token = None
-        self.last_content_relative_update_per_token = None
-        self.last_content_query_cosine_per_token = None
+                if record_stats:
+                    if block.last_gate_abs_mean is not None:
+                        gate_stats.append(block.last_gate_abs_mean)
+                    if block.last_gate_abs_per_token is not None:
+                        gate_token_stats.append(block.last_gate_abs_per_token)
+                    if block.last_attention_entropy_per_token is not None:
+                        attention_entropy_stats.append(
+                            block.last_attention_entropy_per_token
+                        )
+                    if block.last_attention_distance_per_token is not None:
+                        attention_distance_stats.append(
+                            block.last_attention_distance_per_token
+                        )
+        if record_stats:
+            self.last_gate_abs_mean = torch.stack(gate_stats).mean() if gate_stats else None
+            self.last_gate_abs_per_token = (
+                torch.stack(gate_token_stats).mean(dim=0)
+                if gate_token_stats
+                else None
+            )
+            self.last_attention_entropy_per_token = (
+                torch.stack(attention_entropy_stats).mean(dim=0)
+                if attention_entropy_stats
+                else None
+            )
+            self.last_attention_distance_per_token = (
+                torch.stack(attention_distance_stats).mean(dim=0)
+                if attention_distance_stats
+                else None
+            )
+            self.last_query_attention_gate_abs_per_token = self._mean_stat(
+                [
+                    {
+                        "attention_gate": block.last_attention_gate_abs_per_token,
+                    }
+                    for block in self.blocks
+                ],
+                "attention_gate",
+            )
+            self.last_query_mlp_gate_abs_per_token = self._mean_stat(
+                [
+                    {
+                        "mlp_gate": block.last_mlp_gate_abs_per_token,
+                    }
+                    for block in self.blocks
+                ],
+                "mlp_gate",
+            )
+            self.last_content_attention_gate_abs_per_token = None
+            self.last_content_mlp_gate_abs_per_token = None
+            self.last_content_update_rms_per_token = None
+            self.last_content_relative_update_per_token = None
+            self.last_content_query_cosine_per_token = None
+        else:
+            self._clear_stream_stats()
         out = self.final_layer(x, y)
         return out.squeeze(1) if squeeze else out
 
@@ -1255,6 +1292,7 @@ class FlowLoss(nn.Module):
         self.time_eps = float(time_eps)
         self.uniform_mix = float(uniform_mix)
         self.solver = str(solver or "heun").lower()
+        self.collect_guidance_diagnostics = False
         self._guidance_diagnostic_sums = {}
         self._guidance_diagnostic_counts = {}
         if self.num_sampling_steps <= 0:
@@ -1383,6 +1421,7 @@ class FlowLoss(nn.Module):
         context_positions: torch.Tensor | None = None,
         context_conditions: torch.Tensor | None = None,
         latent_mixer_cache: dict[str, torch.Tensor] | None = None,
+        record_stats: bool = False,
     ) -> torch.Tensor:
         model_dtype = self.net.input_proj.weight.dtype
         model_device = self.net.input_proj.weight.device
@@ -1406,11 +1445,31 @@ class FlowLoss(nn.Module):
             model_device,
             model_dtype,
         )
+        return self._velocity_prepared(
+            x_t,
+            t,
+            z,
+            context_kwargs,
+            latent_mixer_cache,
+            record_stats=record_stats,
+        )
+
+    def _velocity_prepared(
+        self,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        z: torch.Tensor,
+        context_kwargs,
+        latent_mixer_cache,
+        *,
+        record_stats: bool = False,
+    ) -> torch.Tensor:
         return self.net(
             x_t,
             self._scale_time(t),
             c=z,
             latent_mixer_cache=latent_mixer_cache,
+            record_stats=record_stats,
             **context_kwargs,
         )
 
@@ -1437,12 +1496,20 @@ class FlowLoss(nn.Module):
             "context_conditions": None,
         }
 
-    def forward(self, target, z, mask=None, sigma=None, image_positions=None, context_latents=None):
+    def forward(
+        self,
+        target,
+        z,
+        mask=None,
+        sigma=None,
+        image_positions=None,
+        context_latents=None,
+        record_stats: bool = True,
+    ):
         model_dtype = self.net.input_proj.weight.dtype
         model_device = self.net.input_proj.weight.device
-        target = target.to(device=model_device)
-        target_model = target.to(dtype=model_dtype)
-        target_float = target.float()
+        target_float = target.to(device=model_device, dtype=torch.float32)
+        target_model = target_float.to(dtype=model_dtype)
         z = z.to(device=model_device, dtype=model_dtype)
         if mask is not None:
             mask = mask.to(device=model_device, dtype=model_dtype)
@@ -1455,18 +1522,35 @@ class FlowLoss(nn.Module):
 
         batch_shape = target_model.shape[:-1]
         t = self._sample_times(int(math.prod(batch_shape)), model_device).view(batch_shape)
-        noise = torch.randn(target_float.shape, device=model_device, dtype=torch.float32)
+        noise = torch.randn(
+            target_float.shape,
+            device=model_device,
+            dtype=torch.float32,
+        )
         t_view = t.unsqueeze(-1).float()
-        x_t_float = (1.0 - t_view) * noise + t_view * target_float
+        x_t = (1.0 - t_view) * noise + t_view * target_float
         v_target = target_float - noise
         context_kwargs = self._training_context(target_model, sigma, image_positions, context_latents=context_latents)
-        v_pred = self.velocity(x_t_float.to(dtype=model_dtype), t, z, **context_kwargs)
-        token_loss = (v_pred.float() - v_target).pow(2).mean(dim=-1)
+        v_pred = self.velocity(
+            x_t,
+            t,
+            z,
+            record_stats=record_stats,
+            **context_kwargs,
+        )
+
+        velocity_error = v_pred.float() - v_target
+        token_loss = velocity_error.square().mean(dim=-1)
         if mask is not None:
-            token_loss = (token_loss * mask.float()).sum() / mask.float().sum().clamp_min(1.0)
+            mask_float = mask.float()
+            token_loss = (token_loss * mask_float).sum() / mask_float.sum().clamp_min(1.0)
             loss_mean = token_loss
         else:
             loss_mean = token_loss.mean()
+
+        if not record_stats:
+            self.last_forward_stats = {}
+            return loss_mean
 
         stats = {
             "flow/loss": loss_mean.detach().float(),
@@ -1474,7 +1558,7 @@ class FlowLoss(nn.Module):
             "flow/t_mean": t.detach().float().mean(),
             "flow/t_min": t.detach().float().min(),
             "flow/t_max": t.detach().float().max(),
-            "flow/x_t_rms": self._rms_stat(x_t_float),
+            "flow/x_t_rms": self._rms_stat(x_t),
             "flow/v_target_rms": self._rms_stat(v_target),
             "flow/v_pred_rms": self._rms_stat(v_pred),
         }
@@ -1493,11 +1577,12 @@ class FlowLoss(nn.Module):
             )
             for lower, upper in bucket_edges:
                 bucket_mask = (reveal_fractions >= lower) & (reveal_fractions < upper)
-                if bucket_mask.any():
-                    tag = f"{int(lower * 100):02d}_{min(100, int(upper * 100)):02d}"
-                    stats[f"flow/reveal_{tag}_v_mse"] = (
-                        token_loss[bucket_mask].mean().detach().float()
-                    )
+                bucket_weights = bucket_mask.to(dtype=token_loss.dtype)
+                tag = f"{int(lower * 100):02d}_{min(100, int(upper * 100)):02d}"
+                stats[f"flow/reveal_{tag}_v_mse"] = (
+                    (token_loss * bucket_weights).sum()
+                    / bucket_weights.sum().clamp_min(1.0)
+                ).detach().float()
             context_buckets = (
                 ("0", 0, 0),
                 ("1", 1, 1),
@@ -1529,18 +1614,19 @@ class FlowLoss(nn.Module):
                 bucket_mask = context_counts >= lower
                 if upper is not None:
                     bucket_mask &= context_counts <= upper
-                if not bucket_mask.any():
-                    continue
+                bucket_weights = bucket_mask.to(dtype=token_loss.dtype)
                 stats[f"flow/context_{tag}_v_mse"] = (
-                    token_loss[bucket_mask].mean().detach().float()
-                )
+                    (token_loss * bucket_weights).sum()
+                    / bucket_weights.sum().clamp_min(1.0)
+                ).detach().float()
                 if (
                     isinstance(gate_per_token, torch.Tensor)
                     and gate_per_token.shape == token_loss.shape
                 ):
                     stats[f"flow/context_{tag}_gate_abs"] = (
-                        gate_per_token[bucket_mask].mean().detach().float()
-                    )
+                        (gate_per_token * bucket_weights).sum()
+                        / bucket_weights.sum().clamp_min(1.0)
+                    ).detach().float()
                 for metric_name, metric_value in (
                     ("query_attention_gate_abs", query_attention_gate),
                     ("query_mlp_gate_abs", query_mlp_gate),
@@ -1552,22 +1638,25 @@ class FlowLoss(nn.Module):
                         and metric_value.shape == token_loss.shape
                     ):
                         stats[f"flow/context_{tag}_{metric_name}"] = (
-                            metric_value[bucket_mask].mean().detach().float()
-                        )
+                            (metric_value * bucket_weights).sum()
+                            / bucket_weights.sum().clamp_min(1.0)
+                        ).detach().float()
                 if (
                     isinstance(attention_entropy, torch.Tensor)
                     and attention_entropy.shape == token_loss.shape
                 ):
                     stats[f"flow/context_{tag}_attention_entropy"] = (
-                        attention_entropy[bucket_mask].mean().detach().float()
-                    )
+                        (attention_entropy * bucket_weights).sum()
+                        / bucket_weights.sum().clamp_min(1.0)
+                    ).detach().float()
                 if (
                     isinstance(attention_distance, torch.Tensor)
                     and attention_distance.shape == token_loss.shape
                 ):
                     stats[f"flow/context_{tag}_attention_distance"] = (
-                        attention_distance[bucket_mask].mean().detach().float()
-                    )
+                        (attention_distance * bucket_weights).sum()
+                        / bucket_weights.sum().clamp_min(1.0)
+                    ).detach().float()
         gate_stat = getattr(self.net, "last_gate_abs_mean", None)
         if gate_stat is not None:
             stats["flow/head_residual_gate"] = gate_stat.detach().float()
@@ -1623,10 +1712,24 @@ class FlowLoss(nn.Module):
         debug_check=None,
         ode_step: int | None = None,
         debug_phase: str = "",
+        context_prepared: bool = False,
     ) -> torch.Tensor:
+        def _velocity(current_x, current_t, current_z, current_context):
+            if context_prepared:
+                return self._velocity_prepared(
+                    current_x,
+                    current_t,
+                    current_z,
+                    {
+                        "query_positions": current_context.get("query_positions"),
+                    },
+                    current_context.get("latent_mixer_cache"),
+                )
+            return self.velocity(current_x, current_t, current_z, **current_context)
+
         z_is_paired = z.shape[0] == x.shape[0] * 2
         if cfg == 1.0 and not z_is_paired:
-            velocity = self.velocity(x, t, z, **context_kwargs)
+            velocity = _velocity(x, t, z, context_kwargs)
             if debug_check is not None:
                 debug_check(
                     f"{debug_phase}velocity",
@@ -1638,10 +1741,11 @@ class FlowLoss(nn.Module):
         x_pair = torch.cat([x, x], dim=0)
         t_pair = torch.cat([t, t], dim=0)
         paired_context_kwargs = context_kwargs if context_is_paired else self._duplicate_context(context_kwargs)
-        v_pair = self.velocity(x_pair, t_pair, z, **paired_context_kwargs)
+        v_pair = _velocity(x_pair, t_pair, z, paired_context_kwargs)
         v_cond, v_uncond = torch.chunk(v_pair, 2, dim=0)
         velocity_delta = v_cond - v_uncond
-        self._record_guidance_delta(velocity_delta, context_kwargs)
+        if self.collect_guidance_diagnostics:
+            self._record_guidance_delta(velocity_delta, context_kwargs)
         scaled_velocity_delta = float(cfg) * velocity_delta
         guided_velocity = v_uncond + scaled_velocity_delta
         if debug_check is not None:
@@ -1672,7 +1776,14 @@ class FlowLoss(nn.Module):
         self._guidance_diagnostic_sums = {}
         self._guidance_diagnostic_counts = {}
 
+    def set_guidance_diagnostics(self, enabled: bool) -> None:
+        self.collect_guidance_diagnostics = bool(enabled)
+        if not self.collect_guidance_diagnostics:
+            self.reset_guidance_diagnostics()
+
     def _record_guidance_delta(self, velocity_delta, context_kwargs) -> None:
+        if not self.collect_guidance_diagnostics:
+            return
         if velocity_delta.ndim < 2:
             return
         per_token = velocity_delta.detach().float().pow(2).mean(dim=-1).sqrt()
@@ -1880,13 +1991,23 @@ class FlowLoss(nn.Module):
                 context_kwargs = self._duplicate_context(context_kwargs)
                 context_is_paired = True
         times = torch.linspace(0.0, 1.0, steps + 1, device=z.device, dtype=torch.float32)
+        time_deltas = times[1:] - times[:-1]
+        schedule_name = str(cfg_schedule or "constant").lower()
+        if cfg == 1.0 or schedule_name in {"constant", "none", "off", ""}:
+            cfg_values = [float(cfg)] * (steps + 1)
+        else:
+            progress_values = times.detach().cpu().tolist()
+            cfg_values = [
+                self._scheduled_cfg(cfg, cfg_schedule, progress)
+                for progress in progress_values
+            ]
 
         for idx in range(steps):
             _debug_check("ode_state", x, idx, {"condition": z})
             t = times[idx].expand(x_shape)
             t_next = times[idx + 1].expand(x_shape)
-            dt = (times[idx + 1] - times[idx]).float()
-            cfg_t = self._scheduled_cfg(cfg, cfg_schedule, float(times[idx].item()))
+            dt = time_deltas[idx]
+            cfg_t = cfg_values[idx]
             v = self._guided_velocity(
                 x.to(dtype=model_dtype),
                 t,
@@ -1897,6 +2018,7 @@ class FlowLoss(nn.Module):
                 debug_check=_debug_check if debug_finite else None,
                 ode_step=idx,
                 debug_phase="predictor_",
+                context_prepared=True,
             ).float()
             _debug_check("guided_velocity", v, idx, {"state": x, "condition": z})
             if solver == "euler":
@@ -1905,7 +2027,7 @@ class FlowLoss(nn.Module):
             elif solver == "heun":
                 x_euler = x + dt * v
                 _debug_check("heun_euler_predictor", x_euler, idx, {"velocity": v, "condition": z})
-                cfg_t_next = self._scheduled_cfg(cfg, cfg_schedule, float(times[idx + 1].item()))
+                cfg_t_next = cfg_values[idx + 1]
                 v_next = self._guided_velocity(
                     x_euler.to(dtype=model_dtype),
                     t_next,
@@ -1916,6 +2038,7 @@ class FlowLoss(nn.Module):
                     debug_check=_debug_check if debug_finite else None,
                     ode_step=idx,
                     debug_phase="corrector_",
+                    context_prepared=True,
                 ).float()
                 _debug_check(
                     "heun_corrector_velocity",

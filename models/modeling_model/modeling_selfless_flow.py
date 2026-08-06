@@ -2368,9 +2368,13 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                     **flow_context,
                     debug_finite=debug_finite,
                     debug_label=(
-                        f"single_stream_generation_step={step_idx},"
-                        f"sample_indices={sample_indices.detach().cpu().tolist()},"
-                        f"local_positions={local_positions_for_condition.detach().cpu().tolist()}"
+                        (
+                            f"single_stream_generation_step={step_idx},"
+                            f"sample_indices={sample_indices.detach().cpu().tolist()},"
+                            f"local_positions={local_positions_for_condition.detach().cpu().tolist()}"
+                        )
+                        if debug_finite
+                        else ""
                     ),
                 ).to(work_latents.dtype)
                 _debug_check("flow_prediction", pred, step_idx)
