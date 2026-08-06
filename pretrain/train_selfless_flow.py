@@ -1,5 +1,4 @@
 import os
-import copy
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault("WANDB_MODE", "offline")
@@ -15,7 +14,6 @@ import math
 import time
 import importlib.util
 import colorsys
-from contextlib import nullcontext
 from pathlib import Path
 from omegaconf import OmegaConf
 import torch
@@ -23,20 +21,36 @@ from torch.optim import AdamW
 import torch.nn.functional as F
 
 
-from accelerate import Accelerator
+from accelerate import Accelerator, DataLoaderConfiguration
 from accelerate.logging import get_logger
 from accelerate.utils import DistributedType, set_seed
 
 from utils.dataset_utils import get_dataloaders
 from utils.wsd_schedule import get_wsd_schedule
+from utils.selfless_flow_optimizer import weight_decay_for_parameter
+from utils.selfless_training_runtime import (
+    RESUME_SCHEMA,
+    RESUME_SIGNATURE_VERSION,
+    TrainingWindow,
+    build_resume_signature,
+    validate_resume_metadata,
+    validate_wsd_contract,
+)
+from utils.sharded_ema import (
+    DEFAULT_EMA_CHUNK_NUMEL,
+    RankShardedEMA,
+    build_sharded_ema_layout,
+    load_ema_manifest,
+    mark_hf_ema_config_fp32,
+    merge_sharded_ema_state_dict,
+    read_sharded_ema_rows,
+)
 from models.logging import set_verbosity_info, set_verbosity_error
 from utils.utils import (
-    AverageMeter,
     flatten_omega_conf,
     get_config,
     get_selfless_mask,
     load_model_tokenizer,
-    log_grad_norm,
     save_checkpoint,
     save_hf_model,
 )
@@ -140,6 +154,84 @@ def _load_image_flow_adapter(model, adapter_path, config):
     _log_info(f"Loaded finalized image-flow adapter from {adapter_path}")
 
 
+def _apply_trainable_scope(model, config) -> dict[str, int | str]:
+    """Apply the explicit optimizer scope before EMA/DeepSpeed construction."""
+
+    raw_scope = str(config.training.get("trainable_scope", "full")).strip().lower()
+    aliases = {
+        "full": "full",
+        "all": "full",
+        "image_flow_head": "image_flow_head",
+        "flow_head": "image_flow_head",
+        "flow_head_only": "image_flow_head",
+    }
+    scope = aliases.get(raw_scope)
+    if scope is None:
+        raise ValueError(
+            "Unknown training.trainable_scope="
+            f"{raw_scope!r}; expected 'full' or 'image_flow_head'."
+        )
+
+    trainable_prefixes = (
+        "image_flow_head.",
+        "image_flow_condition_proj.",
+    )
+    if scope == "full":
+        for parameter in model.parameters():
+            parameter.requires_grad_(True)
+    else:
+        for name, parameter in model.named_parameters():
+            parameter.requires_grad_(name.startswith(trainable_prefixes))
+
+        unexpected = [
+            name
+            for name, parameter in model.named_parameters()
+            if parameter.requires_grad and not name.startswith(trainable_prefixes)
+        ]
+        if unexpected:
+            raise RuntimeError(
+                "image_flow_head trainable scope leaked into frozen parameters: "
+                f"{unexpected[:8]}"
+            )
+        expects_tied_embeddings = bool(
+            getattr(model.config, "tie_word_embeddings", False)
+        )
+        if (
+            expects_tied_embeddings
+            and model.lm_head.weight is not model.model.embed_tokens.weight
+        ):
+            raise RuntimeError(
+                "Expected lm_head.weight and model.embed_tokens.weight to remain tied."
+            )
+        if (
+            model.model.embed_tokens.weight.requires_grad
+            or model.lm_head.weight.requires_grad
+        ):
+            raise RuntimeError("The Qwen token embedding/lm_head was not frozen.")
+
+    total_numel = sum(parameter.numel() for parameter in model.parameters())
+    trainable_numel = sum(
+        parameter.numel()
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    )
+    if trainable_numel <= 0:
+        raise RuntimeError(f"trainable_scope={scope!r} selected no parameters")
+    frozen_numel = total_numel - trainable_numel
+    return {
+        "scope": scope,
+        "total_numel": int(total_numel),
+        "trainable_numel": int(trainable_numel),
+        "frozen_numel": int(frozen_numel),
+    }
+
+
+def _write_image_flow_adapter(state, config, global_step):
+    path = Path(config.experiment.output_dir) / f"image_flow_adapter-{global_step}.pt"
+    torch.save(state, path)
+    logger.info(f"Saved image-flow adapter to {path}")
+
+
 def _save_image_flow_adapter(model, config, accelerator, global_step):
     if not config.training.get("save_image_flow_adapter", False):
         return
@@ -165,9 +257,64 @@ def _save_image_flow_adapter(model, config, accelerator, global_step):
             for name, token_id in token_ids.items()
         },
     }
-    path = Path(config.experiment.output_dir) / f"image_flow_adapter-{global_step}.pt"
-    torch.save(state, path)
-    logger.info(f"Saved image-flow adapter to {path}")
+    _write_image_flow_adapter(state, config, global_step)
+
+
+def _save_ema_image_flow_adapter(
+    ema_directory: Path,
+    config,
+    accelerator,
+    global_step,
+) -> None:
+    if not config.training.get("save_image_flow_adapter", False):
+        return
+    if accelerator.is_main_process:
+        manifest = load_ema_manifest(ema_directory)
+        prefixes = (
+            "image_flow_head.",
+            "image_flow_condition_proj.",
+            "model.image_token_embedder.",
+        )
+        selected_names = [
+            name
+            for name in manifest["state_keys"]
+            if name.startswith(prefixes)
+        ]
+        selected_state = merge_sharded_ema_state_dict(
+            ema_directory,
+            names=selected_names,
+        )
+        token_ids = _special_token_ids(config)
+        embedding_rows = read_sharded_ema_rows(
+            ema_directory,
+            "model.embed_tokens.weight",
+            token_ids.values(),
+        )
+        state = {
+            "image_flow_head": {
+                name.removeprefix("image_flow_head."): value
+                for name, value in selected_state.items()
+                if name.startswith("image_flow_head.")
+            },
+            "image_flow_condition_proj": {
+                name.removeprefix("image_flow_condition_proj."): value
+                for name, value in selected_state.items()
+                if name.startswith("image_flow_condition_proj.")
+            },
+            "image_token_embedder": {
+                name.removeprefix("model.image_token_embedder."): value
+                for name, value in selected_state.items()
+                if name.startswith("model.image_token_embedder.")
+            },
+            "special_token_ids": token_ids,
+            "special_token_embeddings": {
+                name: embedding_rows[token_id].clone()
+                for name, token_id in token_ids.items()
+            },
+        }
+        _write_image_flow_adapter(state, config, global_step)
+        del selected_state, embedding_rows, state
+    accelerator.wait_for_everyone()
 
 
 def _ema_enabled(config) -> bool:
@@ -181,118 +328,59 @@ def _ema_decay(config) -> float:
     return decay
 
 
-def _create_ema_model(model, config):
-    if not _ema_enabled(config):
-        return None
-    ema_model = copy.deepcopy(model)
-    ema_model.float()
-    ema_model.eval()
-    for param in ema_model.parameters():
-        param.requires_grad_(False)
-    return ema_model
-
-
-@torch.no_grad()
-def _sync_ema_model(ema_model, model, accelerator) -> None:
-    source_state = accelerator.unwrap_model(model).state_dict()
-    ema_state = ema_model.state_dict()
-    if set(source_state.keys()) != set(ema_state.keys()):
-        missing = sorted(set(ema_state.keys()) - set(source_state.keys()))
-        unexpected = sorted(set(source_state.keys()) - set(ema_state.keys()))
-        raise RuntimeError(f"EMA state mismatch: missing={missing}, unexpected={unexpected}")
-
-    for name, ema_value in ema_state.items():
-        source_value = source_state[name].detach().to(
-            device=ema_value.device,
-            dtype=ema_value.dtype,
-            non_blocking=True,
-        )
-        ema_value.copy_(source_value)
-
-
-@torch.no_grad()
-def _update_ema_model(ema_model, model, accelerator, decay: float) -> None:
-    source_state = accelerator.unwrap_model(model).state_dict()
-    ema_state = ema_model.state_dict()
-    updated_floating_values = set()
-    for name, ema_value in ema_state.items():
-        source_value = source_state[name].detach().to(
-            device=ema_value.device,
-            dtype=ema_value.dtype,
-            non_blocking=True,
-        )
-        if torch.is_floating_point(ema_value):
-            storage_key = (ema_value.device, ema_value.data_ptr())
-            if storage_key in updated_floating_values:
-                continue
-            updated_floating_values.add(storage_key)
-            ema_value.mul_(decay).add_(source_value, alpha=1.0 - decay)
-        else:
-            ema_value.copy_(source_value)
-
-
-@torch.no_grad()
-def _maybe_update_ema_model(
-    ema_model,
-    model,
-    accelerator,
-    decay: float,
-    next_step: int,
-    update_after_step: int,
-    ema_started: bool,
-) -> bool:
-    if ema_model is None:
-        return ema_started
-    if next_step < update_after_step:
-        return ema_started
-    if not ema_started and update_after_step > 0:
-        _sync_ema_model(ema_model, model, accelerator)
-        return True
-    _update_ema_model(ema_model, model, accelerator, decay)
-    return True
-
-
-def _ema_state_path(config, global_step) -> Path:
+def _ema_state_directory(config, global_step) -> Path:
     output_dir = Path(config.experiment.output_dir)
     if isinstance(global_step, int):
-        return output_dir / f"checkpoint-{global_step}" / "ema_state.pt"
-    return output_dir / f"ema_state-{global_step}.pt"
+        return output_dir / f"checkpoint-{global_step}"
+    return output_dir / f"ema-{global_step}"
 
 
-def _save_ema_state(ema_model, config, accelerator, global_step) -> None:
-    if ema_model is None or not accelerator.is_main_process:
+def _save_ema_state(
+    ema: RankShardedEMA | None,
+    config,
+    accelerator,
+    global_step,
+) -> Path | None:
+    if ema is None:
+        return None
+    directory = _ema_state_directory(config, global_step)
+    manifest_path = ema.save_checkpoint(
+        directory,
+        accelerator,
+        global_step=int(global_step) if isinstance(global_step, int) else ema.global_step,
+    )
+    if accelerator.is_main_process:
+        logger.info(f"Saved sharded EMA state to {manifest_path}")
+    return directory
+
+
+def _save_ema_hf_model(
+    ema: RankShardedEMA | None,
+    model,
+    tokenizer,
+    config,
+    accelerator,
+    global_step,
+    ema_directory: Path | None,
+) -> None:
+    if ema is None or not ema.started or not bool(config.training.get("ema_save_hf_model", True)):
         return
-    path = _ema_state_path(config, global_step)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    state = {
-        "global_step": global_step,
-        "decay": _ema_decay(config),
-        "state_dict": {k: v.detach().cpu() for k, v in ema_model.state_dict().items()},
-    }
-    torch.save(state, path)
-    logger.info(f"Saved EMA state to {path}")
-
-
-def _load_ema_state_if_available(ema_model, checkpoint_dir: Path) -> bool:
-    path = Path(checkpoint_dir) / "ema_state.pt"
-    if not path.exists():
-        return False
-    state = torch.load(path, map_location="cpu")
-    state_dict = state.get("state_dict", state)
-    ema_model.load_state_dict(state_dict, strict=True)
-    logger.info(f"Loaded EMA state from {path}")
-    return True
-
-
-def _save_ema_hf_model(ema_model, tokenizer, config, accelerator, global_step) -> None:
-    if ema_model is None or not bool(config.training.get("ema_save_hf_model", True)):
-        return
-    if not accelerator.is_main_process:
-        return
-    save_path = Path(config.experiment.output_dir) / f"hf_model-{global_step}-ema"
-    ema_model.save_pretrained(save_path, safe_serialization=True)
-    tokenizer.save_pretrained(save_path)
-    logger.info(f"Saved EMA HF model to {save_path}")
+    if ema_directory is None or not (ema_directory / "ema_manifest.json").is_file():
+        ema_directory = _save_ema_state(ema, config, accelerator, global_step)
+    if accelerator.is_main_process:
+        merged_state = merge_sharded_ema_state_dict(ema_directory)
+        save_path = Path(config.experiment.output_dir) / f"hf_model-{global_step}-ema"
+        unwrapped = accelerator.unwrap_model(model)
+        unwrapped.save_pretrained(
+            save_path,
+            state_dict=merged_state,
+            safe_serialization=True,
+        )
+        mark_hf_ema_config_fp32(save_path)
+        tokenizer.save_pretrained(save_path)
+        logger.info(f"Saved EMA HF model to {save_path}")
+        del merged_state
+    accelerator.wait_for_everyone()
 
 
 def _unwrap_epoch_dataset(dataset):
@@ -306,13 +394,164 @@ def _unwrap_epoch_dataset(dataset):
     return ds
 
 
+_resume_signature = build_resume_signature
+
+
+def _write_training_checkpoint_metadata(
+    checkpoint_dir: Path,
+    *,
+    accelerator,
+    global_step: int,
+    epoch: int,
+    batches_consumed_in_epoch: int,
+    config_signature: str,
+    ema_layout,
+) -> None:
+    if accelerator.is_main_process:
+        payload = {
+            "schema": RESUME_SCHEMA,
+            "global_step": int(global_step),
+            "epoch": int(epoch),
+            "batches_consumed_in_epoch": int(batches_consumed_in_epoch),
+            "world_size": int(accelerator.num_processes),
+            "gradient_accumulation_steps": int(
+                accelerator.gradient_accumulation_steps
+            ),
+            "config_signature": config_signature,
+            "config_signature_version": RESUME_SIGNATURE_VERSION,
+            "ema_layout_fingerprint": (
+                ema_layout["layout_fingerprint"] if ema_layout is not None else None
+            ),
+        }
+        path = checkpoint_dir / "metadata.json"
+        temp_path = checkpoint_dir / f".{path.name}.tmp-{os.getpid()}"
+        temp_path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temp_path, path)
+    accelerator.wait_for_everyone()
+
+
+def _mark_checkpoint_complete(
+    checkpoint_dir: Path,
+    *,
+    accelerator,
+    global_step: int,
+) -> None:
+    if accelerator.is_main_process:
+        path = checkpoint_dir / "checkpoint_complete.json"
+        temp_path = checkpoint_dir / f".{path.name}.tmp-{os.getpid()}"
+        temp_path.write_text(
+            json.dumps(
+                {
+                    "schema": "selfless_caption_checkpoint_complete_v1",
+                    "global_step": int(global_step),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temp_path, path)
+    accelerator.wait_for_everyone()
+
+
+def _begin_checkpoint_write(
+    checkpoint_dir: Path,
+    *,
+    accelerator,
+) -> None:
+    """Invalidate an existing commit marker before replacing checkpoint files."""
+
+    if accelerator.is_main_process:
+        (checkpoint_dir / "checkpoint_complete.json").unlink(missing_ok=True)
+    accelerator.wait_for_everyone()
+
+
+def _validate_checkpoint_complete(
+    checkpoint_dir: Path,
+    *,
+    expected_global_step: int,
+) -> None:
+    completion_file = checkpoint_dir / "checkpoint_complete.json"
+    if not completion_file.is_file():
+        raise RuntimeError(
+            f"Refusing to resume an incomplete checkpoint: missing {completion_file}"
+        )
+    completion = json.loads(completion_file.read_text(encoding="utf-8"))
+    expected = {
+        "schema": "selfless_caption_checkpoint_complete_v1",
+        "global_step": int(expected_global_step),
+    }
+    if completion != expected:
+        raise RuntimeError(
+            "Invalid caption checkpoint completion marker: "
+            f"checkpoint={completion}, expected={expected}"
+        )
+
+
+def _set_caption_dataloader_epoch(dataloader, *, epoch: int, seed: int) -> None:
+    if hasattr(dataloader, "set_epoch"):
+        dataloader.set_epoch(int(epoch))
+    for candidate in (
+        dataloader,
+        getattr(dataloader, "dataloader", None),
+        getattr(dataloader, "base_dataloader", None),
+    ):
+        if candidate is None:
+            continue
+        generator = getattr(candidate, "generator", None)
+        if isinstance(generator, torch.Generator):
+            generator.manual_seed(int(seed) + int(epoch))
+        sampler = getattr(candidate, "sampler", None)
+        sampler_generator = getattr(sampler, "generator", None)
+        if isinstance(sampler_generator, torch.Generator):
+            sampler_generator.manual_seed(int(seed) + int(epoch))
+
+
 def main():
     #########################
     #      SETUP Config     #
     #########################
     config = get_config()
+    validate_wsd_contract(config)
+
+    log_every = int(config.experiment.log_every)
+    flow_stats_every = int(config.experiment.get("flow_stats_every", 0))
+    backbone_gate_stats_every = int(
+        config.experiment.get("backbone_gate_stats_every", 0)
+    )
+    if log_every <= 0:
+        raise ValueError(f"experiment.log_every must be positive, got {log_every}")
+    for name, frequency in (
+        ("flow_stats_every", flow_stats_every),
+        ("backbone_gate_stats_every", backbone_gate_stats_every),
+    ):
+        if frequency < 0:
+            raise ValueError(f"experiment.{name} must be non-negative, got {frequency}")
+        if frequency and frequency % log_every:
+            raise ValueError(
+                f"experiment.{name} must be zero or a multiple of log_every "
+                f"({log_every}), got {frequency}"
+            )
         
     total_batch_size_per_gpu = config.training.batch_size
+    mixed_precision = str(config.training.mixed_precision).lower()
+    gradient_accumulation_dtype = str(
+        config.training.get("gradient_accumulation_dtype", "fp32")
+    ).lower()
+    if mixed_precision != "bf16":
+        raise ValueError(
+            "Selfless-Flow training requires training.mixed_precision='bf16', "
+            f"got {config.training.mixed_precision!r}."
+        )
+    if gradient_accumulation_dtype != "fp32":
+        raise ValueError(
+            "Selfless-Flow training requires FP32 gradient accumulation, "
+            f"got {gradient_accumulation_dtype!r}."
+        )
     
     config.experiment.output_dir = os.path.join(config.experiment.output_dir, config.experiment.project)
 
@@ -320,16 +559,33 @@ def main():
     # SETUP Accelerator     #
     #########################
     num_processes = int(os.environ.get("WORLD_SIZE", 1))
-    assert num_processes != -1
+    if num_processes <= 0:
+        raise ValueError(f"WORLD_SIZE must be positive, got {num_processes}")
+    global_micro_batch = int(config.training.batch_size) * num_processes
+    if int(config.training.total_batch_size) % global_micro_batch:
+        raise ValueError(
+            "training.total_batch_size must be divisible by batch_size * world_size: "
+            f"{config.training.total_batch_size} % ({config.training.batch_size} * {num_processes}) != 0"
+        )
+    gradient_accumulation_steps = int(config.training.total_batch_size) // global_micro_batch
     print(f"Number of processes: {num_processes}")
     print(f"Total batch size: {config.training.total_batch_size}")
     print(f"Batch size per GPU: {total_batch_size_per_gpu}")
-    print(f"Gradient accumulation steps: {(config.training.total_batch_size // config.training.batch_size) // num_processes}")
+    print(f"Gradient accumulation steps: {gradient_accumulation_steps}")
     accelerator = Accelerator(
-        gradient_accumulation_steps=((config.training.total_batch_size // config.training.batch_size) // num_processes),
-        mixed_precision=config.training.mixed_precision,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        mixed_precision=mixed_precision,
         log_with="wandb",
         step_scheduler_with_optimizer=config.training.step_scheduler_with_optimizer,
+        dataloader_config=DataLoaderConfiguration(
+            non_blocking=True,
+            use_seedable_sampler=True,
+            data_seed=int(
+                config.training.get(
+                    "dataloader_shuffle_seed", config.training.seed
+                )
+            ),
+        ),
     )
     print(f"Accelerator state: {accelerator.state}")
     print(f"accelerator.gradient_accumulation_steps: {accelerator.gradient_accumulation_steps}")
@@ -340,6 +596,15 @@ def main():
         accelerator.state.deepspeed_plugin.deepspeed_config["gradient_accumulation_steps"] = (
             accelerator.gradient_accumulation_steps
         )
+        accelerator.state.deepspeed_plugin.deepspeed_config["gradient_clipping"] = float(
+            config.training.max_grad_norm
+        )
+        # DeepSpeed 0.18.x reads the accumulation dtype from the nested
+        # data_types config. A top-level `gradient_accumulation_dtype` key is
+        # accepted but silently ignored.
+        accelerator.state.deepspeed_plugin.deepspeed_config.setdefault(
+            "data_types", {}
+        )["grad_accum_dtype"] = gradient_accumulation_dtype
 
     #####################################
     # SETUP LOGGING, SEED and CONFIG    #
@@ -379,56 +644,84 @@ def main():
     # MODELS and TOKENIZER  #
     #########################
     logger.info("Loading tokenizer and model")
-    model, tokenizer = load_model_tokenizer(config=config, logger=logger)
+    model, tokenizer = load_model_tokenizer(
+        config=config,
+        logger=logger,
+        model_dtype=torch.bfloat16,
+    )
 
     flow_adapter = config.model.get("pretrained_image_flow_adapter", None)
     _load_image_flow_adapter(model, flow_adapter, config)
 
-    if config.training.get("use_gradient_checkpointing", False):
-        model.gradient_checkpointing_enable()
-        logger.info("Gradient checkpointing enabled")
+    trainability = _apply_trainable_scope(model, config)
+    logger.info(
+        "Trainable scope: "
+        f"scope={trainability['scope']}, "
+        f"trainable={trainability['trainable_numel']:,}, "
+        f"frozen={trainability['frozen_numel']:,}, "
+        f"total={trainability['total_numel']:,}"
+    )
 
-    ema_model = _create_ema_model(model, config)
-    ema_decay_value = _ema_decay(config) if ema_model is not None else None
+    ema_layout = None
+    ema = None
+    ema_decay_value = _ema_decay(config) if _ema_enabled(config) else None
     ema_update_after_step = int(config.training.get("ema_update_after_step", 0))
     if ema_update_after_step < 0:
         raise ValueError(f"ema_update_after_step must be >= 0, got {ema_update_after_step}")
-    if ema_model is not None:
+    if _ema_enabled(config):
+        if bool(config.training.get("ema_validate", False)):
+            raise ValueError(
+                "training.ema_validate=true is unsupported with rank-sharded EMA: "
+                "the EMA exists as distributed FP32 tensor chunks and is not an "
+                "executable model. Save/merge the HF EMA checkpoint and evaluate it offline."
+            )
+        ema_chunk_numel = int(
+            config.training.get("ema_shard_chunk_numel", DEFAULT_EMA_CHUNK_NUMEL)
+        )
+        ema_layout = build_sharded_ema_layout(
+            model,
+            world_size=accelerator.num_processes,
+            chunk_numel=ema_chunk_numel,
+        )
         logger.info(
-            "EMA enabled: "
+            "Rank-sharded EMA enabled: "
             f"decay={ema_decay_value:g}, update_after_step={ema_update_after_step}, dtype=fp32, "
-            f"validate={bool(config.training.get('ema_validate', True))}, "
+            f"chunk_numel={ema_chunk_numel}, "
+            f"rank_bytes={ema_layout['rank_bytes']}, "
+            f"validate={bool(config.training.get('ema_validate', False))}, "
             f"save_adapter={bool(config.training.get('ema_save_adapter', True))}, "
             f"save_hf_model={bool(config.training.get('ema_save_hf_model', True))}"
         )
         if accelerator.distributed_type == DistributedType.DEEPSPEED:
-            logger.warning(
-                "EMA keeps an unsharded shadow model. This may require extra memory with DeepSpeed."
+            deepspeed_config = accelerator.state.deepspeed_plugin.deepspeed_config
+            zero_stage = int(
+                deepspeed_config.get("zero_optimization", {}).get(
+                    "stage", deepspeed_config.get("zero_stage", -1)
+                )
             )
+            if zero_stage != 2:
+                raise ValueError(
+                    "Rank-sharded EMA currently requires DeepSpeed ZeRO-2 because "
+                    f"it reads local complete parameters; resolved ZeRO stage is {zero_stage}."
+                )
 
     ##################################
     #   Optimizer and LR scheduler   #
     ##################################
     optimizer_config = config.optimizer.params
 
-    # Use lower LR for pretrained backbone and higher LR for continuous-image
-    # modules. Keep flow head normalization/projection parameters out of weight decay.
+    # Use lower LR for the pretrained backbone and higher LR for continuous-
+    # image modules. Decay flow-head matrix weights while keeping biases,
+    # normalization parameters, and the small input projectors decay-free.
     base_lr = float(optimizer_config.learning_rate)
     backbone_lr = float(optimizer_config.get("backbone_learning_rate", base_lr))
     flow_lr = float(optimizer_config.get("flow_learning_rate", base_lr))
     projector_lr = float(optimizer_config.get("projector_learning_rate", flow_lr))
     special_token_lr = float(optimizer_config.get("special_token_learning_rate", projector_lr))
-    no_decay = [
-        "bias",
-        "layer_norm.weight",
-        "layernorm.weight",
-        "input_layernorm.weight",
-        "post_attention_layernorm.weight",
-        "norm.weight",
-        "embed_tokens.weight",
-        "lm_head.weight",
-    ]
-
+    global_weight_decay = float(optimizer_config.weight_decay)
+    flow_weight_decay = float(
+        optimizer_config.get("flow_weight_decay", global_weight_decay)
+    )
     def lr_for_param(name):
         if name.startswith("image_flow_head."):
             return flow_lr
@@ -442,12 +735,11 @@ def main():
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        is_image_module = (
-            name.startswith("image_flow_head.")
-            or "image_token_embedder" in name
-            or name.startswith("image_flow_condition_proj.")
+        weight_decay = weight_decay_for_parameter(
+            name,
+            global_weight_decay=global_weight_decay,
+            flow_weight_decay=flow_weight_decay,
         )
-        weight_decay = 0.0 if is_image_module or any(nd in name for nd in no_decay) else optimizer_config.weight_decay
         key = (lr_for_param(name), weight_decay)
         grouped.setdefault(key, []).append(param)
 
@@ -460,7 +752,8 @@ def main():
         f"backbone={backbone_lr:g}, image_token_embedder/image_flow_condition_proj={projector_lr:g}, "
         f"image_flow_head={flow_lr:g}; "
         f"special_tokens={special_token_lr:g}; "
-        f"weight_decay={optimizer_config.weight_decay:g}"
+        f"weight_decay={global_weight_decay:g}, "
+        f"flow_weight_decay={flow_weight_decay:g}"
     )
 
     optimizer_type = config.optimizer.name
@@ -481,6 +774,13 @@ def main():
         num_decay_steps=config.lr_scheduler.params.decay_steps,
         num_training_steps=config.training.max_train_steps,
         min_lr_ratio=config.lr_scheduler.params.min_lr_scale
+    )
+    logger.info(
+        "WSD schedule: "
+        f"warmup_steps={int(config.lr_scheduler.params.warmup_steps)}, "
+        f"stable_steps={int(config.training.max_train_steps) - int(config.lr_scheduler.params.warmup_steps) - int(config.lr_scheduler.params.decay_steps)}, "
+        f"warmdown_steps={int(config.lr_scheduler.params.decay_steps)}, "
+        f"min_lr_scale={float(config.lr_scheduler.params.min_lr_scale):g}"
     )
 
     ##################################
@@ -505,8 +805,20 @@ def main():
         val_dataloader = val_dataloader.prepare_with_accelerator(accelerator)
     else:
         model, optimizer, train_dataloader, val_dataloader, lr_scheduler = accelerator.prepare(model, optimizer, train_dataloader, val_dataloader, lr_scheduler)
-    if ema_model is not None:
-        ema_model.to(accelerator.device)
+    if ema_layout is not None:
+        ema = RankShardedEMA(
+            ema_layout,
+            rank=accelerator.process_index,
+            decay=ema_decay_value,
+            update_after_step=ema_update_after_step,
+        )
+        ema.bind(accelerator.unwrap_model(model))
+
+    config_signature = _resume_signature(
+        config,
+        world_size=accelerator.num_processes,
+        gradient_accumulation_steps=accelerator.gradient_accumulation_steps,
+    )
 
     ##################################
     #       MODEL RESUME         #
@@ -514,55 +826,83 @@ def main():
     global_step = 0
     resume_step = 0
     resume_checkpoint_dir = None
+    resume_metadata = None
 
-    if config.experiment.resume_from_checkpoint is not None:
+    if not _is_disabled_path(config.experiment.resume_from_checkpoint):
         candidate_path = Path(config.experiment.resume_from_checkpoint)
         if candidate_path.exists():
             resume_checkpoint_dir = candidate_path
         else:
-            logger.warning(f"Specified checkpoint not found: {candidate_path}")
+            raise FileNotFoundError(
+                f"Specified resume checkpoint does not exist: {candidate_path}"
+            )
 
     if resume_checkpoint_dir and resume_checkpoint_dir.exists():
         logger.info(f"Resuming training from checkpoint: {resume_checkpoint_dir}")
-        
-        # 加载模型权重、优化器状态、RNG 状态
-        accelerator.load_state(resume_checkpoint_dir)
-        
         metadata_file = resume_checkpoint_dir / "metadata.json"
-        if metadata_file.exists():
-            with open(metadata_file, "r") as f:
-                metadata = json.load(f)
-            resume_step = metadata.get("global_step", 0)
-        else:
-            logger.error(f"Error loading metadata from {metadata_file}")
-        
+        if not metadata_file.is_file():
+            raise RuntimeError(
+                f"Refusing to resume a checkpoint without metadata: {metadata_file}"
+            )
+        resume_metadata = json.loads(metadata_file.read_text(encoding="utf-8"))
+        resume_step = int(resume_metadata["global_step"])
+        _validate_checkpoint_complete(
+            resume_checkpoint_dir,
+            expected_global_step=resume_step,
+        )
+        if int(resume_metadata.get("world_size", -1)) != accelerator.num_processes:
+            raise RuntimeError(
+                "Caption resume requires the same world size: "
+                f"checkpoint={resume_metadata.get('world_size')}, "
+                f"current={accelerator.num_processes}"
+            )
+        validate_resume_metadata(
+            resume_metadata,
+            checkpoint_dir=resume_checkpoint_dir,
+            config=config,
+            world_size=accelerator.num_processes,
+            gradient_accumulation_steps=(
+                accelerator.gradient_accumulation_steps
+            ),
+            current_signature=config_signature,
+        )
+        expected_ema_fingerprint = (
+            ema_layout["layout_fingerprint"] if ema_layout is not None else None
+        )
+        if resume_metadata.get("ema_layout_fingerprint") != expected_ema_fingerprint:
+            raise RuntimeError("Resume EMA layout fingerprint mismatch")
+
+        # Model, optimizer, scheduler, and RNG state are loaded only after the
+        # immutable resume contract has been validated.
+        accelerator.load_state(resume_checkpoint_dir)
         global_step = resume_step
         logger.info(f"Resumed at global_step={global_step}")
 
     else:
-        logger.warning("No valid checkpoint found or specified, starting fresh training.")
+        logger.info("Starting fresh caption training.")
         global_step = 0
         resume_step = 0
 
-    ema_started = False
-    if ema_model is not None:
-        loaded_ema_state = False
-        if resume_checkpoint_dir and _load_ema_state_if_available(ema_model, resume_checkpoint_dir):
-            ema_model.to(accelerator.device)
-            loaded_ema_state = True
+    if ema is not None:
+        if resume_checkpoint_dir:
+            ema.load_checkpoint(
+                resume_checkpoint_dir,
+                accelerator,
+                expected_global_step=global_step,
+            )
+            logger.info(
+                f"Loaded rank {accelerator.process_index} EMA shard at global_step={global_step}."
+            )
         else:
-            _sync_ema_model(ema_model, model, accelerator)
-            logger.info("Initialized EMA weights from the current training model.")
-        ema_started = global_step >= ema_update_after_step
-        if ema_started:
-            source = "loaded checkpoint" if loaded_ema_state else "current training model"
-            logger.info(f"EMA is active at global_step={global_step} from {source}.")
+            ema.initialize_from_model(global_step=global_step)
+            logger.info("Initialized this rank's FP32 EMA shard from the training model.")
+        if ema.started:
+            logger.info(f"EMA is active at global_step={global_step}.")
         else:
             logger.info(
                 "EMA updates are delayed until "
                 f"global_step={ema_update_after_step}; validation and adapter saves will use the training model until then."
             )
-        ema_model.eval()
 
     ##################################
     #             Training           #
@@ -581,42 +921,53 @@ def main():
     if accelerator.is_main_process:
         os.makedirs(config.experiment.output_dir, exist_ok=True)
         config_path = Path(config.experiment.output_dir) / "config.yaml"
-        logging.info(f"Saving config to {config_path}")
-        OmegaConf.save(config, config_path)
+        if not config_path.exists():
+            logging.info(f"Saving immutable run config to {config_path}")
+            OmegaConf.save(config, config_path)
+        else:
+            logging.info(f"Keeping existing immutable run config at {config_path}")
 
-    batch_time_m = AverageMeter()
-    data_time_m = AverageMeter()
-    end = time.time()
     batches_to_skip = 0
     resume_epoch = 0
     initial_train_dataloader = train_dataloader
     if resume_step > 0:
-        raw_batches_to_skip = resume_step * accelerator.gradient_accumulation_steps
+        resume_epoch = int(resume_metadata["epoch"])
+        batches_to_skip = int(resume_metadata["batches_consumed_in_epoch"])
         try:
             dataloader_len = len(train_dataloader)
         except TypeError:
             dataloader_len = 0
-        if dataloader_len > 0:
-            resume_epoch = raw_batches_to_skip // dataloader_len
-            batches_to_skip = raw_batches_to_skip % dataloader_len
-            logger.info(
-                f"Resuming from step {resume_step}: dataloader_len={dataloader_len}, "
-                f"resume_epoch={resume_epoch}, skipping {batches_to_skip} batches in the first resumed epoch."
+        if dataloader_len <= 0 or batches_to_skip < 0 or batches_to_skip > dataloader_len:
+            raise RuntimeError(
+                "Invalid caption dataloader resume offset: "
+                f"epoch={resume_epoch}, offset={batches_to_skip}, len={dataloader_len}"
             )
-            if _is_multimodal_ds:
-                ds.set_epoch(resume_epoch)
-        else:
-            batches_to_skip = raw_batches_to_skip
-            logger.info(f"Resuming from step {resume_step}, skipping {batches_to_skip} batches...")
-        if batches_to_skip > 0:
-            initial_train_dataloader = accelerator.skip_first_batches(train_dataloader, batches_to_skip)
+        logger.info(
+            f"Resuming from step {resume_step}: dataloader_len={dataloader_len}, "
+            f"resume_epoch={resume_epoch}, skipping {batches_to_skip} prepared batches."
+        )
+        if _is_multimodal_ds:
+            ds.set_epoch(resume_epoch)
+    caption_shuffle_seed = int(
+        config.training.get("dataloader_shuffle_seed", config.training.seed)
+    )
+    _set_caption_dataloader_epoch(
+        train_dataloader,
+        epoch=resume_epoch,
+        seed=caption_shuffle_seed,
+    )
+    if batches_to_skip > 0:
+        initial_train_dataloader = accelerator.skip_first_batches(
+            train_dataloader,
+            batches_to_skip,
+        )
 
     model.train()
-    if ema_model is not None:
-        ema_model.eval()
 
     train_iter = iter(initial_train_dataloader)
+    training_window = TrainingWindow()
     training_runtime_started_at = time.time()
+    training_runtime_start_step = global_step
     if accelerator.device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(accelerator.device)
 
@@ -630,15 +981,25 @@ def main():
     )
 
     epoch = resume_epoch
+    batches_consumed_in_epoch = batches_to_skip
     while global_step < config.training.max_train_steps:
+        data_wait_started = time.perf_counter()
         try:
             batch = next(train_iter)
         except StopIteration:
             epoch += 1
+            batches_consumed_in_epoch = 0
             if _is_multimodal_ds:
                 ds.set_epoch(epoch)
+            _set_caption_dataloader_epoch(
+                train_dataloader,
+                epoch=epoch,
+                seed=caption_shuffle_seed,
+            )
             train_iter = iter(train_dataloader)
             batch = next(train_iter)
+        batches_consumed_in_epoch += 1
+        data_wait_seconds = time.perf_counter() - data_wait_started
         
         # *-------*-------*-------*-------*-------*-------*
         # Data Processing
@@ -649,32 +1010,56 @@ def main():
                 "Selfless-Flow training requires an image batch from "
                 "ImageNetFlowCacheDataset."
             )
-        t_1 = 0.0
-
         if is_multimodal:
-            input_ids = batch["input_ids"].contiguous().to(accelerator.device)  # [B, L] — no shift for selfless
-            token_types = batch["token_types"].to(accelerator.device)  # [B, L]
-            sigma = batch["sigma"].to(accelerator.device)  # [B, L], pre-computed by dataloader
-            labels = batch["labels"].to(accelerator.device)  # [B, L], pre-computed by dataloader
+            input_ids = batch["input_ids"].contiguous().to(
+                accelerator.device, non_blocking=True
+            )  # [B, L] — no shift for selfless
+            token_types = batch["token_types"].to(
+                accelerator.device, non_blocking=True
+            )  # [B, L]
+            sigma = batch["sigma"].to(
+                accelerator.device, non_blocking=True
+            )  # [B, L], pre-computed by dataloader
+            labels = batch["labels"].to(
+                accelerator.device, non_blocking=True
+            )  # [B, L], pre-computed by dataloader
             segment_ids = batch.get("segment_ids", None)
             if segment_ids is not None:
-                segment_ids = segment_ids.to(accelerator.device)
+                segment_ids = segment_ids.to(accelerator.device, non_blocking=True)
             position_ids = batch.get("position_ids", None)
             if position_ids is not None:
-                position_ids = position_ids.to(accelerator.device)
+                position_ids = position_ids.to(accelerator.device, non_blocking=True)
+            image_local_positions = batch.get("image_local_positions", None)
+            if image_local_positions is not None:
+                image_local_positions = image_local_positions.to(
+                    accelerator.device, non_blocking=True
+                )
+            image_span_table = batch.get("image_span_table", None)
+            logical_images = int(image_span_table.shape[0]) if image_span_table is not None else 0
+            if image_span_table is not None:
+                image_span_table = image_span_table.to(
+                    accelerator.device, non_blocking=True
+                )
             image_latents = batch.get("image_latents", None)
             if image_latents is not None:
-                image_latents = image_latents.to(accelerator.device)
+                image_latents = image_latents.to(
+                    accelerator.device, non_blocking=True
+                )
             pack_stats = batch.get("pack_stats", None)
-            if pack_stats is not None:
-                pack_stats = pack_stats.to(accelerator.device)
             B, L = input_ids.shape
+            training_window.record_batch(
+                rows=B,
+                sequence_length=L,
+                logical_images=logical_images,
+                pack_stats=pack_stats,
+                data_wait_seconds=data_wait_seconds,
+            )
 
             image_uncond_rows = None
             image_uncond_mask = batch.get("image_uncond_mask", None)
             if image_uncond_mask is not None:
                 image_uncond_mask = image_uncond_mask.to(
-                    accelerator.device, dtype=torch.bool
+                    accelerator.device, dtype=torch.bool, non_blocking=True
                 )
             image_uncond_prob = float(config.model.get("image_uncond_prob", 0.0))
             if image_uncond_mask is None and image_uncond_prob > 0.0:
@@ -682,8 +1067,7 @@ def main():
                 sampled_rows = (
                     torch.rand(B, device=accelerator.device) < image_uncond_prob
                 ) & has_image
-                if sampled_rows.any():
-                    image_uncond_rows = sampled_rows
+                image_uncond_rows = sampled_rows
 
             selfless_attention_mask = get_selfless_mask(
                 sigma=sigma,
@@ -717,7 +1101,9 @@ def main():
                         f"{int(image_uncond_mask.sum().item())}"
                     )
                 if pack_stats is not None:
-                    valid_tokens, image_tokens, padding_tokens, packed_len = pack_stats.tolist()
+                    valid_tokens, image_tokens, padding_tokens, packed_len = map(
+                        int, pack_stats
+                    )
                     logger.info(
                         f"pack stats: valid={valid_tokens}, image={image_tokens}, "
                         f"padding={padding_tokens}, L={packed_len}, "
@@ -731,7 +1117,7 @@ def main():
                             row_count,
                             pack_capacity,
                             overflow_count,
-                        ) = pack_details.tolist()
+                        ) = map(int, pack_details)
                         logger.info(
                             "segment pack: "
                             f"images={image_count}, rows={row_count}, "
@@ -749,8 +1135,8 @@ def main():
                             ),
                             "pack_manifest": batch.get("pack_manifest"),
                             "sample_img_ids": batch.get(
-                                "sample_img_ids", torch.empty(0, dtype=torch.long)
-                            ).tolist(),
+                                "sample_img_ids", []
+                            ),
                             "sample_token_sha256": batch.get(
                                 "sample_token_sha256", []
                             ),
@@ -771,6 +1157,7 @@ def main():
         # *-------*-------*-------*-------*-------*-------*
         # Forward & Backward
         # *-------*-------*-------*-------*-------*-------*
+        grad_norm_value = None
         with accelerator.accumulate(model):
             forward_kwargs = {
                 "X0_input_ids": input_ids,
@@ -782,32 +1169,41 @@ def main():
                 forward_kwargs["flow_sigma"] = sigma
                 if position_ids is not None:
                     forward_kwargs["position_ids"] = position_ids
+                if image_local_positions is not None:
+                    forward_kwargs["image_local_positions"] = image_local_positions
+                if image_span_table is not None:
+                    forward_kwargs["image_span_table"] = image_span_table
             if is_multimodal and image_latents is not None:
                 forward_kwargs["image_latents"] = image_latents
             record_backbone_gate_stats = (
                 str(config.model.get("backbone_attention_output_gate", "none"))
                 != "none"
-            ) and (
-                (global_step + 1) % int(config.experiment.log_every) == 0
+                and backbone_gate_stats_every > 0
+                and accelerator.sync_gradients
+                and (global_step + 1) % backbone_gate_stats_every == 0
             )
             if record_backbone_gate_stats:
                 forward_kwargs["record_backbone_gate_stats"] = True
                 forward_kwargs["backbone_gate_stats_level"] = "summary"
+            forward_kwargs["record_flow_stats"] = (
+                flow_stats_every > 0
+                and accelerator.sync_gradients
+                and (global_step + 1) % flow_stats_every == 0
+            )
 
             model_output = model(**forward_kwargs)
             loss = model_output.loss
-            if not bool(torch.isfinite(loss.detach()).all().item()):
-                flow_stats = getattr(model_output, "flow_debug_stats", None) or {}
-                compact_stats = {
-                    key: float(value.detach().float().cpu().item())
-                    for key, value in flow_stats.items()
-                    if isinstance(value, torch.Tensor) and value.numel() == 1
-                }
-                raise FloatingPointError(
-                    "non-finite training loss at the first detected forward: "
-                    f"global_step={global_step}, loss={loss.detach()}, "
-                    f"flow_stats={compact_stats}"
+            finite_loss = torch.isfinite(loss.detach()).all()
+            if hasattr(torch, "_assert_async"):
+                torch._assert_async(
+                    finite_loss,
+                    f"non-finite caption training loss at global_step={global_step}",
                 )
+            elif (global_step + 1) % int(config.experiment.log_every) == 0:
+                if not bool(finite_loss.item()):
+                    raise FloatingPointError(
+                        f"non-finite caption training loss at global_step={global_step}"
+                    )
 
             flow_stats = getattr(model_output, "flow_debug_stats", None)
             if flow_stats:
@@ -834,90 +1230,149 @@ def main():
             accelerator.backward(loss)
 
             if accelerator.sync_gradients:
-                if config.training.max_grad_norm:
-                    accelerator.clip_grad_norm_(model.parameters(), config.training.max_grad_norm)
+                if (
+                    accelerator.distributed_type != DistributedType.DEEPSPEED
+                    and config.training.max_grad_norm
+                ):
+                    grad_norm_value = accelerator.clip_grad_norm_(
+                        model.parameters(), config.training.max_grad_norm
+                    )
                 
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
-                if ema_model is not None:
+                if (
+                    accelerator.distributed_type == DistributedType.DEEPSPEED
+                    and (global_step + 1)
+                    % int(config.experiment.log_grad_norm_every)
+                    == 0
+                    and hasattr(model, "get_global_grad_norm")
+                ):
+                    grad_norm_value = model.get_global_grad_norm()
+                if ema is not None:
                     next_step = global_step + 1
-                    was_ema_started = ema_started
-                    ema_started = _maybe_update_ema_model(
-                        ema_model,
-                        model,
-                        accelerator,
-                        ema_decay_value,
-                        next_step,
-                        ema_update_after_step,
-                        ema_started,
-                    )
-                    if ema_started and not was_ema_started and accelerator.is_main_process:
+                    was_ema_started = ema.started
+                    ema.maybe_update(next_step)
+                    if ema.started and not was_ema_started and accelerator.is_main_process:
                         logger.info(f"Started EMA at global_step={next_step} by syncing current model weights.")
-
-                # 记录梯度范数 (可选)
-                if (global_step + 1) % config.experiment.log_grad_norm_every == 0 and accelerator.is_main_process:
-                    log_grad_norm(model, accelerator, global_step + 1)
 
         # *-------*-------*-------*-------*-------*-------*
         # Logging & Saving & Validation
         # *-------*-------*-------*-------*-------*-------*
         if accelerator.sync_gradients:
             global_step += 1
-            
-            batch_time_m.update(time.time() - end)
-            end = time.time()
+            training_window.record_optimizer_step()
+            did_log = global_step % log_every == 0
 
             # Logging
-            if global_step % config.experiment.log_every == 0:
+            if did_log:
                 grad_accum = accelerator.gradient_accumulation_steps
                 # Average loss across all micro-batches and all ranks
                 avg_loss_per_step = acc_loss / grad_accum
                 global_avg_loss = accelerator.reduce(avg_loss_per_step, reduction="mean")
+                global_avg_loss_value = float(global_avg_loss.item())
 
+                window_rows = accelerator.gather(
+                    training_window.as_tensor(accelerator.device)
+                ).reshape(-1, 10)
+                totals = window_rows[:, :9].sum(dim=0)
+                elapsed = window_rows[:, 9].max()
+                summary_values = torch.cat((totals, elapsed.unsqueeze(0))).tolist()
+                (
+                    optimizer_steps_total,
+                    micro_batches_total,
+                    logical_images_total,
+                    physical_rows_total,
+                    physical_tokens_total,
+                    valid_tokens_total,
+                    image_tokens_total,
+                    padding_tokens_total,
+                    data_wait_total,
+                    window_seconds,
+                ) = summary_values
+                world_size = float(accelerator.num_processes)
+                window_seconds = max(window_seconds, 1.0e-12)
+                optimizer_steps_per_rank = max(
+                    optimizer_steps_total / world_size,
+                    1.0,
+                )
+                micro_batches_total = max(micro_batches_total, 1.0)
                 samples_per_second_per_gpu = (
-                        accelerator.gradient_accumulation_steps * config.training.batch_size / batch_time_m.val
+                    logical_images_total / world_size / window_seconds
                 )
 
                 logs = {
-                    "t_1": t_1,
-                    "step_loss": global_avg_loss.item(),
-                    "train/loss_image_flow": global_avg_loss.item(),
+                    "step_loss": global_avg_loss_value,
+                    "train/loss_image_flow": global_avg_loss_value,
                     "lr": lr_scheduler.get_last_lr()[0],
                     "samples/sec/gpu": samples_per_second_per_gpu,
-                    "tokens/sec/gpu": samples_per_second_per_gpu * L,
-                    "batch_time": batch_time_m.val,
+                    "physical_rows/sec/gpu": (
+                        physical_rows_total / world_size / window_seconds
+                    ),
+                    "tokens/sec/gpu": (
+                        physical_tokens_total / world_size / window_seconds
+                    ),
+                    "valid_tokens/sec/gpu": (
+                        valid_tokens_total / world_size / window_seconds
+                    ),
+                    "image_tokens/sec/gpu": (
+                        image_tokens_total / world_size / window_seconds
+                    ),
+                    "seconds/optimizer_step": (
+                        window_seconds / optimizer_steps_per_rank
+                    ),
+                    "data_wait_ms/microbatch": (
+                        1000.0 * data_wait_total / micro_batches_total
+                    ),
+                    "data_wait_fraction": (
+                        data_wait_total / world_size / window_seconds
+                    ),
                 }
-                if ema_model is not None:
+                if ema is not None:
                     logs["ema/decay"] = ema_decay_value
-                    logs["ema/started"] = float(ema_started)
-                if is_multimodal and pack_stats is not None:
-                    valid_tokens, image_tokens, padding_tokens, packed_len = pack_stats.tolist()
-                    logs["pack/valid_tokens"] = valid_tokens
-                    logs["pack/image_tokens"] = image_tokens
-                    logs["pack/padding_tokens"] = padding_tokens
-                    logs["pack/padding_ratio"] = padding_tokens / max(1, config.training.batch_size * packed_len)
-                    logs["pack/seq_len"] = packed_len
-                    logs["valid_tokens/sec/gpu"] = (
-                        samples_per_second_per_gpu
-                        * valid_tokens
-                        / max(1, config.training.batch_size)
+                    logs["ema/started"] = float(ema.started)
+                if physical_rows_total > 0:
+                    logs["pack/seq_len"] = (
+                        physical_tokens_total / physical_rows_total
                     )
-                    logs["image_tokens/sec/gpu"] = (
-                        samples_per_second_per_gpu
-                        * image_tokens
-                        / max(1, config.training.batch_size)
+                if valid_tokens_total + padding_tokens_total > 0:
+                    logs["pack/padding_ratio"] = (
+                        padding_tokens_total
+                        / (valid_tokens_total + padding_tokens_total)
+                    )
+                    logs["pack/valid_tokens/microbatch/gpu"] = (
+                        valid_tokens_total / micro_batches_total
+                    )
+                    logs["pack/image_tokens/microbatch/gpu"] = (
+                        image_tokens_total / micro_batches_total
+                    )
+                    logs["pack/padding_tokens/microbatch/gpu"] = (
+                        padding_tokens_total / micro_batches_total
                     )
 
                 if acc_flow_stats:
                     flow_stat_count = acc_flow_stat_batches.clamp_min(1.0)
-                    global_flow_stats = {}
-                    for key, value in acc_flow_stats.items():
-                        stat = accelerator.reduce(
-                            value / flow_stat_count, reduction="mean"
-                        )
-                        global_flow_stats[key] = stat.item()
-                        logs[f"train/{key}"] = stat.item()
+                    flow_stat_keys = sorted(acc_flow_stats)
+                    local_flow_stats = torch.stack(
+                        [
+                            acc_flow_stats[key] / flow_stat_count
+                            for key in flow_stat_keys
+                        ]
+                    )
+                    reduced_flow_stats = accelerator.reduce(
+                        local_flow_stats,
+                        reduction="mean",
+                    )
+                    flow_stat_values = reduced_flow_stats.tolist()
+                    global_flow_stats = dict(
+                        zip(flow_stat_keys, flow_stat_values)
+                    )
+                    logs.update(
+                        {
+                            f"train/{key}": value
+                            for key, value in global_flow_stats.items()
+                        }
+                    )
                 if acc_backbone_gate_stats:
                     gate_stat_count = (
                         acc_backbone_gate_stat_batches.clamp_min(1.0)
@@ -936,16 +1391,26 @@ def main():
                     )
                     for key, stat in zip(
                         gate_stat_keys,
-                        reduced_gate_stats,
+                        reduced_gate_stats.tolist(),
                     ):
-                        logs[f"train/{key}"] = stat.item()
+                        logs[f"train/{key}"] = stat
+
+                if (
+                    grad_norm_value is not None
+                    and global_step
+                    % int(config.experiment.log_grad_norm_every)
+                    == 0
+                ):
+                    logs["train/global_grad_norm"] = float(
+                        torch.as_tensor(grad_norm_value).detach().float().item()
+                    )
 
                 accelerator.log(logs, step=global_step)
 
                 if accelerator.is_main_process:
                     msg = (
                         f"Step: {global_step} | "
-                        f"Loss: {global_avg_loss.item():0.4f}"
+                        f"Loss: {global_avg_loss_value:0.4f}"
                     )
                     if acc_flow_stats:
                         msg += (
@@ -954,39 +1419,70 @@ def main():
                         )
                     msg += (
                         f" | LR: {lr_scheduler.get_last_lr()[0]:0.6f} | "
-                        f"Sec/Iter: {batch_time_m.val:0.4f}"
+                        f"Sec/Step: {logs['seconds/optimizer_step']:0.4f} | "
+                        f"Data/Microbatch: {logs['data_wait_ms/microbatch']:0.2f}ms"
                     )
                     logger.info(msg)
 
-                batch_time_m.reset()
-                data_time_m.reset()
+            post_step_maintenance_started = time.perf_counter()
 
             # Checkpointing
             if global_step % config.experiment.save_every == 0:
-                active_ema_model = ema_model if ema_started else None
-                save_checkpoint(model, config, accelerator, global_step)
-                _save_ema_state(active_ema_model, config, accelerator, global_step)
-                adapter_model = (
-                    active_ema_model
-                    if active_ema_model is not None and bool(config.training.get("ema_save_adapter", True))
-                    else model
+                checkpoint_dir = (
+                    Path(config.experiment.output_dir)
+                    / f"checkpoint-{global_step}"
                 )
-                _save_image_flow_adapter(adapter_model, config, accelerator, global_step)
+                _begin_checkpoint_write(
+                    checkpoint_dir,
+                    accelerator=accelerator,
+                )
+                save_checkpoint(model, config, accelerator, global_step)
+                _write_training_checkpoint_metadata(
+                    checkpoint_dir,
+                    accelerator=accelerator,
+                    global_step=global_step,
+                    epoch=epoch,
+                    batches_consumed_in_epoch=batches_consumed_in_epoch,
+                    config_signature=config_signature,
+                    ema_layout=ema_layout,
+                )
+                ema_directory = _save_ema_state(ema, config, accelerator, global_step)
+                _mark_checkpoint_complete(
+                    checkpoint_dir,
+                    accelerator=accelerator,
+                    global_step=global_step,
+                )
+                if ema is not None and ema.started and bool(config.training.get("ema_save_adapter", True)):
+                    _save_ema_image_flow_adapter(
+                        ema_directory,
+                        config,
+                        accelerator,
+                        global_step,
+                    )
+                else:
+                    _save_image_flow_adapter(model, config, accelerator, global_step)
             
             if global_step % config.experiment.save_hfmodel_every == 0:
-                active_ema_model = ema_model if ema_started else None
                 save_hf_model(model, tokenizer, config, accelerator, global_step)
-                _save_ema_hf_model(active_ema_model, tokenizer, config, accelerator, global_step)
+                ema_directory = (
+                    _ema_state_directory(config, global_step)
+                    if ema is not None
+                    else None
+                )
+                _save_ema_hf_model(
+                    ema,
+                    model,
+                    tokenizer,
+                    config,
+                    accelerator,
+                    global_step,
+                    ema_directory,
+                )
                 
             # Validation
             if global_step % config.experiment.val_every == 0:
-                eval_model = (
-                    ema_model
-                    if ema_model is not None and ema_started and bool(config.training.get("ema_validate", True))
-                    else model
-                )
                 validate(
-                    eval_model,
+                    model,
                     val_dataloader,
                     accelerator,
                     global_step,
@@ -994,8 +1490,16 @@ def main():
                 )
 
                 model.train()
-                if ema_model is not None:
-                    ema_model.eval()
+
+            # Exclude checkpointing and validation from the next training
+            # throughput window. The current window was sampled before these
+            # cold-path operations started.
+            if did_log:
+                training_window.reset()
+            else:
+                training_window.exclude_elapsed(
+                    time.perf_counter() - post_step_maintenance_started
+                )
 
             # Reset per-step accumulators for the next optimizer step
             acc_loss.zero_()
@@ -1032,9 +1536,10 @@ def main():
             "global_step": int(global_step),
             "world_size": int(accelerator.num_processes),
             "total_batch_size": int(total_batch_size),
+            "steps_this_run": int(global_step - training_runtime_start_step),
             "training_wall_seconds": float(runtime_max[2].item()),
             "train_samples_per_second": float(
-                global_step
+                (global_step - training_runtime_start_step)
                 * total_batch_size
                 / max(float(runtime_max[2].item()), 1e-12)
             ),
@@ -1044,7 +1549,25 @@ def main():
             "peak_cuda_reserved_bytes_per_rank": int(
                 runtime_max[1].item()
             ),
+            "trainability": trainability,
         }
+        if ema_layout is not None:
+            full_ema_bytes = int(
+                sum(chunk["bytes"] for chunk in ema_layout["chunks"].values())
+            )
+            max_shard_bytes = int(max(ema_layout["rank_bytes"]))
+            runtime_payload["ema"] = {
+                "full_fp32_replica_bytes": full_ema_bytes,
+                "shard_bytes_by_rank": ema_layout["rank_bytes"],
+                "max_shard_bytes": max_shard_bytes,
+                "minimum_bytes_saved_per_rank": full_ema_bytes
+                - max_shard_bytes,
+                "minimum_fraction_saved_per_rank": (
+                    (full_ema_bytes - max_shard_bytes) / full_ema_bytes
+                    if full_ema_bytes
+                    else 0.0
+                ),
+            }
         runtime_path = (
             Path(config.experiment.output_dir)
             / "training_runtime_metrics.json"
@@ -1054,85 +1577,110 @@ def main():
             encoding="utf-8",
         )
     if bool(config.experiment.get("save_final", True)):
-        active_ema_model = ema_model if ema_started else None
         save_hf_model(model, tokenizer, config, accelerator, "final")
-        _save_ema_hf_model(active_ema_model, tokenizer, config, accelerator, "final")
-        _save_ema_state(active_ema_model, config, accelerator, "final")
-        adapter_model = (
-            active_ema_model
-            if active_ema_model is not None and bool(config.training.get("ema_save_adapter", True))
-            else model
+        ema_directory = _save_ema_state(ema, config, accelerator, "final")
+        _save_ema_hf_model(
+            ema,
+            model,
+            tokenizer,
+            config,
+            accelerator,
+            "final",
+            ema_directory,
         )
-        _save_image_flow_adapter(adapter_model, config, accelerator, "final")
+        if ema is not None and ema.started and bool(config.training.get("ema_save_adapter", True)):
+            _save_ema_image_flow_adapter(
+                ema_directory,
+                config,
+                accelerator,
+                "final",
+            )
+        else:
+            _save_image_flow_adapter(model, config, accelerator, "final")
     accelerator.end_training()
 
 
 @torch.no_grad()
 def validate(model, val_dataloader, accelerator, global_step, config=None):
-    model.eval()  # DeepSpeed requires explicit eval mode for no_grad forward
-    try:
-        _validate_multimodal(
-            model,
-            val_dataloader,
-            accelerator,
-            global_step,
-            config,
-        )
-    finally:
-        model.train()
+    validation_seed = int(
+        config.experiment.get("validation_seed", config.training.seed)
+    ) + int(accelerator.process_index)
+    cuda_devices = (
+        [int(accelerator.device.index)]
+        if accelerator.device.type == "cuda"
+        else []
+    )
+    # Validation must not perturb the training RNG stream, and every checkpoint
+    # must see the same flow times/noise on each rank.
+    with torch.random.fork_rng(devices=cuda_devices):
+        torch.default_generator.manual_seed(validation_seed)
+        if accelerator.device.type == "cuda":
+            with torch.cuda.device(accelerator.device):
+                torch.cuda.manual_seed(validation_seed)
+        model.eval()  # DeepSpeed requires explicit eval mode for no_grad forward
+        try:
+            _validate_multimodal(
+                model,
+                val_dataloader,
+                accelerator,
+                global_step,
+                config,
+            )
+        finally:
+            model.train()
 
 
 @torch.no_grad()
 def _load_vae_decoder(config, accelerator):
     global _VAE_CACHE
-    if _VAE_CACHE is not None:
-        return _VAE_CACHE
+    if _VAE_CACHE is None:
+        vae_path = Path(config.experiment.get("validation_vae_path", "public/vae/mar-kl16/kl16.ckpt"))
+        if not vae_path.exists():
+            logger.warning(f"Skipping validation image decode; missing VAE checkpoint: {vae_path}")
+            return None
 
-    vae_path = Path(config.experiment.get("validation_vae_path", "public/vae/mar-kl16/kl16.ckpt"))
-    if not vae_path.exists():
-        logger.warning(f"Skipping validation image decode; missing VAE checkpoint: {vae_path}")
-        return None
-
-    vae_module_root = Path(
-        config.experiment.get(
-            "validation_vae_module_root",
-            "/inspire/hdd/global_user/wanjiaxin-253108030048/code/mar",
+        vae_module_root = Path(
+            config.experiment.get(
+                "validation_vae_module_root",
+                "/inspire/hdd/global_user/wanjiaxin-253108030048/code/mar",
+            )
         )
-    )
-    vae_module_path = vae_module_root / "models" / "vae.py"
-    if not vae_module_path.exists():
-        logger.warning(f"Skipping validation image decode; missing VAE module: {vae_module_path}")
-        return None
-    spec = importlib.util.spec_from_file_location("kl16_vae", vae_module_path)
-    vae_module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(vae_module)
-    AutoencoderKL = vae_module.AutoencoderKL
+        vae_module_path = vae_module_root / "models" / "vae.py"
+        if not vae_module_path.exists():
+            logger.warning(f"Skipping validation image decode; missing VAE module: {vae_module_path}")
+            return None
+        spec = importlib.util.spec_from_file_location("kl16_vae", vae_module_path)
+        vae_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(vae_module)
+        AutoencoderKL = vae_module.AutoencoderKL
 
-    vae = AutoencoderKL(embed_dim=16, ch_mult=(1, 1, 2, 2, 4), ckpt_path=str(vae_path))
+        vae = AutoencoderKL(embed_dim=16, ch_mult=(1, 1, 2, 2, 4), ckpt_path=str(vae_path))
+        vae = vae.eval()
+        for param in vae.parameters():
+            param.requires_grad_(False)
+        _VAE_CACHE = vae
+
     vae_dtype_name = str(config.experiment.get("validation_vae_dtype", "fp32")).lower()
     dtype = torch.float16 if vae_dtype_name in {"fp16", "float16", "half"} and accelerator.device.type == "cuda" else torch.float32
-    vae = vae.to(device=accelerator.device, dtype=dtype).eval()
-    for param in vae.parameters():
-        param.requires_grad_(False)
-    _VAE_CACHE = vae
-    return vae
+    return _VAE_CACHE.to(device=accelerator.device, dtype=dtype).eval()
 
 
-def _image_spans(token_types: torch.Tensor, image_tokens_per_img: int):
+def _image_spans_from_table(
+    image_span_table: torch.Tensor,
+    image_tokens_per_img: int,
+) -> list[tuple[int, int, int]]:
+    """Read validation spans without scanning a CUDA tensor token by token."""
+
+    rows = image_span_table.detach().cpu().tolist()
     spans = []
-    bsz, seq_len = token_types.shape
-    for b in range(bsz):
-        pos = 0
-        while pos < seq_len:
-            if token_types[b, pos].item() != 1:
-                pos += 1
-                continue
-            start = pos
-            while pos < seq_len and token_types[b, pos].item() == 1:
-                pos += 1
-            end = pos
-            if end - start == image_tokens_per_img:
-                spans.append((b, start, end))
+    for row in rows:
+        batch_index, _, start, end, _ = map(int, row)
+        if end - start != image_tokens_per_img:
+            raise ValueError(
+                "validation image span length does not match model config: "
+                f"start={start}, end={end}, expected={image_tokens_per_img}"
+            )
+        spans.append((batch_index, start, end))
     return spans
 
 
@@ -1350,6 +1898,7 @@ def _save_validation_flow_images(
     input_ids,
     token_types,
     sigma,
+    image_span_table,
     image_latents,
     accelerator,
     global_step,
@@ -1365,22 +1914,36 @@ def _save_validation_flow_images(
 
     unwrapped = accelerator.unwrap_model(model)
     image_tokens_per_img = int(getattr(unwrapped.config, "image_tokens_per_img", config.model.get("image_tokens_per_img", 256)))
-    spans = _image_spans(token_types, image_tokens_per_img)
+    spans = _image_spans_from_table(
+        image_span_table,
+        image_tokens_per_img,
+    )
 
-    gather_context = nullcontext()
-    flow_head_params = list(unwrapped.image_flow_head.parameters())
-    if any(hasattr(param, "ds_id") for param in flow_head_params):
-        try:
-            import deepspeed
-            gather_context = deepspeed.zero.GatheredParameters(
-                flow_head_params,
-                modifier_rank=0,
+    # ZeRO-2 keeps complete parameters on every rank, so validation can run in
+    # parallel without gathering the flow head onto rank 0.  Direct execution
+    # is not valid for partitioned ZeRO-3 parameters.
+    if accelerator.distributed_type == DistributedType.DEEPSPEED:
+        deepspeed_config = accelerator.state.deepspeed_plugin.deepspeed_config
+        zero_stage = int(
+            deepspeed_config.get("zero_optimization", {}).get(
+                "stage", deepspeed_config.get("zero_stage", -1)
             )
-        except Exception:
-            pass
+        )
+        if zero_stage != 2:
+            raise RuntimeError(
+                "Parallel validation image generation requires replicated "
+                f"parameters (DeepSpeed ZeRO-2); resolved stage is {zero_stage}."
+            )
 
-    with gather_context:
-        if not accelerator.is_main_process:
+    span_counts = accelerator.gather(
+        torch.tensor([len(spans)], device=accelerator.device, dtype=torch.long)
+    )
+    common_span_count = int(span_counts.min().item())
+
+    with torch.no_grad():
+        if common_span_count <= 0:
+            if accelerator.is_main_process:
+                logger.warning("Skipping validation image decode; at least one rank has no complete image span.")
             return
         if not spans:
             logger.warning("Skipping validation image decode; no complete image span in validation batch.")
@@ -1390,7 +1953,10 @@ def _save_validation_flow_images(
         if vae is None:
             return
 
-        sample_count = min(int(config.experiment.get("validation_image_samples", 4)), len(spans))
+        sample_count = min(
+            int(config.experiment.get("validation_image_samples", 4)),
+            common_span_count,
+        )
         flow_temperature = float(config.experiment.get("validation_flow_temperature", 1.0))
         flow_cfg = float(config.experiment.get("validation_flow_cfg", 1.0))
         flow_cfg_schedule = str(config.experiment.get("validation_flow_cfg_schedule", "constant"))
@@ -1525,9 +2091,13 @@ def _save_validation_flow_images(
         from torchvision.utils import make_grid, save_image
 
         image_dir = Path(config.experiment.output_dir) / "validation_flow_images"
-        image_dir.mkdir(parents=True, exist_ok=True)
+        write_images = accelerator.is_main_process
+        if write_images:
+            image_dir.mkdir(parents=True, exist_ok=True)
         wandb_images = {}
-        save_debug_images = bool(config.experiment.get("validation_save_debug_images", False))
+        save_debug_images = write_images and bool(
+            config.experiment.get("validation_save_debug_images", False)
+        )
         pred_img = (decoded_pred + 1.0) / 2.0
         probe_x0_imgs = {
             time_value: (decoded + 1.0) / 2.0
@@ -1600,14 +2170,15 @@ def _save_validation_flow_images(
                     save_image(single_stream_img, single_stream_path)
                     wandb_images[f"{log_prefix}/debug/pred"] = single_stream_path
 
-                comparison = torch.stack([target_img, single_stream_img], dim=1).flatten(0, 1)
-                comparison_grid = make_grid(comparison, nrow=2)
-                comparison_path = image_dir / f"step-{global_step:08d}-strategy_{strategy_tag}.png"
-                save_image(comparison_grid, comparison_path)
-                wandb_images[f"{log_prefix}/target_strategy_grid"] = comparison_path
+                if write_images:
+                    comparison = torch.stack([target_img, single_stream_img], dim=1).flatten(0, 1)
+                    comparison_grid = make_grid(comparison, nrow=2)
+                    comparison_path = image_dir / f"step-{global_step:08d}-strategy_{strategy_tag}.png"
+                    save_image(comparison_grid, comparison_path)
+                    wandb_images[f"{log_prefix}/target_strategy_grid"] = comparison_path
 
-                comparison_tiles.append(single_stream_img)
-                comparison_names.append(strategy_tag)
+                    comparison_tiles.append(single_stream_img)
+                    comparison_names.append(strategy_tag)
 
                 if single_stream_trace:
                     trace_strategy = single_stream_trace.get("order_strategy", strategy_tag)
@@ -1654,21 +2225,37 @@ def _save_validation_flow_images(
             comparison_tiles = []
             comparison_names = []
 
-        overview_tiles = [target_img] + list(probe_x0_imgs.values()) + [pred_img] + comparison_tiles
-        overview_grid = make_grid(torch.stack(overview_tiles, dim=1).flatten(0, 1), nrow=len(overview_tiles))
-        overview_path = image_dir / f"step-{global_step:08d}-overview.png"
-        save_image(overview_grid, overview_path)
-        wandb_images["val/overview_target_flow_fullsample"] = overview_path
-        probe_column_names = [f"flow_x0_est_t{time_value:g}" for time_value in probe_x0_imgs]
-        logger.info(
-            "Validation overview columns: target, "
-            + ", ".join(probe_column_names)
-            + ", full_sample"
-            + (f", {', '.join(comparison_names)}" if comparison_names else "")
+        metric_keys = sorted(logs)
+        local_metric_values = torch.tensor(
+            [logs[key] for key in metric_keys],
+            device=accelerator.device,
+            dtype=torch.float64,
         )
-        accelerator.log(logs, step=global_step)
-        _log_wandb_validation_images(accelerator, wandb_images, global_step)
-        logger.info(f"Saved validation flow images to {image_dir}")
+        global_metric_values = accelerator.reduce(
+            local_metric_values,
+            reduction="mean",
+        )
+        global_logs = dict(zip(metric_keys, global_metric_values.tolist()))
+
+        if write_images:
+            overview_tiles = [target_img] + list(probe_x0_imgs.values()) + [pred_img] + comparison_tiles
+            overview_grid = make_grid(torch.stack(overview_tiles, dim=1).flatten(0, 1), nrow=len(overview_tiles))
+            overview_path = image_dir / f"step-{global_step:08d}-overview.png"
+            save_image(overview_grid, overview_path)
+            wandb_images["val/overview_target_flow_fullsample"] = overview_path
+            probe_column_names = [f"flow_x0_est_t{time_value:g}" for time_value in probe_x0_imgs]
+            logger.info(
+                "Validation overview columns: target, "
+                + ", ".join(probe_column_names)
+                + ", full_sample"
+                + (f", {', '.join(comparison_names)}" if comparison_names else "")
+            )
+            accelerator.log(global_logs, step=global_step)
+            _log_wandb_validation_images(accelerator, wandb_images, global_step)
+            logger.info(f"Saved validation flow images to {image_dir}")
+
+        if bool(config.experiment.get("validation_release_vae_gpu", True)):
+            vae.to(device="cpu")
 
 
 @torch.no_grad()
@@ -1691,7 +2278,7 @@ def _validate_multimodal(model, val_dataloader, accelerator, global_step, config
     )
 
     for validation_batch_idx, batch in enumerate(val_dataloader):
-        if "segment_ids" in batch or "position_ids" in batch:
+        if "segment_ids" in batch:
             raise RuntimeError(
                 "Packed multimodal batches are training-only. Validation loss "
                 "and validation image generation require one logical sample "
@@ -1701,13 +2288,29 @@ def _validate_multimodal(model, val_dataloader, accelerator, global_step, config
             diagnostic_head.set_attention_diagnostics(
                 validation_batch_idx < diagnostic_batches
             )
-        input_ids = batch["input_ids"].contiguous().to(accelerator.device)
-        token_types = batch["token_types"].to(accelerator.device)
-        sigma = batch["sigma"].to(accelerator.device)
-        labels = batch["labels"].to(accelerator.device)
+        input_ids = batch["input_ids"].contiguous().to(
+            accelerator.device, non_blocking=True
+        )
+        token_types = batch["token_types"].to(
+            accelerator.device, non_blocking=True
+        )
+        sigma = batch["sigma"].to(accelerator.device, non_blocking=True)
+        labels = batch["labels"].to(accelerator.device, non_blocking=True)
+        position_ids = batch["position_ids"].to(
+            accelerator.device, non_blocking=True
+        )
+        image_local_positions = batch["image_local_positions"].to(
+            accelerator.device, non_blocking=True
+        )
+        host_image_span_table = batch["image_span_table"]
+        image_span_table = host_image_span_table.to(
+            accelerator.device, non_blocking=True
+        )
         image_latents = batch.get("image_latents", None)
         if image_latents is not None:
-            image_latents = image_latents.to(accelerator.device)
+            image_latents = image_latents.to(
+                accelerator.device, non_blocking=True
+            )
         B, L = input_ids.shape
 
         image_mask = token_types == 1
@@ -1721,9 +2324,13 @@ def _validate_multimodal(model, val_dataloader, accelerator, global_step, config
             X0_input_ids=input_ids, labels=labels,
             attention_mask=selfless_attention_mask,
             token_types=token_types,
+            position_ids=position_ids,
+            image_local_positions=image_local_positions,
+            image_span_table=image_span_table,
             image_latents=image_latents,
             flow_sigma=sigma,
             calculate_likelihood=True,
+            record_flow_stats=(validation_batch_idx < diagnostic_batches),
         )
         flow_stats = getattr(output, "flow_debug_stats", None) or {}
         for key, value in flow_stats.items():
@@ -1741,13 +2348,17 @@ def _validate_multimodal(model, val_dataloader, accelerator, global_step, config
             local_flow_stat_counts[key] = local_flow_stat_counts.get(
                 key, torch.tensor(0.0, device=accelerator.device)
             ) + 1.0
-        if not saved_validation_images and image_latents is not None and image_mask.any():
+        if (
+            not saved_validation_images
+            and image_latents is not None
+        ):
             _save_validation_flow_images(
                 model=model,
                 output=output,
                 input_ids=input_ids,
                 token_types=token_types,
                 sigma=sigma,
+                image_span_table=host_image_span_table,
                 image_latents=image_latents,
                 accelerator=accelerator,
                 global_step=global_step,
@@ -1792,6 +2403,11 @@ def _validate_multimodal(model, val_dataloader, accelerator, global_step, config
                         "schema": "selfless_flow_validation_metrics_v1",
                         "global_step": int(global_step),
                         "training_seed": int(config.training.seed),
+                        "validation_seed": int(
+                            config.experiment.get(
+                                "validation_seed", config.training.seed
+                            )
+                        ),
                         "metrics": logs,
                     },
                     indent=2,
@@ -1801,7 +2417,7 @@ def _validate_multimodal(model, val_dataloader, accelerator, global_step, config
                 encoding="utf-8",
             )
         logger.info(
-            f"[Validation] Step {global_step + 1} | "
+            f"[Validation] Step {global_step} | "
             f"ImageFlow: {avg_loss:.4f}"
         )
 

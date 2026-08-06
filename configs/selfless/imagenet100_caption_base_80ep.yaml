@@ -1,15 +1,21 @@
+# Canonical Selfless-Flow base: pretrained Qwen3-0.6B backbone, contextual
+# flow head, and the code-level pure row/column 2D RoPE contract.
 experiment:
-    project: "selfless-flow-imagenet-caption"
-    name: "imagenet-caption-flow-qwen3base-pure2d"
+    project: "selfless-flow-base-imagenet100-caption-80ep"
+    name: "pure2d-caption-qwen3base-imagenet100-seed42-8xh100-b256-80ep"
     wandb_project: "unified-mm"
     output_dir: "output"
-    save_every: 5000
+    # 449 optimizer steps/epoch with 115000 train images and global batch 256.
+    save_every: 8980                 # 20 epochs
     log_every: 10
-    log_grad_norm_every: 500
-    checkpoints_total_limit: 4
-    save_hfmodel_every: 10000
-    val_every: 1000
-    validation_image_every: 2000
+    log_grad_norm_every: 449         # 1 epoch
+    checkpoints_total_limit: 2
+    # Final HF/raw+EMA export is handled once by save_final; avoid duplicate
+    # hf_model-35920 and hf_model-final copies.
+    save_hfmodel_every: 1000000000
+    save_final: true
+    val_every: 4490                  # 10 epochs
+    validation_image_every: 4490     # 10 epochs
     validation_image_samples: 8
     validation_flow_temperature: 1.0
     validation_flow_cfg: 3.5
@@ -31,10 +37,11 @@ model:
     use_flex_attention: true
     image_tokens_per_img: 256
     image_latent_dim: 16
+    # No ablation gate belongs to the canonical base architecture.
     backbone_attention_output_gate: "none"
     image_flow_depth: 8
     image_flow_width: 1280
-    image_flow_num_sampling_steps: "100"
+    image_flow_num_sampling_steps: "10"
     image_flow_batch_mul: 4
     image_flow_time_scale: 1000.0
     image_flow_time_sampling: "logit_normal"
@@ -50,14 +57,15 @@ model:
 dataset:
     class_name: "ImageNetFlowCacheDataset"
     params:
-        cache_path: "public/datasets/imagenet_full/vae_posterior_mar_kl16/posterior_stats_all_fp16.pt"
-        manifest_jsonl: "public/datasets/imagenet_full/manifest.jsonl"
+        cache_path: "public/datasets/imagenet_ablation_100c_balanced/vae_posterior_mar_kl16/posterior_stats_100c_1250pc_fp16.pt"
+        manifest_jsonl: "public/datasets/imagenet_ablation_100c_balanced/manifest.jsonl"
+        split_manifest_jsonl: "public/datasets/imagenet_ablation_100c_balanced/split_seed42_val100.jsonl"
         conditioning_mode: "caption"
-        caption_jsonl: "public/datasets/imagenet_full/captions/imagenet1k_train_caption_join.jsonl"
+        caption_jsonl: "public/datasets/imagenet_ablation_100c_balanced/captions/imagenet100_recaption_short_join.jsonl"
         caption_text_key: "recaption_short"
         caption_path_key: "path"
         caption_id_key: "id"
-        caption_manifest_sha256: "213b3a2cef493082ed1054a8abd8c357941ee8e2168382a58837abaa6c1b2f00"
+        caption_manifest_sha256: "85941ade4a64c88200f2223645317b8f504bb604a54211a08a4556737c50903f"
         cache_caption_tokens: false
         model_context_length: 32768
         image_tokens_per_img: 256
@@ -65,9 +73,6 @@ dataset:
         max_seq_length: null
         pad_to_length: null
         pad_to_multiple_of: null
-        val_ratio: 0.01
-        split_strategy: "stratified"
-        split_seed: 42
         packing:
             enabled: true
             algorithm: "deterministic_best_fit_decreasing"
@@ -97,7 +102,7 @@ lr_scheduler:
     params:
         learning_rate: ${optimizer.params.learning_rate}
         warmup_steps: 2000
-        decay_steps: 10000
+        decay_steps: 8980             # final 20 epochs
         min_lr_scale: 0.1
 
 training:
@@ -109,7 +114,7 @@ training:
     dataloader_shuffle_seed: 42
     dataloader_workers: 8
     dataloader_prefetch_factor: 4
-    max_train_steps: 500000
+    max_train_steps: 35920            # 80 * floor(115000 / 256)
     max_grad_norm: 1.0
     use_gradient_checkpointing: false
     step_scheduler_with_optimizer: false
@@ -124,12 +129,16 @@ training:
     save_image_flow_adapter: true
 
 evaluation:
-    checkpoint: "output/selfless-flow-imagenet-caption/hf_model-final-ema"
+    checkpoint: "output/selfless-flow-base-imagenet100-caption-80ep/hf_model-final-ema"
     model_dtype: "bf16"
     samples: 10000
+    # The Qwen CFG KV cache was ~86 MiB/sample at the probed caption max length.
+    # H100 probing passes at 512/rank (~45 GiB incremental peak at step 1);
+    # keep decode separately microbatched so the full evaluation stays safe.
     batch_size: 4096
     batch_size_per_h100: 512
-    sampling_steps: 100
+    vae_decode_batch_size: 64
+    sampling_steps: 10
     temperature: 1.0
     cfg: 3.5
     cfg_schedule: "constant"
@@ -137,3 +146,4 @@ evaluation:
     parallel_rate: 1
     strategies: "spatial_halton"
     seed: 42
+    real_stats_path: "public/datasets/imagenet_ablation_100c_balanced/fid_stats/inception_v3_2048_original_256.pt"

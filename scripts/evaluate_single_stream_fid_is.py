@@ -42,7 +42,7 @@ from scripts.image_evaluation_metrics import (  # noqa: E402
 from scripts.generate_flow_validation_images import (  # noqa: E402
     decode_latents,
     load_adapter,
-    load_ema_state,
+    load_sharded_ema_checkpoint,
     load_model_state,
     load_vae,
 )
@@ -215,7 +215,7 @@ def parse_args():
     parser.add_argument("--model_path_override", default="")
     parser.add_argument("--adapter", default="none")
     parser.add_argument("--model_state", default="")
-    parser.add_argument("--ema_state", default="")
+    parser.add_argument("--ema_checkpoint", default="")
     parser.add_argument("--output_dir", default="output/single_stream_fid_is")
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
@@ -237,13 +237,21 @@ def parse_args():
     )
     parser.add_argument("--samples", type=int, default=1024)
     parser.add_argument("--split", choices=["val", "train"], default="val")
-    parser.add_argument("--sampling_steps", default="50")
+    parser.add_argument("--sampling_steps", default="10")
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--cfg", type=float, default=1.0)
     parser.add_argument("--cfg_schedule", choices=["constant", "linear"], default="constant")
     parser.add_argument("--flow_solver", choices=["heun", "euler"], default="heun")
     parser.add_argument("--parallel_rate", type=int, default=1)
     parser.add_argument("--strategies", default="spatial_halton")
+    parser.add_argument(
+        "--disable_backbone_kv_cache",
+        action="store_true",
+        help=(
+            "Disable incremental Qwen backbone KV caching for numerical A/B "
+            "checks. Fixed-order image evaluation enables it by default."
+        ),
+    )
     parser.add_argument("--vae_dtype", choices=["fp32", "fp16"], default="fp32")
     parser.add_argument(
         "--vae_decode_batch_size",
@@ -689,7 +697,7 @@ def build_evaluation_resume_contract(
             "model_path": evaluation_artifact_identity(model_path),
             "adapter": evaluation_artifact_identity(args.adapter),
             "model_state": evaluation_artifact_identity(args.model_state),
-            "ema_state": evaluation_artifact_identity(args.ema_state),
+            "ema_checkpoint": evaluation_artifact_identity(args.ema_checkpoint),
             "real_stats": evaluation_artifact_identity(real_stats_path),
             "inception_weights": evaluation_artifact_identity(
                 inception_weights_path
@@ -722,6 +730,7 @@ def build_evaluation_resume_contract(
             "temperature": float(args.temperature),
             "flow_solver": str(args.flow_solver),
             "parallel_rate": int(args.parallel_rate),
+            "backbone_kv_cache": not bool(args.disable_backbone_kv_cache),
             "model_dtype": str(args.model_dtype),
             "vae_dtype": str(args.vae_dtype),
             "canonical_pairing_enabled": bool(canonical_pairing_enabled),
@@ -815,6 +824,9 @@ def evaluation_metrics_state(metrics: Mapping) -> dict[str, object]:
             "flow_content_cache_peak_bytes_per_sample": float(
                 state["flow_content_cache_peak_bytes_per_sample"]
             ),
+            "backbone_kv_cache_peak_bytes": float(
+                state["backbone_kv_cache_peak_bytes"]
+            ),
             "flow_cfg_cache_divergence_sum": (
                 None
                 if state["flow_cfg_cache_divergence_sum"] is None
@@ -861,6 +873,9 @@ def evaluation_metrics_from_state(
             ),
             "flow_content_cache_peak_bytes_per_sample": float(
                 item["flow_content_cache_peak_bytes_per_sample"]
+            ),
+            "backbone_kv_cache_peak_bytes": float(
+                item["backbone_kv_cache_peak_bytes"]
             ),
             "flow_cfg_cache_divergence_sum": (
                 None
@@ -1606,8 +1621,10 @@ def main():
         print(f"Loading model state: {args.model_state or 'none'}")
     model_state_report = load_model_state(model, args.model_state)
     if is_main_process(rank):
-        print(f"Loading EMA state: {args.ema_state or 'none'}")
-    ema_state_report = load_ema_state(model, args.ema_state)
+        print(f"Loading sharded EMA checkpoint: {args.ema_checkpoint or 'none'}")
+    ema_checkpoint_report = load_sharded_ema_checkpoint(
+        model, args.ema_checkpoint
+    )
     model = model.to(device).eval()
     if hasattr(model.image_flow_head, "reset_guidance_diagnostics"):
         model.image_flow_head.reset_guidance_diagnostics()
@@ -1780,6 +1797,7 @@ def main():
             "count": 0,
             "generation_wall_seconds": 0.0,
             "flow_content_cache_peak_bytes_per_sample": 0.0,
+            "backbone_kv_cache_peak_bytes": 0.0,
             "flow_cfg_cache_divergence_sum": None,
             "flow_cfg_cache_divergence_count": 0,
         }
@@ -2150,6 +2168,9 @@ def main():
                 flow_solver=args.flow_solver,
                 parallel_rate=int(args.parallel_rate),
                 order_strategy=str(strategy),
+                use_backbone_cache=not bool(
+                    args.disable_backbone_kv_cache
+                ),
                 return_trace=True,
                 debug_finite=bool(args.debug_finite_generation),
             )
@@ -2222,6 +2243,10 @@ def main():
                             "flow_content_cache_peak_bytes_per_sample", 0
                         )
                     ),
+                )
+                state["backbone_kv_cache_peak_bytes"] = max(
+                    float(state["backbone_kv_cache_peak_bytes"]),
+                    float(trace.get("backbone_kv_cache_peak_bytes", 0)),
                 )
                 cache_divergence = trace.get(
                     "flow_cfg_content_cache_divergence_by_layer"
@@ -2481,7 +2506,7 @@ def main():
         },
         "adapter": adapter_report,
         "model_state": model_state_report,
-        "ema_state": ema_state_report,
+        "ema_checkpoint": ema_checkpoint_report,
         "split": args.split,
         "seed": int(args.seed),
         "batch_size": int(args.batch_size),
@@ -2533,6 +2558,7 @@ def main():
         "temperature": float(args.temperature),
         "flow_solver": str(args.flow_solver),
         "parallel_rate": int(args.parallel_rate),
+        "backbone_kv_cache": not bool(args.disable_backbone_kv_cache),
         "inception_weights_path": inception_weights_path,
         "strategies": {},
     }
@@ -2552,6 +2578,10 @@ def main():
         )
         global_flow_cache_peak_bytes = reduce_max(
             state.get("flow_content_cache_peak_bytes_per_sample", 0.0),
+            device,
+        )
+        global_backbone_cache_peak_bytes = reduce_max(
+            state.get("backbone_kv_cache_peak_bytes", 0.0),
             device,
         )
         local_cache_divergence = state.get("flow_cfg_cache_divergence_sum")
@@ -2644,6 +2674,12 @@ def main():
                 ),
                 "flow_content_cache_peak_mib_per_sample": (
                     global_flow_cache_peak_bytes / (1024.0 * 1024.0)
+                ),
+                "backbone_kv_cache_peak_bytes_per_rank": int(
+                    global_backbone_cache_peak_bytes
+                ),
+                "backbone_kv_cache_peak_mib_per_rank": (
+                    global_backbone_cache_peak_bytes / (1024.0 * 1024.0)
                 ),
                 "flow_cfg_content_cache_divergence_by_layer": (
                     [

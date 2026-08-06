@@ -21,14 +21,14 @@ from models.modeling_model import modeling_selfless_flow as selfless_flow  # noq
 from models.modeling_model.modeling_selfless_flow import Qwen3ForCausalLM  # noqa: E402
 from pretrain import train_selfless_flow as train_flow  # noqa: E402
 from pretrain.train_selfless_flow import (  # noqa: E402
-    _create_ema_model,
-    _load_ema_state_if_available,
     _load_image_flow_adapter,
-    _maybe_update_ema_model,
-    _save_ema_state,
-    _save_image_flow_adapter,
-    _sync_ema_model,
-    _update_ema_model,
+    _save_ema_image_flow_adapter,
+)
+from utils.sharded_ema import (  # noqa: E402
+    RankShardedEMA,
+    build_sharded_ema_layout,
+    mark_hf_ema_config_fp32,
+    merge_sharded_ema_state_dict,
 )
 
 
@@ -47,13 +47,18 @@ class SmokeLogger:
 
 
 class SmokeAccelerator:
-    def __init__(self, device):
-        self.is_main_process = True
+    def __init__(self, device, *, rank=0):
+        self.process_index = int(rank)
+        self.is_main_process = self.process_index == 0
         self.device = device
 
     @staticmethod
     def unwrap_model(model):
         return model
+
+    @staticmethod
+    def wait_for_everyone():
+        return None
 
 
 def patch_cpu_runtime():
@@ -160,6 +165,16 @@ def synthetic_batch(device):
         "labels": labels,
         "sigma": sigma,
         "image_latents": image_latents,
+        "image_local_positions": torch.tensor(
+            [[-1, -1, 0, 1, 2, 3, -1, -1]],
+            device=device,
+            dtype=torch.long,
+        ),
+        "image_span_table": torch.tensor(
+            [[0, 0, 2, 6, 0]],
+            device=device,
+            dtype=torch.long,
+        ),
     }
 
 
@@ -172,6 +187,8 @@ def run_train_step(model, batch):
         attention_mask=object(),
         token_types=batch["token_types"],
         image_latents=batch["image_latents"],
+        image_local_positions=batch["image_local_positions"],
+        image_span_table=batch["image_span_table"],
     )
     loss = output.loss
     if not torch.isfinite(loss):
@@ -191,6 +208,8 @@ def run_validation(model, batch):
         attention_mask=object(),
         token_types=batch["token_types"],
         image_latents=batch["image_latents"],
+        image_local_positions=batch["image_local_positions"],
+        image_span_table=batch["image_span_table"],
         calculate_likelihood=True,
     )
     loss = output.loss
@@ -229,128 +248,248 @@ def run_validation(model, batch):
     }
 
 
+def _in_memory_merged_state(emas, model):
+    layout = emas[0].layout
+    source_state = model.state_dict(keep_vars=True)
+    canonical = {}
+    for name, metadata in layout["tensors"].items():
+        source = source_state[name]
+        dtype = torch.float32 if source.dtype.is_floating_point else source.dtype
+        canonical[name] = torch.empty(metadata["shape"], dtype=dtype, device=source.device)
+    seen = set()
+    for ema in emas:
+        for chunk_id, value in ema.shards.items():
+            if chunk_id in seen:
+                raise RuntimeError(f"EMA chunk {chunk_id} is owned by more than one rank")
+            seen.add(chunk_id)
+            chunk = layout["chunks"][chunk_id]
+            canonical[chunk["tensor"]].view(-1).narrow(
+                0, int(chunk["offset"]), int(chunk["numel"])
+            ).copy_(value)
+    if seen != set(layout["chunks"]):
+        raise RuntimeError(
+            f"EMA chunks are incomplete: missing={sorted(set(layout['chunks']) - seen)}"
+        )
+    return {
+        name: canonical[layout["canonical_for_name"][name]]
+        for name in layout["state_keys"]
+    }
+
+
+def _make_virtual_emas(model, *, world_size, decay, update_after_step, chunk_numel):
+    layout = build_sharded_ema_layout(
+        model,
+        world_size=world_size,
+        chunk_numel=chunk_numel,
+    )
+    emas = []
+    for rank in range(world_size):
+        ema = RankShardedEMA(
+            layout,
+            rank=rank,
+            decay=decay,
+            update_after_step=update_after_step,
+        )
+        ema.bind(model)
+        ema.initialize_from_model(global_step=0)
+        emas.append(ema)
+    return layout, emas
+
+
 @torch.no_grad()
-def verify_ema_precision_and_delay(device):
-    config = smoke_train_config(Path("unused"))
-    config.training.ema_decay = 0.5
-
+def verify_ema_precision_and_delay(device, output_dir):
     model = Qwen3ForCausalLM(tiny_config()).to(device=device, dtype=torch.bfloat16)
-    ema_model = _create_ema_model(model, config).to(device)
-    accelerator = SmokeAccelerator(device)
+    layout, emas = _make_virtual_emas(
+        model,
+        world_size=2,
+        decay=0.5,
+        update_after_step=5,
+        chunk_numel=17,
+    )
 
+    owned = [chunk_id for ema in emas for chunk_id in ema.local_chunk_ids]
+    if len(owned) != len(set(owned)) or set(owned) != set(layout["chunks"]):
+        raise RuntimeError("EMA sharding has missing or duplicate chunks")
     floating_dtypes = {
         value.dtype
-        for value in ema_model.state_dict().values()
-        if torch.is_floating_point(value)
+        for ema in emas
+        for value in ema.shards.values()
+        if value.dtype.is_floating_point
     }
     if floating_dtypes != {torch.float32}:
-        raise RuntimeError(f"EMA floating state must be fp32, got {sorted(str(dtype) for dtype in floating_dtypes)}")
+        raise RuntimeError(f"EMA floating shards must be fp32, got {floating_dtypes}")
 
-    _sync_ema_model(ema_model, model, accelerator)
-    started = False
+    initial = _in_memory_merged_state(emas, model)
     with torch.no_grad():
-        ema_model.model.embed_tokens.weight.fill_(1.0)
         model.model.embed_tokens.weight.fill_(2.0)
+    for ema in emas:
+        ema.maybe_update(4)
+    before_start = _in_memory_merged_state(emas, model)
+    for name in initial:
+        torch.testing.assert_close(before_start[name], initial[name], rtol=0, atol=0)
 
-    started = _maybe_update_ema_model(
-        ema_model,
-        model,
-        accelerator,
-        decay=0.5,
-        next_step=4,
-        update_after_step=5,
-        ema_started=started,
+    for ema in emas:
+        ema.maybe_update(5)
+    after_sync = _in_memory_merged_state(emas, model)
+    torch.testing.assert_close(
+        after_sync["model.embed_tokens.weight"],
+        torch.full_like(after_sync["model.embed_tokens.weight"], 2.0),
+        rtol=0,
+        atol=0,
     )
-    if started:
-        raise RuntimeError("EMA should not start before ema_update_after_step.")
-    if not torch.allclose(ema_model.model.embed_tokens.weight, torch.ones_like(ema_model.model.embed_tokens.weight)):
-        raise RuntimeError("EMA changed before ema_update_after_step.")
-
-    started = _maybe_update_ema_model(
-        ema_model,
-        model,
-        accelerator,
-        decay=0.5,
-        next_step=5,
-        update_after_step=5,
-        ema_started=started,
-    )
-    if not started:
-        raise RuntimeError("EMA did not start at ema_update_after_step.")
-    expected_sync = torch.full_like(ema_model.model.embed_tokens.weight, 2.0)
-    if not torch.allclose(ema_model.model.embed_tokens.weight, expected_sync):
-        raise RuntimeError("EMA start should sync current weights before averaging.")
-
     with torch.no_grad():
         model.model.embed_tokens.weight.fill_(4.0)
-    _maybe_update_ema_model(
-        ema_model,
-        model,
-        accelerator,
-        decay=0.5,
-        next_step=6,
-        update_after_step=5,
-        ema_started=started,
+    for ema in emas:
+        ema.maybe_update(6)
+    after_update = _in_memory_merged_state(emas, model)
+    torch.testing.assert_close(
+        after_update["model.embed_tokens.weight"],
+        torch.full_like(after_update["model.embed_tokens.weight"], 3.0),
+        rtol=0,
+        atol=0,
     )
-    expected_ema = torch.full_like(ema_model.model.embed_tokens.weight, 3.0)
-    if not torch.allclose(ema_model.model.embed_tokens.weight, expected_ema):
-        raise RuntimeError("EMA did not average after the delayed sync step.")
 
     class TiedSmokeModel(torch.nn.Module):
         def __init__(self):
             super().__init__()
-            self.embed = torch.nn.Embedding(2, 2)
-            self.head = torch.nn.Linear(2, 2, bias=False)
+            self.embed = torch.nn.Embedding(4, 3)
+            self.head = torch.nn.Linear(3, 4, bias=False)
             self.head.weight = self.embed.weight
 
     tied_model = TiedSmokeModel().to(device)
-    tied_ema = _create_ema_model(tied_model, config).to(device)
-    if tied_ema.embed.weight.data_ptr() != tied_ema.head.weight.data_ptr():
-        raise RuntimeError("Tied smoke model lost weight tying in EMA copy.")
-    with torch.no_grad():
-        tied_model.embed.weight.fill_(10.0)
-        tied_ema.embed.weight.zero_()
-    _update_ema_model(tied_ema, tied_model, accelerator, decay=0.9)
-    tied_value = float(tied_ema.embed.weight.flatten()[0].item())
-    if abs(tied_value - 1.0) > 1.0e-6:
-        raise RuntimeError(f"Tied EMA weight was updated more than once: got {tied_value}")
+    tied_layout, tied_emas = _make_virtual_emas(
+        tied_model,
+        world_size=2,
+        decay=0.9,
+        update_after_step=0,
+        chunk_numel=4,
+    )
+    if tied_layout["canonical_for_name"]["embed.weight"] != tied_layout["canonical_for_name"]["head.weight"]:
+        raise RuntimeError("Tied weights were not assigned to one canonical EMA tensor")
+    for ema in tied_emas:
+        for value in ema.shards.values():
+            value.zero_()
+    tied_model.embed.weight.fill_(10.0)
+    for ema in tied_emas:
+        ema.maybe_update(1)
+    tied_merged = _in_memory_merged_state(tied_emas, tied_model)
+    torch.testing.assert_close(
+        tied_merged["embed.weight"],
+        torch.ones_like(tied_merged["embed.weight"]),
+        rtol=0,
+        atol=0,
+    )
+    if tied_merged["embed.weight"].data_ptr() != tied_merged["head.weight"].data_ptr():
+        raise RuntimeError("Merged tied weights do not share canonical storage")
+
+    checkpoint_dir = output_dir / "ema-regression"
+    for ema in reversed(emas):
+        ema.save_checkpoint(
+            checkpoint_dir,
+            SmokeAccelerator(device, rank=ema.rank),
+            global_step=6,
+        )
+    disk_merged = merge_sharded_ema_state_dict(checkpoint_dir)
+    if list(disk_merged) != list(model.state_dict()):
+        raise RuntimeError("Merged HF EMA state_dict is incomplete or out of order")
+    for name, expected in after_update.items():
+        torch.testing.assert_close(disk_merged[name], expected.cpu(), rtol=0, atol=0)
+
+    reloaded = []
+    for rank in range(2):
+        ema = RankShardedEMA(
+            layout,
+            rank=rank,
+            decay=0.5,
+            update_after_step=5,
+        )
+        ema.bind(model)
+        ema.load_checkpoint(
+            checkpoint_dir,
+            SmokeAccelerator(device, rank=rank),
+            expected_global_step=6,
+        )
+        reloaded.append(ema)
+    for old, new in zip(emas, reloaded):
+        if old.started != new.started or old.global_step != new.global_step:
+            raise RuntimeError("EMA resume metadata did not round-trip")
+        for chunk_id in old.local_chunk_ids:
+            torch.testing.assert_close(old.shards[chunk_id], new.shards[chunk_id], rtol=0, atol=0)
+
+    mismatch = RankShardedEMA(
+        build_sharded_ema_layout(model, world_size=1, chunk_numel=17),
+        rank=0,
+        decay=0.5,
+        update_after_step=5,
+    )
+    mismatch.bind(model)
+    try:
+        mismatch.load_checkpoint(
+            checkpoint_dir,
+            SmokeAccelerator(device),
+            expected_global_step=6,
+        )
+    except RuntimeError as error:
+        if "same world size" not in str(error):
+            raise
+    else:
+        raise RuntimeError("EMA resume accepted a different world size")
 
     return {
         "floating_dtype": "torch.float32",
-        "delay_sync_value": float(expected_sync.flatten()[0].item()),
-        "post_start_ema_value": float(expected_ema.flatten()[0].item()),
-        "tied_single_update_value": tied_value,
-    }
+        "world_size": 2,
+        "chunk_count": len(layout["chunks"]),
+        "rank_bytes": layout["rank_bytes"],
+        "delay_sync_value": 2.0,
+        "post_start_ema_value": 3.0,
+        "tied_single_update_value": 1.0,
+        "checkpoint_dir": str(checkpoint_dir),
+    }, model, emas, checkpoint_dir
 
 
-def save_and_reload(model, ema_model, config, output_dir, batch, device):
-    accelerator = SmokeAccelerator(device)
-    hf_dir = output_dir / "hf_model-smoke"
-    model.save_pretrained(hf_dir, safe_serialization=True)
-
-    _save_image_flow_adapter(ema_model, config, accelerator, "smoke")
-    _save_ema_state(ema_model, config, accelerator, 1)
-
+def save_and_reload(model, emas, checkpoint_dir, config, output_dir, batch, device):
+    merged = merge_sharded_ema_state_dict(checkpoint_dir)
+    hf_dir = output_dir / "hf_model-smoke-ema"
+    model.save_pretrained(hf_dir, state_dict=dict(merged), safe_serialization=True)
+    mark_hf_ema_config_fp32(hf_dir)
     loaded = Qwen3ForCausalLM.from_pretrained(hf_dir).to(device)
     loaded.eval()
+    loaded_state = loaded.state_dict()
+    if list(loaded_state) != list(merged):
+        raise RuntimeError("HF EMA reload state_dict is incomplete")
+    for name, expected in merged.items():
+        torch.testing.assert_close(
+            loaded_state[name].cpu(), expected.cpu(), rtol=0, atol=0
+        )
+    torch.manual_seed(991)
     loaded_metrics = run_validation(loaded, batch)
 
+    _save_ema_image_flow_adapter(
+        checkpoint_dir,
+        config,
+        SmokeAccelerator(device),
+        "smoke",
+    )
+    adapter_path = output_dir / "image_flow_adapter-smoke.pt"
     adapter_loaded = Qwen3ForCausalLM(tiny_config()).to(device)
-    _load_image_flow_adapter(adapter_loaded, output_dir / "image_flow_adapter-smoke.pt", config)
-    adapter_metrics = run_validation(adapter_loaded, batch)
+    _load_image_flow_adapter(adapter_loaded, adapter_path, config)
+    adapter_state = torch.load(adapter_path, map_location="cpu", weights_only=True)
+    for name, value in adapter_loaded.image_flow_head.state_dict().items():
+        torch.testing.assert_close(value.cpu(), adapter_state["image_flow_head"][name], rtol=0, atol=0)
+    for name, value in adapter_loaded.image_flow_condition_proj.state_dict().items():
+        torch.testing.assert_close(
+            value.cpu(), adapter_state["image_flow_condition_proj"][name], rtol=0, atol=0
+        )
 
     ema_loaded = Qwen3ForCausalLM(tiny_config()).to(device)
-    if not _load_ema_state_if_available(ema_loaded, output_dir / "checkpoint-1"):
-        raise RuntimeError("EMA state was not saved or could not be loaded.")
-    ema_loaded.to(device)
+    ema_loaded.load_state_dict(merged, strict=True)
+    torch.manual_seed(991)
     ema_metrics = run_validation(ema_loaded, batch)
-
     return {
         "hf_model_dir": str(hf_dir),
-        "adapter_path": str(output_dir / "image_flow_adapter-smoke.pt"),
-        "ema_state_path": str(output_dir / "checkpoint-1" / "ema_state.pt"),
+        "adapter_path": str(adapter_path),
+        "ema_manifest": str(checkpoint_dir / "ema_manifest.json"),
         "loaded_validation": loaded_metrics,
-        "adapter_validation": adapter_metrics,
         "ema_validation": ema_metrics,
     }
 
@@ -379,19 +518,34 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     config = smoke_train_config(output_dir)
-    model = Qwen3ForCausalLM(tiny_config()).to(device)
+    ema_regression, model, emas, checkpoint_dir = verify_ema_precision_and_delay(
+        device,
+        output_dir,
+    )
     batch = synthetic_batch(device)
-
-    ema_model = _create_ema_model(model, config)
-    _sync_ema_model(ema_model, model, SmokeAccelerator(device))
-    ema_regression = verify_ema_precision_and_delay(device)
-
     train_loss = run_train_step(model, batch)
-    _update_ema_model(ema_model, model, SmokeAccelerator(device), decay=float(config.training.ema_decay))
-    ema_model.eval()
+    for ema in emas:
+        ema.maybe_update(7)
+    for ema in reversed(emas):
+        ema.save_checkpoint(
+            checkpoint_dir,
+            SmokeAccelerator(device, rank=ema.rank),
+            global_step=7,
+        )
 
+    merged = merge_sharded_ema_state_dict(checkpoint_dir)
+    ema_model = Qwen3ForCausalLM(tiny_config()).to(device)
+    ema_model.load_state_dict(merged, strict=True)
     validation = run_validation(ema_model, batch)
-    reload_metrics = save_and_reload(model, ema_model, config, output_dir, batch, device)
+    reload_metrics = save_and_reload(
+        model,
+        emas,
+        checkpoint_dir,
+        config,
+        output_dir,
+        batch,
+        device,
+    )
 
     report = {
         "device": str(device),

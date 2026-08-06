@@ -24,6 +24,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from utils.dataset_utils import get_dataloaders
+from utils.sharded_ema import load_ema_manifest, merge_sharded_ema_state_dict
 from utils.utils import get_selfless_mask, load_model_tokenizer
 
 
@@ -45,11 +46,11 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--ema_state",
+        "--ema_checkpoint",
         default="",
         help=(
-            "Optional EMA state to load after model_state/adapter. Supports checkpoint "
-            "ema_state.pt files with a 'state_dict' key or a plain state_dict."
+            "Optional rank-sharded EMA checkpoint directory containing "
+            "ema_manifest.json and one safetensors shard per training rank."
         ),
     )
     parser.add_argument("--output_dir", default="output/manual_flow_validation")
@@ -58,7 +59,7 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--samples", type=int, default=4)
     parser.add_argument("--split", choices=["val", "train"], default="val")
-    parser.add_argument("--sampling_steps", default="50")
+    parser.add_argument("--sampling_steps", default="10")
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--cfg", type=float, default=1.0)
     parser.add_argument("--cfg_schedule", choices=["constant", "linear"], default="constant")
@@ -381,33 +382,21 @@ def load_model_state(model, model_state_path: str):
     }
 
 
-def load_ema_state(model, ema_state_path: str):
-    if not ema_state_path:
-        return {"ema_state": None}
-    path = Path(ema_state_path)
-    if path.is_dir():
-        candidate = path / "ema_state.pt"
-        if candidate.exists():
-            path = candidate
-    if not path.exists():
-        raise FileNotFoundError(path)
-    state = torch.load(path, map_location="cpu")
-    if isinstance(state, dict) and "state_dict" in state:
-        state_dict = state["state_dict"]
-        global_step = state.get("global_step")
-        decay = state.get("decay")
-    else:
-        state_dict = state
-        global_step = None
-        decay = None
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+def load_sharded_ema_checkpoint(model, ema_checkpoint_path: str):
+    if not ema_checkpoint_path:
+        return {"ema_checkpoint": None}
+    path = Path(ema_checkpoint_path)
+    manifest = load_ema_manifest(path)
+    state_dict = merge_sharded_ema_state_dict(path)
+    model.load_state_dict(state_dict, strict=True)
+    runtime = manifest.get("runtime") or {}
     return {
-        "ema_state": str(path),
-        "global_step": global_step,
-        "decay": decay,
+        "ema_checkpoint": str(path),
+        "global_step": runtime.get("global_step"),
+        "decay": runtime.get("decay"),
         "keys": len(state_dict),
-        "missing": list(missing),
-        "unexpected": list(unexpected),
+        "missing": [],
+        "unexpected": [],
     }
 
 
@@ -629,8 +618,10 @@ def main():
     )
     print(f"Loading model state: {args.model_state or 'none'}")
     model_state_report = load_model_state(model, args.model_state)
-    print(f"Loading EMA state: {args.ema_state or 'none'}")
-    ema_state_report = load_ema_state(model, args.ema_state)
+    print(f"Loading sharded EMA checkpoint: {args.ema_checkpoint or 'none'}")
+    ema_checkpoint_report = load_sharded_ema_checkpoint(
+        model, args.ema_checkpoint
+    )
     model = model.to(device).eval()
     print("Loading KL16 VAE...")
     vae = load_vae(config, device, args.vae_dtype)
@@ -645,6 +636,9 @@ def main():
     labels = batch["labels"].to(device)
     sigma = batch["sigma"].to(device)
     image_latents = batch["image_latents"].to(device)
+    position_ids = batch["position_ids"].to(device)
+    image_local_positions = batch["image_local_positions"].to(device)
+    image_span_table = batch["image_span_table"].to(device)
 
     attention_mask = get_selfless_mask(sigma=sigma, seq_len=input_ids.shape[1], device=device)
     print("Running teacher-forced forward pass...")
@@ -654,6 +648,9 @@ def main():
             attention_mask=attention_mask,
             labels=labels,
             token_types=token_types,
+            position_ids=position_ids,
+            image_local_positions=image_local_positions,
+            image_span_table=image_span_table,
             image_latents=image_latents,
             flow_sigma=sigma,
             calculate_likelihood=True,
@@ -671,6 +668,9 @@ def main():
                 device=device,
                 input_ids=input_ids,
                 token_types=token_types,
+                position_ids=position_ids,
+                image_local_positions=image_local_positions,
+                image_span_table=image_span_table,
                 boi_token_id=int(config.model.boi_token_id),
                 image_uncond_rows=image_uncond_rows,
             )
@@ -699,7 +699,7 @@ def main():
     metrics = {
         "adapter": adapter_report,
         "model_state": model_state_report,
-        "ema_state": ema_state_report,
+        "ema_checkpoint": ema_checkpoint_report,
         "config": args.config,
         "model_path": str(config.model.model_path),
         "sampling_steps": str(args.sampling_steps),

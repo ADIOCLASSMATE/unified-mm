@@ -12,6 +12,17 @@ from transformers import AutoConfig, AutoTokenizer
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+# Keep mask values (sigma, segment ids, CFG masks) as graph inputs.  Compiling
+# create_block_mask itself avoids rebuilding its dense intermediate eagerly on
+# every micro-batch without specializing on the contents of those tensors.
+_compiled_create_block_mask = torch.compile(
+    create_block_mask,
+    fullgraph=True,
+    dynamic=True,
+    mode="default",
+)
+
+
 ##################################################
 #              config utils
 ##################################################
@@ -239,7 +250,7 @@ def load_model_tokenizer(
                         f"from text mask token id={mask_token_id}"
                     )
 
-    if config.training.get("use_gradient_checkpointing", True):
+    if config.training.get("use_gradient_checkpointing", False):
         model.gradient_checkpointing_enable()
         model.config.use_cache = False
         if logger is not None:
@@ -314,7 +325,8 @@ def save_hf_model(model, tokenizer, config, accelerator, global_step):
             state_dict=state_dict,
             safe_serialization=True
         )
-    tokenizer.save_pretrained(save_path)
+        tokenizer.save_pretrained(save_path)
+    accelerator.wait_for_everyone()
 
 
 ##################################################
@@ -450,4 +462,14 @@ def get_selfless_mask(
         )
         return allowed & (~q_is_uncond_image | kv_same_image_span)
 
-    return create_block_mask(selfless_fn, B=B, H=None, Q_LEN=seq_len, KV_LEN=seq_len, device=device)
+    block_mask_builder = (
+        _compiled_create_block_mask if sigma.is_cuda else create_block_mask
+    )
+    return block_mask_builder(
+        selfless_fn,
+        B=B,
+        H=None,
+        Q_LEN=seq_len,
+        KV_LEN=seq_len,
+        device=device,
+    )

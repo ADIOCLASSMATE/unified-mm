@@ -82,6 +82,7 @@ def build_local_row_col_rope(
     axis_dims: tuple[int, int],
     rope_theta: float = 10000.0,
     dtype: torch.dtype | None = None,
+    validate_positions: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build interleaved local-grid row/column RoPE cos/sin in FP32."""
 
@@ -103,7 +104,7 @@ def build_local_row_col_rope(
     if any(dim <= 0 or dim % 2 for dim in axis_dims):
         raise ValueError(f"axis_dims must be positive and even, got {axis_dims}.")
     positions = positions.to(dtype=torch.long)
-    if positions.numel():
+    if validate_positions and positions.numel():
         min_position = int(positions.min().item())
         max_position = int(positions.max().item())
         if min_position < 0 or max_position >= image_tokens_per_img:

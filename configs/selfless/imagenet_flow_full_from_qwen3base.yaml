@@ -78,6 +78,7 @@ optimizer:
         beta1: 0.9
         beta2: 0.95
         weight_decay: 0.01
+        flow_weight_decay: 0.01
         epsilon: 1e-8
 
 lr_scheduler:
@@ -92,8 +93,10 @@ training:
     batch_size: 64
     total_batch_size: 1024
     mixed_precision: "bf16"
+    gradient_accumulation_dtype: "fp32"
     seed: 42
     dataloader_workers: 8
+    dataloader_prefetch_factor: 4
     max_train_steps: 500000
     max_grad_norm: 1.0
     use_gradient_checkpointing: false
