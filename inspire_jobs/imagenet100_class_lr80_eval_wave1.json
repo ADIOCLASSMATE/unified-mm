@@ -1,0 +1,33 @@
+{
+  "profiles": {
+    "job": {
+      "main_h100x8": {
+        "workspace": "分布式训练空间",
+        "project": "随机序语言建模-统一自回归与掩码扩散的随机顺序生成框架",
+        "group": "开发区-H100-cuda12.8版本-183核",
+        "quota": "8,160,1800",
+        "image": "docker.sii.shaipower.online/inspire-studio/dev-wjx:v-2.1"
+      }
+    }
+  },
+  "defaults": {
+    "priority": 4,
+    "nodes": 1,
+    "max_time": 48,
+    "shm_size": 64,
+    "auto_fault_tolerance": false,
+    "enable_notification": false
+  },
+  "jobs": [
+    {
+      "name": "sf-c80-b2e5-f1e4-ev",
+      "profile": "main_h100x8",
+      "command": "cd /inspire/hdd/global_user/wanjiaxin-253108030048/code/unified-mm && CHECKPOINT=output/selfless-flow-im100-class-lr80-b2e5-f1e4/hf_model-final-ema OUTPUT_DIR=output/selfless-flow-im100-class-lr80-b2e5-f1e4-fid-is bash script/selfless/evaluate_imagenet100_class_fid_is.sh --canonical_pairing --skip_target_decode"
+    },
+    {
+      "name": "sf-c80-b2e5-f2e4-ev",
+      "profile": "main_h100x8",
+      "command": "cd /inspire/hdd/global_user/wanjiaxin-253108030048/code/unified-mm && CHECKPOINT=output/selfless-flow-im100-class-lr80-b2e5-f2e4/hf_model-final-ema OUTPUT_DIR=output/selfless-flow-im100-class-lr80-b2e5-f2e4-fid-is bash script/selfless/evaluate_imagenet100_class_fid_is.sh --canonical_pairing --skip_target_decode"
+    }
+  ]
+}

@@ -140,3 +140,4 @@ def test_dataset_signature_has_no_retired_layout_or_mode_switches():
     assert "caption_sequence_modes" not in parameters
     assert "caption_prefix" not in parameters
     assert "label_text" not in parameters
+    assert "latent_hflip_prob" not in parameters

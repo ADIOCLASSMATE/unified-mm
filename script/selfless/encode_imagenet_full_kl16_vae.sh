@@ -5,14 +5,16 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "${REPO_ROOT}/script/offline_env.sh"
 
 IMAGENET_TRAIN_DIR="${IMAGENET_TRAIN_DIR:-/inspire/dataset/imagenet/v1/ILSVRC/Data/CLS-LOC/train}"
-OUTPUT_DIR="${OUTPUT_DIR:-public/datasets/imagenet_full/vae_latents_mar_kl16}"
 MANIFEST_JSONL="${MANIFEST_JSONL:-public/datasets/imagenet_full/manifest.jsonl}"
+SOURCE_MODE="${SOURCE_MODE:-manifest_jsonl}"
 VAE_PATH="${VAE_PATH:-public/vae/mar-kl16/kl16.ckpt}"
-CACHE_SHARD_DIR="${CACHE_SHARD_DIR:-public/datasets/imagenet_full/vae_latents_mar_kl16_cache_shards}"
-CACHE_PATH="${CACHE_PATH:-public/datasets/imagenet_full/vae_latents_mar_kl16/flow_latents_all_fp16.pt}"
+CACHE_SHARD_DIR="${CACHE_SHARD_DIR:-public/datasets/imagenet_full/vae_posterior_mar_kl16_cache_shards}"
+CACHE_PATH="${CACHE_PATH:-public/datasets/imagenet_full/vae_posterior_mar_kl16/posterior_stats_all_fp16.pt}"
+SUBSET_MANIFEST_JSONL="${SUBSET_MANIFEST_JSONL:-public/datasets/imagenet_ablation_100c_balanced/manifest.jsonl}"
+SUBSET_CACHE_PATH="${SUBSET_CACHE_PATH:-public/datasets/imagenet_ablation_100c_balanced/vae_posterior_mar_kl16/posterior_stats_100c_1250pc_fp16.pt}"
 
 BATCH_SIZE="${BATCH_SIZE:-512}"
-NUM_WORKERS="${NUM_WORKERS:-8}"
+NUM_WORKERS="${NUM_WORKERS:-16}"
 PREFETCH_FACTOR="${PREFETCH_FACTOR:-4}"
 DEVICE="${DEVICE:-cuda}"
 NUM_GPUS="${NUM_GPUS:-4}"
@@ -22,32 +24,40 @@ NUM_SHARDS="${NUM_SHARDS:-1}"
 SHARD_INDEX="${SHARD_INDEX:-0}"
 MAX_IMAGES="${MAX_IMAGES:--1}"
 OVERWRITE="${OVERWRITE:-0}"
-SAVE_PER_IMAGE="${SAVE_PER_IMAGE:-0}"
 MERGE_CACHE="${MERGE_CACHE:-1}"
-LOG_DIR="${LOG_DIR:-${OUTPUT_DIR}/logs}"
+BUILD_100C_CACHE="${BUILD_100C_CACHE:-1}"
+LOG_DIR="${LOG_DIR:-public/datasets/imagenet_full/vae_posterior_mar_kl16/logs}"
 
 overwrite_args=()
 if [[ "${OVERWRITE}" == "1" ]]; then
   overwrite_args+=(--overwrite)
 fi
-save_args=(--cache_shard_dir "${CACHE_SHARD_DIR}")
-if [[ "${SAVE_PER_IMAGE}" != "1" ]]; then
-  save_args+=(--skip_per_image)
-fi
-
 run_encode_shard() {
   local shard_index="$1"
   local num_shards="$2"
   local gpu_id="${3:-}"
-  local manifest_arg="${MANIFEST_JSONL}"
+  local source_args=()
+  if [[ "${SOURCE_MODE}" == "manifest_jsonl" ]]; then
+    source_args=(
+      --source_mode manifest_jsonl
+      --source_manifest_jsonl "${MANIFEST_JSONL}"
+    )
+  elif [[ "${SOURCE_MODE}" == "imagenet_train" ]]; then
+    source_args=(
+      --source_mode imagenet_train
+      --imagenet_train_dir "${IMAGENET_TRAIN_DIR}"
+      --manifest_jsonl "${MANIFEST_JSONL}"
+    )
+  else
+    echo "Unsupported SOURCE_MODE=${SOURCE_MODE}" >&2
+    return 2
+  fi
 
   if [[ -n "${gpu_id}" ]]; then
     CUDA_VISIBLE_DEVICES="${gpu_id}" python scripts/imagenet_encode_kl16_vae.py \
-      --source_mode imagenet_train \
-      --imagenet_train_dir "${IMAGENET_TRAIN_DIR}" \
-      --output_dir "${OUTPUT_DIR}" \
-      --manifest_jsonl "${manifest_arg}" \
+      "${source_args[@]}" \
       --vae_path "${VAE_PATH}" \
+      --cache_shard_dir "${CACHE_SHARD_DIR}" \
       --batch_size "${BATCH_SIZE}" \
       --num_workers "${NUM_WORKERS}" \
       --prefetch_factor "${PREFETCH_FACTOR}" \
@@ -55,15 +65,12 @@ run_encode_shard() {
       --num_shards "${num_shards}" \
       --shard_index "${shard_index}" \
       --max_images "${MAX_IMAGES}" \
-      "${save_args[@]}" \
       "${overwrite_args[@]}"
   else
     python scripts/imagenet_encode_kl16_vae.py \
-      --source_mode imagenet_train \
-      --imagenet_train_dir "${IMAGENET_TRAIN_DIR}" \
-      --output_dir "${OUTPUT_DIR}" \
-      --manifest_jsonl "${manifest_arg}" \
+      "${source_args[@]}" \
       --vae_path "${VAE_PATH}" \
+      --cache_shard_dir "${CACHE_SHARD_DIR}" \
       --batch_size "${BATCH_SIZE}" \
       --num_workers "${NUM_WORKERS}" \
       --prefetch_factor "${PREFETCH_FACTOR}" \
@@ -71,7 +78,6 @@ run_encode_shard() {
       --num_shards "${num_shards}" \
       --shard_index "${shard_index}" \
       --max_images "${MAX_IMAGES}" \
-      "${save_args[@]}" \
       "${overwrite_args[@]}"
   fi
 }
@@ -88,7 +94,6 @@ if [[ "${PARALLEL}" == "1" && "${NUM_GPUS}" -gt 1 ]]; then
   trap 'for pid in "${pids[@]:-}"; do kill "${pid}" 2>/dev/null || true; done' INT TERM
 
   echo "Launching ${NUM_GPUS} ImageNet KL16 VAE encode shards."
-  echo "Output: ${OUTPUT_DIR}"
   echo "Cache shards: ${CACHE_SHARD_DIR}"
   for shard in $(seq 0 $((NUM_GPUS - 1))); do
     gpu="${gpu_ids[$shard]}"
@@ -120,5 +125,13 @@ if [[ "${MERGE_CACHE}" == "1" ]]; then
   python pretrain/merge_flow_latent_shards.py \
     --shard_dir "${CACHE_SHARD_DIR}" \
     --output_path "${CACHE_PATH}" \
+    --manifest_jsonl "${MANIFEST_JSONL}" \
     --mmap
+fi
+
+if [[ "${BUILD_100C_CACHE}" == "1" ]]; then
+  python scripts/subset_imagenet_posterior_cache.py \
+    --full_cache_path "${CACHE_PATH}" \
+    --subset_manifest_jsonl "${SUBSET_MANIFEST_JSONL}" \
+    --output_path "${SUBSET_CACHE_PATH}"
 fi

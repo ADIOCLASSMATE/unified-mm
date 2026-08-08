@@ -73,6 +73,29 @@ def test_configs_record_h100_batch_contract(config_name):
     assert config.evaluation.batch_size_per_h100 == 512
 
 
+@pytest.mark.parametrize(
+    "config_name",
+    [
+        "imagenet_flow_full_from_qwen3base.yaml",
+        "imagenet100_class_base_80ep.yaml",
+    ],
+)
+def test_class_training_configs_use_b32_ga2_without_checkpointing(config_name):
+    config = OmegaConf.load(
+        REPO_ROOT / "configs" / "selfless" / config_name
+    )
+    world_size = 8
+    assert config.dataset.params.conditioning_mode == "class"
+    assert config.training.batch_size == 32
+    assert config.training.total_batch_size == 512
+    assert (
+        config.training.total_batch_size
+        // (config.training.batch_size * world_size)
+        == 2
+    )
+    assert config.training.use_gradient_checkpointing is False
+
+
 def test_real_stats_loader_is_not_bound_to_an_ablation_split(tmp_path):
     path = tmp_path / "stats.pt"
     torch.save(

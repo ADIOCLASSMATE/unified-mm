@@ -1,10 +1,30 @@
-.pipeline
-.sii
-.claude
-.venv
-output*
-public
-__pycache__
+.pipeline/
+.sii/
+.claude/
+.venv/
+
+# Python and test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Local secrets and editor metadata
+.env
+.env.*
+!.env.example
+.DS_Store
+.idea/
+.vscode/
+
+# Local experiment artifacts
+output*/
+logs/
 *.log
-wandb
+wandb/
 core.*
+public

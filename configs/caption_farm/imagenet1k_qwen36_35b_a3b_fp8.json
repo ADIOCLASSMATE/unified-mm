@@ -1,0 +1,145 @@
+{
+  "schema": "imagenet_qwen_caption_farm_config_v1",
+  "dataset": {
+    "source_manifest": "/inspire/hdd/global_user/wanjiaxin-253108030048/code/unified-mm/public/datasets/imagenet_full/manifest.jsonl",
+    "original_captions": "/inspire/hdd/global_user/wanjiaxin-253108030048/code/unified-mm/public/datasets/imagenet_full/captions/imagenet1k_train_caption_join.jsonl",
+    "dataset_id": "imagenet",
+    "version_id": "v1",
+    "platform_path": "rclone-worker-1/imagenet/v1",
+    "container_path": "/inspire/dataset/imagenet/v1",
+    "compatibility_manifests": [
+      "/inspire/hdd/global_user/wanjiaxin-253108030048/code/unified-mm/public/datasets/imagenet_ablation_100c_balanced/manifest.jsonl"
+    ]
+  },
+  "model": {
+    "engine": "vllm-openai",
+    "repository": "Qwen/Qwen3.6-35B-A3B-FP8",
+    "snapshot_path": "/inspire/hdd/global_user/wanjiaxin-253108030048/.cache/modelscope/models/Qwen--Qwen3.6-35B-A3B-FP8/snapshots/master",
+    "expected_quant_method": "fp8",
+    "inference": {
+      "host": "127.0.0.1",
+      "port": 18080,
+      "served_model_name": "qwen36-35b-a3b-fp8-caption-v1",
+      "max_model_len": 4096,
+      "gpu_memory_utilization": 0.92,
+      "max_num_seqs": 16,
+      "request_concurrency": 8,
+      "load_timeout_seconds": 1200,
+      "request_timeout_seconds": 60,
+      "server_command": [
+        "/inspire/hdd/global_user/wanjiaxin-253108030048/.venvs/qwen36-caption-vllm/bin/vllm",
+        "serve",
+        "{model_path}",
+        "--served-model-name",
+        "{served_model_name}",
+        "--host",
+        "{host}",
+        "--port",
+        "{port}",
+        "--tensor-parallel-size",
+        "1",
+        "--max-model-len",
+        "{max_model_len}",
+        "--gpu-memory-utilization",
+        "{gpu_memory_utilization}",
+        "--max-num-seqs",
+        "{max_num_seqs}",
+        "--limit-mm-per-prompt",
+        "{\"image\":1}",
+        "--trust-remote-code",
+        "--no-enable-log-requests"
+      ]
+    }
+  },
+  "caption": {
+    "captions_per_image": 3,
+    "prompt_version": "qwen36-imagenet-visual-detail-v1",
+    "system_prompt": "You are a precise image captioner. Return only one fluent English caption, without a title, prefix, markdown, or analysis. Describe only details that are visually supported by the image.",
+    "prompt_variants": [
+      "Write one concrete English caption of roughly {target_min_words}-{target_max_words} words. Identify the main visible subject, its appearance and pose, the surrounding scene, spatial relationships, lighting, color, and other useful visual details. Vary the wording naturally.",
+      "Describe this image in one information-dense English caption of about {target_min_words}-{target_max_words} words. Focus on distinctive visual attributes, action or posture, background context, composition, texture, and lighting. Use natural wording and output only the caption.",
+      "Produce a single detailed English caption, approximately {target_min_words}-{target_max_words} words long. Ground every phrase in the visible image, covering the principal object or animal, notable colors and shapes, setting, viewpoint, and relevant nearby elements. Do not add commentary."
+    ],
+    "target_min_words": 32,
+    "target_max_words": 60,
+    "max_output_tokens": 128,
+    "temperature": 0.8,
+    "top_p": 0.9,
+    "top_k": 40,
+    "presence_penalty": 1.0
+  },
+  "queue": {
+    "lease_seconds": 900,
+    "heartbeat_seconds": 60,
+    "claim_batch_size": 16,
+    "max_attempts": 5,
+    "lock_timeout_seconds": 300,
+    "lock_stale_seconds": 60,
+    "idle_exit_seconds": 180
+  },
+  "platform": {
+    "enabled": true,
+    "workspace": "分布式训练空间",
+    "image": "docker.sii.shaipower.online/inspire-studio/dev-wjx:v-2.1",
+    "image_readiness_notebook": "dev-wjx",
+    "priority": 1,
+    "gpu_type": "H100",
+    "quota": "1,20,200",
+    "nodes": 1,
+    "repository_path": "/inspire/hdd/global_user/wanjiaxin-253108030048/code/unified-mm",
+    "worker_script": "scripts/imagenet_qwen_caption_farm.py",
+    "runtime_python": "/inspire/hdd/global_user/wanjiaxin-253108030048/.venvs/qwen36-caption-vllm/bin/python",
+    "projects": [
+      {
+        "name": "随机序语言建模-统一自回归与掩码扩散的随机顺序生成框架",
+        "weight": 2,
+        "max_active_jobs": 16
+      },
+      {
+        "name": "多模态大模型新架构评测探索与scaling-law",
+        "weight": 1,
+        "max_active_jobs": 16
+      }
+    ],
+    "targets": [
+      {
+        "group": "开发区-H100-cuda12.8版本-183核",
+        "quota": "1,20,200",
+        "weight": 1,
+        "max_active_jobs": 16
+      }
+    ],
+    "shm_size_gib": 64,
+    "max_time_hours": 24,
+    "api_rate_limit_retries": 4,
+    "image_readiness_cache_seconds": 3600,
+    "target_discovery_cache_seconds": 300,
+    "submission_rate_limit_retries": 3,
+    "submission_rate_limit_base_seconds": 30,
+    "submission_rate_limit_max_seconds": 120,
+    "submission_verification_attempts": 5,
+    "submission_verification_interval_seconds": 2
+  },
+  "controller": {
+    "global_max_active_jobs": 16,
+    "target_active_jobs": 16,
+    "submission_burst": 1,
+    "min_submit_interval_seconds": 90,
+    "reconcile_interval_seconds": 90,
+    "rejection_backoff_base_seconds": 60,
+    "rejection_backoff_max_seconds": 1800,
+    "circuit_breaker_rejections": 3,
+    "circuit_breaker_recovery_seconds": 3600,
+    "no_progress_attention_seconds": 3600,
+    "zero_active_attention_seconds": 300,
+    "diagnosis_retry_seconds": 300,
+    "worker_failure_attention_threshold": 3,
+    "worker_failure_attention_window_seconds": 900
+  },
+  "output": {
+    "version": "qwen36-35b-a3b-fp8-local-multicap-v1",
+    "published_jsonl": "/inspire/hdd/global_user/wanjiaxin-253108030048/code/unified-mm/public/datasets/imagenet_distilled_captions/imagenet1k/local_qwen36_35b_a3b_fp8_v1.jsonl",
+    "published_metadata": "/inspire/hdd/global_user/wanjiaxin-253108030048/code/unified-mm/public/datasets/imagenet_distilled_captions/imagenet1k/local_qwen36_35b_a3b_fp8_v1.metadata.json",
+    "verify_images_on_publish": true
+  }
+}
