@@ -1293,17 +1293,11 @@ def main():
 
             model_output = model(**forward_kwargs)
             loss = model_output.loss
-            finite_loss = torch.isfinite(loss.detach()).all()
-            if hasattr(torch, "_assert_async"):
-                torch._assert_async(
-                    finite_loss,
-                    f"non-finite caption training loss at global_step={global_step}",
-                )
-            elif (global_step + 1) % int(config.experiment.log_every) == 0:
-                if not bool(finite_loss.item()):
-                    raise FloatingPointError(
-                        f"non-finite caption training loss at global_step={global_step}"
-                    )
+            # Every microbatch loss is accumulated below and the complete
+            # window is checked when it is reduced for logging.  Do not use
+            # torch._assert_async here: torch-npu 2.6.0 falls back to CPU for
+            # aten::_assert_async.msg, introducing a host/device synchronization
+            # on every microbatch.
             finite_loss_microbatches_checked += 1
 
             flow_stats = getattr(model_output, "flow_debug_stats", None)
@@ -1394,6 +1388,11 @@ def main():
                 avg_loss_per_step = acc_loss / grad_accum
                 global_avg_loss = accelerator.reduce(avg_loss_per_step, reduction="mean")
                 global_avg_loss_value = float(global_avg_loss.item())
+                if not math.isfinite(global_avg_loss_value):
+                    raise FloatingPointError(
+                        "non-finite accumulated training loss at "
+                        f"global_step={global_step}"
+                    )
                 last_logged_loss = global_avg_loss_value
 
                 window_rows = accelerator.gather(
