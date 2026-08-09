@@ -6,10 +6,12 @@ fresh posterior samples without running the VAE or evaluating exp(logvar).
 """
 
 import argparse
+import hashlib
+import importlib.util
 import json
-import sys
+import os
+from collections.abc import Sequence
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
 
 import torch
 from PIL import Image
@@ -17,20 +19,150 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from tqdm import tqdm
 
-
 POSTERIOR_CACHE_FORMAT = "imagenet_kl16_scaled_posterior_v1"
 POSTERIOR_STATS_LAYOUT = "scaled_mean_then_scaled_std"
-VAE_MODULE_ROOT = Path("/inspire/hdd/global_user/wanjiaxin-253108030048/code/mar")
-if str(VAE_MODULE_ROOT) not in sys.path:
-    sys.path.insert(0, str(VAE_MODULE_ROOT))
 
-from models.vae import AutoencoderKL  # noqa: E402
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def load_vae_class(module_root: Path):
+    module_path = module_root / "models" / "vae.py"
+    if not module_path.is_file():
+        raise FileNotFoundError(f"Missing MAR KL16 VAE module: {module_path}")
+    spec = importlib.util.spec_from_file_location("mar_kl16_vae", module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load MAR KL16 VAE module: {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.AutoencoderKL
+
+
+def resolve_device(value: str) -> torch.device:
+    requested = str(value).strip().lower()
+    if requested == "auto":
+        try:
+            import tbe
+            import torch_npu
+
+            if torch.npu.is_available():
+                requested = "npu:0"
+            elif torch.cuda.is_available():
+                requested = "cuda:0"
+            else:
+                requested = "cpu"
+        except ImportError:
+            requested = "cuda:0" if torch.cuda.is_available() else "cpu"
+    device = torch.device(requested)
+    if device.type == "npu":
+        import tbe  # noqa: F401
+        import torch_npu  # noqa: F401
+
+        if not torch.npu.is_available():
+            raise RuntimeError(
+                "NPU was requested but torch.npu.is_available() is false"
+            )
+        index = 0 if device.index is None else int(device.index)
+        if index >= torch.npu.device_count():
+            raise RuntimeError(
+                f"NPU index {index} is out of range for {torch.npu.device_count()} devices"
+            )
+        torch.npu.set_device(index)
+        device = torch.device("npu", index)
+    elif device.type == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "CUDA was requested but torch.cuda.is_available() is false"
+            )
+        index = 0 if device.index is None else int(device.index)
+        torch.cuda.set_device(index)
+        device = torch.device("cuda", index)
+    return device
+
+
+def resolve_vae_dtype(value: str, device: torch.device) -> torch.dtype:
+    value = str(value).strip().lower()
+    if value == "auto":
+        value = "fp16" if device.type in {"cuda", "npu"} else "fp32"
+    mapping = {
+        "fp16": torch.float16,
+        "float16": torch.float16,
+        "bf16": torch.bfloat16,
+        "bfloat16": torch.bfloat16,
+        "fp32": torch.float32,
+        "float32": torch.float32,
+    }
+    if value not in mapping:
+        raise ValueError(f"Unsupported --vae_dtype={value!r}")
+    if device.type == "cpu" and mapping[value] != torch.float32:
+        raise ValueError("CPU VAE encoding requires --vae_dtype fp32")
+    return mapping[value]
+
+
+def validate_reusable_shard(
+    path: Path,
+    samples: Sequence[tuple[int, Path, str | None]],
+    *,
+    num_shards: int,
+    shard_index: int,
+    scaling_factor: float,
+    vae_checkpoint_sha256: str,
+    vae_module_sha256: str,
+    source_manifest_sha256: str | None,
+    source_image_root: str | None,
+) -> None:
+    payload = torch.load(
+        str(path),
+        map_location="cpu",
+        mmap=True,
+        weights_only=True,
+    )
+    stats = payload.get("posterior_stats")
+    image_ids = payload.get("img_ids")
+    metadata = payload.get("metadata", {})
+    expected_ids = torch.tensor([sample[0] for sample in samples], dtype=torch.int64)
+    expected_shape = (len(samples), 256, 32)
+    if not torch.is_tensor(stats) or tuple(stats.shape) != expected_shape:
+        raise RuntimeError(
+            f"existing shard cannot be reused; shape={getattr(stats, 'shape', None)}, "
+            f"expected={expected_shape}: {path}"
+        )
+    if stats.dtype != torch.float16 or not torch.equal(image_ids, expected_ids):
+        raise RuntimeError(f"existing shard tensor contract mismatch: {path}")
+    expected_metadata = {
+        "format": POSTERIOR_CACHE_FORMAT,
+        "stats_layout": POSTERIOR_STATS_LAYOUT,
+        "num_shards": num_shards,
+        "shard_index": shard_index,
+        "scaling_factor": scaling_factor,
+        "vae_checkpoint_sha256": vae_checkpoint_sha256,
+        "vae_module_sha256": vae_module_sha256,
+        "source_manifest_sha256": source_manifest_sha256,
+        "source_image_root": source_image_root,
+    }
+    for field, expected in expected_metadata.items():
+        if metadata.get(field) != expected:
+            raise RuntimeError(
+                f"existing shard metadata mismatch for {field}: "
+                f"{metadata.get(field)!r} != {expected!r}: {path}"
+            )
+    for start in range(0, stats.shape[0], 512):
+        chunk = stats[start : start + 512]
+        if not bool(torch.isfinite(chunk).all()) or bool((chunk[..., 16:] < 0).any()):
+            raise RuntimeError(
+                f"existing shard contains invalid posterior stats: {path}"
+            )
 
 
 class ImagePathDataset(Dataset):
     def __init__(
         self,
-        samples: Sequence[Tuple[int, Path, Optional[str]]],
+        samples: Sequence[tuple[int, Path, str | None]],
         image_size: int,
     ):
         self.samples = list(samples)
@@ -42,9 +174,7 @@ class ImagePathDataset(Dataset):
                 ),
                 transforms.CenterCrop(image_size),
                 transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]
-                ),
+                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
             ]
         )
 
@@ -58,9 +188,9 @@ class ImagePathDataset(Dataset):
         return img_id, tensor, str(path), synset or ""
 
 
-def load_img_ids(docs_jsonl: Path) -> List[int]:
+def load_img_ids(docs_jsonl: Path) -> list[int]:
     seen = set()
-    img_ids: List[int] = []
+    img_ids: list[int] = []
     with docs_jsonl.open() as handle:
         for line in handle:
             if not line.strip():
@@ -78,7 +208,7 @@ def load_samples_from_docs(
     docs_jsonl: Path,
     image_dir: Path,
     image_extension: str,
-) -> List[Tuple[int, Path, Optional[str]]]:
+) -> list[tuple[int, Path, str | None]]:
     return [
         (img_id, image_dir / f"{img_id:012d}.{image_extension}", None)
         for img_id in load_img_ids(docs_jsonl)
@@ -89,8 +219,8 @@ def load_samples_from_imagenet_train(
     train_dir: Path,
     start_img_id: int,
     max_images: int,
-) -> List[Tuple[int, Path, Optional[str]]]:
-    samples: List[Tuple[int, Path, Optional[str]]] = []
+) -> list[tuple[int, Path, str | None]]:
+    samples: list[tuple[int, Path, str | None]] = []
     used = 0
     for class_dir in sorted(path for path in train_dir.iterdir() if path.is_dir()):
         synset = class_dir.name
@@ -107,18 +237,27 @@ def load_samples_from_imagenet_train(
 def load_samples_from_manifest(
     manifest_jsonl: Path,
     max_images: int,
-) -> List[Tuple[int, Path, Optional[str]]]:
-    samples: List[Tuple[int, Path, Optional[str]]] = []
+    source_image_root: Path | None = None,
+) -> list[tuple[int, Path, str | None]]:
+    samples: list[tuple[int, Path, str | None]] = []
     with manifest_jsonl.open() as handle:
         for line in handle:
             if not line.strip():
                 continue
             row = json.loads(line)
+            synset = row.get("synset")
+            source_path = Path(row["source_path"])
+            if source_image_root is not None:
+                if not synset:
+                    raise ValueError(
+                        "--source_image_root requires every manifest row to contain synset"
+                    )
+                source_path = source_image_root / str(synset) / source_path.name
             samples.append(
                 (
                     int(row["img_id"]),
-                    Path(row["source_path"]),
-                    row.get("synset"),
+                    source_path,
+                    synset,
                 )
             )
             if max_images > 0 and len(samples) >= max_images:
@@ -128,7 +267,7 @@ def load_samples_from_manifest(
 
 def save_manifest(
     path: Path,
-    samples: Sequence[Tuple[int, Path, Optional[str]]],
+    samples: Sequence[tuple[int, Path, str | None]],
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w") as handle:
@@ -169,8 +308,12 @@ def main() -> None:
         default="public/datasets/imagenet_full/manifest.jsonl",
     )
     parser.add_argument(
-        "--vae_path", default="public/vae/mar-kl16/kl16.ckpt"
+        "--source_image_root",
+        default=None,
+        help="Resolve manifest synset/filename under this current filesystem root.",
     )
+    parser.add_argument("--vae_path", default="public/vae/mar-kl16/kl16.ckpt")
+    parser.add_argument("--vae_module_root", default="public/code/mar")
     parser.add_argument("--cache_shard_dir", required=True)
     parser.add_argument("--image_size", type=int, default=256)
     parser.add_argument("--image_extension", default="jpg")
@@ -178,7 +321,12 @@ def main() -> None:
     parser.add_argument("--batch_size", type=int, default=512)
     parser.add_argument("--num_workers", type=int, default=16)
     parser.add_argument("--prefetch_factor", type=int, default=4)
-    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--device", default="auto")
+    parser.add_argument(
+        "--vae_dtype",
+        choices=["auto", "fp16", "bf16", "fp32"],
+        default="auto",
+    )
     parser.add_argument("--num_shards", type=int, default=1)
     parser.add_argument("--shard_index", type=int, default=0)
     parser.add_argument("--overwrite", action="store_true")
@@ -196,6 +344,10 @@ def main() -> None:
     vae_path = Path(args.vae_path)
     if not vae_path.exists():
         raise FileNotFoundError(f"Missing KL16 checkpoint: {vae_path}")
+    vae_module_root = Path(args.vae_module_root)
+    AutoencoderKL = load_vae_class(vae_module_root)
+    vae_checkpoint_sha256 = sha256_file(vae_path)
+    vae_module_sha256 = sha256_file(vae_module_root / "models" / "vae.py")
 
     if args.source_mode == "docs_jsonl":
         samples = load_samples_from_docs(
@@ -213,7 +365,13 @@ def main() -> None:
         )
     else:
         samples = load_samples_from_manifest(
-            Path(args.source_manifest_jsonl), args.max_images
+            Path(args.source_manifest_jsonl),
+            args.max_images,
+            (
+                Path(args.source_image_root)
+                if args.source_image_root is not None
+                else None
+            ),
         )
 
     if args.manifest_jsonl and args.shard_index == 0:
@@ -230,15 +388,32 @@ def main() -> None:
         f"shard-{args.shard_index:05d}-of-{args.num_shards:05d}.pt"
     )
     if shard_path.exists() and not args.overwrite:
-        print(f"Posterior cache shard already exists, skipping: {shard_path}")
+        source_manifest_sha256 = (
+            sha256_file(Path(args.source_manifest_jsonl))
+            if args.source_mode == "manifest_jsonl"
+            else None
+        )
+        validate_reusable_shard(
+            shard_path,
+            samples,
+            num_shards=args.num_shards,
+            shard_index=args.shard_index,
+            scaling_factor=args.scaling_factor,
+            vae_checkpoint_sha256=vae_checkpoint_sha256,
+            vae_module_sha256=vae_module_sha256,
+            source_manifest_sha256=source_manifest_sha256,
+            source_image_root=args.source_image_root,
+        )
+        print(f"Validated and reused posterior cache shard: {shard_path}")
         return
 
-    device = torch.device(args.device)
+    device = resolve_device(args.device)
+    vae_dtype = resolve_vae_dtype(args.vae_dtype, device)
     torch.manual_seed(args.seed + args.shard_index)
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
+    if device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
-    vae_dtype = torch.float16 if device.type == "cuda" else torch.float32
     vae = AutoencoderKL(
         embed_dim=16,
         ch_mult=(1, 1, 2, 2, 4),
@@ -257,6 +432,8 @@ def main() -> None:
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
+        # torch_npu does not use CUDA's pinned-memory allocator.  Asynchronous
+        # host-to-NPU copies are still requested below and dispatch correctly.
         pin_memory=device.type == "cuda",
         persistent_workers=args.num_workers > 0,
         **loader_kwargs,
@@ -275,9 +452,9 @@ def main() -> None:
                 non_blocking=True,
             )
             posterior = vae.encode(images)
-            batch_stats = torch.cat(
-                (posterior.mean, posterior.std), dim=1
-            ).mul_(args.scaling_factor)
+            batch_stats = torch.cat((posterior.mean, posterior.std), dim=1).mul_(
+                args.scaling_factor
+            )
             if tuple(batch_stats.shape[1:]) != (32, 16, 16):
                 raise ValueError(
                     "KL16 posterior must have shape [B, 32, 16, 16], got "
@@ -306,17 +483,24 @@ def main() -> None:
         "shard_index": args.shard_index,
         "source_mode": args.source_mode,
         "source_manifest_jsonl": (
-            args.source_manifest_jsonl
+            args.source_manifest_jsonl if args.source_mode == "manifest_jsonl" else None
+        ),
+        "source_manifest_sha256": (
+            sha256_file(Path(args.source_manifest_jsonl))
             if args.source_mode == "manifest_jsonl"
             else None
         ),
+        "source_image_root": args.source_image_root,
         "imagenet_train_dir": (
-            args.imagenet_train_dir
-            if args.source_mode == "imagenet_train"
-            else None
+            args.imagenet_train_dir if args.source_mode == "imagenet_train" else None
         ),
         "vae": "mar-kl16",
+        "vae_module_root": str(vae_module_root),
+        "vae_module_sha256": vae_module_sha256,
         "vae_checkpoint": str(vae_path),
+        "vae_checkpoint_sha256": vae_checkpoint_sha256,
+        "device_type": device.type,
+        "vae_dtype": str(vae_dtype).removeprefix("torch."),
         "scaling_factor": args.scaling_factor,
         "image_size": args.image_size,
         "posterior_shape": [16, 16, 32],
@@ -332,7 +516,7 @@ def main() -> None:
         },
         temporary_path,
     )
-    temporary_path.replace(shard_path)
+    os.replace(temporary_path, shard_path)
     print(f"Saved {encoded} posterior rows to {shard_path}")
 
 

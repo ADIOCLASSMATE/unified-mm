@@ -12,7 +12,6 @@ from typing import Any
 import torch
 from omegaconf import OmegaConf
 
-
 RESUME_SIGNATURE_VERSION = 3
 LEGACY_RESUME_SCHEMA = "selfless_caption_training_checkpoint_v2"
 RESUME_SCHEMA = "selfless_caption_training_checkpoint_v3"
@@ -245,7 +244,10 @@ class TrainingWindow:
                 time.perf_counter() - self.started_at,
             ],
             device=device,
-            dtype=torch.float64,
+            # Ascend 910B does not support FP64 and would implicitly cast this
+            # HCCL bookkeeping tensor.  Per-log-window counters remain exactly
+            # representable at FP32 for the production logging cadence.
+            dtype=torch.float32,
         )
 
     def reset(self) -> None:

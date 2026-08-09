@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import os
 
+import tbe  # noqa: F401
 import torch
+import torch.distributed as dist
 import torch_npu  # noqa: F401
 from accelerate import Accelerator
+
+from utils.selfless_training_runtime import TrainingWindow
 
 
 def main() -> None:
@@ -39,6 +43,42 @@ def main() -> None:
     if not torch.equal(gathered_elapsed, expected_elapsed):
         raise AssertionError((gathered_elapsed, expected_elapsed))
 
+    all_reduce_value = torch.tensor(
+        [rank + 1.0], device=accelerator.device, dtype=torch.float32
+    )
+    dist.all_reduce(all_reduce_value, op=dist.ReduceOp.SUM)
+    expected_sum = accelerator.num_processes * (accelerator.num_processes + 1) / 2
+    if float(all_reduce_value.item()) != expected_sum:
+        raise AssertionError((float(all_reduce_value.item()), expected_sum))
+
+    window = TrainingWindow()
+    window.record_batch(
+        rows=rank + 1,
+        sequence_length=320,
+        logical_images=rank + 2,
+        pack_stats=(100 + rank, 64 + rank, 20 + rank, 320),
+        data_wait_seconds=0.001 * (rank + 1),
+    )
+    window.record_optimizer_step()
+    window_tensor = window.as_tensor(accelerator.device)
+    if window_tensor.dtype != torch.float32:
+        raise AssertionError(window_tensor.dtype)
+    gathered_windows = accelerator.gather(window_tensor).reshape(-1, 10).cpu()
+    if not torch.equal(
+        gathered_windows[:, 0],
+        torch.ones(accelerator.num_processes, dtype=torch.float32),
+    ):
+        raise AssertionError(gathered_windows[:, 0])
+    if not torch.equal(
+        gathered_windows[:, 3],
+        torch.arange(
+            1,
+            accelerator.num_processes + 1,
+            dtype=torch.float32,
+        ),
+    ):
+        raise AssertionError(gathered_windows[:, 3])
+
     torch.npu.manual_seed(123 + rank)
     state_before = torch.npu.get_rng_state().clone()
     with torch.random.fork_rng(devices=[local_rank], device_type="npu"):
@@ -50,7 +90,10 @@ def main() -> None:
     if accelerator.is_main_process:
         print(
             f"PASS world={accelerator.num_processes} "
-            f"memory_dtype={gathered_memory.dtype} elapsed_dtype={gathered_elapsed.dtype}"
+            f"memory_dtype={gathered_memory.dtype} "
+            f"elapsed_dtype={gathered_elapsed.dtype} "
+            f"window_dtype={gathered_windows.dtype} "
+            f"hccl_all_reduce_sum={float(all_reduce_value.item()):g}"
         )
 
 

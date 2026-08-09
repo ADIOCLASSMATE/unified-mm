@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 
+import tbe  # noqa: F401
 import torch
 import torch_npu
 

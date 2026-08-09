@@ -8,6 +8,12 @@ os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
 os.environ.setdefault("DIFFUSERS_OFFLINE", "1")
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "true")
+try:
+    # CANN's embedded compiler initializes more reliably when its Python
+    # package is loaded before torch_npu (required for fusion-attention JIT).
+    import tbe  # noqa: F401
+except ImportError:
+    pass
 import json
 import logging
 import math
@@ -406,6 +412,8 @@ def _write_training_checkpoint_metadata(
     batches_consumed_in_epoch: int,
     config_signature: str,
     ema_layout,
+    cumulative_training_wall_seconds: float,
+    cumulative_finite_loss_microbatches_checked: int,
 ) -> None:
     if accelerator.is_main_process:
         payload = {
@@ -421,6 +429,12 @@ def _write_training_checkpoint_metadata(
             "config_signature_version": RESUME_SIGNATURE_VERSION,
             "ema_layout_fingerprint": (
                 ema_layout["layout_fingerprint"] if ema_layout is not None else None
+            ),
+            "cumulative_training_wall_seconds": float(
+                cumulative_training_wall_seconds
+            ),
+            "cumulative_finite_loss_microbatches_checked": int(
+                cumulative_finite_loss_microbatches_checked
             ),
         }
         path = checkpoint_dir / "metadata.json"
@@ -468,6 +482,50 @@ def _begin_checkpoint_write(
     if accelerator.is_main_process:
         (checkpoint_dir / "checkpoint_complete.json").unlink(missing_ok=True)
     accelerator.wait_for_everyone()
+
+
+def _save_npu_rng_state(checkpoint_dir: Path, accelerator) -> None:
+    """Add the per-rank NPU RNG state missing from Accelerate 1.14."""
+
+    if accelerator.device.type != "npu":
+        return
+    rng_path = checkpoint_dir / f"random_states_{accelerator.process_index}.pkl"
+    if not rng_path.is_file():
+        raise RuntimeError(f"Accelerate did not save the expected RNG file: {rng_path}")
+    states = torch.load(str(rng_path), map_location="cpu", weights_only=False)
+    states["torch_npu_manual_seed"] = torch.npu.get_rng_state(
+        accelerator.device
+    ).cpu()
+    # Accelerate 1.14 falls through to its CUDA restore branch when no
+    # supported accelerator backend is detected. An empty CUDA state is a
+    # harmless no-op on an NPU-only host and lets its CPU/Python/NumPy restore
+    # path complete before the explicit NPU restore below.
+    states.setdefault("torch_cuda_manual_seed", [])
+    temp_path = rng_path.with_name(f".{rng_path.name}.tmp-{os.getpid()}")
+    torch.save(states, str(temp_path))
+    os.replace(temp_path, rng_path)
+    accelerator.wait_for_everyone()
+
+
+def _restore_npu_rng_state(checkpoint_dir: Path, accelerator) -> None:
+    """Strictly restore the per-rank NPU RNG state saved above."""
+
+    if accelerator.device.type != "npu":
+        return
+    rng_path = checkpoint_dir / f"random_states_{accelerator.process_index}.pkl"
+    states = torch.load(str(rng_path), map_location="cpu", weights_only=False)
+    npu_state = states.get("torch_npu_manual_seed")
+    if not isinstance(npu_state, torch.Tensor) or npu_state.dtype != torch.uint8:
+        raise RuntimeError(f"Checkpoint has no valid NPU RNG state: {rng_path}")
+    torch.npu.set_rng_state(npu_state, accelerator.device)
+    restored = torch.npu.get_rng_state(accelerator.device).cpu()
+    if not torch.equal(restored, npu_state.cpu()):
+        raise RuntimeError(f"NPU RNG restore verification failed: {rng_path}")
+    logger.info(
+        "Restored and verified rank %d NPU RNG state from %s",
+        accelerator.process_index,
+        rng_path,
+    )
 
 
 def _validate_checkpoint_complete(
@@ -789,6 +847,35 @@ def main():
     logger.info("Creating dataloaders and lr_scheduler")
 
     train_dataloader, val_dataloader = get_dataloaders(config, tokenizer)
+    configured_workers = int(config.training.dataloader_workers)
+    for loader_name, dataloader in (
+        ("train", train_dataloader),
+        ("validation", val_dataloader),
+    ):
+        if int(dataloader.num_workers) != configured_workers:
+            raise RuntimeError(
+                f"{loader_name} DataLoader worker mismatch: "
+                f"configured={configured_workers}, runtime={dataloader.num_workers}"
+            )
+        if configured_workers == 0 and (
+            dataloader.persistent_workers
+            or dataloader.prefetch_factor is not None
+        ):
+            raise RuntimeError(
+                f"{loader_name} DataLoader must disable worker persistence and "
+                "prefetching when dataloader_workers=0: "
+                f"persistent_workers={dataloader.persistent_workers}, "
+                f"prefetch_factor={dataloader.prefetch_factor}"
+            )
+    logger.info(
+        "DataLoader runtime: workers=%d, train_persistent=%s, "
+        "train_prefetch=%s, validation_persistent=%s, validation_prefetch=%s",
+        configured_workers,
+        train_dataloader.persistent_workers,
+        train_dataloader.prefetch_factor,
+        val_dataloader.persistent_workers,
+        val_dataloader.prefetch_factor,
+    )
 
     ##################################
     #       Prepare accelerator     #
@@ -875,6 +962,7 @@ def main():
         # Model, optimizer, scheduler, and RNG state are loaded only after the
         # immutable resume contract has been validated.
         accelerator.load_state(resume_checkpoint_dir)
+        _restore_npu_rng_state(resume_checkpoint_dir, accelerator)
         global_step = resume_step
         logger.info(f"Resumed at global_step={global_step}")
 
@@ -883,6 +971,14 @@ def main():
         global_step = 0
         resume_step = 0
 
+    cumulative_wall_seconds_before_run = float(
+        (resume_metadata or {}).get("cumulative_training_wall_seconds", 0.0)
+    )
+    cumulative_loss_checks_before_run = int(
+        (resume_metadata or {}).get(
+            "cumulative_finite_loss_microbatches_checked", 0
+        )
+    )
     if ema is not None:
         if resume_checkpoint_dir:
             ema.load_checkpoint(
@@ -970,6 +1066,8 @@ def main():
     training_runtime_start_step = global_step
     if accelerator.device.type == "npu":
         torch.npu.reset_peak_memory_stats(accelerator.device)
+    elif accelerator.device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(accelerator.device)
 
     # Accumulators across gradient-accumulation micro-batches.
     acc_loss = torch.tensor(0.0, device=accelerator.device)
@@ -979,6 +1077,8 @@ def main():
     acc_backbone_gate_stat_batches = torch.tensor(
         0.0, device=accelerator.device
     )
+    finite_loss_microbatches_checked = 0
+    last_logged_loss = None
 
     epoch = resume_epoch
     batches_consumed_in_epoch = batches_to_skip
@@ -1204,6 +1304,7 @@ def main():
                     raise FloatingPointError(
                         f"non-finite caption training loss at global_step={global_step}"
                     )
+            finite_loss_microbatches_checked += 1
 
             flow_stats = getattr(model_output, "flow_debug_stats", None)
             if flow_stats:
@@ -1237,6 +1338,17 @@ def main():
                     grad_norm_value = accelerator.clip_grad_norm_(
                         model.parameters(), config.training.max_grad_norm
                     )
+                    if (
+                        (global_step + 1)
+                        % int(config.experiment.log_grad_norm_every)
+                        == 0
+                        and not bool(
+                            torch.isfinite(torch.as_tensor(grad_norm_value)).all()
+                        )
+                    ):
+                        raise FloatingPointError(
+                            f"non-finite gradient norm at global_step={global_step}"
+                        )
                 
                 optimizer.step()
                 lr_scheduler.step()
@@ -1246,9 +1358,20 @@ def main():
                     and (global_step + 1)
                     % int(config.experiment.log_grad_norm_every)
                     == 0
-                    and hasattr(model, "get_global_grad_norm")
                 ):
-                    grad_norm_value = model.get_global_grad_norm()
+                    if hasattr(model, "get_global_grad_norm"):
+                        deepspeed_grad_norm = model.get_global_grad_norm()
+                    else:
+                        deepspeed_grad_norm = None
+                    if deepspeed_grad_norm is None:
+                        raise RuntimeError("DeepSpeed gradient norm is unavailable")
+                    if not bool(
+                        torch.isfinite(torch.as_tensor(deepspeed_grad_norm)).all()
+                    ):
+                        raise FloatingPointError(
+                            f"non-finite DeepSpeed gradient norm at global_step={global_step}"
+                        )
+                    grad_norm_value = deepspeed_grad_norm
                 if ema is not None:
                     next_step = global_step + 1
                     was_ema_started = ema.started
@@ -1271,6 +1394,7 @@ def main():
                 avg_loss_per_step = acc_loss / grad_accum
                 global_avg_loss = accelerator.reduce(avg_loss_per_step, reduction="mean")
                 global_avg_loss_value = float(global_avg_loss.item())
+                last_logged_loss = global_avg_loss_value
 
                 window_rows = accelerator.gather(
                     training_window.as_tensor(accelerator.device)
@@ -1417,6 +1541,8 @@ def main():
                             f" | FlowMSE: {global_flow_stats.get('flow/v_mse', 0.0):0.4f}"
                             f" | FlowPredVRMS: {global_flow_stats.get('flow/v_pred_rms', 0.0):0.4f}"
                         )
+                    if grad_norm_value is not None:
+                        msg += f" | GradNorm: {float(torch.as_tensor(grad_norm_value).detach().float().item()):0.4f}"
                     msg += (
                         f" | LR: {lr_scheduler.get_last_lr()[0]:0.6f} | "
                         f"Sec/Step: {logs['seconds/optimizer_step']:0.4f} | "
@@ -1437,6 +1563,7 @@ def main():
                     accelerator=accelerator,
                 )
                 save_checkpoint(model, config, accelerator, global_step)
+                _save_npu_rng_state(checkpoint_dir, accelerator)
                 _write_training_checkpoint_metadata(
                     checkpoint_dir,
                     accelerator=accelerator,
@@ -1445,6 +1572,15 @@ def main():
                     batches_consumed_in_epoch=batches_consumed_in_epoch,
                     config_signature=config_signature,
                     ema_layout=ema_layout,
+                    cumulative_training_wall_seconds=(
+                        cumulative_wall_seconds_before_run
+                        + time.time()
+                        - training_runtime_started_at
+                    ),
+                    cumulative_finite_loss_microbatches_checked=(
+                        cumulative_loss_checks_before_run
+                        + finite_loss_microbatches_checked
+                    ),
                 )
                 ema_directory = _save_ema_state(ema, config, accelerator, global_step)
                 _mark_checkpoint_complete(
@@ -1512,6 +1648,7 @@ def main():
 
     training_runtime_elapsed = time.time() - training_runtime_started_at
     if accelerator.device.type == "npu":
+        memory_backend = "npu"
         local_memory = torch.tensor(
             [
                 int(torch.npu.max_memory_allocated(accelerator.device)),
@@ -1520,7 +1657,18 @@ def main():
             device=accelerator.device,
             dtype=torch.int64,
         )
+    elif accelerator.device.type == "cuda":
+        memory_backend = "cuda"
+        local_memory = torch.tensor(
+            [
+                int(torch.cuda.max_memory_allocated(accelerator.device)),
+                int(torch.cuda.max_memory_reserved(accelerator.device)),
+            ],
+            device=accelerator.device,
+            dtype=torch.int64,
+        )
     else:
+        memory_backend = accelerator.device.type
         local_memory = torch.zeros(
             2,
             device=accelerator.device,
@@ -1540,19 +1688,32 @@ def main():
         runtime_payload = {
             "schema": "selfless_training_runtime_metrics_v1",
             "global_step": int(global_step),
+            "run_start_global_step": int(training_runtime_start_step),
             "world_size": int(accelerator.num_processes),
             "total_batch_size": int(total_batch_size),
             "steps_this_run": int(global_step - training_runtime_start_step),
+            "finite_loss_microbatches_checked": int(
+                finite_loss_microbatches_checked
+            ),
+            "last_logged_loss": last_logged_loss,
             "training_wall_seconds": float(elapsed_max.item()),
+            "cumulative_training_wall_seconds": float(
+                cumulative_wall_seconds_before_run + elapsed_max.item()
+            ),
+            "cumulative_finite_loss_microbatches_checked": int(
+                cumulative_loss_checks_before_run
+                + finite_loss_microbatches_checked
+            ),
             "train_samples_per_second": float(
                 (global_step - training_runtime_start_step)
                 * total_batch_size
                 / max(float(elapsed_max.item()), 1e-12)
             ),
-            "peak_cuda_allocated_bytes_per_rank": int(
+            "memory_backend": memory_backend,
+            "peak_memory_allocated_bytes_per_rank": int(
                 memory_max[0].item()
             ),
-            "peak_cuda_reserved_bytes_per_rank": int(
+            "peak_memory_reserved_bytes_per_rank": int(
                 memory_max[1].item()
             ),
             "trainability": trainability,
@@ -1574,14 +1735,24 @@ def main():
                     else 0.0
                 ),
             }
-        runtime_path = (
-            Path(config.experiment.output_dir)
-            / "training_runtime_metrics.json"
+        runtime_root = Path(config.experiment.output_dir)
+        runtime_paths = (
+            runtime_root / "training_runtime_metrics.json",
+            runtime_root
+            / (
+                "training_runtime_metrics_"
+                f"step-{training_runtime_start_step}-to-{global_step}.json"
+            ),
         )
-        runtime_path.write_text(
-            json.dumps(runtime_payload, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
+        for runtime_path in runtime_paths:
+            runtime_temp_path = runtime_path.with_name(
+                f".{runtime_path.name}.tmp-{os.getpid()}"
+            )
+            runtime_temp_path.write_text(
+                json.dumps(runtime_payload, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(runtime_temp_path, runtime_path)
     if bool(config.experiment.get("save_final", True)):
         save_hf_model(model, tokenizer, config, accelerator, "final")
         ema_directory = _save_ema_state(ema, config, accelerator, "final")
@@ -1667,7 +1838,12 @@ def _load_vae_decoder(config, accelerator):
         _VAE_CACHE = vae
 
     vae_dtype_name = str(config.experiment.get("validation_vae_dtype", "fp32")).lower()
-    dtype = torch.float16 if vae_dtype_name in {"fp16", "float16", "half"} and accelerator.device.type == "cuda" else torch.float32
+    dtype = (
+        torch.float16
+        if vae_dtype_name in {"fp16", "float16", "half"}
+        and accelerator.device.type in {"cuda", "npu"}
+        else torch.float32
+    )
     return _VAE_CACHE.to(device=accelerator.device, dtype=dtype).eval()
 
 
@@ -1675,7 +1851,7 @@ def _image_spans_from_table(
     image_span_table: torch.Tensor,
     image_tokens_per_img: int,
 ) -> list[tuple[int, int, int]]:
-    """Read validation spans without scanning a CUDA tensor token by token."""
+    """Read validation spans without scanning an accelerator tensor token by token."""
 
     rows = image_span_table.detach().cpu().tolist()
     spans = []
