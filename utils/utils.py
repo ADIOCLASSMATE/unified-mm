@@ -7,20 +7,8 @@ import sys
 import torch
 from omegaconf import DictConfig, ListConfig, OmegaConf
 from typing import Any, List, Tuple
-from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 from transformers import AutoConfig, AutoTokenizer
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-
-# Keep mask values (sigma, segment ids, CFG masks) as graph inputs.  Compiling
-# create_block_mask itself avoids rebuilding its dense intermediate eagerly on
-# every micro-batch without specializing on the contents of those tensors.
-_compiled_create_block_mask = torch.compile(
-    create_block_mask,
-    fullgraph=True,
-    dynamic=True,
-    mode="default",
-)
 
 
 ##################################################
@@ -362,7 +350,7 @@ def get_selfless_mask(
     image_uncond_rows: torch.Tensor | None = None,
     segment_ids: torch.Tensor | None = None,
     image_uncond_mask: torch.Tensor | None = None,
-) -> BlockMask:
+) -> torch.Tensor:
     """
     Selfless Attention mask — removes the diagonal (self-attention) from both streams.
 
@@ -375,7 +363,8 @@ def get_selfless_mask(
         seq_len: Sequence length
 
     Returns:
-        BlockMask for selfless attention.
+        Dense bool mask for npu_fusion_attention, shape [B, 1, seq_len, seq_len].
+        True = disallow attention (与 GPU BlockMask 的 allowed 语义相反)。
     """
 
     B = sigma.shape[0]
@@ -434,42 +423,25 @@ def get_selfless_mask(
                 dim=1,
             )
 
-    def selfless_fn(b, h, q_idx, kv_idx):
-        S_q = sigma[b, q_idx]
-        S_kv = sigma[b, kv_idx]
-        allowed = S_kv < S_q  # strict — no diagonal, no self-view
-        if use_segments:
-            q_segment = segment_ids[b, q_idx]
-            kv_segment = segment_ids[b, kv_idx]
-            allowed = (
-                allowed
-                & (q_segment >= 0)
-                & (kv_segment >= 0)
-                & (q_segment == kv_segment)
-            )
-        if not use_image_uncond:
-            return allowed
-
+    # 向量化构造 dense bool mask（True = disallow），替代 create_block_mask
+    S_q = sigma.unsqueeze(-1)    # [B, S, 1]
+    S_kv = sigma.unsqueeze(1)    # [B, 1, S]
+    allowed = S_kv < S_q         # strict — no diagonal, no self-view
+    if use_segments:
+        q_seg = segment_ids.unsqueeze(-1)
+        kv_seg = segment_ids.unsqueeze(1)
+        allowed = allowed & (q_seg >= 0) & (kv_seg >= 0) & (q_seg == kv_seg)
+    if use_image_uncond:
         if image_uncond_mask is not None:
-            q_is_uncond_image = image_uncond_mask[b, q_idx]
+            q_is_uncond_image = image_uncond_mask.unsqueeze(-1)
         else:
-            q_is_uncond_image = image_uncond_rows[b] & (
-                token_types[b, q_idx] == 1
-            )
+            q_is_uncond_image = (
+                image_uncond_rows.view(B, 1)
+                & (token_types == 1)
+            ).unsqueeze(-1)
         kv_same_image_span = (
-            (token_types[b, kv_idx] == 1)
-            & (image_span_ids[b, kv_idx] == image_span_ids[b, q_idx])
+            (token_types.unsqueeze(1) == 1)
+            & (image_span_ids.unsqueeze(1) == image_span_ids.unsqueeze(-1))
         )
-        return allowed & (~q_is_uncond_image | kv_same_image_span)
-
-    block_mask_builder = (
-        _compiled_create_block_mask if sigma.is_cuda else create_block_mask
-    )
-    return block_mask_builder(
-        selfless_fn,
-        B=B,
-        H=None,
-        Q_LEN=seq_len,
-        KV_LEN=seq_len,
-        device=device,
-    )
+        allowed = allowed & (~q_is_uncond_image | kv_same_image_span)
+    return (~allowed).unsqueeze(1)  # [B, 1, S, S], True = disallow

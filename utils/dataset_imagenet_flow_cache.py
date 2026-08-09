@@ -69,7 +69,7 @@ class ImageNetFlowCacheDataset(Dataset):
         # persistent workers reuse OS pages instead of copying the full
         # ImageNet tensor into every process.
         obj = torch.load(
-            self.cache_path,
+            str(self.cache_path),
             map_location="cpu",
             mmap=True,
             weights_only=True,

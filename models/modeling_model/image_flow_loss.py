@@ -3,6 +3,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch_npu
 from torch.utils.checkpoint import checkpoint
 
 from .image_position_utils import (
@@ -167,13 +168,23 @@ class ContextualFlowBlock(nn.Module):
         self.last_attention_distance_per_token = None
         self.last_update_rms_per_token = None
 
-    def _split_heads(self, x):
+    def _split_heads(self, x, input_layout="BNSD"):
         batch_size, seq_len, _ = x.shape
-        return x.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        x = x.view(batch_size, seq_len, self.num_heads, self.head_dim)
+        if input_layout == "BSND":
+            return x
+        if input_layout == "BNSD":
+            return x.transpose(1, 2)
+        raise ValueError(f"unsupported flow attention layout: {input_layout}")
 
-    def _merge_heads(self, x):
-        batch_size, _, seq_len, _ = x.shape
-        return x.transpose(1, 2).reshape(batch_size, seq_len, self.channels)
+    def _merge_heads(self, x, input_layout="BNSD"):
+        if input_layout == "BSND":
+            batch_size, seq_len, _, _ = x.shape
+            return x.reshape(batch_size, seq_len, self.channels)
+        if input_layout == "BNSD":
+            batch_size, _, seq_len, _ = x.shape
+            return x.transpose(1, 2).reshape(batch_size, seq_len, self.channels)
+        raise ValueError(f"unsupported flow attention layout: {input_layout}")
 
     def _format_context_mask(self, context_mask, batch_size, query_len, context_len, device):
         if context_mask is None:
@@ -190,21 +201,24 @@ class ContextualFlowBlock(nn.Module):
             )
         return context_mask
 
-    def _apply_rope(self, x, positions, rope=None):
+    def _apply_rope(self, x, positions, rope=None, input_layout="BNSD"):
         if positions is None:
             raise ValueError(
                 "Pure-2D flow-head RoPE requires explicit local positions."
             )
         if rope is None:
-            return apply_local_row_col_rope(
-                x,
+            rope_input = x.transpose(1, 2) if input_layout == "BSND" else x
+            result = apply_local_row_col_rope(
+                rope_input,
                 positions,
                 image_tokens_per_img=self.image_tokens_per_img,
                 axis_dims=self.rope_axis_dims,
             )
+            return result.transpose(1, 2) if input_layout == "BSND" else result
         cos, sin = rope
-        cos = cos.unsqueeze(1)
-        sin = sin.unsqueeze(1)
+        head_axis = 2 if input_layout == "BSND" else 1
+        cos = cos.unsqueeze(head_axis)
+        sin = sin.unsqueeze(head_axis)
         return x * cos + rotate_half(x) * sin
 
     def prepare_cross_cache(
@@ -212,16 +226,23 @@ class ContextualFlowBlock(nn.Module):
         context_hidden,
         context_positions=None,
         context_rope=None,
+        input_layout="BNSD",
     ):
         context_hidden = self.cross_kv_norm(context_hidden)
-        k = self._split_heads(self.cross_k(context_hidden))
-        k = self._apply_rope(k, context_positions, context_rope)
-        v = self._split_heads(self.cross_v(context_hidden))
+        k = self._split_heads(self.cross_k(context_hidden), input_layout)
+        k = self._apply_rope(
+            k,
+            context_positions,
+            context_rope,
+            input_layout=input_layout,
+        )
+        v = self._split_heads(self.cross_v(context_hidden), input_layout)
         return {
             "k": k,
             "v": v,
             "context_positions": context_positions,
             "k_rotation_count": 1,
+            "input_layout": input_layout,
         }
 
     def _record_attention_diagnostics(
@@ -231,9 +252,13 @@ class ContextualFlowBlock(nn.Module):
         context_mask,
         query_positions,
         context_positions,
+        input_layout="BNSD",
     ):
         if not self.collect_attention_diagnostics:
             return
+        if input_layout == "BSND":
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
         batch_size, _, query_len, _ = q.shape
         context_len = k.shape[2]
         mask = self._format_context_mask(
@@ -293,12 +318,18 @@ class ContextualFlowBlock(nn.Module):
         batch_size, query_len, _ = x.shape
         if k.shape[0] != batch_size:
             raise ValueError(f"context cache batch {k.shape[0]} must match query batch {batch_size}")
-        context_len = k.shape[2]
+        input_layout = layer_cache.get("input_layout", "BNSD")
+        context_len = k.shape[1] if input_layout == "BSND" else k.shape[2]
         if context_len == 0:
             return None
 
-        q = self._split_heads(self.cross_q(x))
-        q = self._apply_rope(q, query_positions, query_rope)
+        q = self._split_heads(self.cross_q(x), input_layout)
+        q = self._apply_rope(
+            q,
+            query_positions,
+            query_rope,
+            input_layout=input_layout,
+        )
         attn_dtype = q.dtype
         k = k.to(device=x.device, dtype=attn_dtype)
         v = v.to(device=x.device, dtype=attn_dtype)
@@ -309,6 +340,7 @@ class ContextualFlowBlock(nn.Module):
                 context_mask,
                 query_positions,
                 layer_cache.get("context_positions"),
+                input_layout=input_layout,
             )
         context_mask = self._format_context_mask(
             context_mask,
@@ -319,17 +351,26 @@ class ContextualFlowBlock(nn.Module):
         )
         has_context = context_mask.any(dim=-1)
         safe_mask = context_mask | (~has_context).unsqueeze(-1)
-        out = F.scaled_dot_product_attention(
+        # npu_fusion_attention 的 mask 语义是 True=disallow，与 SDPA(allow) 相反。
+        # 全部允许时 atten_mask=None 走全连接 kernel（已验证与 SDPA 数值一致）。
+        # atten_mask 需 [B,1|H,Q,KV] 四维。
+        # 无 sync 版本：始终传 mask，避免 bool(safe_mask.all()) 的 device→host sync。
+        npu_atten_mask = (~safe_mask).unsqueeze(1)
+        out = torch_npu.npu_fusion_attention(
             q,
             k,
             v,
-            attn_mask=safe_mask.unsqueeze(1),
-            dropout_p=self.dropout if self.training else 0.0,
-            is_causal=False,
+            head_num=self.num_heads,
+            input_layout=input_layout,
+            atten_mask=npu_atten_mask,
+            sparse_mode=0,
             scale=self.scale,
-        )
-        out = out * has_context[:, None, :, None].to(dtype=out.dtype)
-        return self.cross_out(self._merge_heads(out))
+        )[0]
+        if input_layout == "BSND":
+            out = out * has_context[:, :, None, None].to(dtype=out.dtype)
+        else:
+            out = out * has_context[:, None, :, None].to(dtype=out.dtype)
+        return self.cross_out(self._merge_heads(out, input_layout))
 
     def forward(
         self,
@@ -1066,6 +1107,7 @@ class ContextualFlowTransformerHead(nn.Module):
                 )
             query_stats = []
             content_stats = []
+            direct_input_layout = "BSND" if x.is_npu else "BNSD"
             for block in self.blocks:
                 if self.grad_checkpointing and not torch.jit.is_scripting():
                     def _dual_step(content_hidden, query_hidden, block=block):
@@ -1073,6 +1115,7 @@ class ContextualFlowTransformerHead(nn.Module):
                             content_hidden,
                             context_positions=context_positions,
                             context_rope=context_rope,
+                            input_layout=direct_input_layout,
                         )
                         next_content = block(
                             content_hidden,
@@ -1106,6 +1149,7 @@ class ContextualFlowTransformerHead(nn.Module):
                         content,
                         context_positions=context_positions,
                         context_rope=context_rope,
+                        input_layout=direct_input_layout,
                     )
                     content = block(
                         content,

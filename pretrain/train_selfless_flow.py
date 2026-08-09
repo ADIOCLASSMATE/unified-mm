@@ -968,8 +968,8 @@ def main():
     training_window = TrainingWindow()
     training_runtime_started_at = time.time()
     training_runtime_start_step = global_step
-    if accelerator.device.type == "cuda":
-        torch.cuda.reset_peak_memory_stats(accelerator.device)
+    if accelerator.device.type == "npu":
+        torch.npu.reset_peak_memory_stats(accelerator.device)
 
     # Accumulators across gradient-accumulation micro-batches.
     acc_loss = torch.tensor(0.0, device=accelerator.device)
@@ -1511,24 +1511,30 @@ def main():
                 break
 
     training_runtime_elapsed = time.time() - training_runtime_started_at
-    if accelerator.device.type == "cuda":
-        local_runtime = torch.tensor(
+    if accelerator.device.type == "npu":
+        local_memory = torch.tensor(
             [
-                float(torch.cuda.max_memory_allocated(accelerator.device)),
-                float(torch.cuda.max_memory_reserved(accelerator.device)),
-                float(training_runtime_elapsed),
+                int(torch.npu.max_memory_allocated(accelerator.device)),
+                int(torch.npu.max_memory_reserved(accelerator.device)),
             ],
             device=accelerator.device,
-            dtype=torch.float64,
+            dtype=torch.int64,
         )
     else:
-        local_runtime = torch.tensor(
-            [0.0, 0.0, float(training_runtime_elapsed)],
+        local_memory = torch.zeros(
+            2,
             device=accelerator.device,
-            dtype=torch.float64,
+            dtype=torch.int64,
         )
-    gathered_runtime = accelerator.gather(local_runtime).reshape(-1, 3)
-    runtime_max = gathered_runtime.max(dim=0).values
+    local_elapsed = torch.tensor(
+        [float(training_runtime_elapsed)],
+        device=accelerator.device,
+        dtype=torch.float32,
+    )
+    gathered_memory = accelerator.gather(local_memory).reshape(-1, 2)
+    gathered_elapsed = accelerator.gather(local_elapsed).reshape(-1)
+    memory_max = gathered_memory.max(dim=0).values
+    elapsed_max = gathered_elapsed.max()
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         runtime_payload = {
@@ -1537,17 +1543,17 @@ def main():
             "world_size": int(accelerator.num_processes),
             "total_batch_size": int(total_batch_size),
             "steps_this_run": int(global_step - training_runtime_start_step),
-            "training_wall_seconds": float(runtime_max[2].item()),
+            "training_wall_seconds": float(elapsed_max.item()),
             "train_samples_per_second": float(
                 (global_step - training_runtime_start_step)
                 * total_batch_size
-                / max(float(runtime_max[2].item()), 1e-12)
+                / max(float(elapsed_max.item()), 1e-12)
             ),
             "peak_cuda_allocated_bytes_per_rank": int(
-                runtime_max[0].item()
+                memory_max[0].item()
             ),
             "peak_cuda_reserved_bytes_per_rank": int(
-                runtime_max[1].item()
+                memory_max[1].item()
             ),
             "trainability": trainability,
         }
@@ -1605,18 +1611,18 @@ def validate(model, val_dataloader, accelerator, global_step, config=None):
     validation_seed = int(
         config.experiment.get("validation_seed", config.training.seed)
     ) + int(accelerator.process_index)
-    cuda_devices = (
+    npu_devices = (
         [int(accelerator.device.index)]
-        if accelerator.device.type == "cuda"
+        if accelerator.device.type == "npu"
         else []
     )
     # Validation must not perturb the training RNG stream, and every checkpoint
     # must see the same flow times/noise on each rank.
-    with torch.random.fork_rng(devices=cuda_devices):
+    with torch.random.fork_rng(devices=npu_devices, device_type="npu"):
         torch.default_generator.manual_seed(validation_seed)
-        if accelerator.device.type == "cuda":
-            with torch.cuda.device(accelerator.device):
-                torch.cuda.manual_seed(validation_seed)
+        if accelerator.device.type == "npu":
+            with torch.npu.device(accelerator.device):
+                torch.npu.manual_seed(validation_seed)
         model.eval()  # DeepSpeed requires explicit eval mode for no_grad forward
         try:
             _validate_multimodal(

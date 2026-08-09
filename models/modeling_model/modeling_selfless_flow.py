@@ -24,13 +24,9 @@ import os
 from typing import Optional, Union
 
 import torch
+import torch_npu
 from torch import nn
 from torch.nn import functional as F
-from torch.nn.attention.flex_attention import (
-    BlockMask,
-    create_block_mask,
-    flex_attention,
-)
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
@@ -53,10 +49,6 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple
 from transformers.utils.deprecation import deprecate_kwarg
 
-try:
-    from flash_attn.ops.triton.layer_norm import rms_norm_fn as flash_rms_norm
-except Exception:
-    flash_rms_norm = None
 from .image_flow_loss import FlowLoss
 from .image_backbone import (
     CANONICAL_IMAGE_LATENT_DIM,
@@ -67,12 +59,8 @@ from .image_position_utils import (
     build_row_col_position_ids,
 )
 
-try:
-    from liger_kernel.ops.swiglu import LigerSiLUMulFunction  # noqa: F401
-
-    liger_kernel_is_available = True
-except ImportError:
-    liger_kernel_is_available = False
+# NPU-only: liger-kernel（triton fused swiglu）不可用，强制走原生 PyTorch 路径
+liger_kernel_is_available = False
 
 
 def auto_docstring(obj=None, **_kwargs):
@@ -175,19 +163,10 @@ class Qwen3RMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, hidden_states):
-        if (
-            hidden_states.is_cuda
-            and flash_rms_norm is not None
-            and os.environ.get("SELFLESS_USE_FLASH_RMSNORM", "1").lower()
-            not in {"0", "false", "no", "off"}
-        ):
-            return flash_rms_norm(
-                hidden_states,
-                weight=self.weight,
-                bias=None,
-                eps=self.variance_epsilon,
-            )
-
+        if hidden_states.is_npu:
+            return torch_npu.npu_rms_norm(
+                hidden_states, self.weight, epsilon=self.variance_epsilon
+            )[0]
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
@@ -369,34 +348,53 @@ def compute_image_local_positions(
     return local_positions
 
 
-@torch.compile(fullgraph=True, mode="max-autotune-no-cudagraphs")
+def _to_bool_atten_mask(attention_mask) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert a stored dense additive/bool mask into npu_fusion_attention bool mask (True = disallow).
+
+    npu_fusion_attention 在全 mask 行（所有 kv 均 disallow）上会产生 NaN/垃圾值，
+    而 FlexAttention 对这些行返回严格的 0。这里先放行 kv[0] 避免 NaN，再由
+    调用方使用 valid_rows 将输出恢复为严格的 0。
+
+    无 sync 版本：始终在 GPU 上执行 clamp，避免 bool(row_all.any()) 的
+    device→host sync（每层 2 次 × 28 层 = 56 次 sync，~200ms/step）。
+    """
+    if attention_mask.dtype == torch.bool:
+        mask = attention_mask
+    else:
+        mask = attention_mask < 0
+    row_all = mask.all(dim=-1, keepdim=True)
+    # 无条件执行：对非全 mask 行是 no-op（mask[..., 0] & True = mask[..., 0]）
+    mask = mask.clone()
+    mask[..., 0] = mask[..., 0] & ~row_all.squeeze(-1)
+    return mask, ~row_all
+
+
 def compiled_flex_attention(query, key, value, attention_mask, scaling, enable_gqa):
-    """编译优化的 flex_attention 包装函数"""
-    return flex_attention(
-        query=query,
-        key=key,
-        value=value,
-        score_mod=None,
-        block_mask=attention_mask,
+    """NPU 原生融合注意力（训练路径）——替代 GPU 的 compiled flex_attention。
+
+    attention_mask: dense bool/additive mask，形状 [B, 1|H, Q_LEN, KV_LEN]，
+    True 或 -inf 表示禁止 attend（与 flex_attention BlockMask 语义相反，已在
+    get_selfless_mask 侧转换好）。
+    """
+    # npu_fusion_attention 原生支持 Nq/Nkv 为正整数的 GQA；保留紧凑 KV heads，
+    # 避免 repeat_interleave 的额外显存、带宽和反向归并开销。
+    safe_mask, valid_rows = _to_bool_atten_mask(attention_mask)
+    out = torch_npu.npu_fusion_attention(
+        query,
+        key,
+        value,
+        head_num=query.shape[1],
+        input_layout="BNSD",
+        atten_mask=safe_mask,
+        sparse_mode=0,
         scale=scaling,
-        enable_gqa=enable_gqa,
-        return_lse=False,
     )
+    return out[0] * valid_rows.to(dtype=out[0].dtype)
 
 
-@torch.compile(fullgraph=True, mode="default", dynamic=True)
 def dynamic_flex_attention(query, key, value, attention_mask, scaling, enable_gqa):
-    """自适应tokens长度的 flex_attention 包装函数"""
-    return flex_attention(
-        query=query,
-        key=key,
-        value=value,
-        score_mod=None,
-        block_mask=attention_mask,
-        scale=scaling,
-        enable_gqa=enable_gqa,
-        return_lse=False,
-    )
+    """NPU 原生融合注意力（eval / 动态长度路径）——与 compiled 版同实现。"""
+    return compiled_flex_attention(query, key, value, attention_mask, scaling, enable_gqa)
 
 
 class _SelflessStaticCacheLayer:
@@ -717,7 +715,7 @@ class Qwen3Attention(nn.Module):
         X0_hidden_states: torch.Tensor,
         XT_hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        attention_mask: BlockMask,
+        attention_mask: torch.Tensor,
         past_key_values: Optional[Cache] = None,
         cache_read_only: bool = False,
         cache_write_mask: Optional[torch.BoolTensor] = None,
@@ -826,7 +824,7 @@ class Qwen3Attention(nn.Module):
                 query=X0_query_states,
                 key=X0_key_states,
                 value=X0_value_states,
-                attention_mask=attention_mask,  # 直接传入 BlockMask
+                attention_mask=attention_mask,  # dense bool mask (True=disallow)
                 scaling=self.scaling,  # 使用预定义的缩放因子
                 enable_gqa=enable_gqa,  # 如果 kv heads 少于 q heads，需要启用
             )
@@ -835,7 +833,7 @@ class Qwen3Attention(nn.Module):
                     query=XT_query_states,
                     key=X0_key_states,
                     value=X0_value_states,
-                    attention_mask=attention_mask,  # 直接传入 BlockMask
+                    attention_mask=attention_mask,  # dense bool mask (True=disallow)
                     scaling=self.scaling,  # 使用预定义的缩放因子
                     enable_gqa=enable_gqa,  # 如果 kv heads 少于 q heads，需要启用
                 )
@@ -850,7 +848,7 @@ class Qwen3Attention(nn.Module):
                 query=X0_query_states,
                 key=X0_key_states,
                 value=X0_value_states,
-                attention_mask=attention_mask,  # 直接传入 BlockMask
+                attention_mask=attention_mask,  # dense bool mask (True=disallow)
                 scaling=self.scaling,  # 使用预定义的缩放因子
                 enable_gqa=enable_gqa,  # 如果 kv heads 少于 q heads，需要启用
             )
@@ -859,7 +857,7 @@ class Qwen3Attention(nn.Module):
                     query=XT_query_states,
                     key=X0_key_states,
                     value=X0_value_states,
-                    attention_mask=attention_mask,  # 直接传入 BlockMask
+                    attention_mask=attention_mask,  # dense bool mask (True=disallow)
                     scaling=self.scaling,  # 使用预定义的缩放因子
                     enable_gqa=enable_gqa,  # 如果 kv heads 少于 q heads，需要启用
                 )
@@ -937,7 +935,7 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
         self,
         X0_hidden_states: torch.Tensor,
         XT_hidden_states: torch.Tensor,
-        attention_mask: BlockMask,
+        attention_mask: torch.Tensor,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Cache] = None,
         use_cache: Optional[bool] = False,
@@ -1328,7 +1326,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
     def forward(
         self,
         X0_input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[BlockMask] = None,
+        attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Cache] = None,
         X0_inputs_embeds: Optional[torch.FloatTensor] = None,
@@ -1341,7 +1339,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
         Args:
             X0_input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
                 Indices of input sequence tokens in the vocabulary.
-            attention_mask (`BlockMask`, *optional*):
+            attention_mask (`torch.Tensor`, *optional*):
                 Attention mask for Flex Attention. Should be a block mask of shape `(batch_size, sequence_length)`.
             calculate_likelihood (`bool`, *optional*):
                 Whether to calculate the likelihood of the input sequence. If `True`, the model will compute the likelihood using the XT stream, which is necessary for training. If `False`, the model will only compute the hidden states for the X0 stream, which can be used for efficient decoding.
@@ -1629,7 +1627,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
     def forward(
         self,
         X0_input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[BlockMask] = None,
+        attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Cache] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
@@ -1648,7 +1646,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 `[X0_1, X0_2, ..., X0_n]`, where `X0_i` represents the visible content token for the i-th
                 position. If `inputs_embeds` is not provided, this argument will be used to
                 compute the input embeddings.
-            attention_mask (`BlockMask`, *optional*):
+            attention_mask (`torch.Tensor`, *optional*):
                 Attention mask for selfless sigma-causal attention. The mask should be designed such that
                 query positions can only attend to key/value positions with lower sigma.
             labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
@@ -1761,8 +1759,17 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 image_context_latents = context_for_loss[
                     rows.unsqueeze(1), token_indices
                 ]
+                selected_hidden_states = torch.index_select(hidden_states, 0, rows)
+                hidden_gather_indices = token_indices.unsqueeze(-1).expand(
+                    -1, -1, hidden_states.shape[-1]
+                )
+                image_hidden_states = torch.gather(
+                    selected_hidden_states,
+                    dim=1,
+                    index=hidden_gather_indices,
+                )
                 image_conditions = self._prepare_image_flow_condition(
-                    hidden_states[rows.unsqueeze(1), token_indices]
+                    image_hidden_states
                 )
                 flow_sigma = model_kwargs.get("flow_sigma", None)
                 if flow_sigma is None:
@@ -1847,7 +1854,6 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             output["flow_debug_stats"] = flow_debug_stats
         return output
 
-    @torch.compile(mode="max-autotune-no-cudagraphs")
     def loss_function(self, logits, labels, ignore_index, reduction="mean"):
         return F.cross_entropy(
             logits.view(-1, logits.size(-1)),
@@ -2292,29 +2298,19 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             query_valid: torch.Tensor,
             *,
             image_uncond: bool,
-        ) -> BlockMask:
+        ) -> torch.Tensor:
             query_sigma = query_sigma.to(device=device, dtype=torch.float32)
             query_valid = query_valid.to(device=device, dtype=torch.bool)
 
-            def mask_mod(b, h, q_idx, kv_idx):
-                del h
-                allowed = (
-                    query_valid[b, q_idx]
-                    & backbone_key_valid[b, kv_idx]
-                    & (backbone_key_sigma[b, kv_idx] < query_sigma[b, q_idx])
-                )
-                if image_uncond:
-                    allowed = allowed & backbone_key_is_image[b, kv_idx]
-                return allowed
-
-            return create_block_mask(
-                mask_mod,
-                B=len(spans),
-                H=None,
-                Q_LEN=query_sigma.shape[1],
-                KV_LEN=backbone_max_cache_len,
-                device=device,
+            # dense bool mask (True = disallow) for npu_fusion_attention
+            allowed = (
+                query_valid.unsqueeze(-1)
+                & backbone_key_valid.unsqueeze(1)
+                & (backbone_key_sigma.unsqueeze(1) < query_sigma.unsqueeze(-1))
             )
+            if image_uncond:
+                allowed = allowed & backbone_key_is_image.unsqueeze(1)
+            return (~allowed).unsqueeze(1)  # [B, 1, Q_LEN, KV_LEN]
 
         def _next_backbone_query_positions() -> torch.Tensor:
             positions = []
