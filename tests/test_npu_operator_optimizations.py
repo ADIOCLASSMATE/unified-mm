@@ -78,6 +78,61 @@ def _check_native_gqa(device: torch.device) -> None:
             )
 
 
+def _check_prepared_attention_mask(device: torch.device) -> None:
+    from models.modeling_model.modeling_selfless_flow import (
+        _to_bool_atten_mask,
+        compiled_flex_attention,
+    )
+
+    batch, query_heads, kv_heads, seq_len, head_dim = 2, 4, 2, 32, 16
+    scale = 1.0 / math.sqrt(head_dim)
+    query_base = torch.randn(
+        batch, query_heads, seq_len, head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    key_base = torch.randn(
+        batch, kv_heads, seq_len, head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    value_base = torch.randn_like(key_base)
+    output_grad = torch.randn_like(query_base)
+    sigma = torch.rand(batch, seq_len, device=device)
+    mask = sigma[:, None, None, :] >= sigma[:, None, :, None]
+    prepared_mask = _to_bool_atten_mask(mask)
+
+    def run(attention_mask) -> tuple[torch.Tensor, ...]:
+        query = query_base.detach().clone().requires_grad_(True)
+        key = key_base.detach().clone().requires_grad_(True)
+        value = value_base.detach().clone().requires_grad_(True)
+        output = compiled_flex_attention(
+            query,
+            key,
+            value,
+            attention_mask,
+            scale,
+            True,
+        )
+        (output * output_grad).sum().backward()
+        torch.npu.synchronize()
+        return output.detach(), query.grad.detach(), key.grad.detach(), value.grad.detach()
+
+    per_call = run(mask)
+    cached = run(prepared_mask)
+    for name, reference, candidate in zip(
+        ("output", "query_grad", "key_grad", "value_grad"),
+        per_call,
+        cached,
+    ):
+        rel_l2, max_abs = _metrics(reference, candidate)
+        if rel_l2 != 0.0 or max_abs != 0.0:
+            raise AssertionError(
+                f"prepared attention mask {name} mismatch: "
+                f"rel_l2={rel_l2}, max_abs={max_abs}"
+            )
+
+
 def _check_flow_attention_layout(device: torch.device) -> None:
     batch, seq_len, heads, head_dim = 2, 32, 8, 16
     scale = 1.0 / math.sqrt(head_dim)
@@ -135,6 +190,55 @@ def _check_flow_attention_layout(device: torch.device) -> None:
         raise AssertionError("flow BSND fully-masked rows must be strictly zero")
 
 
+def _check_prepared_flow_mask(device: torch.device) -> None:
+    from models.modeling_model.image_flow_loss import ContextualFlowBlock
+
+    batch, seq_len, channels, heads = 2, 32, 128, 8
+    block = ContextualFlowBlock(
+        channels=channels,
+        num_heads=heads,
+        image_tokens_per_img=256,
+    ).to(device=device, dtype=torch.bfloat16)
+    x = torch.randn(
+        batch,
+        seq_len,
+        channels,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    context = torch.randn_like(x)
+    positions = torch.arange(seq_len, device=device).expand(batch, -1)
+    sigma = torch.rand(batch, seq_len, device=device)
+    mask = sigma[:, None, :] < sigma[:, :, None]
+    cache = block.prepare_cross_cache(context, context_positions=positions)
+    prepared_mask = block.prepare_context_mask(
+        mask,
+        batch,
+        seq_len,
+        seq_len,
+        device,
+    )
+    reference = block._cross_attention(
+        x,
+        cache,
+        mask,
+        query_positions=positions,
+    )
+    candidate = block._cross_attention(
+        x,
+        cache,
+        prepared_mask,
+        query_positions=positions,
+    )
+    torch.npu.synchronize()
+    rel_l2, max_abs = _metrics(reference, candidate)
+    if rel_l2 != 0.0 or max_abs != 0.0:
+        raise AssertionError(
+            "prepared flow mask output mismatch: "
+            f"rel_l2={rel_l2}, max_abs={max_abs}"
+        )
+
+
 def _check_span_gather(device: torch.device) -> None:
     batch, seq_len, hidden_size = 3, 24, 32
     rows = torch.tensor([0, 0, 2, 1], device=device, dtype=torch.long)
@@ -189,9 +293,11 @@ def main() -> None:
     torch.npu.set_device(0)
     device = torch.device("npu:0")
     _check_native_gqa(device)
+    _check_prepared_attention_mask(device)
     _check_flow_attention_layout(device)
+    _check_prepared_flow_mask(device)
     _check_span_gather(device)
-    print("PASS native_gqa flow_bsnd span_gather")
+    print("PASS native_gqa prepared_mask flow_bsnd prepared_flow_mask span_gather")
 
 
 if __name__ == "__main__":

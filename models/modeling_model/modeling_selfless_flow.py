@@ -378,7 +378,14 @@ def compiled_flex_attention(query, key, value, attention_mask, scaling, enable_g
     """
     # npu_fusion_attention 原生支持 Nq/Nkv 为正整数的 GQA；保留紧凑 KV heads，
     # 避免 repeat_interleave 的额外显存、带宽和反向归并开销。
-    safe_mask, valid_rows = _to_bool_atten_mask(attention_mask)
+    if isinstance(attention_mask, tuple):
+        if len(attention_mask) != 2:
+            raise ValueError(
+                "prepared attention_mask must contain (safe_mask, valid_rows)"
+            )
+        safe_mask, valid_rows = attention_mask
+    else:
+        safe_mask, valid_rows = _to_bool_atten_mask(attention_mask)
     out = torch_npu.npu_fusion_attention(
         query,
         key,
@@ -1352,6 +1359,13 @@ class Qwen3Model(Qwen3PreTrainedModel):
             raise ValueError(
                 "attention_mask must be provided for selfless sigma-causal attention."
             )
+
+        # Every decoder layer consumes the same dense attention mask, and the
+        # X0/XT streams share it as well.  Preparing it inside each attention
+        # call repeated all/clone/index operations 56 times per microbatch on
+        # the 28-layer training path.  Keep the safe mask and fully-masked-row
+        # indicator device-resident and reuse them across all layers/streams.
+        attention_mask = _to_bool_atten_mask(attention_mask)
 
         debug_finite_backbone = bool(kwargs.get("debug_finite_backbone", False))
         debug_backbone_label = str(kwargs.get("debug_backbone_label", ""))

@@ -201,6 +201,25 @@ class ContextualFlowBlock(nn.Module):
             )
         return context_mask
 
+    def prepare_context_mask(
+        self,
+        context_mask,
+        batch_size,
+        query_len,
+        context_len,
+        device,
+    ):
+        context_mask = self._format_context_mask(
+            context_mask,
+            batch_size,
+            query_len,
+            context_len,
+            device,
+        )
+        has_context = context_mask.any(dim=-1)
+        safe_mask = context_mask | (~has_context).unsqueeze(-1)
+        return context_mask, (~safe_mask).unsqueeze(1), has_context
+
     def _apply_rope(self, x, positions, rope=None, input_layout="BNSD"):
         if positions is None:
             raise ValueError(
@@ -333,6 +352,23 @@ class ContextualFlowBlock(nn.Module):
         attn_dtype = q.dtype
         k = k.to(device=x.device, dtype=attn_dtype)
         v = v.to(device=x.device, dtype=attn_dtype)
+        if isinstance(context_mask, tuple):
+            if len(context_mask) != 3:
+                raise ValueError(
+                    "prepared context_mask must contain "
+                    "(context_mask, npu_atten_mask, has_context)"
+                )
+            context_mask, npu_atten_mask, has_context = context_mask
+        else:
+            context_mask, npu_atten_mask, has_context = (
+                self.prepare_context_mask(
+                    context_mask,
+                    batch_size,
+                    query_len,
+                    context_len,
+                    x.device,
+                )
+            )
         if record_stats:
             self._record_attention_diagnostics(
                 q,
@@ -342,20 +378,10 @@ class ContextualFlowBlock(nn.Module):
                 layer_cache.get("context_positions"),
                 input_layout=input_layout,
             )
-        context_mask = self._format_context_mask(
-            context_mask,
-            batch_size,
-            query_len,
-            context_len,
-            x.device,
-        )
-        has_context = context_mask.any(dim=-1)
-        safe_mask = context_mask | (~has_context).unsqueeze(-1)
         # npu_fusion_attention 的 mask 语义是 True=disallow，与 SDPA(allow) 相反。
         # 全部允许时 atten_mask=None 走全连接 kernel（已验证与 SDPA 数值一致）。
         # atten_mask 需 [B,1|H,Q,KV] 四维。
         # 无 sync 版本：始终传 mask，避免 bool(safe_mask.all()) 的 device→host sync。
-        npu_atten_mask = (~safe_mask).unsqueeze(1)
         out = torch_npu.npu_fusion_attention(
             q,
             k,
@@ -1105,6 +1131,13 @@ class ContextualFlowTransformerHead(nn.Module):
                     "Dynamic dual-stream training requires an explicit "
                     "strict sigma-causal mask."
                 )
+            prepared_content_mask = self.blocks[0].prepare_context_mask(
+                content_mask,
+                batch_size,
+                context_len,
+                context_len,
+                x.device,
+            )
             query_stats = []
             content_stats = []
             direct_input_layout = "BSND" if x.is_npu else "BNSD"
@@ -1121,7 +1154,7 @@ class ContextualFlowTransformerHead(nn.Module):
                             content_hidden,
                             content_y,
                             layer_cache=layer_cache,
-                            context_mask=content_mask,
+                            context_mask=prepared_content_mask,
                             query_positions=context_positions,
                             query_rope=context_rope,
                             include_mlp=True,
@@ -1131,7 +1164,7 @@ class ContextualFlowTransformerHead(nn.Module):
                             query_hidden,
                             y,
                             layer_cache=layer_cache,
-                            context_mask=content_mask,
+                            context_mask=prepared_content_mask,
                             query_positions=query_positions,
                             query_rope=query_rope,
                             record_stats=record_stats,
@@ -1155,7 +1188,7 @@ class ContextualFlowTransformerHead(nn.Module):
                         content,
                         content_y,
                         layer_cache=layer_cache,
-                        context_mask=content_mask,
+                        context_mask=prepared_content_mask,
                         query_positions=context_positions,
                         query_rope=context_rope,
                         include_mlp=True,
@@ -1167,7 +1200,7 @@ class ContextualFlowTransformerHead(nn.Module):
                         x,
                         y,
                         layer_cache=layer_cache,
-                        context_mask=content_mask,
+                        context_mask=prepared_content_mask,
                         query_positions=query_positions,
                         query_rope=query_rope,
                         record_stats=record_stats,
