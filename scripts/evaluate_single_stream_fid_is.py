@@ -1228,6 +1228,36 @@ def decode_latents_in_microbatches(
     )
 
 
+def extract_inception_features_in_microbatches(
+    inception,
+    images: torch.Tensor,
+    *,
+    batch_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Extract metric tensors without materializing full-batch activations."""
+
+    local_batch = int(images.shape[0])
+    metric_batch = int(batch_size)
+    if metric_batch < 0:
+        raise ValueError(
+            "Inception batch size must be nonnegative, "
+            f"got {metric_batch}"
+        )
+    if metric_batch == 0 or metric_batch >= local_batch:
+        return extract_inception_features(inception, images)
+
+    features = []
+    logits = []
+    for start in range(0, local_batch, metric_batch):
+        batch_features, batch_logits = extract_inception_features(
+            inception,
+            images[start : start + metric_batch],
+        )
+        features.append(batch_features)
+        logits.append(batch_logits)
+    return torch.cat(features, dim=0), torch.cat(logits, dim=0)
+
+
 def span_latents_to_chw(
     image_latents: torch.Tensor,
     spans: list[tuple[int, int, int]],
@@ -2210,7 +2240,11 @@ def main():
                 real_images,
                 label=f"real_images.rank{rank}.batch{batch_idx}",
             )
-            real_features, _ = extract_inception_features(inception, real_images)
+            real_features, _ = extract_inception_features_in_microbatches(
+                inception,
+                real_images,
+                batch_size=int(args.vae_decode_batch_size),
+            )
             require_finite_metric_tensor(
                 real_features,
                 label=f"real_features.rank{rank}.batch{batch_idx}",
@@ -2271,9 +2305,10 @@ def main():
             )
             generated_images = metric_images(decoded_generated_images)
             state = metrics[strategy]
-            fake_features, fake_logits = extract_inception_features(
+            fake_features, fake_logits = extract_inception_features_in_microbatches(
                 inception,
                 generated_images,
+                batch_size=int(args.vae_decode_batch_size),
             )
             require_finite_metric_tensor(
                 fake_features,

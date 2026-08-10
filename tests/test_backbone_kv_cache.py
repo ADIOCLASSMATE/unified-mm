@@ -120,6 +120,16 @@ def test_backbone_static_kv_cache_matches_full_recompute_with_cfg(monkeypatch):
     # pending instead of paying for a useless terminal cache write.
     assert cached_trace["backbone_kv_cache_tokens_committed"] == 3
     assert cached_trace["backbone_kv_cache_peak_bytes"] > 0
+    assert cached_trace["flow_content_cache_peak_bytes_per_sample"] > 0
+    assert len(
+        cached_trace["flow_cfg_content_cache_divergence_by_layer"]
+    ) == 1
+    assert all(
+        torch.isfinite(torch.tensor(value))
+        for value in cached_trace[
+            "flow_cfg_content_cache_divergence_by_layer"
+        ]
+    )
 
 
 @torch.no_grad()

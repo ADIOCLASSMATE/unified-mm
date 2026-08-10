@@ -15,6 +15,7 @@ from scripts.evaluate_single_stream_fid_is import (
     evaluation_metrics_from_state,
     evaluation_metrics_state,
     evaluation_progress_payload,
+    extract_inception_features_in_microbatches,
     load_evaluation_resume_checkpoint,
     save_evaluation_resume_checkpoint,
     shard_unpacked_batch_rows,
@@ -93,6 +94,70 @@ def test_vae_decode_microbatch_preserves_order(monkeypatch):
 
     assert calls == [2, 2, 1]
     assert torch.equal(decoded, latents + 1)
+
+
+def test_inception_microbatch_preserves_features_and_logits(monkeypatch):
+    calls = []
+
+    def fake_extract(_inception, images):
+        calls.append(int(images.shape[0]))
+        values = images.reshape(images.shape[0], -1)
+        return values + 1, values + 2
+
+    monkeypatch.setattr(
+        evaluator,
+        "extract_inception_features",
+        fake_extract,
+    )
+    images = torch.arange(5, dtype=torch.float32).view(5, 1, 1, 1)
+    features, logits = extract_inception_features_in_microbatches(
+        object(),
+        images,
+        batch_size=2,
+    )
+
+    assert calls == [2, 2, 1]
+    assert torch.equal(features, images.reshape(5, 1) + 1)
+    assert torch.equal(logits, images.reshape(5, 1) + 2)
+
+
+@pytest.mark.parametrize(
+    ("batch_size", "expected_calls"),
+    [(0, [5]), (5, [5]), (8, [5])],
+)
+def test_inception_microbatch_full_batch_modes(
+    monkeypatch,
+    batch_size,
+    expected_calls,
+):
+    calls = []
+
+    def fake_extract(_inception, images):
+        calls.append(int(images.shape[0]))
+        return images, images
+
+    monkeypatch.setattr(
+        evaluator,
+        "extract_inception_features",
+        fake_extract,
+    )
+    images = torch.zeros(5, 1, 1, 1)
+    extract_inception_features_in_microbatches(
+        object(),
+        images,
+        batch_size=batch_size,
+    )
+
+    assert calls == expected_calls
+
+
+def test_inception_microbatch_rejects_negative_batch_size():
+    with pytest.raises(ValueError, match="must be nonnegative"):
+        extract_inception_features_in_microbatches(
+            object(),
+            torch.zeros(1, 1, 1, 1),
+            batch_size=-1,
+        )
 
 
 def test_emit_evaluation_progress_writes_atomic_json_and_newline_log(

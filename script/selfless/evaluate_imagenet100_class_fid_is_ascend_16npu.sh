@@ -11,6 +11,7 @@ source "${CANN_SET_ENV}"
 export UNIFIED_MM_VENV="${UNIFIED_MM_VENV:-.venv-npu}"
 source "${REPO_ROOT}/script/offline_env.sh"
 cd "${REPO_ROOT}"
+export HCCL_INTRA_ROCE_ENABLE="${HCCL_INTRA_ROCE_ENABLE:-1}"
 
 CONFIG="${CONFIG:-configs/selfless/imagenet100_class_base_80ep_ascend_16npu.yaml}"
 CHECKPOINT="${CHECKPOINT:-output/selfless-flow-im100-class-ascend16-b16ga2-b4e5-f1e4/hf_model-final-ema}"
@@ -19,7 +20,7 @@ DEVICE="${DEVICE:-npu}"
 NUM_PROCESSES="${NUM_PROCESSES:-16}"
 SAMPLES="${SAMPLES:-10000}"
 SAMPLING_STEPS="${SAMPLING_STEPS:-100}"
-BATCH_SIZE_PER_DEVICE="${BATCH_SIZE_PER_DEVICE:-16}"
+BATCH_SIZE_PER_DEVICE="${BATCH_SIZE_PER_DEVICE:-256}"
 VAE_DECODE_BATCH_SIZE="${VAE_DECODE_BATCH_SIZE:-16}"
 REAL_STATS_PATH="${REAL_STATS_PATH:-public/datasets/imagenet_ablation_100c_balanced/fid_stats/inception_v3_2048_original_256.pt}"
 INCEPTION_WEIGHTS_PATH="${INCEPTION_WEIGHTS_PATH:-output/cache/inception/weights-inception-2015-12-05-6726825d.pth}"
@@ -41,9 +42,13 @@ if [[ "${SAMPLING_STEPS}" != "100" ]]; then
   echo "ERROR: formal ImageNet-100 FID/IS requires 100 sampling steps, got ${SAMPLING_STEPS}" >&2
   exit 5
 fi
-if [[ "${BATCH_SIZE_PER_DEVICE}" != "16" ]]; then
-  echo "ERROR: validated Ascend evaluation batch is 16/NPU, got ${BATCH_SIZE_PER_DEVICE}" >&2
+if [[ "${BATCH_SIZE_PER_DEVICE}" != "256" ]]; then
+  echo "ERROR: validated Ascend evaluation batch is 256/NPU, got ${BATCH_SIZE_PER_DEVICE}" >&2
   exit 6
+fi
+if [[ "${HCCL_INTRA_ROCE_ENABLE}" != "1" ]]; then
+  echo "ERROR: HCCL_INTRA_ROCE_ENABLE must equal 1" >&2
+  exit 7
 fi
 
 PYTHONPATH=. python - \
@@ -99,7 +104,8 @@ bash "${REPO_ROOT}/script/selfless/evaluate_imagenet_flow.sh" \
   --require_official_protocol \
   --canonical_pairing \
   --skip_target_decode \
-  --debug_finite_generation \
+  --resume_progress \
+  --resume_checkpoint_interval_batches 1 \
   "$@"
 
 python scripts/validate_ascend_imagenet100_evaluation.py \

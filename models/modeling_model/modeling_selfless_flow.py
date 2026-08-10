@@ -2155,36 +2155,17 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         def _flow_context(
             sample_indices: torch.Tensor, local_positions: torch.Tensor
         ) -> dict[str, torch.Tensor]:
-            if backbone_cache_enabled:
-                selected_caches = list(flow_content_caches_cond)
-            else:
-                sample_index_list = (
-                    sample_indices.detach().to(device="cpu").tolist()
+            if int(sample_indices.numel()) != len(spans):
+                raise RuntimeError(
+                    "batched flow cache requires one active token per sample; "
+                    f"got {sample_indices.numel()} tokens for {len(spans)} samples"
                 )
-                selected_caches = [
-                    flow_content_caches_cond[int(sample_idx)]
-                    for sample_idx in sample_index_list
-                ]
-            cache_is_paired = False
-            if use_flow_cfg:
-                if backbone_cache_enabled:
-                    selected_caches.extend(flow_content_caches_uncond)
-                else:
-                    selected_caches.extend(
-                        flow_content_caches_uncond[int(sample_idx)]
-                        for sample_idx in sample_index_list
-                    )
-                cache_is_paired = True
             return {
                 "query_positions": local_positions.to(
                     device=device, dtype=torch.long
                 ),
-                "latent_mixer_cache": (
-                    self.image_flow_head.stack_latent_mixer_caches(
-                        selected_caches
-                    )
-                ),
-                "latent_mixer_cache_is_paired": cache_is_paired,
+                "latent_mixer_cache": flow_content_cache,
+                "latent_mixer_cache_is_paired": bool(use_flow_cfg),
             }
 
         if not replay_original_sigma:
@@ -2245,24 +2226,13 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 "Incremental generation requires an empty "
                 "initial image-latent prefix."
             )
-        flow_content_caches_cond = [
-            self.image_flow_head.empty_latent_mixer_cache(batch_size=1)
-            for _ in spans
-        ]
-        flow_content_caches_uncond = (
-            [
-                self.image_flow_head.empty_latent_mixer_cache(batch_size=1)
-                for _ in spans
-            ]
-            if use_flow_cfg
-            else None
+        flow_cache_branches = 2 if use_flow_cfg else 1
+        flow_content_cache = self.image_flow_head.empty_latent_mixer_cache(
+            batch_size=len(spans) * flow_cache_branches,
+            capacity=image_tokens_per_img,
         )
         flow_cache_peak_bytes = 0
-        flow_cache_divergence_sum = torch.zeros(
-            len(self.image_flow_head.net.blocks),
-            device=device,
-            dtype=torch.float32,
-        )
+        flow_cache_divergence_sum = None
         flow_cache_divergence_count = 0
         boi_token_id = getattr(self.config, "boi_token_id", None)
         if use_flow_cfg and boi_token_id is None:
@@ -2910,7 +2880,6 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 _debug_check("flow_prediction", pred, step_idx)
 
             cursor = 0
-            condition_cursor = 0
             for (
                 sample_idx,
                 local_positions,
@@ -2923,15 +2892,6 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                     cursor += count
                 else:
                     chunk = local_chunks
-                condition_chunk = z[
-                    condition_cursor : condition_cursor + count
-                ]
-                uncond_condition_chunk = (
-                    z_uncond[condition_cursor : condition_cursor + count]
-                    if z_uncond is not None
-                    else None
-                )
-                condition_cursor += count
                 start = local_spans[sample_idx][1]
                 work_latents[sample_idx, start + local_positions] = chunk
                 generated[sample_idx, local_positions] = chunk
@@ -2961,44 +2921,23 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                         "Dynamic flow cache commit must append one token at a "
                         "time."
                     )
-                flow_content_caches_cond[sample_idx] = (
-                    self.image_flow_head.append_latent_mixer_cache(
-                        flow_content_caches_cond[sample_idx],
-                        context_latents=chunk,
-                        context_conditions=condition_chunk,
-                        context_positions=local_positions,
-                    )
+            cache_latents = pred
+            cache_conditions = z
+            cache_positions = local_positions_for_condition
+            if use_flow_cfg:
+                cache_latents = torch.cat([cache_latents, cache_latents], dim=0)
+                cache_conditions = torch.cat(
+                    [cache_conditions, z_uncond], dim=0
                 )
-                if use_flow_cfg:
-                    flow_content_caches_uncond[sample_idx] = (
-                        self.image_flow_head.append_latent_mixer_cache(
-                            flow_content_caches_uncond[sample_idx],
-                            context_latents=chunk,
-                            context_conditions=uncond_condition_chunk,
-                            context_positions=local_positions,
-                        )
-                    )
-                    for layer_idx, (cond_layer, uncond_layer) in enumerate(
-                        zip(
-                            flow_content_caches_cond[sample_idx]["layers"],
-                            flow_content_caches_uncond[sample_idx]["layers"],
-                        )
-                    ):
-                        delta = (
-                            cond_layer["k"][:, :, -1]
-                            .detach()
-                            .float()
-                            .sub(
-                                uncond_layer["k"][:, :, -1]
-                                .detach()
-                                .float()
-                            )
-                            .pow(2)
-                            .mean()
-                            .sqrt()
-                        )
-                        flow_cache_divergence_sum[layer_idx] += delta
-                    flow_cache_divergence_count += 1
+                cache_positions = torch.cat(
+                    [cache_positions, cache_positions], dim=0
+                )
+            flow_content_cache = self.image_flow_head.append_latent_mixer_cache(
+                flow_content_cache,
+                context_latents=cache_latents,
+                context_conditions=cache_conditions,
+                context_positions=cache_positions,
+            )
             if backbone_cache_enabled:
                 committed_seq_positions = (
                     span_starts + backbone_query_local_positions
@@ -3017,17 +2956,48 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             ):
                 break
 
-        if flow_content_caches_cond:
-            final_branch_caches = [flow_content_caches_cond[0]]
-            if use_flow_cfg:
-                final_branch_caches.append(flow_content_caches_uncond[0])
+        if flow_content_cache is not None:
             flow_cache_peak_bytes = sum(
                 layer_cache[cache_name].numel()
                 * layer_cache[cache_name].element_size()
-                for branch_cache in final_branch_caches
-                for layer_cache in branch_cache["layers"]
+                for layer_cache in flow_content_cache["layers"]
                 for cache_name in ("k", "v")
-            )
+            ) // len(spans)
+            if use_flow_cfg:
+                flow_cache_divergence_sum = torch.zeros(
+                    len(flow_content_cache["layers"]),
+                    device=device,
+                    dtype=torch.float32,
+                )
+                diagnostic_batch = 32
+                for layer_idx, layer_cache in enumerate(
+                    flow_content_cache["layers"]
+                ):
+                    conditional = layer_cache["k"][: len(spans)]
+                    unconditional = layer_cache["k"][len(spans) :]
+                    for start in range(0, len(spans), diagnostic_batch):
+                        delta = (
+                            conditional[start : start + diagnostic_batch]
+                            .detach()
+                            .float()
+                            .sub(
+                                unconditional[
+                                    start : start + diagnostic_batch
+                                ]
+                                .detach()
+                                .float()
+                            )
+                        )
+                        flow_cache_divergence_sum[layer_idx] += (
+                            delta.pow(2)
+                            .mean(dim=(1, 3))
+                            .sqrt()
+                            .sum()
+                        )
+                flow_cache_divergence_count = (
+                    len(spans)
+                    * int(flow_content_cache["layers"][0]["k"].shape[2])
+                )
 
         generated = generated.view(len(spans), side, side, image_latent_dim).permute(
             0, 3, 1, 2

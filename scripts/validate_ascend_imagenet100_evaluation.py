@@ -84,8 +84,8 @@ def main() -> None:
     expected_distributed = {
         "enabled": True,
         "world_size": 16,
-        "batch_size_global": 256,
-        "batch_size_per_rank": 16,
+        "batch_size_global": 4096,
+        "batch_size_per_rank": 256,
         "device_type": "npu",
         "distributed_backend": "hccl",
     }

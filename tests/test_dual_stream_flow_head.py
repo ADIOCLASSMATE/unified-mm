@@ -178,6 +178,74 @@ def test_empty_and_single_content_cache_are_finite():
     assert torch.isfinite(single).all()
 
 
+def test_fixed_capacity_content_cache_matches_growing_cache():
+    flow = _flow()
+    content, query, condition, time, positions, _, _ = _inputs()
+    growing = flow.empty_latent_mixer_cache()
+    fixed = flow.empty_latent_mixer_cache(capacity=3)
+    storage_pointers = [
+        (layer["k_storage"].data_ptr(), layer["v_storage"].data_ptr())
+        for layer in fixed["layers"]
+    ]
+
+    for token_index in range(3):
+        kwargs = {
+            "context_latents": content[:, token_index],
+            "context_conditions": condition[:, token_index],
+            "context_positions": positions[:, token_index],
+        }
+        growing = flow.append_latent_mixer_cache(growing, **kwargs)
+        fixed = flow.append_latent_mixer_cache(fixed, **kwargs)
+
+        assert fixed["active_length"] == token_index + 1
+        assert fixed["capacity"] == 3
+        assert storage_pointers == [
+            (
+                layer["k_storage"].data_ptr(),
+                layer["v_storage"].data_ptr(),
+            )
+            for layer in fixed["layers"]
+        ]
+        for growing_layer, fixed_layer in zip(
+            growing["layers"], fixed["layers"]
+        ):
+            active_length = token_index + 1
+            torch.testing.assert_close(
+                fixed_layer["k"][:, :, :active_length],
+                growing_layer["k"],
+            )
+            torch.testing.assert_close(
+                fixed_layer["v"][:, :, :active_length],
+                growing_layer["v"],
+            )
+
+    growing_velocity = flow.velocity(
+        query[:, -1],
+        time[:, -1],
+        condition[:, -1],
+        query_positions=positions[:, -1],
+        latent_mixer_cache=growing,
+    )
+    fixed_velocity = flow.velocity(
+        query[:, -1],
+        time[:, -1],
+        condition[:, -1],
+        query_positions=positions[:, -1],
+        latent_mixer_cache=fixed,
+    )
+    torch.testing.assert_close(fixed_velocity, growing_velocity)
+    stacked_fixed = flow.stack_latent_mixer_caches([fixed])
+    assert stacked_fixed["layers"][0]["k"].shape[2] == 3
+    stacked_velocity = flow.velocity(
+        query[:, -1],
+        time[:, -1],
+        condition[:, -1],
+        query_positions=positions[:, -1],
+        latent_mixer_cache=stacked_fixed,
+    )
+    torch.testing.assert_close(stacked_velocity, growing_velocity)
+
+
 def test_stacked_cfg_cache_matches_separate_branches():
     flow = _flow()
     content, query, condition, time, positions, _, _ = _inputs()

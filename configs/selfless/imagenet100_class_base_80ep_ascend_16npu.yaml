@@ -125,8 +125,10 @@ evaluation:
     checkpoint: "output/selfless-flow-im100-class-ascend16-b16ga2-b4e5-f1e4/hf_model-final-ema"
     model_dtype: "bf16"
     samples: 10000
-    batch_size: 256
-    batch_size_per_npu: 16
+    batch_size: 4096
+    batch_size_per_npu: 256
+    # Keep both VAE decode and Inception extraction microbatched. The model
+    # generation batch remains 256/NPU while metric activations stay bounded.
     vae_decode_batch_size: 16
     sampling_steps: 100
     temperature: 1.0

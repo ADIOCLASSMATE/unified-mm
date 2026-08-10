@@ -871,45 +871,77 @@ class ContextualFlowTransformerHead(nn.Module):
             "cache_contract": self.cache_contract(),
         }
 
-    def empty_latent_mixer_cache(self, batch_size=1):
+    def empty_latent_mixer_cache(self, batch_size=1, capacity=None):
         batch_size = int(batch_size)
         if batch_size <= 0:
             raise ValueError(f"batch_size must be positive, got {batch_size}.")
+        cache_capacity = None if capacity is None else int(capacity)
+        if cache_capacity is not None and cache_capacity <= 0:
+            raise ValueError(
+                f"cache capacity must be positive, got {cache_capacity}."
+            )
+        storage_length = cache_capacity or 0
         device = self.input_proj.weight.device
         dtype = self.input_proj.weight.dtype
-        empty_positions = torch.empty(
-            batch_size, 0, device=device, dtype=torch.long
+        position_storage = torch.zeros(
+            batch_size,
+            storage_length,
+            device=device,
+            dtype=torch.long,
+        )
+        visible_positions = (
+            position_storage
+            if cache_capacity is not None
+            else position_storage[:, :0]
         )
         layers = []
         for block in self.blocks:
+            k_storage = torch.zeros(
+                batch_size,
+                block.num_heads,
+                storage_length,
+                block.head_dim,
+                device=device,
+                dtype=dtype,
+            )
+            v_storage = torch.zeros_like(k_storage)
             layers.append(
                 {
-                    "k": torch.empty(
-                        batch_size,
-                        block.num_heads,
-                        0,
-                        block.head_dim,
-                        device=device,
-                        dtype=dtype,
+                    "k": (
+                        k_storage
+                        if cache_capacity is not None
+                        else k_storage[:, :, :0]
                     ),
-                    "v": torch.empty(
-                        batch_size,
-                        block.num_heads,
-                        0,
-                        block.head_dim,
-                        device=device,
-                        dtype=dtype,
+                    "v": (
+                        v_storage
+                        if cache_capacity is not None
+                        else v_storage[:, :, :0]
                     ),
-                    "context_positions": empty_positions,
+                    "k_storage": k_storage,
+                    "v_storage": v_storage,
+                    "context_positions": visible_positions,
                     "k_rotation_count": 1,
                 }
             )
+        mask_storage = torch.zeros(
+            batch_size,
+            1,
+            storage_length,
+            device=device,
+            dtype=torch.bool,
+        )
         return {
             "layers": layers,
-            "context_mask": torch.empty(
-                batch_size, 1, 0, device=device, dtype=torch.bool
+            "context_mask": (
+                mask_storage
+                if cache_capacity is not None
+                else mask_storage[:, :, :0]
             ),
-            "context_positions": empty_positions,
+            "context_positions": visible_positions,
+            "capacity": cache_capacity,
+            "active_length": 0,
+            "context_mask_storage": mask_storage,
+            "context_positions_storage": position_storage,
             "position_digest": None,
             "position_contract": self.position_contract(),
             "cache_contract": self.cache_contract(),
@@ -957,14 +989,19 @@ class ContextualFlowTransformerHead(nn.Module):
 
         hidden = self._initial_content_hidden(context_latents, context_positions)
         content_y = self._content_condition(context_conditions)
-        previous_len = cache["layers"][0]["k"].shape[2]
-        previous_mask = torch.ones(
-            batch_size,
-            1,
-            previous_len,
-            device=model_device,
-            dtype=torch.bool,
+        previous_len = int(
+            cache.get(
+                "active_length",
+                cache["layers"][0]["k"].shape[2],
+            )
         )
+        cache_capacity = cache.get("capacity")
+        if cache_capacity is not None and previous_len >= int(cache_capacity):
+            raise ValueError(
+                "latent mixer cache capacity exceeded: "
+                f"active_length={previous_len}, capacity={cache_capacity}"
+            )
+        previous_mask = cache["context_mask"]
         updated_layers = []
         for layer_idx, block in enumerate(self.blocks):
             previous_layer = cache["layers"][layer_idx]
@@ -982,38 +1019,82 @@ class ContextualFlowTransformerHead(nn.Module):
                 query_rope=context_rope,
                 include_mlp=True,
             )
+            if cache_capacity is None:
+                updated_layers.append(
+                    {
+                        "k": torch.cat(
+                            [previous_layer["k"], new_layer["k"]], dim=2
+                        ),
+                        "v": torch.cat(
+                            [previous_layer["v"], new_layer["v"]], dim=2
+                        ),
+                        "context_positions": torch.cat(
+                            [
+                                previous_layer["context_positions"],
+                                context_positions,
+                            ],
+                            dim=1,
+                        ),
+                        "k_rotation_count": 1,
+                    }
+                )
+                continue
+            k_storage = previous_layer["k_storage"]
+            v_storage = previous_layer["v_storage"]
+            k_storage[:, :, previous_len : previous_len + 1].copy_(
+                new_layer["k"]
+            )
+            v_storage[:, :, previous_len : previous_len + 1].copy_(
+                new_layer["v"]
+            )
             updated_layers.append(
                 {
-                    "k": torch.cat(
-                        [previous_layer["k"], new_layer["k"]], dim=2
-                    ),
-                    "v": torch.cat(
-                        [previous_layer["v"], new_layer["v"]], dim=2
-                    ),
-                    "context_positions": torch.cat(
-                        [
-                            previous_layer["context_positions"],
-                            context_positions,
-                        ],
-                        dim=1,
-                    ),
+                    # Expose the full fixed-capacity storage so every flow
+                    # attention call has one static shape. Inactive columns
+                    # are excluded by ``context_mask`` below.
+                    "k": k_storage,
+                    "v": v_storage,
+                    "k_storage": k_storage,
+                    "v_storage": v_storage,
+                    "context_positions": None,
                     "k_rotation_count": 1,
                 }
             )
-        positions = torch.cat(
-            [cache["context_positions"], context_positions], dim=1
-        )
-        return {
-            "layers": updated_layers,
-            "context_mask": torch.ones(
+        if cache_capacity is None:
+            positions = torch.cat(
+                [cache["context_positions"], context_positions], dim=1
+            )
+            context_mask = torch.ones(
                 batch_size,
                 1,
                 previous_len + 1,
                 device=model_device,
                 dtype=torch.bool,
-            ),
+            )
+            mask_storage = None
+            position_storage = None
+        else:
+            mask_storage = cache["context_mask_storage"]
+            position_storage = cache["context_positions_storage"]
+            mask_storage[:, :, previous_len] = True
+            position_storage[:, previous_len : previous_len + 1].copy_(
+                context_positions
+            )
+            context_mask = mask_storage
+            positions = position_storage
+            for layer_cache in updated_layers:
+                layer_cache["context_positions"] = positions
+        return {
+            "layers": updated_layers,
+            "context_mask": context_mask,
             "context_positions": positions,
-            "position_digest": self._position_digest(positions),
+            "capacity": cache_capacity,
+            "active_length": previous_len + 1,
+            "context_mask_storage": mask_storage,
+            "context_positions_storage": position_storage,
+            "position_digest": self._position_digest(
+                positions[:, : previous_len + 1]
+            ),
             "position_contract": self.position_contract(),
             "cache_contract": self.cache_contract(),
         }
@@ -1027,7 +1108,15 @@ class ContextualFlowTransformerHead(nn.Module):
                 raise ValueError("stack_latent_mixer_caches expects batch-one caches.")
         device = self.input_proj.weight.device
         dtype = self.input_proj.weight.dtype
-        max_len = max(cache["layers"][0]["k"].shape[2] for cache in caches)
+        max_len = max(
+            int(
+                cache.get(
+                    "active_length",
+                    cache["layers"][0]["k"].shape[2],
+                )
+            )
+            for cache in caches
+        )
         batch_size = len(caches)
         positions = torch.zeros(
             batch_size, max_len, device=device, dtype=torch.long
@@ -1047,10 +1136,19 @@ class ContextualFlowTransformerHead(nn.Module):
             )
             v = torch.zeros_like(k)
             for row, cache in enumerate(caches):
-                length = cache["layers"][layer_idx]["k"].shape[2]
+                length = int(
+                    cache.get(
+                        "active_length",
+                        cache["layers"][layer_idx]["k"].shape[2],
+                    )
+                )
                 if length:
-                    k[row, :, :length] = cache["layers"][layer_idx]["k"][0]
-                    v[row, :, :length] = cache["layers"][layer_idx]["v"][0]
+                    k[row, :, :length] = cache["layers"][layer_idx]["k"][
+                        0, :, :length
+                    ]
+                    v[row, :, :length] = cache["layers"][layer_idx]["v"][
+                        0, :, :length
+                    ]
                     if layer_idx == 0:
                         positions[row, :length] = cache["context_positions"][0]
                         mask[row, 0, :length] = True
@@ -1492,8 +1590,11 @@ class FlowLoss(nn.Module):
             context_conditions=context_conditions,
         )
 
-    def empty_latent_mixer_cache(self, batch_size=1):
-        return self.net.empty_latent_mixer_cache(batch_size=batch_size)
+    def empty_latent_mixer_cache(self, batch_size=1, capacity=None):
+        return self.net.empty_latent_mixer_cache(
+            batch_size=batch_size,
+            capacity=capacity,
+        )
 
     def append_latent_mixer_cache(self, cache, **kwargs):
         return self.net.append_latent_mixer_cache(cache, **kwargs)

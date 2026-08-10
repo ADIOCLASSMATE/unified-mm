@@ -269,10 +269,10 @@ def validate_config(config, world_size: int, split_counts: Counter) -> dict:
         "backbone_lr": (float(config.optimizer.params.backbone_learning_rate), 4e-5),
         "flow_lr": (float(config.optimizer.params.flow_learning_rate), 1e-4),
         "evaluation_samples": (int(config.evaluation.samples), 10_000),
-        "evaluation_batch_size": (int(config.evaluation.batch_size), 256),
+        "evaluation_batch_size": (int(config.evaluation.batch_size), 4096),
         "evaluation_batch_size_per_npu": (
             int(config.evaluation.batch_size_per_npu),
-            16,
+            256,
         ),
         "evaluation_sampling_steps": (
             int(config.evaluation.sampling_steps),
