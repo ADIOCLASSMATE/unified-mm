@@ -97,6 +97,9 @@ export SAMPLING_STEPS BATCH_SIZE_PER_DEVICE VAE_DECODE_BATCH_SIZE
 export REAL_STATS_PATH INCEPTION_WEIGHTS_PATH
 bash "${REPO_ROOT}/script/selfless/evaluate_imagenet_flow.sh" \
   --require_official_protocol \
+  --canonical_pairing \
+  --skip_target_decode \
+  --debug_finite_generation \
   "$@"
 
 python scripts/validate_ascend_imagenet100_evaluation.py \
