@@ -134,6 +134,8 @@ git status --short >"${AUDIT_DIR}/git_status.txt"
 AUDIT_SOURCE_PATHS=(
   accelerate_configs/16_npus_deepspeed_zero2.yaml
   configs/selfless/imagenet100_class_base_80ep_ascend_16npu.yaml
+  models/modeling_model/image_flow_loss.py
+  models/modeling_model/modeling_selfless_flow.py
   pretrain/merge_flow_latent_shards.py
   pretrain/train_selfless_flow.py
   script/offline_env.sh
@@ -148,6 +150,7 @@ AUDIT_SOURCE_PATHS=(
   scripts/validate_kl16_posterior_decode.py
   tests/test_npu_operator_optimizations.py
   tests/test_npu_runtime_primitives.py
+  utils/utils.py
   utils/selfless_training_runtime.py
 )
 {

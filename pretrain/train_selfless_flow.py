@@ -2410,7 +2410,10 @@ def _save_validation_flow_images(
         local_metric_values = torch.tensor(
             [logs[key] for key in metric_keys],
             device=accelerator.device,
-            dtype=torch.float64,
+            # HCCL does not support float64 all-reduce. These are display and
+            # monitoring metrics derived from fp32 tensors, so fp32 preserves
+            # their source precision and is portable across CUDA and Ascend.
+            dtype=torch.float32,
         )
         global_metric_values = accelerator.reduce(
             local_metric_values,

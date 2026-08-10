@@ -8,16 +8,20 @@ cd "${REPO_ROOT}"
 CONFIG="${CONFIG:-configs/selfless/imagenet_flow_full_from_qwen3base.yaml}"
 CHECKPOINT="${CHECKPOINT:-output/selfless-flow-stage0-imagenet-full-from-qwen3base/hf_model-final-ema}"
 OUTPUT_DIR="${OUTPUT_DIR:-output/selfless-flow-evaluation}"
-NUM_GPUS="${NUM_GPUS:-8}"
-BATCH_SIZE_PER_GPU="${BATCH_SIZE_PER_GPU:-384}"
-BATCH_SIZE="${BATCH_SIZE:-$((NUM_GPUS * BATCH_SIZE_PER_GPU))}"
+DEVICE="${DEVICE:-cuda}"
+NUM_PROCESSES="${NUM_PROCESSES:-${NUM_GPUS:-8}}"
+BATCH_SIZE_PER_DEVICE="${BATCH_SIZE_PER_DEVICE:-${BATCH_SIZE_PER_GPU:-384}}"
+BATCH_SIZE="${BATCH_SIZE:-$((NUM_PROCESSES * BATCH_SIZE_PER_DEVICE))}"
 VAE_DECODE_BATCH_SIZE="${VAE_DECODE_BATCH_SIZE:-64}"
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+if [[ "${DEVICE}" == cuda* ]]; then
+  export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+fi
 
-torchrun --standalone --nproc_per_node="${NUM_GPUS}" \
+torchrun --standalone --nproc_per_node="${NUM_PROCESSES}" \
   scripts/evaluate_single_stream_fid_is.py \
   --config "${CONFIG}" \
   --model_path_override "${CHECKPOINT}" \
+  --device "${DEVICE}" \
   --model_dtype "${MODEL_DTYPE:-bf16}" \
   --samples "${SAMPLES:-10000}" \
   --split val \

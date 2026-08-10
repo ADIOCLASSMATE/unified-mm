@@ -119,9 +119,9 @@ evaluation:
     checkpoint: "output/selfless-flow-im100-class-ascend16-b16ga2-b4e5-f1e4/hf_model-final-ema"
     model_dtype: "bf16"
     samples: 10000
-    batch_size: 3072
-    batch_size_per_h100: 384
-    vae_decode_batch_size: 64
+    batch_size: 256
+    batch_size_per_npu: 16
+    vae_decode_batch_size: 16
     sampling_steps: 100
     temperature: 1.0
     cfg: 3.5

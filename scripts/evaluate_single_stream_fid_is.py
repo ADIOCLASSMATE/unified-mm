@@ -38,6 +38,7 @@ from scripts.image_evaluation_metrics import (  # noqa: E402
     build_inception_extractor,
     extract_inception_features,
     frechet_distance,
+    metric_accumulation_dtype,
 )
 from scripts.generate_flow_validation_images import (  # noqa: E402
     decode_latents,
@@ -286,7 +287,8 @@ def parse_args():
         default="",
         help=(
             "Precomputed original-ImageNet Inception moments shared across architectures. "
-            "When set, this overrides --real_source and real images are not re-extracted."
+            "When set, this overrides --real_source and real images are not re-extracted. "
+            "Pass 'none' to explicitly disable a path inherited from the config."
         ),
     )
     parser.add_argument(
@@ -450,6 +452,14 @@ def evaluation_process_group_timeout_seconds() -> int:
     return timeout_seconds
 
 
+def npu_is_available() -> bool:
+    try:
+        import torch_npu  # noqa: F401
+    except ImportError:
+        return False
+    return bool(hasattr(torch, "npu") and torch.npu.is_available())
+
+
 def init_distributed(requested_device: str):
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
@@ -467,8 +477,28 @@ def init_distributed(requested_device: str):
             f"so every rank receives WORLD_SIZE, or unset rank env vars. env={distributed_env}"
         )
 
-    requested = str(requested_device).lower()
-    if requested != "cpu" and torch.cuda.is_available():
+    requested = str(requested_device).lower().strip()
+    wants_npu = requested == "npu" or requested.startswith("npu:")
+    wants_cuda = requested == "cuda" or requested.startswith("cuda:")
+    if requested not in {"auto", "cpu"} and not (wants_npu or wants_cuda):
+        raise ValueError(
+            "--device must be one of auto, cpu, cuda[:index], or "
+            f"npu[:index], got {requested_device!r}"
+        )
+
+    npu_available = npu_is_available() if requested in {"auto", "npu"} or wants_npu else False
+    if wants_npu and not npu_available:
+        raise RuntimeError("--device requests Ascend NPU, but torch_npu/NPU is unavailable")
+    if wants_cuda and not torch.cuda.is_available():
+        raise RuntimeError("--device requests CUDA, but CUDA is unavailable")
+
+    if npu_available and (wants_npu or requested == "auto"):
+        if distributed or requested in {"auto", "npu"}:
+            device = torch.device(f"npu:{local_rank}")
+        else:
+            device = torch.device(requested_device)
+        torch.npu.set_device(device)
+    elif torch.cuda.is_available() and (wants_cuda or requested == "auto"):
         if distributed or requested in {"auto", "cuda"}:
             device = torch.device(f"cuda:{local_rank}")
         else:
@@ -478,7 +508,10 @@ def init_distributed(requested_device: str):
         device = torch.device("cpu")
 
     if distributed and not dist.is_initialized():
-        backend = "nccl" if device.type == "cuda" else "gloo"
+        backend = {
+            "cuda": "nccl",
+            "npu": "hccl",
+        }.get(device.type, "gloo")
         dist.init_process_group(
             backend=backend,
             timeout=timedelta(
@@ -520,10 +553,44 @@ def token_type_debug(token_types: torch.Tensor, image_tokens_per_img: int) -> di
 def distributed_barrier(distributed: bool, device: torch.device):
     if not distributed or not (dist.is_available() and dist.is_initialized()):
         return
-    if device.type == "cuda":
+    if device.type in {"cuda", "npu"}:
         dist.barrier(device_ids=[int(device.index or 0)])
     else:
         dist.barrier()
+
+
+def synchronize_device(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    elif device.type == "npu":
+        torch.npu.synchronize(device)
+
+
+def reset_peak_memory_stats(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    elif device.type == "npu":
+        torch.npu.reset_peak_memory_stats(device)
+
+
+def max_memory_allocated_mib(device: torch.device) -> float:
+    if device.type == "cuda":
+        value = torch.cuda.max_memory_allocated(device)
+    elif device.type == "npu":
+        value = torch.npu.max_memory_allocated(device)
+    else:
+        value = 0
+    return float(value) / (1024.0**2)
+
+
+def max_memory_reserved_mib(device: torch.device) -> float:
+    if device.type == "cuda":
+        value = torch.cuda.max_memory_reserved(device)
+    elif device.type == "npu":
+        value = torch.npu.max_memory_reserved(device)
+    else:
+        value = 0
+    return float(value) / (1024.0**2)
 
 
 def is_main_process(rank: int) -> bool:
@@ -763,10 +830,14 @@ def feature_moments_from_state(state, *, device: torch.device):
         return None
     return FeatureMoments(
         count=torch.as_tensor(state["count"], dtype=torch.long, device=device),
-        sum=torch.as_tensor(state["sum"], dtype=torch.float64, device=device),
+        sum=torch.as_tensor(
+            state["sum"],
+            dtype=metric_accumulation_dtype(device),
+            device=device,
+        ),
         outer_sum=torch.as_tensor(
             state["outer_sum"],
-            dtype=torch.float64,
+            dtype=metric_accumulation_dtype(device),
             device=device,
         ),
     )
@@ -791,12 +862,12 @@ def inception_score_moments_from_state(state, *, device: torch.device):
         count=torch.as_tensor(state["count"], dtype=torch.long, device=device),
         probability_sum=torch.as_tensor(
             state["probability_sum"],
-            dtype=torch.float64,
+            dtype=metric_accumulation_dtype(device),
             device=device,
         ),
         probability_log_probability_sum=torch.as_tensor(
             state["probability_log_probability_sum"],
-            dtype=torch.float64,
+            dtype=metric_accumulation_dtype(device),
             device=device,
         ),
     )
@@ -825,7 +896,7 @@ def evaluation_metrics_state(metrics: Mapping) -> dict[str, object]:
                 state["flow_content_cache_peak_bytes_per_sample"]
             ),
             "backbone_kv_cache_peak_bytes": float(
-                state["backbone_kv_cache_peak_bytes"]
+                state.get("backbone_kv_cache_peak_bytes", 0.0)
             ),
             "flow_cfg_cache_divergence_sum": (
                 None
@@ -875,7 +946,7 @@ def evaluation_metrics_from_state(
                 item["flow_content_cache_peak_bytes_per_sample"]
             ),
             "backbone_kv_cache_peak_bytes": float(
-                item["backbone_kv_cache_peak_bytes"]
+                item.get("backbone_kv_cache_peak_bytes", 0.0)
             ),
             "flow_cfg_cache_divergence_sum": (
                 None
@@ -1051,7 +1122,11 @@ def emit_evaluation_progress(
 
 
 def reduce_sum(value: float, device: torch.device) -> float:
-    tensor = torch.tensor(float(value), device=device, dtype=torch.float64)
+    tensor = torch.tensor(
+        float(value),
+        device=device,
+        dtype=metric_accumulation_dtype(device),
+    )
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
     return float(tensor.item())
@@ -1059,7 +1134,11 @@ def reduce_sum(value: float, device: torch.device) -> float:
 
 def reduce_max(value: float | None, device: torch.device) -> float | None:
     raw_value = -float("inf") if value is None else float(value)
-    tensor = torch.tensor(raw_value, device=device, dtype=torch.float64)
+    tensor = torch.tensor(
+        raw_value,
+        device=device,
+        dtype=metric_accumulation_dtype(device),
+    )
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(tensor, op=dist.ReduceOp.MAX)
     reduced = float(tensor.item())
@@ -1705,9 +1784,14 @@ def main():
             )
 
     inception_weights_path = resolve_inception_weights_path(args.inception_weights_path)
-    real_stats_path = str(
-        args.real_stats_path
-        or config.get("evaluation", {}).get("real_stats_path", "")
+    requested_real_stats_path = str(args.real_stats_path).strip()
+    real_stats_path = (
+        ""
+        if requested_real_stats_path.lower() in {"none", "null"}
+        else str(
+            requested_real_stats_path
+            or config.get("evaluation", {}).get("real_stats_path", "")
+        )
     )
     shared_real_payload = None
     if real_stats_path:
@@ -1808,8 +1892,7 @@ def main():
         if shared_real_payload is not None
         else FeatureMoments.zeros(int(args.fid_feature), device)
     )
-    if device.type == "cuda":
-        torch.cuda.reset_peak_memory_stats(device)
+    reset_peak_memory_stats(device)
 
     generated = 0
     seen_complete_spans = 0
@@ -1954,16 +2037,8 @@ def main():
             != 0
         ):
             return
-        current_allocated_mib = (
-            float(torch.cuda.max_memory_allocated(device)) / (1024.0**2)
-            if device.type == "cuda"
-            else 0.0
-        )
-        current_reserved_mib = (
-            float(torch.cuda.max_memory_reserved(device)) / (1024.0**2)
-            if device.type == "cuda"
-            else 0.0
-        )
+        current_allocated_mib = max_memory_allocated_mib(device)
+        current_reserved_mib = max_memory_reserved_mib(device)
         save_evaluation_resume_checkpoint(
             out_dir,
             contract=resume_contract,
@@ -2152,8 +2227,7 @@ def main():
 
         for strategy_idx, strategy in enumerate(strategies):
             torch.manual_seed(int(args.seed) + batch_idx * 1009 + strategy_idx * 131071 + rank * 1_000_003)
-            if device.type == "cuda":
-                torch.cuda.synchronize(device)
+            synchronize_device(device)
             generation_started = time.perf_counter()
             single_latents, trace = model.sample_image_latents_single_stream(
                 input_ids=input_ids,
@@ -2181,8 +2255,7 @@ def main():
                 batch_idx=batch_idx,
                 global_indices=selected_global_indices,
             )
-            if device.type == "cuda":
-                torch.cuda.synchronize(device)
+            synchronize_device(device)
             generation_elapsed = time.perf_counter() - generation_started
             decoded_generated_images = decode_latents_in_microbatches(
                 vae,
@@ -2371,26 +2444,24 @@ def main():
             else real_moments
         )
         real_mean, real_cov = real_reference_moments.mean_cov()
-    peak_cuda_allocated_mib = reduce_max(
+    peak_device_allocated_mib = reduce_max(
         (
             max(
                 restored_cuda_peak_allocated_mib,
-                float(torch.cuda.max_memory_allocated(device))
-                / (1024.0**2),
+                max_memory_allocated_mib(device),
             )
-            if device.type == "cuda"
+            if device.type in {"cuda", "npu"}
             else None
         ),
         device,
     )
-    peak_cuda_reserved_mib = reduce_max(
+    peak_device_reserved_mib = reduce_max(
         (
             max(
                 restored_cuda_peak_reserved_mib,
-                float(torch.cuda.max_memory_reserved(device))
-                / (1024.0**2),
+                max_memory_reserved_mib(device),
             )
-            if device.type == "cuda"
+            if device.type in {"cuda", "npu"}
             else None
         ),
         device,
@@ -2503,6 +2574,9 @@ def main():
             ),
             "cudnn_allow_tf32": bool(torch.backends.cudnn.allow_tf32),
             "float32_matmul_precision": torch.get_float32_matmul_precision(),
+            "metric_accumulation_dtype": str(
+                metric_accumulation_dtype(device)
+            ),
         },
         "adapter": adapter_report,
         "model_state": model_state_report,
@@ -2520,8 +2594,24 @@ def main():
             "batch_size_global": int(args.batch_size),
             "batch_size_per_rank": int(local_batch_size),
             "dataloader_sharding": "pre_collation_global_stride",
-            "peak_cuda_allocated_mib": peak_cuda_allocated_mib,
-            "peak_cuda_reserved_mib": peak_cuda_reserved_mib,
+            "device_type": str(device.type),
+            "distributed_backend": (
+                dist.get_backend()
+                if dist.is_available() and dist.is_initialized()
+                else None
+            ),
+            "peak_device_allocated_mib": peak_device_allocated_mib,
+            "peak_device_reserved_mib": peak_device_reserved_mib,
+            "peak_cuda_allocated_mib": (
+                peak_device_allocated_mib
+                if device.type == "cuda"
+                else None
+            ),
+            "peak_cuda_reserved_mib": (
+                peak_device_reserved_mib
+                if device.type == "cuda"
+                else None
+            ),
         },
         "real_source": (
             "cached_original_imagenet"

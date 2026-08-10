@@ -19,6 +19,8 @@ EXPECTED_HASHES = {
     "vae_checkpoint": "34ce001bcfffb7af67ec8af1e683a30d7bd45760855ddc7deedc1330f2cfd38f",
     "membership": "6c6fc84e6ec9cb8b92421659d44abbb24d1cc34558213d9fb9db7e4ec44f1c3a",
     "split": "02e5c67c058f95bcca46c82f3c1fc81086f61dcec62ce25049843f09d930a5ba",
+    "inception_weights": "6726825d0af5f729cebd5821db510b11b1cfad8faad88a03f1befd49fb9129b2",
+    "fid_real_stats": "917e4d6af770d91118e592d9aa71ed082025b52ea3236fd2a3c858607e87e232",
 }
 POSTERIOR_FORMAT = "imagenet_kl16_scaled_posterior_v1"
 POSTERIOR_LAYOUT = "scaled_mean_then_scaled_std"
@@ -177,6 +179,61 @@ def validate_cache(
     return metadata
 
 
+def validate_fid_real_stats(path: Path) -> dict:
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    stats = payload.get("stats", {})
+    count = int(stats.get("count", -1))
+    feature_sum = stats.get("sum")
+    outer_sum = stats.get("outer_sum")
+    if count != 10_000:
+        raise RuntimeError(f"FID real-stat count mismatch: {count}")
+    if (
+        not torch.is_tensor(feature_sum)
+        or tuple(feature_sum.shape) != (2048,)
+        or feature_sum.dtype != torch.float32
+        or not bool(torch.isfinite(feature_sum).all())
+    ):
+        raise RuntimeError("FID real-stat feature sum contract failed")
+    if (
+        not torch.is_tensor(outer_sum)
+        or tuple(outer_sum.shape) != (2048, 2048)
+        or outer_sum.dtype != torch.float32
+        or not bool(torch.isfinite(outer_sum).all())
+    ):
+        raise RuntimeError("FID real-stat outer sum contract failed")
+    metadata = payload.get("metadata", {})
+    source = metadata.get("source", {})
+    feature = metadata.get("feature", {})
+    expected = {
+        "classes": (source.get("classes"), 100),
+        "samples_per_class": (source.get("samples_per_class"), 100),
+        "manifest_sha256": (
+            source.get("manifest_sha256"),
+            EXPECTED_HASHES["membership"],
+        ),
+        "split_manifest_sha256": (
+            source.get("split_manifest_sha256"),
+            EXPECTED_HASHES["split"],
+        ),
+        "feature": (feature.get("feature"), 2048),
+        "weights_sha256": (
+            feature.get("weights_sha256"),
+            EXPECTED_HASHES["inception_weights"],
+        ),
+        "accumulation_dtype": (
+            feature.get("accumulation_dtype"),
+            "torch.float32",
+        ),
+    }
+    for field, (actual, required) in expected.items():
+        if actual != required:
+            raise RuntimeError(
+                f"FID real-stat metadata {field} mismatch: "
+                f"{actual!r} != {required!r}"
+            )
+    return metadata
+
+
 def validate_config(config, world_size: int, split_counts: Counter) -> dict:
     params = config.dataset.params
     required_values = {
@@ -202,6 +259,25 @@ def validate_config(config, world_size: int, split_counts: Counter) -> dict:
         "val_every": (int(config.experiment.val_every), 2240),
         "backbone_lr": (float(config.optimizer.params.backbone_learning_rate), 4e-5),
         "flow_lr": (float(config.optimizer.params.flow_learning_rate), 1e-4),
+        "evaluation_samples": (int(config.evaluation.samples), 10_000),
+        "evaluation_batch_size": (int(config.evaluation.batch_size), 256),
+        "evaluation_batch_size_per_npu": (
+            int(config.evaluation.batch_size_per_npu),
+            16,
+        ),
+        "evaluation_sampling_steps": (
+            int(config.evaluation.sampling_steps),
+            100,
+        ),
+        "evaluation_cfg": (float(config.evaluation.cfg), 3.5),
+        "evaluation_flow_solver": (
+            str(config.evaluation.flow_solver),
+            "heun",
+        ),
+        "evaluation_parallel_rate": (
+            int(config.evaluation.parallel_rate),
+            1,
+        ),
     }
     for label, (actual, expected) in required_values.items():
         if actual != expected:
@@ -269,6 +345,10 @@ def main() -> None:
     membership_path = Path(config.dataset.params.manifest_jsonl)
     split_path = Path(config.dataset.params.split_manifest_jsonl)
     cache_path = Path(config.dataset.params.cache_path)
+    inception_weights_path = Path(
+        "output/cache/inception/weights-inception-2015-12-05-6726825d.pth"
+    )
+    fid_real_stats_path = Path(config.evaluation.real_stats_path)
 
     hashes = {
         "qwen_weights": require_hash(
@@ -296,6 +376,16 @@ def main() -> None:
             EXPECTED_HASHES["split"],
             "ImageNet-100 split",
         ),
+        "inception_weights": require_hash(
+            inception_weights_path,
+            EXPECTED_HASHES["inception_weights"],
+            "torch-fidelity Inception weights",
+        ),
+        "fid_real_stats": require_hash(
+            fid_real_stats_path,
+            EXPECTED_HASHES["fid_real_stats"],
+            "ImageNet-100 FID real-stat cache",
+        ),
     }
     for filename in (
         "config.json",
@@ -315,6 +405,7 @@ def main() -> None:
         membership,
         scan_values=not args.skip_cache_value_scan,
     )
+    fid_real_stats_metadata = validate_fid_real_stats(fid_real_stats_path)
     training = validate_config(config, args.world_size, split_counts)
 
     hardware = None
@@ -347,6 +438,12 @@ def main() -> None:
             "sha256": sha256_file(cache_path),
             "format": cache_metadata["format"],
             "stats_layout": cache_metadata["stats_layout"],
+        },
+        "fid_real_stats": {
+            "path": str(fid_real_stats_path),
+            "sha256": hashes["fid_real_stats"],
+            "count": 10_000,
+            "feature": fid_real_stats_metadata["feature"],
         },
         "training": training,
         "hardware": hardware,

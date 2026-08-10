@@ -29,8 +29,22 @@ def build_inception_extractor(
     return extractor.to(device).eval()
 
 
+def metric_accumulation_dtype(device):
+    """Choose a distributed-reduction dtype supported by the accelerator."""
+    import torch
+
+    # HCCL does not implement float64 all-reduce. Accumulate and reduce the
+    # sufficient statistics in fp32 on Ascend, then convert the resulting
+    # means/covariances to CPU float64 in ``frechet_distance`` below.
+    return (
+        torch.float32
+        if torch.device(device).type == "npu"
+        else torch.float64
+    )
+
+
 def extract_inception_features(extractor, images):
-    """Return float64 FID features and unbiased logits."""
+    """Return FID features and unbiased logits in a reducible dtype."""
     import torch
 
     uint8_images = (
@@ -63,9 +77,10 @@ def extract_inception_features(extractor, images):
             "Inception extractor did not return features and "
             "logits_unbiased."
         )
+    dtype = metric_accumulation_dtype(feature.device)
     return (
-        feature.reshape(feature.shape[0], -1).double(),
-        logits.reshape(logits.shape[0], -1).double(),
+        feature.reshape(feature.shape[0], -1).to(dtype=dtype),
+        logits.reshape(logits.shape[0], -1).to(dtype=dtype),
     )
 
 
@@ -79,17 +94,19 @@ class FeatureMoments:
     def zeros(cls, dimension: int, device):
         import torch
 
+        dtype = metric_accumulation_dtype(device)
+
         return cls(
             count=torch.zeros((), dtype=torch.long, device=device),
             sum=torch.zeros(
                 int(dimension),
-                dtype=torch.float64,
+                dtype=dtype,
                 device=device,
             ),
             outer_sum=torch.zeros(
                 int(dimension),
                 int(dimension),
-                dtype=torch.float64,
+                dtype=dtype,
                 device=device,
             ),
         )
@@ -136,6 +153,8 @@ class InceptionScoreMoments:
     def zeros(cls, splits: int, classes: int, device):
         import torch
 
+        dtype = metric_accumulation_dtype(device)
+
         return cls(
             count=torch.zeros(
                 int(splits),
@@ -145,12 +164,12 @@ class InceptionScoreMoments:
             probability_sum=torch.zeros(
                 int(splits),
                 int(classes),
-                dtype=torch.float64,
+                dtype=dtype,
                 device=device,
             ),
             probability_log_probability_sum=torch.zeros(
                 int(splits),
-                dtype=torch.float64,
+                dtype=dtype,
                 device=device,
             ),
         )
@@ -163,7 +182,10 @@ class InceptionScoreMoments:
     ) -> None:
         import torch
 
-        probabilities = logits.double().softmax(dim=-1)
+        probabilities = logits.to(
+            device=self.probability_sum.device,
+            dtype=self.probability_sum.dtype,
+        ).softmax(dim=-1)
         indices = torch.as_tensor(
             global_indices,
             device=logits.device,

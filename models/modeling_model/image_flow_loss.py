@@ -378,20 +378,35 @@ class ContextualFlowBlock(nn.Module):
                 layer_cache.get("context_positions"),
                 input_layout=input_layout,
             )
-        # npu_fusion_attention 的 mask 语义是 True=disallow，与 SDPA(allow) 相反。
-        # 全部允许时 atten_mask=None 走全连接 kernel（已验证与 SDPA 数值一致）。
-        # atten_mask 需 [B,1|H,Q,KV] 四维。
-        # 无 sync 版本：始终传 mask，避免 bool(safe_mask.all()) 的 device→host sync。
-        out = torch_npu.npu_fusion_attention(
-            q,
-            k,
-            v,
-            head_num=self.num_heads,
-            input_layout=input_layout,
-            atten_mask=npu_atten_mask,
-            sparse_mode=0,
-            scale=self.scale,
-        )[0]
+        if q.device.type == "npu":
+            # npu_fusion_attention mask semantics are True=disallow. Always
+            # passing the prepared mask avoids a device-to-host sync.
+            out = torch_npu.npu_fusion_attention(
+                q,
+                k,
+                v,
+                head_num=self.num_heads,
+                input_layout=input_layout,
+                atten_mask=npu_atten_mask,
+                sparse_mode=0,
+                scale=self.scale,
+            )[0]
+        else:
+            q_sdpa = q.transpose(1, 2) if input_layout == "BSND" else q
+            k_sdpa = k.transpose(1, 2) if input_layout == "BSND" else k
+            v_sdpa = v.transpose(1, 2) if input_layout == "BSND" else v
+            safe_mask = context_mask | (~has_context).unsqueeze(-1)
+            out = F.scaled_dot_product_attention(
+                q_sdpa,
+                k_sdpa,
+                v_sdpa,
+                attn_mask=safe_mask.unsqueeze(1),
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=False,
+                scale=self.scale,
+            )
+            if input_layout == "BSND":
+                out = out.transpose(1, 2)
         if input_layout == "BSND":
             out = out * has_context[:, :, None, None].to(dtype=out.dtype)
         else:

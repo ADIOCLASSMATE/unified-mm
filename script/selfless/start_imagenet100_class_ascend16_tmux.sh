@@ -30,6 +30,7 @@ fi
 WANDB_MODE="${WANDB_MODE:-offline}"
 ASCEND_AUDIT_ROOT="${ASCEND_AUDIT_ROOT:-/inspire/sj-ssd3/project/high-dimensionaldata/wanjiaxin-253108030048/npu-parity-audit}"
 FINAL_ACCEPTANCE_JSON="${FINAL_ACCEPTANCE_JSON:-${ASCEND_AUDIT_ROOT}/ASCEND_TRAINING_FINAL_ACCEPTANCE.json}"
+EVALUATION_ACCEPTANCE_JSON="${EVALUATION_ACCEPTANCE_JSON:-${ASCEND_AUDIT_ROOT}/ASCEND_EVALUATION_FINAL_ACCEPTANCE.json}"
 export HCCL_INTRA_ROCE_ENABLE="${HCCL_INTRA_ROCE_ENABLE:-1}"
 
 for pair in \
@@ -121,7 +122,15 @@ FINAL_VALIDATION=(
   --output_json "${FINAL_ACCEPTANCE_JSON}"
 )
 printf -v validation_command '%q ' "${FINAL_VALIDATION[@]}"
-tmux_workflow_command="set -o pipefail; ${tmux_command} && ${validation_command} 2>&1 | tee $(printf '%q' "${FORMAL_GATE_DIR}/final_acceptance.log")"
+FINAL_EVALUATION=(
+  env
+  CHECKPOINT="output/${RUN_PROJECT}/hf_model-final-ema"
+  OUTPUT_DIR="output/${RUN_PROJECT}-fid-is"
+  EVALUATION_ACCEPTANCE_JSON="${EVALUATION_ACCEPTANCE_JSON}"
+  bash script/selfless/evaluate_imagenet100_class_fid_is_ascend_16npu.sh
+)
+printf -v evaluation_command '%q ' "${FINAL_EVALUATION[@]}"
+tmux_workflow_command="set -o pipefail; ${tmux_command} && ${validation_command} 2>&1 | tee $(printf '%q' "${FORMAL_GATE_DIR}/final_acceptance.log") && ${evaluation_command} 2>&1 | tee $(printf '%q' "${FORMAL_GATE_DIR}/final_evaluation.log")"
 printf '%s\n' "${tmux_workflow_command}" >"${FORMAL_GATE_DIR}/tmux_launch_command.sh"
 printf '%s\n' "${SESSION_NAME}" >"${FORMAL_GATE_DIR}/tmux_session.txt"
 printf '%s\n' "${TMUX_SOCKET_NAME}" >"${FORMAL_GATE_DIR}/tmux_socket_name.txt"
@@ -143,3 +152,5 @@ else
 fi
 echo "Training log: output/${RUN_PROJECT}/${training_audit_dir}/training.log"
 echo "Final acceptance JSON: ${FINAL_ACCEPTANCE_JSON}"
+echo "Formal evaluation output: output/${RUN_PROJECT}-fid-is/metrics.json"
+echo "Evaluation acceptance JSON: ${EVALUATION_ACCEPTANCE_JSON}"

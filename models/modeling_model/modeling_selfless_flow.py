@@ -27,6 +27,11 @@ import torch
 import torch_npu
 from torch import nn
 from torch.nn import functional as F
+from torch.nn.attention.flex_attention import (
+    BlockMask,
+    create_block_mask,
+    flex_attention,
+)
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
@@ -369,13 +374,36 @@ def _to_bool_atten_mask(attention_mask) -> tuple[torch.Tensor, torch.Tensor]:
     return mask, ~row_all
 
 
+def _fill_invalid_token_types(
+    token_types: torch.Tensor,
+    valid_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Replace invalid token types without uint8 ``masked_fill`` on Ascend."""
+    return torch.where(
+        valid_mask,
+        token_types,
+        torch.full_like(token_types, 3),
+    )
+
+
 def compiled_flex_attention(query, key, value, attention_mask, scaling, enable_gqa):
-    """NPU 原生融合注意力（训练路径）——替代 GPU 的 compiled flex_attention。
+    """Dispatch attention to fused NPU or reference flex-attention kernels.
 
     attention_mask: dense bool/additive mask，形状 [B, 1|H, Q_LEN, KV_LEN]，
     True 或 -inf 表示禁止 attend（与 flex_attention BlockMask 语义相反，已在
     get_selfless_mask 侧转换好）。
     """
+    if query.device.type != "npu":
+        return flex_attention(
+            query=query,
+            key=key,
+            value=value,
+            block_mask=attention_mask,
+            scale=scaling,
+            enable_gqa=enable_gqa,
+            return_lse=False,
+        )
+
     # npu_fusion_attention 原生支持 Nq/Nkv 为正整数的 GQA；保留紧凑 KV heads，
     # 避免 repeat_interleave 的额外显存、带宽和反向归并开销。
     if isinstance(attention_mask, tuple):
@@ -1365,7 +1393,8 @@ class Qwen3Model(Qwen3PreTrainedModel):
         # call repeated all/clone/index operations 56 times per microbatch on
         # the 28-layer training path.  Keep the safe mask and fully-masked-row
         # indicator device-resident and reuse them across all layers/streams.
-        attention_mask = _to_bool_atten_mask(attention_mask)
+        if isinstance(attention_mask, torch.Tensor):
+            attention_mask = _to_bool_atten_mask(attention_mask)
 
         debug_finite_backbone = bool(kwargs.get("debug_finite_backbone", False))
         debug_backbone_label = str(kwargs.get("debug_backbone_label", ""))
@@ -2312,11 +2341,10 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             query_valid: torch.Tensor,
             *,
             image_uncond: bool,
-        ) -> torch.Tensor:
+        ) -> torch.Tensor | BlockMask:
             query_sigma = query_sigma.to(device=device, dtype=torch.float32)
             query_valid = query_valid.to(device=device, dtype=torch.bool)
 
-            # dense bool mask (True = disallow) for npu_fusion_attention
             allowed = (
                 query_valid.unsqueeze(-1)
                 & backbone_key_valid.unsqueeze(1)
@@ -2324,7 +2352,21 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             )
             if image_uncond:
                 allowed = allowed & backbone_key_is_image.unsqueeze(1)
-            return (~allowed).unsqueeze(1)  # [B, 1, Q_LEN, KV_LEN]
+            if device.type == "npu":
+                return (~allowed).unsqueeze(1)  # True = disallow
+
+            def mask_mod(b, h, q_idx, kv_idx):
+                del h
+                return allowed[b, q_idx, kv_idx]
+
+            return create_block_mask(
+                mask_mod,
+                B=len(spans),
+                H=None,
+                Q_LEN=query_sigma.shape[1],
+                KV_LEN=backbone_max_cache_len,
+                device=device,
+            )
 
         def _next_backbone_query_positions() -> torch.Tensor:
             positions = []
@@ -2523,9 +2565,10 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             context_input_ids = torch.gather(
                 selected_input_ids, 1, context_indices
             )
-            context_token_types = torch.gather(
-                selected_token_types, 1, context_indices
-            ).masked_fill(~context_valid, 3)
+            context_token_types = _fill_invalid_token_types(
+                torch.gather(selected_token_types, 1, context_indices),
+                context_valid,
+            )
             context_query_sigma = context_sigma.masked_fill(
                 ~context_valid, torch.inf
             )

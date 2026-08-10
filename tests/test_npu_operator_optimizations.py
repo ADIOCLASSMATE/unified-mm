@@ -133,6 +133,119 @@ def _check_prepared_attention_mask(device: torch.device) -> None:
             )
 
 
+def _check_uint8_token_type_fill(device: torch.device) -> None:
+    from models.modeling_model.modeling_selfless_flow import (
+        _fill_invalid_token_types,
+    )
+
+    token_types = torch.tensor(
+        [[0, 2, 1], [0, 3, 1]],
+        device=device,
+        dtype=torch.uint8,
+    )
+    valid_mask = torch.tensor(
+        [[True, False, True], [False, True, False]],
+        device=device,
+        dtype=torch.bool,
+    )
+    actual = _fill_invalid_token_types(token_types, valid_mask)
+    expected = torch.tensor(
+        [[0, 3, 1], [3, 3, 3]],
+        device=device,
+        dtype=torch.uint8,
+    )
+    torch.npu.synchronize()
+    if actual.dtype != torch.uint8 or not torch.equal(actual, expected):
+        raise AssertionError(
+            "uint8 token-type fill mismatch: "
+            f"dtype={actual.dtype}, actual={actual.cpu().tolist()}"
+        )
+
+
+@torch.no_grad()
+def _check_single_stream_uint8_cache(device: torch.device) -> None:
+    from transformers import Qwen3Config
+
+    from models.modeling_model.modeling_selfless_flow import Qwen3ForCausalLM
+
+    config = Qwen3Config(
+        vocab_size=32,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        max_position_embeddings=64,
+        pad_token_id=0,
+        bos_token_id=1,
+        eos_token_id=9,
+    )
+    config.mask_token_id = 7
+    config.image_mask_token_id = 8
+    config.boi_token_id = 11
+    config.eoi_token_id = 12
+    config.image_latent_dim = 4
+    config.image_tokens_per_img = 4
+    config.image_flow_width = 32
+    config.image_flow_depth = 1
+    config.image_flow_num_sampling_steps = "1"
+    config.image_flow_batch_mul = 1
+    config.image_flow_time_scale = 1000.0
+    config.image_flow_time_sampling = "uniform"
+    config.image_flow_time_eps = 1.0e-4
+    config.image_flow_time_uniform_mix = 0.0
+    config.image_flow_solver = "euler"
+    config.image_uncond_prob = 0.0
+    config.use_flex_attention = True
+    model = Qwen3ForCausalLM(config).eval().to(
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    input_ids = torch.tensor(
+        [[3, 11, 8, 8, 8, 8, 12, 9], [4, 5, 11, 8, 8, 8, 8, 12]],
+        device=device,
+    )
+    token_types = torch.tensor(
+        [[0, 2, 1, 1, 1, 1, 2, 0], [0, 0, 2, 1, 1, 1, 1, 2]],
+        device=device,
+        dtype=torch.uint8,
+    )
+    sigma = torch.tensor(
+        [[0.0, 1.0, 4.0, 5.0, 6.0, 7.0, 2.0, 3.0],
+         [0.0, 1.0, 2.0, 5.0, 6.0, 7.0, 8.0, 3.0]],
+        device=device,
+    )
+    initial_noise = (
+        torch.arange(32, device=device, dtype=torch.float32).reshape(2, 4, 4)
+        / 17.0
+    )
+    latents, trace = model.sample_image_latents_single_stream(
+        input_ids=input_ids,
+        token_types=token_types,
+        sigma=sigma,
+        spans=[(0, 2, 6), (1, 3, 7)],
+        initial_noise_bank=initial_noise,
+        flow_temperature=0.7,
+        flow_cfg=2.5,
+        flow_cfg_schedule="constant",
+        flow_solver="euler",
+        flow_num_steps=1,
+        parallel_rate=1,
+        order_strategy="spatial_halton",
+        use_backbone_cache=True,
+        return_trace=True,
+    )
+    torch.npu.synchronize()
+    if latents.shape != (2, 4, 2, 2) or not bool(torch.isfinite(latents).all()):
+        raise AssertionError(
+            "NPU single-stream cache returned invalid latents: "
+            f"shape={tuple(latents.shape)}"
+        )
+    if trace["backbone_kv_cache_enabled"] is not True:
+        raise AssertionError(f"NPU single-stream cache was disabled: {trace}")
+
+
 def _check_flow_attention_layout(device: torch.device) -> None:
     batch, seq_len, heads, head_dim = 2, 32, 8, 16
     scale = 1.0 / math.sqrt(head_dim)
@@ -294,10 +407,15 @@ def main() -> None:
     device = torch.device("npu:0")
     _check_native_gqa(device)
     _check_prepared_attention_mask(device)
+    _check_uint8_token_type_fill(device)
+    _check_single_stream_uint8_cache(device)
     _check_flow_attention_layout(device)
     _check_prepared_flow_mask(device)
     _check_span_gather(device)
-    print("PASS native_gqa prepared_mask flow_bsnd prepared_flow_mask span_gather")
+    print(
+        "PASS native_gqa prepared_mask uint8_token_type_fill "
+        "single_stream_cache flow_bsnd prepared_flow_mask span_gather"
+    )
 
 
 if __name__ == "__main__":

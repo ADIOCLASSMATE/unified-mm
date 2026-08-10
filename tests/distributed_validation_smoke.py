@@ -78,6 +78,10 @@ class _DistributedAccelerator:
 
     @staticmethod
     def reduce(value, reduction="sum"):
+        if value.dtype == torch.float64:
+            raise AssertionError(
+                "distributed validation metrics must not use float64 reductions"
+            )
         result = value.clone()
         dist.all_reduce(result, op=dist.ReduceOp.SUM)
         if reduction == "mean":

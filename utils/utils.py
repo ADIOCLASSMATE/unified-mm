@@ -7,6 +7,7 @@ import sys
 import torch
 from omegaconf import DictConfig, ListConfig, OmegaConf
 from typing import Any, List, Tuple
+from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 from transformers import AutoConfig, AutoTokenizer
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -350,7 +351,7 @@ def get_selfless_mask(
     image_uncond_rows: torch.Tensor | None = None,
     segment_ids: torch.Tensor | None = None,
     image_uncond_mask: torch.Tensor | None = None,
-) -> torch.Tensor:
+) -> torch.Tensor | BlockMask:
     """
     Selfless Attention mask — removes the diagonal (self-attention) from both streams.
 
@@ -363,8 +364,7 @@ def get_selfless_mask(
         seq_len: Sequence length
 
     Returns:
-        Dense bool mask for npu_fusion_attention, shape [B, 1, seq_len, seq_len].
-        True = disallow attention (与 GPU BlockMask 的 allowed 语义相反)。
+        A dense disallow mask on NPU, or a BlockMask on CPU/CUDA.
     """
 
     B = sigma.shape[0]
@@ -423,7 +423,9 @@ def get_selfless_mask(
                 dim=1,
             )
 
-    # 向量化构造 dense bool mask（True = disallow），替代 create_block_mask
+    # Build the visibility truth table once. Ascend consumes its dense inverse
+    # directly, while CPU/CUDA reference paths retain the BlockMask contract
+    # expected by torch flex_attention and the architecture tests.
     S_q = sigma.unsqueeze(-1)    # [B, S, 1]
     S_kv = sigma.unsqueeze(1)    # [B, 1, S]
     allowed = S_kv < S_q         # strict — no diagonal, no self-view
@@ -444,4 +446,18 @@ def get_selfless_mask(
             & (image_span_ids.unsqueeze(1) == image_span_ids.unsqueeze(-1))
         )
         allowed = allowed & (~q_is_uncond_image | kv_same_image_span)
-    return (~allowed).unsqueeze(1)  # [B, 1, S, S], True = disallow
+    if sigma.device.type == "npu":
+        return (~allowed).unsqueeze(1)  # [B, 1, S, S], True = disallow
+
+    def selfless_fn(b, h, q_idx, kv_idx):
+        del h
+        return allowed[b, q_idx, kv_idx]
+
+    return create_block_mask(
+        selfless_fn,
+        B=B,
+        H=None,
+        Q_LEN=seq_len,
+        KV_LEN=seq_len,
+        device=device,
+    )
