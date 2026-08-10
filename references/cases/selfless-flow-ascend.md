@@ -37,6 +37,9 @@ DeepSpeed ZeRO-2、HCCL 指标归约与确定性评测协议；全局 monkey pat
 - flow head 与 backbone attention 改为按实际 tensor device 分派：NPU 使用
   `npu_fusion_attention`，CPU/CUDA 参考路径使用 SDPA/BlockMask。
 - 新增 16-NPU 正式评测入口、10,000 张固定原图 real-stat 构建器与严格结果验收。
+- 训练 DataLoader 增加精确 epoch 采样预算：每 epoch 无放回抽取 114,688 张，
+  保证 16 rank × batch 16 × GA 2 的 224 个 optimizer step 全部为 global batch 512，
+  不再在 epoch 尾部同步半个梯度累积 step。
 - 移除会在 pytest 收集阶段直接调用外部模型 API 的旧实验文件 `test_api.py`。
 
 ### 依赖修复
@@ -51,7 +54,7 @@ torch-fidelity v0.2.0 release，SHA-256 为
 ### 测试套件
 
 ```text
-141 passed, 2 skipped, 4 warnings in 13.70s
+143 passed, 2 skipped, 4 warnings in 14.15s
 PASS native_gqa prepared_mask uint8_token_type_fill single_stream_cache flow_bsnd prepared_flow_mask span_gather
 PASS npu_fid_is_metrics world=16 backend=hccl dtype=torch.float32
 ```
@@ -62,6 +65,19 @@ PASS npu_fid_is_metrics world=16 backend=hccl dtype=torch.float32
 
 ```text
 [Validation] Step 1 | ImageFlow: 1.9670
+```
+
+### 16 卡精确 epoch gate
+
+真实模型、真实训练集与 HCCL 完成一个无保存的 224-step epoch：
+
+```text
+samples_per_epoch=114688
+prepared_microbatches_per_rank=448
+optimizer_steps_per_epoch=224
+global_step=224
+finite_loss_microbatches_checked=448
+train_samples_per_second=448.7751
 ```
 
 ### 16 卡端到端评测 gate
@@ -95,6 +111,11 @@ accumulation_dtype=torch.float32
 3. 旧迁移将 NPU 算子硬编码到 CPU 路径：按 `tensor.device.type` 分派，恢复参考测试。
 4. 配置中的 real-stat 路径无法显式关闭：支持 `--real_stats_path none`，仅供 smoke；
    正式入口仍强制冻结 cache。
+5. 原 DataLoader 的 115,000 张训练 split 在分片后产生每 rank 449 个微批；GA=2
+   使每个数据 epoch 的尾部更新只有 global batch 256。日志在 step
+   450/900/1350/... 出现精确半 loss，最终验收的 finite-microbatch 计数也会失败。
+   现按固定种子每 epoch 无放回抽取 114,688 张，并在 accelerator prepare 后强制
+   断言 448 microbatches/rank、224 steps/epoch、80 epochs 与 17,920 steps 完全一致。
 
 ## 待优化项
 

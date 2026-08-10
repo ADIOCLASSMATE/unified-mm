@@ -892,6 +892,57 @@ def main():
         val_dataloader = val_dataloader.prepare_with_accelerator(accelerator)
     else:
         model, optimizer, train_dataloader, val_dataloader, lr_scheduler = accelerator.prepare(model, optimizer, train_dataloader, val_dataloader, lr_scheduler)
+
+    epoch_sample_budget = config.training.get("samples_per_epoch", None)
+    if epoch_sample_budget is not None:
+        epoch_sample_budget = int(epoch_sample_budget)
+        prepared_microbatches = len(train_dataloader)
+        expected_microbatches = epoch_sample_budget // (
+            int(config.training.batch_size) * accelerator.num_processes
+        )
+        if prepared_microbatches != expected_microbatches:
+            raise RuntimeError(
+                "Prepared DataLoader violates the exact epoch sample budget: "
+                f"runtime_microbatches={prepared_microbatches}, "
+                f"expected_microbatches={expected_microbatches}, "
+                f"samples_per_epoch={epoch_sample_budget}"
+            )
+        accumulation_steps = accelerator.gradient_accumulation_steps
+        if prepared_microbatches % accumulation_steps:
+            raise RuntimeError(
+                "Prepared DataLoader would create a partial gradient-"
+                "accumulation step at the epoch boundary: "
+                f"microbatches={prepared_microbatches}, "
+                f"gradient_accumulation_steps={accumulation_steps}"
+            )
+        optimizer_steps_per_epoch = prepared_microbatches // accumulation_steps
+        configured_steps_per_epoch = int(
+            config.training.optimizer_steps_per_epoch
+        )
+        if optimizer_steps_per_epoch != configured_steps_per_epoch:
+            raise RuntimeError(
+                "Optimizer steps/epoch mismatch: "
+                f"runtime={optimizer_steps_per_epoch}, "
+                f"configured={configured_steps_per_epoch}"
+            )
+        num_train_epochs = int(config.training.num_train_epochs)
+        expected_training_steps = optimizer_steps_per_epoch * num_train_epochs
+        if int(config.training.max_train_steps) != expected_training_steps:
+            raise RuntimeError(
+                "Exact epoch contract does not match max_train_steps: "
+                f"{optimizer_steps_per_epoch} * {num_train_epochs} = "
+                f"{expected_training_steps}, configured="
+                f"{int(config.training.max_train_steps)}"
+            )
+        logger.info(
+            "Exact epoch contract: samples=%d, prepared_microbatches/rank=%d, "
+            "gradient_accumulation=%d, optimizer_steps/epoch=%d, epochs=%d",
+            epoch_sample_budget,
+            prepared_microbatches,
+            accumulation_steps,
+            optimizer_steps_per_epoch,
+            num_train_epochs,
+        )
     if ema_layout is not None:
         ema = RankShardedEMA(
             ema_layout,

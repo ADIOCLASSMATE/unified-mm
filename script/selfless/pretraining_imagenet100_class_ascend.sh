@@ -132,6 +132,7 @@ mkdir -p "${AUDIT_DIR}"
 git rev-parse HEAD >"${AUDIT_DIR}/git_commit.txt"
 git status --short >"${AUDIT_DIR}/git_status.txt"
 AUDIT_SOURCE_PATHS=(
+  pyproject.toml
   accelerate_configs/16_npus_deepspeed_zero2.yaml
   configs/selfless/imagenet100_class_base_80ep_ascend_16npu.yaml
   models/modeling_model/image_flow_loss.py
@@ -148,8 +149,10 @@ AUDIT_SOURCE_PATHS=(
   scripts/validate_ascend_imagenet100_assets.py
   scripts/validate_ascend_imagenet100_final_run.py
   scripts/validate_kl16_posterior_decode.py
+  tests/test_imagenet_flow_cache_epoch.py
   tests/test_npu_operator_optimizations.py
   tests/test_npu_runtime_primitives.py
+  utils/imagenet_flow_dataloaders.py
   utils/utils.py
   utils/selfless_training_runtime.py
 )

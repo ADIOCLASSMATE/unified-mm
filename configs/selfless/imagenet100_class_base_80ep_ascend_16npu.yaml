@@ -101,6 +101,12 @@ training:
     # rank fan out to 128 children and can starve the instance health service.
     # The loader deliberately omits prefetch_factor when this value is zero.
     dataloader_workers: 0
+    # Draw a new deterministic, no-replacement subset each epoch.  The budget
+    # is exactly 224 global batches, so every rank sees 448 microbatches and
+    # GA=2 never flushes a partial optimizer step at a DataLoader boundary.
+    samples_per_epoch: 114688
+    optimizer_steps_per_epoch: 224
+    num_train_epochs: 80
     max_train_steps: 17920
     max_grad_norm: 1.0
     use_gradient_checkpointing: false

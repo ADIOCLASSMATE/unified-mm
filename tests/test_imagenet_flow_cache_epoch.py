@@ -1,5 +1,7 @@
 import torch
-from torch.utils.data import DataLoader
+from accelerate.data_loader import BatchSamplerShard
+from omegaconf import OmegaConf
+from torch.utils.data import DataLoader, RandomSampler
 
 from utils.dataset_imagenet_flow_cache import (
     ImageNetFlowCacheDataset,
@@ -7,6 +9,7 @@ from utils.dataset_imagenet_flow_cache import (
     POSTERIOR_STATS_LAYOUT,
     collate_imagenet_flow_cache,
 )
+from utils.imagenet_flow_dataloaders import training_samples_per_epoch
 
 
 class _Tokenizer:
@@ -137,3 +140,61 @@ def test_training_reveal_order_changes_with_epoch(tmp_path):
     second = collate_imagenet_flow_cache([dataset[0]])
 
     assert not torch.equal(first["sigma"], second["sigma"])
+
+
+def test_exact_epoch_budget_has_no_partial_gradient_accumulation_step():
+    dataset = range(115_000)
+    config = OmegaConf.create(
+        {
+            "training": {
+                "total_batch_size": 512,
+                "samples_per_epoch": 114_688,
+            }
+        }
+    )
+    budget = training_samples_per_epoch(config, len(dataset))
+    sampler = RandomSampler(
+        dataset,
+        replacement=False,
+        num_samples=budget,
+        generator=torch.Generator().manual_seed(42),
+    )
+    loader = DataLoader(
+        dataset,
+        batch_size=16,
+        sampler=sampler,
+        drop_last=True,
+    )
+    rank_batches = BatchSamplerShard(
+        loader.batch_sampler,
+        num_processes=16,
+        process_index=0,
+        split_batches=False,
+        even_batches=True,
+    )
+
+    assert len(loader) == 7_168
+    assert len(rank_batches) == 448
+    assert len(rank_batches) % 2 == 0
+    assert len(rank_batches) // 2 == 224
+
+
+def test_unbounded_epoch_would_reproduce_the_partial_ga_tail():
+    dataset = range(115_000)
+    loader = DataLoader(
+        dataset,
+        batch_size=16,
+        shuffle=True,
+        drop_last=True,
+    )
+    rank_batches = BatchSamplerShard(
+        loader.batch_sampler,
+        num_processes=16,
+        process_index=0,
+        split_batches=False,
+        even_batches=True,
+    )
+
+    assert len(loader) == 7_187
+    assert len(rank_batches) == 449
+    assert len(rank_batches) % 2 == 1

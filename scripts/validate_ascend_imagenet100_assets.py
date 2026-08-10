@@ -252,6 +252,15 @@ def validate_config(config, world_size: int, split_counts: Counter) -> dict:
         "image_latent_dim": (int(config.model.image_latent_dim), 16),
         "image_flow_batch_mul": (int(config.model.image_flow_batch_mul), 4),
         "total_batch_size": (int(config.training.total_batch_size), 512),
+        "samples_per_epoch": (
+            int(config.training.samples_per_epoch),
+            114_688,
+        ),
+        "optimizer_steps_per_epoch": (
+            int(config.training.optimizer_steps_per_epoch),
+            224,
+        ),
+        "num_train_epochs": (int(config.training.num_train_epochs), 80),
         "max_train_steps": (int(config.training.max_train_steps), 17_920),
         "warmup_steps": (int(config.lr_scheduler.params.warmup_steps), 1000),
         "decay_steps": (int(config.lr_scheduler.params.decay_steps), 4480),
@@ -305,17 +314,40 @@ def validate_config(config, world_size: int, split_counts: Counter) -> dict:
             f"global batch {global_batch} is not divisible by {microbatch} * {world_size}"
         )
     accumulation = global_batch // global_microbatch
-    steps_per_epoch = split_counts["train"] // global_batch
+    samples_per_epoch = int(config.training.samples_per_epoch)
+    if samples_per_epoch > split_counts["train"]:
+        raise RuntimeError(
+            "samples/epoch exceeds the training split: "
+            f"{samples_per_epoch} > {split_counts['train']}"
+        )
+    if samples_per_epoch % global_batch:
+        raise RuntimeError(
+            "samples/epoch is not divisible by the global batch: "
+            f"{samples_per_epoch} % {global_batch} != 0"
+        )
+    steps_per_epoch = samples_per_epoch // global_batch
     if steps_per_epoch != 224:
         raise RuntimeError(f"optimizer steps/epoch mismatch: {steps_per_epoch}")
-    epochs = int(config.training.max_train_steps) // steps_per_epoch
+    if int(config.training.optimizer_steps_per_epoch) != steps_per_epoch:
+        raise RuntimeError(
+            "configured optimizer steps/epoch mismatch: "
+            f"{config.training.optimizer_steps_per_epoch} != {steps_per_epoch}"
+        )
+    epochs = int(config.training.num_train_epochs)
     if epochs != 80:
         raise RuntimeError(f"epoch count mismatch: {epochs}")
+    if int(config.training.max_train_steps) != steps_per_epoch * epochs:
+        raise RuntimeError(
+            "max optimizer steps does not equal the exact epoch contract: "
+            f"{config.training.max_train_steps} != {steps_per_epoch} * {epochs}"
+        )
     return {
         "world_size": world_size,
         "microbatch_per_rank": microbatch,
         "gradient_accumulation_steps": accumulation,
         "global_batch": global_batch,
+        "samples_per_epoch": samples_per_epoch,
+        "dropped_samples_per_epoch": split_counts["train"] - samples_per_epoch,
         "optimizer_steps_per_epoch": steps_per_epoch,
         "epochs": epochs,
         "max_optimizer_steps": int(config.training.max_train_steps),

@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Sequence
 
 import torch
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, RandomSampler, Subset
 
 from utils.imagenet_flow_batching import collate_imagenet_flow_cache
 from utils.multimodal_segment_packing import (
@@ -19,6 +19,31 @@ from utils.multimodal_segment_packing import (
 
 if TYPE_CHECKING:
     from utils.dataset_imagenet_flow_cache import ImageNetFlowCacheDataset
+
+
+def training_samples_per_epoch(config, dataset_size: int) -> int | None:
+    """Return the exact per-epoch sample budget for fixed global batches."""
+
+    configured = config.training.get("samples_per_epoch", None)
+    if configured is None:
+        return None
+    sample_budget = int(configured)
+    global_batch = int(config.training.total_batch_size)
+    if sample_budget <= 0:
+        raise ValueError(
+            f"training.samples_per_epoch must be positive, got {sample_budget}"
+        )
+    if sample_budget > int(dataset_size):
+        raise ValueError(
+            "training.samples_per_epoch cannot exceed the training split: "
+            f"{sample_budget} > {dataset_size}"
+        )
+    if sample_budget % global_batch:
+        raise ValueError(
+            "training.samples_per_epoch must be divisible by the global batch "
+            f"size: {sample_budget} % {global_batch} != 0"
+        )
+    return sample_budget
 
 
 def _split_key_for_index(
@@ -329,6 +354,20 @@ def build_imagenet_flow_cache_dataloaders(config, tokenizer):
     # Validation/generation keeps one logical sample per physical row.
     val_collate_fn = unpacked_collate_fn
     train_generator = build_training_data_generator(config)
+    epoch_sample_budget = training_samples_per_epoch(
+        config,
+        len(train_dataset),
+    )
+    train_sampler = (
+        RandomSampler(
+            train_dataset,
+            replacement=False,
+            num_samples=epoch_sample_budget,
+            generator=train_generator,
+        )
+        if epoch_sample_budget is not None
+        else None
+    )
     worker_count = int(config.training.dataloader_workers)
     worker_kwargs: dict[str, Any] = {}
     if worker_count > 0:
@@ -339,7 +378,8 @@ def build_imagenet_flow_cache_dataloaders(config, tokenizer):
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.training.batch_size,
-        shuffle=True,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
         num_workers=worker_count,
         pin_memory=True,
         drop_last=True,

@@ -261,6 +261,9 @@ def validate_logs(run_root: Path) -> dict:
         "DistributedType.DEEPSPEED  Backend: hccl",
         f"Num processes: {EXPECTED_WORLD_SIZE}",
         "'grad_accum_dtype': 'fp32'",
+        "Exact epoch contract: samples=114688, "
+        "prepared_microbatches/rank=448, gradient_accumulation=2, "
+        "optimizer_steps/epoch=224, epochs=80",
         f"Step: {EXPECTED_FINAL_STEP} | Loss:",
     )
     missing = [
