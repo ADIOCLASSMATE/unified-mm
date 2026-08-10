@@ -8,7 +8,7 @@
 | 类型 | ImageNet-100 类条件生成训练与 FID/IS 评测 |
 | 仓库 | unified-mm（本地工作区） |
 | 日期 | 2026-08-10 |
-| 状态 | 80 epoch 正式训练已完成并严格验收；10k/100-step 最终评测待完成 |
+| 状态 | 80 epoch 正式训练与 10k/100-step 最终评测均已完成并严格验收 |
 
 ## 环境信息
 
@@ -84,6 +84,23 @@ finite_loss_microbatches_checked=448
 train_samples_per_second=448.7751
 ```
 
+### 16 卡 80 epoch 正式训练
+
+正式训练固定为每卡 batch 16、梯度累积 2、global batch 512、DataLoader workers 0，
+完成 80 个精确 epoch 和 17,920 个 optimizer step。最终训练 checkpoint、EMA 与
+16 个 rank 的 optimizer/RNG 分片齐全，严格验收状态为 `ok`。
+
+```text
+samples_per_epoch=114688
+optimizer_steps_per_epoch=224
+epochs=80
+global_step=17920
+finite_loss_microbatches_checked=35840
+final_loss=0.6527
+train_samples_per_second=400.8510
+final_validation_image_flow=0.6733
+```
+
 ### 16 卡端到端评测 gate
 
 最终 EMA、每卡 256 样本、全局 batch 4096、CFG 3.5、Heun、真实 KL16 VAE
@@ -99,6 +116,26 @@ peak_device_reserved_mib=30668.0
 该 gate 使用正式训练后的 EMA 和 1 个采样步，只验证容量与基础设施，不作为模型
 质量指标。外部 HBM 观测稳定在约 32.7/65.5 GiB；正式协议仍固定为 10,000 样本、
 100 采样步。
+
+### 16 卡 100-step 最终评测
+
+最终评测使用 FP32 EMA checkpoint、模型 BF16、flow integrator/VAE/指标累加 FP32，
+固定每卡 batch 256、global batch 4096、CFG 3.5、100-step Heun、canonical noise
+pairing 与冻结的 10,000 张原图 real-stat。10000/10000 个样本完成，生成 latent
+有限率为 1.0，严格验收状态为 `ok`。
+
+```text
+FID=25.016273944757813
+Inception_Score=69.01506576538085 +/- 0.8990247253689196
+generation_samples_per_second=4.076489107832094
+generation_wall_seconds=2453.09130859375
+peak_device_allocated_mib=25521.693359375
+peak_device_reserved_mib=30674.0
+```
+
+完整指标位于
+`output/selfless-flow-im100-class-ascend16-b16ga2-b4e5-f1e4-fid-is/metrics.json`；
+最终训练与评测 acceptance JSON 均为 `status: ok`。
 
 ### Real-stat cache
 
@@ -127,7 +164,8 @@ accumulation_dtype=torch.float32
    Ascend 仍会累计多套编译/工作区缓存并把 HBM 推到 65 GiB。现统一为批量、固定
    256 长度的 K/V 与 mask，1-step 全批验收期间 HBM 不再随 token 数增长。
 
-## 待优化项
+## 最终结论
 
-- 正式评测完成后记录真实 100-step 吞吐、FID 与 Inception Score。
-- 正式评测固定使用已验收的每卡 256、全局 batch 4096，不再继续上探 batch。
+- 正式训练固定 DataLoader workers 0、global batch 512，已完成 80 epoch 严格验收。
+- 正式评测固定每卡 batch 256、global batch 4096，不再继续上探 batch。
+- 10k/100-step Heun FID/IS 已完成严格验收；训练、评测与进程清理均已闭环。
