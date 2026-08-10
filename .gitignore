@@ -2,6 +2,7 @@
 .sii/
 .claude/
 .venv/
+.venv-*/
 
 # Python and test caches
 __pycache__/
@@ -28,3 +29,7 @@ logs/
 wandb/
 core.*
 public
+
+# Ascend/CANN runtime and JIT artifacts
+/kernel_meta/
+/fusion_result.json
