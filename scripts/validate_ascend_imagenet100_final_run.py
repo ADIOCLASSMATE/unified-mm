@@ -8,6 +8,7 @@ import gc
 import json
 import math
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -34,6 +35,25 @@ EXPECTED_WORLD_SIZE = 16
 EXPECTED_GRADIENT_ACCUMULATION = 2
 EXPECTED_GLOBAL_BATCH = 512
 EXPECTED_LOSS_MICROBATCH_CHECKS = EXPECTED_FINAL_STEP * EXPECTED_GRADIENT_ACCUMULATION
+
+
+def ordered_rng_state_paths(checkpoint: Path) -> list[Path]:
+    """Return RNG shards in numeric rank order after validating their names."""
+    ranked_paths = []
+    for path in checkpoint.glob("random_states_*.pkl"):
+        match = re.fullmatch(r"random_states_(0|[1-9]\d*)\.pkl", path.name)
+        if match is None:
+            raise RuntimeError(f"invalid RNG shard name: {path.name}")
+        ranked_paths.append((int(match.group(1)), path))
+    ranked_paths.sort(key=lambda item: item[0])
+    actual_ranks = [rank for rank, _ in ranked_paths]
+    expected_ranks = list(range(EXPECTED_WORLD_SIZE))
+    if actual_ranks != expected_ranks:
+        raise RuntimeError(
+            "non-contiguous RNG shard ranks: "
+            f"{actual_ranks} != {expected_ranks}"
+        )
+    return [path for _, path in ranked_paths]
 
 
 def require_file(path: Path, label: str, *, minimum_bytes: int = 1) -> Path:
@@ -194,12 +214,8 @@ def validate_checkpoint(run_root: Path) -> dict:
         require_file(path, "DeepSpeed optimizer shard", minimum_bytes=100_000_000)
     require_file(checkpoint / "scheduler.bin", "scheduler state")
 
-    rng_files = sorted(checkpoint.glob("random_states_*.pkl"))
-    if len(rng_files) != EXPECTED_WORLD_SIZE:
-        raise RuntimeError(f"RNG shard count mismatch: {len(rng_files)} != 16")
-    for rank, path in enumerate(rng_files):
-        if path.name != f"random_states_{rank}.pkl":
-            raise RuntimeError(f"non-contiguous RNG shard names: {path.name}")
+    rng_files = ordered_rng_state_paths(checkpoint)
+    for path in rng_files:
         state = torch.load(str(path), map_location="cpu", weights_only=False)
         npu_state = state.get("torch_npu_manual_seed")
         required_keys = {
