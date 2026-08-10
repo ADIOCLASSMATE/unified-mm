@@ -17,6 +17,9 @@ cd "${REPO_ROOT}"
 
 RUN_PROJECT="${RUN_PROJECT:-selfless-flow-im100-class-ascend16-b16ga2-b4e5-f1e4}"
 RUN_NAME="${RUN_NAME:-im100-class-80ep-seed42-16x910b-b16ga2-b512}"
+CONFIG="${CONFIG:-configs/selfless/imagenet100_class_base_80ep_ascend_16npu.yaml}"
+BACKBONE_LR="${BACKBONE_LR:-4e-5}"
+FLOW_HEAD_LR="${FLOW_HEAD_LR:-1e-4}"
 TRAIN_PORT="${TRAIN_PORT:-29531}"
 RESUME_FROM="${RESUME_FROM:-none}"
 TMUX_SOCKET_NAME="${TMUX_SOCKET_NAME:-unified-mm-formal16}"
@@ -68,6 +71,9 @@ COMMON_ENV=(
   env
   RUN_PROJECT="${RUN_PROJECT}"
   RUN_NAME="${RUN_NAME}"
+  CONFIG="${CONFIG}"
+  BACKBONE_LR="${BACKBONE_LR}"
+  FLOW_HEAD_LR="${FLOW_HEAD_LR}"
   TRAIN_PORT="${TRAIN_PORT}"
   RESUME_FROM="${RESUME_FROM}"
   WANDB_MODE="${WANDB_MODE}"
@@ -120,12 +126,15 @@ FINAL_VALIDATION=(
   --run_root "output/${RUN_PROJECT}"
   --audit_root "${ASCEND_AUDIT_ROOT}"
   --output_json "${FINAL_ACCEPTANCE_JSON}"
+  --expected_backbone_lr "${BACKBONE_LR}"
+  --expected_flow_head_lr "${FLOW_HEAD_LR}"
 )
 printf -v validation_command '%q ' "${FINAL_VALIDATION[@]}"
 FINAL_EVALUATION=(
   env
   CHECKPOINT="output/${RUN_PROJECT}/hf_model-final-ema"
   OUTPUT_DIR="output/${RUN_PROJECT}-fid-is"
+  CONFIG="${CONFIG}"
   EVALUATION_ACCEPTANCE_JSON="${EVALUATION_ACCEPTANCE_JSON}"
   bash script/selfless/evaluate_imagenet100_class_fid_is_ascend_16npu.sh
 )

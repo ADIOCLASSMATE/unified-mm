@@ -66,7 +66,12 @@ def load_json(path: Path, label: str) -> dict:
     return json.loads(require_file(path, label).read_text(encoding="utf-8"))
 
 
-def validate_assets_and_config(run_root: Path) -> dict:
+def validate_assets_and_config(
+    run_root: Path,
+    *,
+    expected_backbone_lr: float = 4e-5,
+    expected_flow_head_lr: float = 1e-4,
+) -> dict:
     membership_path = Path(
         "public/datasets/imagenet_ablation_100c_balanced/manifest.jsonl"
     )
@@ -108,7 +113,13 @@ def validate_assets_and_config(run_root: Path) -> dict:
     split_counts = validate_split(split_path, membership)
     cache_metadata = validate_cache(cache_path, membership, scan_values=True)
     config = OmegaConf.load(require_file(run_root / "config.yaml", "run config"))
-    training_contract = validate_config(config, EXPECTED_WORLD_SIZE, split_counts)
+    training_contract = validate_config(
+        config,
+        EXPECTED_WORLD_SIZE,
+        split_counts,
+        expected_backbone_lr=expected_backbone_lr,
+        expected_flow_head_lr=expected_flow_head_lr,
+    )
     return {
         "hashes": hashes,
         "cache_format": cache_metadata["format"],
@@ -391,6 +402,8 @@ def parse_args() -> argparse.Namespace:
             "wanjiaxin-253108030048/npu-parity-audit"
         ),
     )
+    parser.add_argument("--expected_backbone_lr", type=float, default=4e-5)
+    parser.add_argument("--expected_flow_head_lr", type=float, default=1e-4)
     return parser.parse_args()
 
 
@@ -403,7 +416,11 @@ def main() -> None:
         "schema": "ascend_imagenet100_16npu_final_acceptance_v1",
         "status": "ok",
         "run_root": str(run_root.resolve()),
-        "assets_and_config": validate_assets_and_config(run_root),
+        "assets_and_config": validate_assets_and_config(
+            run_root,
+            expected_backbone_lr=args.expected_backbone_lr,
+            expected_flow_head_lr=args.expected_flow_head_lr,
+        ),
         "runtime": validate_runtime(run_root),
         "checkpoint": validate_checkpoint(run_root),
         "formal_gate": validate_formal_gate(run_root, Path(args.audit_root)),

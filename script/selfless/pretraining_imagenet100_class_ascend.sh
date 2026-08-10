@@ -90,6 +90,8 @@ PREFLIGHT_COMMAND=(
   --world_size "${NUM_NPUS}"
   --require_npu_count "${NUM_NPUS}"
   --require_hccl_intra_roce
+  --backbone_lr_override "${BACKBONE_LR}"
+  --flow_head_lr_override "${FLOW_HEAD_LR}"
 )
 
 COMMAND=(

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 from collections import Counter
 from pathlib import Path
@@ -24,6 +25,8 @@ EXPECTED_HASHES = {
 }
 POSTERIOR_FORMAT = "imagenet_kl16_scaled_posterior_v1"
 POSTERIOR_LAYOUT = "scaled_mean_then_scaled_std"
+CANONICAL_BACKBONE_LR = 4e-5
+CANONICAL_FLOW_HEAD_LR = 1e-4
 
 
 def sha256_file(path: Path) -> str:
@@ -234,7 +237,20 @@ def validate_fid_real_stats(path: Path) -> dict:
     return metadata
 
 
-def validate_config(config, world_size: int, split_counts: Counter) -> dict:
+def validate_config(
+    config,
+    world_size: int,
+    split_counts: Counter,
+    *,
+    expected_backbone_lr: float = CANONICAL_BACKBONE_LR,
+    expected_flow_head_lr: float = CANONICAL_FLOW_HEAD_LR,
+) -> dict:
+    for label, value in (
+        ("expected_backbone_lr", expected_backbone_lr),
+        ("expected_flow_head_lr", expected_flow_head_lr),
+    ):
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"{label} must be finite and positive: {value}")
     params = config.dataset.params
     required_values = {
         "conditioning_mode": (str(params.conditioning_mode), "class"),
@@ -266,8 +282,26 @@ def validate_config(config, world_size: int, split_counts: Counter) -> dict:
         "decay_steps": (int(config.lr_scheduler.params.decay_steps), 4480),
         "save_every": (int(config.experiment.save_every), 4480),
         "val_every": (int(config.experiment.val_every), 2240),
-        "backbone_lr": (float(config.optimizer.params.backbone_learning_rate), 4e-5),
-        "flow_lr": (float(config.optimizer.params.flow_learning_rate), 1e-4),
+        "learning_rate": (
+            float(config.optimizer.params.learning_rate),
+            expected_flow_head_lr,
+        ),
+        "backbone_lr": (
+            float(config.optimizer.params.backbone_learning_rate),
+            expected_backbone_lr,
+        ),
+        "projector_lr": (
+            float(config.optimizer.params.projector_learning_rate),
+            expected_flow_head_lr,
+        ),
+        "flow_head_lr": (
+            float(config.optimizer.params.flow_learning_rate),
+            expected_flow_head_lr,
+        ),
+        "special_token_lr": (
+            float(config.optimizer.params.special_token_learning_rate),
+            expected_backbone_lr,
+        ),
         "evaluation_samples": (int(config.evaluation.samples), 10_000),
         "evaluation_batch_size": (int(config.evaluation.batch_size), 4096),
         "evaluation_batch_size_per_npu": (
@@ -351,6 +385,8 @@ def validate_config(config, world_size: int, split_counts: Counter) -> dict:
         "optimizer_steps_per_epoch": steps_per_epoch,
         "epochs": epochs,
         "max_optimizer_steps": int(config.training.max_train_steps),
+        "backbone_learning_rate": expected_backbone_lr,
+        "flow_head_learning_rate": expected_flow_head_lr,
     }
 
 
@@ -364,6 +400,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--require_npu_count", type=int, default=None)
     parser.add_argument("--require_hccl_intra_roce", action="store_true")
     parser.add_argument("--skip_cache_value_scan", action="store_true")
+    parser.add_argument("--backbone_lr_override", type=float, default=None)
+    parser.add_argument("--flow_head_lr_override", type=float, default=None)
     return parser.parse_args()
 
 
@@ -371,6 +409,28 @@ def main() -> None:
     args = parse_args()
     config_path = require_file(Path(args.config), "training config")
     config = OmegaConf.load(config_path)
+    has_backbone_override = args.backbone_lr_override is not None
+    has_flow_head_override = args.flow_head_lr_override is not None
+    if has_backbone_override != has_flow_head_override:
+        raise ValueError(
+            "backbone_lr_override and flow_head_lr_override must be provided together"
+        )
+    expected_backbone_lr = CANONICAL_BACKBONE_LR
+    expected_flow_head_lr = CANONICAL_FLOW_HEAD_LR
+    if has_backbone_override:
+        expected_backbone_lr = float(args.backbone_lr_override)
+        expected_flow_head_lr = float(args.flow_head_lr_override)
+        for label, value in (
+            ("backbone_lr_override", expected_backbone_lr),
+            ("flow_head_lr_override", expected_flow_head_lr),
+        ):
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{label} must be finite and positive: {value}")
+        config.optimizer.params.learning_rate = expected_flow_head_lr
+        config.optimizer.params.backbone_learning_rate = expected_backbone_lr
+        config.optimizer.params.projector_learning_rate = expected_flow_head_lr
+        config.optimizer.params.flow_learning_rate = expected_flow_head_lr
+        config.optimizer.params.special_token_learning_rate = expected_backbone_lr
     qwen_root = Path(config.model.model_path)
     vae_root = Path(config.experiment.validation_vae_module_root)
     vae_checkpoint = Path(config.experiment.validation_vae_path)
@@ -438,7 +498,13 @@ def main() -> None:
         scan_values=not args.skip_cache_value_scan,
     )
     fid_real_stats_metadata = validate_fid_real_stats(fid_real_stats_path)
-    training = validate_config(config, args.world_size, split_counts)
+    training = validate_config(
+        config,
+        args.world_size,
+        split_counts,
+        expected_backbone_lr=expected_backbone_lr,
+        expected_flow_head_lr=expected_flow_head_lr,
+    )
 
     hardware = None
     if args.require_npu_count is not None:
