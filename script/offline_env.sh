@@ -19,8 +19,6 @@ if [ -n "${UNIFIED_MM_VENV:-}" ]; then
   esac
 elif [ -f "${_UNIFIED_MM_REPO_ROOT}/.venv/bin/activate" ]; then
   _UNIFIED_MM_VENV_ROOT="${_UNIFIED_MM_REPO_ROOT}/.venv"
-elif [ -f "${_UNIFIED_MM_REPO_ROOT}/.venv-npu/bin/activate" ]; then
-  _UNIFIED_MM_VENV_ROOT="${_UNIFIED_MM_REPO_ROOT}/.venv-npu"
 else
   _UNIFIED_MM_VENV_ROOT="${_UNIFIED_MM_REPO_ROOT}/.venv"
 fi

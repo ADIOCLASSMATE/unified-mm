@@ -72,6 +72,10 @@ def resolve_device(value: str) -> torch.device:
             raise RuntimeError(
                 f"NPU index {index} is out of range for {torch.npu.device_count()} devices"
             )
+        # This encoder only uses standard operators covered by the installed
+        # torch_npu binaries.  Avoid per-process JIT kernel compilation when
+        # many independent cache shards are encoded on one Ascend node.
+        torch.npu.set_compile_mode(jit_compile=False)
         torch.npu.set_device(index)
         device = torch.device("npu", index)
     elif device.type == "cuda":

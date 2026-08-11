@@ -18,8 +18,19 @@ def test_evaluator_default_is_4096_global(monkeypatch):
         ["evaluate_single_stream_fid_is.py"],
     )
     args = evaluator.parse_args()
+    assert args.device == "npu"
     assert args.batch_size == 4096
-    assert evaluator.per_rank_batch_size(args.batch_size, 8) == 512
+    assert args.allow_nonofficial_fid is False
+    assert evaluator.per_rank_batch_size(args.batch_size, 16) == 256
+
+
+def test_nonofficial_fid_requires_explicit_opt_in(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["evaluate_single_stream_fid_is.py", "--allow_nonofficial_fid"],
+    )
+    assert evaluator.parse_args().allow_nonofficial_fid is True
 
 
 def test_global_batch_must_be_positive_and_evenly_sharded():
@@ -58,42 +69,27 @@ def test_global_batches_are_sharded_before_dataset_collation():
         )
 
 
-@pytest.mark.parametrize(
-    "config_name",
-    [
-        "imagenet_flow_full_from_qwen3base.yaml",
-        "imagenet_flow_caption_from_qwen3base.yaml",
-    ],
-)
-def test_configs_record_h100_batch_contract(config_name):
+def test_production_config_records_final_training_contract():
     config = OmegaConf.load(
-        REPO_ROOT / "configs" / "selfless" / config_name
+        REPO_ROOT
+        / "configs"
+        / "selfless"
+        / "imagenet1k_class_pretrain_800ep_ascend_64npu_bs1024.yaml"
     )
-    assert config.evaluation.batch_size == 4096
-    assert config.evaluation.batch_size_per_h100 == 512
-
-
-@pytest.mark.parametrize(
-    "config_name",
-    [
-        "imagenet_flow_full_from_qwen3base.yaml",
-        "imagenet100_class_base_80ep.yaml",
-    ],
-)
-def test_class_training_configs_use_b32_ga2_without_checkpointing(config_name):
-    config = OmegaConf.load(
-        REPO_ROOT / "configs" / "selfless" / config_name
-    )
-    world_size = 8
     assert config.dataset.params.conditioning_mode == "class"
-    assert config.training.batch_size == 32
-    assert config.training.total_batch_size == 512
-    assert (
-        config.training.total_batch_size
-        // (config.training.batch_size * world_size)
-        == 2
-    )
+    assert config.training.batch_size == 16
+    assert config.training.total_batch_size == 1024
+    assert config.training.total_batch_size // (config.training.batch_size * 64) == 1
     assert config.training.use_gradient_checkpointing is False
+    assert config.optimizer.params.backbone_learning_rate == 30e-5
+    assert config.optimizer.params.special_token_learning_rate == 30e-5
+    assert config.optimizer.params.flow_learning_rate == 4e-5
+    assert config.optimizer.params.projector_learning_rate == 4e-5
+    assert config.training.num_train_epochs == 800
+    assert config.training.max_train_steps == 1_000_800
+    assert config.training.ema_decay == 0.9999
+    assert config.evaluation.batch_size == 4096
+    assert config.evaluation.batch_size_per_npu == 256
 
 
 def test_real_stats_loader_is_not_bound_to_an_ablation_split(tmp_path):

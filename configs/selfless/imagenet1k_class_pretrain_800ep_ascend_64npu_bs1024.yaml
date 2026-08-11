@@ -1,19 +1,20 @@
-# Ascend 910B production configuration for canonical ImageNet-100 training.
-# B32 exhausted 60.96 GiB HBM in the production ZeRO-2 path.  Use the measured
-# safe candidate: 16 samples/rank * 16 ranks * GA 2 = global batch 512.
+# Formal ImageNet-1K class-conditioned pretraining on 64 Ascend 910B NPUs.
+# 16 samples/rank * 64 ranks * GA 1 = global batch 1024.
+# 1,281,024 samples/epoch / 1024 = 1,251 optimizer steps/epoch.
+# WSD phases are exactly 5 warmup + 595 stable + 200 decay epochs.
 experiment:
-    project: "selfless-flow-im100-class-ascend16-b16ga2-b4e5-f1e4"
-    name: "im100-class-80ep-seed42-16x910b-b16ga2-b512"
+    project: "selfless-flow-imagenet1k-class-ascend64-b1024-800ep"
+    name: "imagenet1k-class-800ep-seed42-64x910b-b16ga1-b1024-b30e5-f4e5"
     wandb_project: "unified-mm"
     output_dir: "output"
-    save_every: 4480
-    log_every: 10
-    log_grad_norm_every: 224
-    checkpoints_total_limit: 2
+    save_every: 6255
+    log_every: 50
+    log_grad_norm_every: 1251
+    checkpoints_total_limit: 3
     save_hfmodel_every: 1000000000
     save_final: true
-    val_every: 2240
-    validation_image_every: 2240
+    val_every: 12510
+    validation_image_every: 12510
     validation_image_samples: 8
     validation_flow_temperature: 1.0
     validation_flow_cfg: 3.5
@@ -54,9 +55,8 @@ model:
 dataset:
     class_name: "ImageNetFlowCacheDataset"
     params:
-        cache_path: "public/datasets/imagenet_ablation_100c_balanced/vae_posterior_mar_kl16/posterior_stats_100c_1250pc_fp16.pt"
-        manifest_jsonl: "public/datasets/imagenet_ablation_100c_balanced/manifest.jsonl"
-        split_manifest_jsonl: "public/datasets/imagenet_ablation_100c_balanced/split_seed42_val100.jsonl"
+        cache_path: "public/datasets/imagenet_full/vae_posterior_mar_kl16/posterior_stats_imagenet1k_train_fp16.pt"
+        manifest_jsonl: "public/datasets/imagenet_full/manifest.jsonl"
         synset_mapping_path: "public/dataset/imagenet/v1/LOC_synset_mapping.txt"
         conditioning_mode: "class"
         image_tokens_per_img: 256
@@ -64,17 +64,23 @@ dataset:
         max_seq_length: 320
         pad_to_length: 320
         pad_to_multiple_of: 64
+        split_strategy: "stratified"
+        split_seed: 42
+        val_samples_per_class: 50
+        # The 50K probe rows remain in the training population. A shallow
+        # validation view keeps posterior/reveal RNG fixed at epoch zero.
+        validation_overlap_train: true
     preprocessing:
         max_seq_length: 320
 
 optimizer:
     name: "adamw"
     params:
-        learning_rate: 1.0e-4
-        backbone_learning_rate: 4.0e-5
-        projector_learning_rate: 1.0e-4
-        flow_learning_rate: 1.0e-4
-        special_token_learning_rate: 4.0e-5
+        learning_rate: 4e-5
+        backbone_learning_rate: 30e-5
+        projector_learning_rate: 4e-5
+        flow_learning_rate: 4e-5
+        special_token_learning_rate: 30e-5
         scale_lr: false
         beta1: 0.9
         beta2: 0.95
@@ -86,34 +92,28 @@ lr_scheduler:
     scheduler: "wsd"
     params:
         learning_rate: ${optimizer.params.learning_rate}
-        warmup_steps: 1000
-        decay_steps: 4480
+        warmup_steps: 6255
+        decay_steps: 250200
         min_lr_scale: 0.1
 
 training:
     batch_size: 16
-    total_batch_size: 512
+    total_batch_size: 1024
     mixed_precision: "bf16"
     gradient_accumulation_dtype: "fp32"
     seed: 42
     dataloader_shuffle_seed: 42
-    # Keep collation in each rank process. With 16 ranks, eight workers per
-    # rank fan out to 128 children and can starve the instance health service.
-    # The loader deliberately omits prefetch_factor when this value is zero.
     dataloader_workers: 0
-    # Draw a new deterministic, no-replacement subset each epoch.  The budget
-    # is exactly 224 global batches, so every rank sees 448 microbatches and
-    # GA=2 never flushes a partial optimizer step at a DataLoader boundary.
-    samples_per_epoch: 114688
-    optimizer_steps_per_epoch: 224
-    num_train_epochs: 80
-    max_train_steps: 17920
+    samples_per_epoch: 1281024
+    optimizer_steps_per_epoch: 1251
+    num_train_epochs: 800
+    max_train_steps: 1000800
     max_grad_norm: 1.0
     use_gradient_checkpointing: false
     step_scheduler_with_optimizer: false
     from_scratch: false
     use_ema: true
-    ema_decay: 0.999
+    ema_decay: 0.9999
     ema_update_after_step: 0
     ema_shard_chunk_numel: 4194304
     ema_validate: false
@@ -122,13 +122,11 @@ training:
     save_image_flow_adapter: true
 
 evaluation:
-    checkpoint: "output/selfless-flow-im100-class-ascend16-b16ga2-b4e5-f1e4/hf_model-final-ema"
+    checkpoint: "output/selfless-flow-imagenet1k-class-ascend64-b1024-800ep/hf_model-final-ema"
     model_dtype: "bf16"
-    samples: 10000
+    samples: 50000
     batch_size: 4096
     batch_size_per_npu: 256
-    # Keep both VAE decode and Inception extraction microbatched. The model
-    # generation batch remains 256/NPU while metric activations stay bounded.
     vae_decode_batch_size: 16
     sampling_steps: 100
     temperature: 1.0
@@ -138,4 +136,5 @@ evaluation:
     parallel_rate: 1
     strategies: "spatial_halton"
     seed: 42
-    real_stats_path: "public/datasets/imagenet_ablation_100c_balanced/fid_stats/inception_v3_2048_original_256.pt"
+    inception_weights_path: "public/models/torch-fidelity/weights-inception-2015-12-05-6726825d.pth"
+    real_stats_path: "public/datasets/imagenet_full/fid_stats/inception_v3_2048_imagenet_val50000_256.pt"

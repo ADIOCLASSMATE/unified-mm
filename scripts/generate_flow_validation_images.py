@@ -30,7 +30,10 @@ from utils.utils import get_selfless_mask, load_model_tokenizer
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Manual validation image generation for image rectified-flow heads.")
-    parser.add_argument("--config", default="configs/selfless/imagenet_flow_full_from_qwen3base.yaml")
+    parser.add_argument(
+        "--config",
+        default="configs/selfless/imagenet1k_class_pretrain_800ep_ascend_64npu_bs1024.yaml",
+    )
     parser.add_argument("--model_path_override", default="")
     parser.add_argument(
         "--adapter",
@@ -54,7 +57,7 @@ def parse_args():
         ),
     )
     parser.add_argument("--output_dir", default="output/manual_flow_validation")
-    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--device", default="npu")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--samples", type=int, default=4)
@@ -412,7 +415,11 @@ def load_vae(config, device, dtype_name):
     vae_module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(vae_module)
     vae = vae_module.AutoencoderKL(embed_dim=16, ch_mult=(1, 1, 2, 2, 4), ckpt_path=str(vae_path))
-    dtype = torch.float16 if dtype_name == "fp16" and device.type == "cuda" else torch.float32
+    dtype = (
+        torch.float16
+        if dtype_name == "fp16" and device.type in {"cuda", "npu"}
+        else torch.float32
+    )
     vae = vae.to(device=device, dtype=dtype).eval()
     for param in vae.parameters():
         param.requires_grad_(False)
@@ -598,7 +605,17 @@ def main():
     refine_ratios = parse_float_list(args.refine_ratios)
     probe_times = parse_float_list(args.probe_times)
     torch.manual_seed(args.seed)
-    device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
+    device = torch.device(args.device)
+    if device.type == "npu":
+        import torch_npu  # noqa: F401
+
+        if not torch.npu.is_available():
+            raise RuntimeError("Ascend NPU was requested but is unavailable")
+        torch.npu.set_device(0 if device.index is None else device.index)
+    elif device.type == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA was requested but is unavailable")
+        torch.cuda.set_device(0 if device.index is None else device.index)
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 

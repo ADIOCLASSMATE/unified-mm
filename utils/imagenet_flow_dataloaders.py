@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import random
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional, Sequence
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch.utils.data import DataLoader, RandomSampler, Subset
@@ -58,7 +59,7 @@ def _build_split_indices(
     val_ratio: float,
     seed: int,
     strategy: str,
-    val_samples_per_class: Optional[int] = None,
+    val_samples_per_class: int | None = None,
 ) -> tuple[list[int], list[int]]:
     n_items = len(dataset)
     if n_items <= 0:
@@ -223,6 +224,30 @@ def _load_explicit_split_indices(
     return train_indices, val_indices
 
 
+def _build_dataset_subsets(
+    dataset: ImageNetFlowCacheDataset,
+    train_indices: list[int],
+    val_indices: list[int],
+    *,
+    validation_overlap_train: bool,
+) -> tuple[Subset, Subset]:
+    """Build train/validation views without changing validation RNG semantics."""
+
+    validation_dataset = dataset
+    if validation_overlap_train:
+        train_indices = list(range(len(dataset)))
+        # Both views share mmap-backed posterior tensors and immutable metadata,
+        # while keeping separate training masks. Validation therefore remains
+        # deterministic even though its rows are also available to training.
+        validation_dataset = copy.copy(dataset)
+        validation_dataset.set_training_indices([])
+    dataset.set_training_indices(train_indices)
+    return (
+        Subset(dataset, train_indices),
+        Subset(validation_dataset, val_indices),
+    )
+
+
 def build_imagenet_flow_cache_dataloaders(config, tokenizer):
     # Imported lazily to keep the dataset module's compatibility re-exports
     # free of a module-import cycle.
@@ -296,9 +321,14 @@ def build_imagenet_flow_cache_dataloaders(config, tokenizer):
                 else None
             ),
         )
-    dataset.set_training_indices(train_indices)
-    train_dataset = Subset(dataset, train_indices)
-    val_dataset = Subset(dataset, val_indices)
+    train_dataset, val_dataset = _build_dataset_subsets(
+        dataset,
+        train_indices,
+        val_indices,
+        validation_overlap_train=bool(
+            params.get("validation_overlap_train", False)
+        ),
+    )
 
     pad_to_length = params.get("pad_to_length", None)
     if params.get("pad_to_max_length", False):

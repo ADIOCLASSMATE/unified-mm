@@ -4,16 +4,16 @@
 from __future__ import annotations
 
 import argparse
-from collections import Counter
 import hashlib
 import json
-from pathlib import Path
 import sys
 import tempfile
+from collections import Counter
+from pathlib import Path
 
-from PIL import Image
 import torch
 import torch.distributed as dist
+from PIL import Image
 from torch.utils.data import DataLoader, Dataset, Sampler
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -60,9 +60,17 @@ class ImageDataset(Dataset):
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--manifest", required=True)
-    parser.add_argument("--split_manifest", required=True)
-    parser.add_argument("--imagenet_train_dir", required=True)
+    parser.add_argument("--manifest", default=None)
+    parser.add_argument("--split_manifest", default=None)
+    parser.add_argument("--imagenet_train_dir", default=None)
+    parser.add_argument(
+        "--class_image_root",
+        default=None,
+        help=(
+            "Class-folder image root used directly as the real distribution. "
+            "This is mutually exclusive with --manifest/--split_manifest."
+        ),
+    )
     parser.add_argument("--inception_weights_path", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--device", default="npu")
@@ -78,6 +86,54 @@ def parse_args():
 
 
 def load_selected_paths(args) -> tuple[list[Path], list[dict[str, object]]]:
+    if args.class_image_root:
+        if args.manifest or args.split_manifest or args.imagenet_train_dir:
+            raise ValueError(
+                "--class_image_root is mutually exclusive with "
+                "--manifest/--split_manifest/--imagenet_train_dir"
+            )
+        root = Path(args.class_image_root)
+        if not root.is_dir():
+            raise FileNotFoundError(root)
+        paths: list[Path] = []
+        selected: list[dict[str, object]] = []
+        for class_dir in sorted(path for path in root.iterdir() if path.is_dir()):
+            class_paths = sorted(path for path in class_dir.iterdir() if path.is_file())
+            if len(class_paths) != int(args.expected_samples_per_class):
+                raise ValueError(
+                    f"{class_dir} has {len(class_paths)} images; expected "
+                    f"{args.expected_samples_per_class}"
+                )
+            for path in class_paths:
+                selected.append(
+                    {
+                        "synset": class_dir.name,
+                        # Keep the selected-set identity independent of the
+                        # platform mount point while retaining the absolute
+                        # root separately in metadata.
+                        "source_path": path.relative_to(root).as_posix(),
+                        "split": str(args.split),
+                        "split_index": len(selected),
+                    }
+                )
+                paths.append(path)
+        if len(paths) != int(args.expected_samples):
+            raise ValueError(
+                f"{root} has {len(paths)} class-folder images; expected "
+                f"{args.expected_samples}"
+            )
+        class_count = len({str(row["synset"]) for row in selected})
+        if class_count != int(args.expected_classes):
+            raise ValueError(
+                f"{root} has {class_count} classes; expected {args.expected_classes}"
+            )
+        return paths, selected
+
+    if not args.manifest or not args.split_manifest or not args.imagenet_train_dir:
+        raise ValueError(
+            "provide either --class_image_root or all of --manifest, "
+            "--split_manifest and --imagenet_train_dir"
+        )
     manifest_path = Path(args.manifest)
     split_path = Path(args.split_manifest)
     image_root = Path(args.imagenet_train_dir)
@@ -167,6 +223,10 @@ def save_atomic(payload: dict[str, object], output: Path) -> None:
 def main() -> None:
     args = parse_args()
     distributed, rank, world_size, _, device = init_distributed(args.device)
+    if device.type == "npu":
+        # Inception uses operators provided by the installed torch_npu binary.
+        # Avoid compiling the same inference graph independently on every rank.
+        torch.npu.set_compile_mode(jit_compile=False)
     paths, selected = load_selected_paths(args)
     sampler = RankStrideSampler(len(paths), rank, world_size)
     loader = DataLoader(
@@ -213,10 +273,29 @@ def main() -> None:
             },
             "metadata": {
                 "source": {
-                    "manifest": str(Path(args.manifest).resolve()),
-                    "manifest_sha256": file_sha256(args.manifest),
-                    "split_manifest": str(Path(args.split_manifest).resolve()),
-                    "split_manifest_sha256": file_sha256(args.split_manifest),
+                    "manifest": (
+                        str(Path(args.manifest).resolve())
+                        if args.manifest
+                        else None
+                    ),
+                    "manifest_sha256": (
+                        file_sha256(args.manifest) if args.manifest else None
+                    ),
+                    "split_manifest": (
+                        str(Path(args.split_manifest).resolve())
+                        if args.split_manifest
+                        else None
+                    ),
+                    "split_manifest_sha256": (
+                        file_sha256(args.split_manifest)
+                        if args.split_manifest
+                        else None
+                    ),
+                    "class_image_root": (
+                        str(Path(args.class_image_root).resolve())
+                        if args.class_image_root
+                        else None
+                    ),
                     "selected_records_sha256": selected_records_sha256(selected),
                     "split": str(args.split),
                     "classes": int(args.expected_classes),

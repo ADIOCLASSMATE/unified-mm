@@ -498,7 +498,11 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Tiny unified model smoke: train, validate, save, and reload.")
     parser.add_argument("--output_dir", default="output/unified_smoke")
     parser.add_argument("--seed", type=int, default=123)
-    parser.add_argument("--device", default="cuda", help="Use cuda for GPU smoke, or cpu for local fallback.")
+    parser.add_argument(
+        "--device",
+        default="npu",
+        help="Use npu for the production smoke, or cpu for a local fallback.",
+    )
     parser.add_argument("--no_clean", action="store_true", help="Do not remove an existing output_dir first.")
     return parser.parse_args()
 
@@ -508,9 +512,19 @@ def main():
     train_flow.logger = SmokeLogger()
     patch_cpu_runtime()
     torch.manual_seed(args.seed)
-    if args.device == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA was requested for unified smoke, but torch.cuda.is_available() is false.")
     device = torch.device(args.device)
+    if device.type == "npu":
+        import torch_npu  # noqa: F401
+
+        if not torch.npu.is_available():
+            raise RuntimeError(
+                "NPU was requested for unified smoke, but torch.npu.is_available() is false."
+            )
+        torch.npu.set_device(0 if device.index is None else device.index)
+    elif device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA was requested for unified smoke, but torch.cuda.is_available() is false."
+        )
 
     output_dir = Path(args.output_dir)
     if output_dir.exists() and not args.no_clean:

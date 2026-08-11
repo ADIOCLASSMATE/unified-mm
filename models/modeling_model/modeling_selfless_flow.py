@@ -64,10 +64,6 @@ from .image_position_utils import (
     build_row_col_position_ids,
 )
 
-# NPU-only: liger-kernel（triton fused swiglu）不可用，强制走原生 PyTorch 路径
-liger_kernel_is_available = False
-
-
 def auto_docstring(obj=None, **_kwargs):
     def decorator(target):
         return target
@@ -194,13 +190,7 @@ class Qwen3MLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
-        if liger_kernel_is_available:
-            return self.down_proj(
-                LigerSiLUMulFunction.apply(self.gate_proj(x), self.up_proj(x))
-            )
-        else:
-            down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-            return down_proj
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
 def rotate_half(x):

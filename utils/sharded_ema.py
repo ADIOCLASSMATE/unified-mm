@@ -296,11 +296,19 @@ class RankShardedEMA:
             chunk = self.layout["chunks"][chunk_id]
             tensor_meta = self.layout["tensors"][chunk["tensor"]]
             source = self._source_chunk(chunk_id)
-            new_shards[chunk_id] = source.to(
-                dtype=_dtype_from_name(tensor_meta["ema_dtype"]),
-                copy=True,
-                non_blocking=True,
-            ).contiguous()
+            ema_dtype = _dtype_from_name(tensor_meta["ema_dtype"])
+            if source.dtype == ema_dtype:
+                # torch-npu 2.6 may alias a same-device, same-dtype
+                # ``to(copy=True)`` result. EMA storage must never alias the
+                # live model or its in-place update becomes self-referential.
+                shard = source.clone(memory_format=torch.contiguous_format)
+            else:
+                shard = source.to(
+                    dtype=ema_dtype,
+                    copy=True,
+                    non_blocking=True,
+                ).contiguous()
+            new_shards[chunk_id] = shard
         self.shards = new_shards
 
     @torch.no_grad()

@@ -212,13 +212,16 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Offline FID/IS evaluation for selfless single-stream image generation."
     )
-    parser.add_argument("--config", default="configs/selfless/imagenet_flow_full_from_qwen3base.yaml")
+    parser.add_argument(
+        "--config",
+        default="configs/selfless/imagenet1k_class_pretrain_800ep_ascend_64npu_bs1024.yaml",
+    )
     parser.add_argument("--model_path_override", default="")
     parser.add_argument("--adapter", default="none")
     parser.add_argument("--model_state", default="")
     parser.add_argument("--ema_checkpoint", default="")
     parser.add_argument("--output_dir", default="output/single_stream_fid_is")
-    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--device", default="npu")
     parser.add_argument(
         "--model_dtype",
         choices=("bf16", "fp32"),
@@ -231,8 +234,8 @@ def parse_args():
         type=int,
         default=4096,
         help=(
-            "Global generation batch. The H100 default is 512 samples per "
-            "rank on eight ranks (4096 total); sharding happens before "
+            "Global generation batch. The Ascend default is 256 samples per "
+            "rank on 16 ranks (4096 total); sharding happens before "
             "dataset collation."
         ),
     )
@@ -322,6 +325,15 @@ def parse_args():
         help=(
             "Fail unless shared real stats, the full matching fake sample count, "
             "and 10 deterministic IS splits are used."
+        ),
+    )
+    parser.add_argument(
+        "--allow_nonofficial_fid",
+        action="store_true",
+        help=(
+            "Compute a diagnostic FID against frozen real statistics even "
+            "when the generated sample count does not match the real-stat "
+            "count. The result is not an official comparable FID."
         ),
     )
     parser.add_argument(
@@ -2467,6 +2479,7 @@ def main():
     compute_fid = bool(
         shared_real_payload is None
         or int(args.samples) == int(shared_real_count)
+        or args.allow_nonofficial_fid
     )
     if is_main_process(rank) and compute_fid:
         real_reference_moments = (
@@ -2527,6 +2540,8 @@ def main():
         },
         "metric_protocol": {
             "fid_reducer": "symmetric_eigendecomposition",
+            "fid_computed": bool(compute_fid),
+            "nonofficial_fid_enabled": bool(args.allow_nonofficial_fid),
             "is_split_assignment": "contiguous_by_global_sample_index",
             "is_std": "population",
             "is_splits": int(args.is_splits),

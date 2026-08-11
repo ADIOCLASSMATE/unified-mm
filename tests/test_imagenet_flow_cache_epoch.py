@@ -1,20 +1,25 @@
+from typing import ClassVar
+
 import torch
 from accelerate.data_loader import BatchSamplerShard
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader, RandomSampler
 
 from utils.dataset_imagenet_flow_cache import (
-    ImageNetFlowCacheDataset,
     POSTERIOR_CACHE_FORMAT,
     POSTERIOR_STATS_LAYOUT,
+    ImageNetFlowCacheDataset,
     collate_imagenet_flow_cache,
 )
-from utils.imagenet_flow_dataloaders import training_samples_per_epoch
+from utils.imagenet_flow_dataloaders import (
+    _build_dataset_subsets,
+    training_samples_per_epoch,
+)
 
 
 class _Tokenizer:
     eos_token_id = 14
-    _token_ids = {
+    _token_ids: ClassVar[dict[str, int]] = {
         "Generate": 100,
         "an": 101,
         "image": 104,
@@ -129,6 +134,29 @@ def test_validation_reveal_order_is_fixed_across_rng_and_epochs(tmp_path):
     second = collate_imagenet_flow_cache([dataset[0]])
 
     assert torch.equal(first["sigma"], second["sigma"])
+
+
+def test_overlapping_validation_view_remains_deterministic(tmp_path):
+    dataset = _make_dataset(tmp_path)
+    train_dataset, val_dataset = _build_dataset_subsets(
+        dataset,
+        train_indices=[],
+        val_indices=[0],
+        validation_overlap_train=True,
+    )
+
+    first_train = train_dataset[0]
+    first_val = val_dataset[0]
+    train_dataset.dataset.set_epoch(9)
+    second_train = train_dataset[0]
+    second_val = val_dataset[0]
+
+    assert train_dataset.dataset._is_training_index(0) is True
+    assert val_dataset.dataset._is_training_index(0) is False
+    assert not torch.equal(
+        first_train["image_latents"], second_train["image_latents"]
+    )
+    assert torch.equal(first_val["image_latents"], second_val["image_latents"])
 
 
 def test_training_reveal_order_changes_with_epoch(tmp_path):

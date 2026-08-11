@@ -132,6 +132,19 @@ def test_sharded_update_matches_full_fp32_reference_and_tied_updates_once():
     assert merged["embed.weight"].data_ptr() == merged["proj.weight"].data_ptr()
 
 
+def test_same_dtype_ema_shards_do_not_alias_live_model_storage():
+    model = _TiedModel()
+    layout, emas = _make_emas(model, world_size=2)
+    state = model.state_dict(keep_vars=True)
+    for ema in emas:
+        for chunk_id, shard in ema.shards.items():
+            source_name = layout["chunks"][chunk_id]["tensor"]
+            assert (
+                shard.untyped_storage().data_ptr()
+                != state[source_name].untyped_storage().data_ptr()
+            )
+
+
 def test_delayed_start_sync_semantics():
     model = _TiedModel()
     _, emas = _make_emas(model, decay=0.5, update_after_step=3)
