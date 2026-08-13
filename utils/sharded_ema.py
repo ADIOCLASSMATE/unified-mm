@@ -597,17 +597,54 @@ def read_sharded_ema_rows(
     return result
 
 
-def mark_hf_ema_config_fp32(directory: str | Path) -> None:
-    """Correct the HF config dtype after saving FP32 EMA state via a BF16 module."""
+def cast_state_dict_floating_dtype(
+    state_dict: dict[str, torch.Tensor],
+    dtype: torch.dtype,
+) -> dict[str, torch.Tensor]:
+    """Cast floating tensors while preserving exact tensor aliases."""
+
+    if not dtype.is_floating_point:
+        raise ValueError(f"EMA export dtype must be floating point, got {dtype}")
+    converted_by_identity: dict[int, torch.Tensor] = {}
+    converted: dict[str, torch.Tensor] = {}
+    for name, tensor in state_dict.items():
+        if not tensor.is_floating_point() or tensor.dtype == dtype:
+            converted[name] = tensor
+            continue
+        identity = id(tensor)
+        value = converted_by_identity.get(identity)
+        if value is None:
+            value = tensor.to(dtype=dtype)
+            converted_by_identity[identity] = value
+        converted[name] = value
+    return converted
+
+
+def mark_hf_ema_config_dtype(directory: str | Path, dtype: torch.dtype) -> None:
+    """Correct the HF config dtype after saving an explicitly cast EMA state."""
+
+    dtype_names = {
+        torch.bfloat16: "bfloat16",
+        torch.float32: "float32",
+    }
+    dtype_name = dtype_names.get(dtype)
+    if dtype_name is None:
+        raise ValueError(f"Unsupported EMA HF export dtype: {dtype}")
 
     config_path = Path(directory) / "config.json"
     config = json.loads(config_path.read_text(encoding="utf-8"))
-    config["dtype"] = "float32"
+    config["dtype"] = dtype_name
     if "torch_dtype" in config:
-        config["torch_dtype"] = "float32"
+        config["torch_dtype"] = dtype_name
     temp_path = config_path.parent / f".{config_path.name}.tmp-{os.getpid()}"
     temp_path.write_text(
         json.dumps(config, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
     os.replace(temp_path, config_path)
+
+
+def mark_hf_ema_config_fp32(directory: str | Path) -> None:
+    """Backward-compatible wrapper for FP32 EMA HF exports."""
+
+    mark_hf_ema_config_dtype(directory, torch.float32)

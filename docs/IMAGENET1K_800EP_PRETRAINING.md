@@ -63,8 +63,14 @@ decay would make the formal decay less than two epochs.
 
 ### Recovery, validation, and logging
 
-- save a complete resumable checkpoint every 5 epochs (6,255 steps);
-- retain the latest 3 checkpoints, including their sharded EMA state;
+- save a complete resumable checkpoint every 10 epochs (12,510 steps);
+- retain the latest 3 ordinary checkpoints, including their sharded EMA state;
+- permanently retain every 100-epoch checkpoint (125,100 steps); these
+  milestones do not participate in or consume slots from the rolling limit;
+- export and permanently retain a complete BF16 EMA HF evaluation model every
+  10 epochs as `hf_model-<step>-ema-eval`;
+- do not save intermediate image-flow adapters; export only
+  `image_flow_adapter-final.pt` at the end of training;
 - run validation loss and validation-image probes every 10 epochs;
 - log scalar training metrics every 50 steps;
 - read and validate the DeepSpeed global gradient norm once per epoch;
@@ -156,6 +162,12 @@ RESUME_FROM=output/selfless-flow-imagenet1k-class-ascend64-b1024-800ep/checkpoin
 After training, formal FID/IS uses 50,000 generated samples, deterministic
 canonical noise pairing, CFG 3.5, 100-step Heun, and the frozen official-val
 moments:
+
+The permanently retained 10-epoch EMA evaluation exports are complete model
+weights, not partial flow adapters. Evaluate one by passing its directory, for
+example `hf_model-12510-ema-eval`, through `--model_path_override`. The rolling
+DeepSpeed checkpoints remain the source for exact training recovery, while the
+smaller BF16 EMA exports are the source for historical FID/IS curves.
 
 ```bash
 torchrun --standalone --nproc_per_node=16 \

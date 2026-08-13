@@ -256,37 +256,98 @@ def log_grad_norm(model, accelerator, global_step):
             accelerator.log({"grad_norm/" + name: grad_norm}, step=global_step)
 
 
+def rotate_checkpoints_for_save(
+    output_dir: str | Path,
+    checkpoints_total_limit: int,
+    *,
+    current_checkpoint_name: str,
+    milestone_every_steps: int = 0,
+) -> list[Path]:
+    """Rotate ordinary checkpoints while permanently retaining milestones.
+
+    In distributed saves, a non-main rank may create the destination directory
+    before rank 0 scans the output directory.  Excluding the current name makes
+    retention deterministic even if that happens or a prior write left an
+    incomplete destination behind.  Positive multiples of
+    ``milestone_every_steps`` never participate in rotation or consume one of
+    the rolling slots.
+    """
+
+    limit = int(checkpoints_total_limit)
+    if limit < 1:
+        raise ValueError(f"checkpoints_total_limit must be positive, got {limit}")
+    milestone_every_steps = int(milestone_every_steps)
+    if milestone_every_steps < 0:
+        raise ValueError(
+            "milestone_every_steps must be non-negative, got "
+            f"{milestone_every_steps}"
+        )
+
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    def checkpoint_step(path: Path) -> int | None:
+        match = re.fullmatch(r"checkpoint-(\d+)", path.name)
+        return int(match.group(1)) if match else None
+
+    def is_milestone(step: int) -> bool:
+        return (
+            milestone_every_steps > 0
+            and step > 0
+            and step % milestone_every_steps == 0
+        )
+
+    current_match = re.fullmatch(r"checkpoint-(\d+)", current_checkpoint_name)
+    if current_match is None:
+        raise ValueError(
+            "current_checkpoint_name must match checkpoint-<step>, got "
+            f"{current_checkpoint_name!r}"
+        )
+    current_is_milestone = is_milestone(int(current_match.group(1)))
+
+    rotating_checkpoints: list[tuple[int, Path]] = []
+    for path in output_path.iterdir():
+        step = checkpoint_step(path)
+        if (
+            not path.is_dir()
+            or path.name == current_checkpoint_name
+            or step is None
+            or is_milestone(step)
+        ):
+            continue
+        rotating_checkpoints.append((step, path))
+    checkpoints = [
+        path for _, path in sorted(rotating_checkpoints, key=lambda item: item[0])
+    ]
+    rolling_slots_before_save = limit if current_is_milestone else limit - 1
+    num_to_remove = max(0, len(checkpoints) - rolling_slots_before_save)
+    removing = checkpoints[:num_to_remove]
+    for checkpoint in removing:
+        shutil.rmtree(checkpoint)
+    return removing
+
+
 def save_checkpoint(model, config, accelerator, global_step):
     output_dir = config.experiment.output_dir
     checkpoints_total_limit = config.experiment.get("checkpoints_total_limit", None)
+    checkpoint_milestone_every = int(
+        config.experiment.get("checkpoint_milestone_every", 0)
+    )
+    save_path = Path(output_dir) / f"checkpoint-{global_step}"
 
     if accelerator.is_main_process and checkpoints_total_limit is not None:
-        # 使用 glob 或 listdir
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir, exist_ok=True)
-            
-        checkpoints = [d for d in os.listdir(output_dir) if d.startswith("checkpoint")]
-        
-        def get_step(name):
-            # 尝试从 "checkpoint-1000" 中提取 "1000"
-            match = re.search(r"checkpoint-(\d+)", name)
-            if match:
-                return int(match.group(1))
-            return -1 # 无法解析的文件夹排在最前面或被忽略
-        
-        checkpoints = [c for c in checkpoints if get_step(c) != -1]
-        checkpoints = sorted(checkpoints, key=get_step)
+        rotate_checkpoints_for_save(
+            output_dir,
+            checkpoints_total_limit,
+            current_checkpoint_name=save_path.name,
+            milestone_every_steps=checkpoint_milestone_every,
+        )
 
-        if len(checkpoints) >= checkpoints_total_limit:
-            # 删除最旧的，保留最近的 (total_limit - 1) 个，以便腾出位置给新的
-            num_to_remove = len(checkpoints) - checkpoints_total_limit + 1
-            removing_checkpoints = checkpoints[:num_to_remove]
-            
-            for rm in removing_checkpoints:
-                rm_path = os.path.join(output_dir, rm)
-                shutil.rmtree(rm_path)
-        
-    save_path = Path(output_dir) / f"checkpoint-{global_step}"
+    # Hold non-main ranks outside accelerator.save_state until rank 0 has
+    # finished retention.  Otherwise they can recreate or populate a directory
+    # while rank 0 is deleting old checkpoints.
+    accelerator.wait_for_everyone()
+
     # 这一步保存了：Model, Optimizer, LR Scheduler, Random States
     accelerator.save_state(save_path)
 

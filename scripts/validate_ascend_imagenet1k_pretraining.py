@@ -80,10 +80,18 @@ def validate_config(config, *, world_size: int) -> dict[str, object]:
         "max_train_steps": (int(config.training.max_train_steps), MAX_STEPS),
         "warmup_steps": (int(config.lr_scheduler.params.warmup_steps), 6_255),
         "decay_steps": (int(config.lr_scheduler.params.decay_steps), 250_200),
-        "save_every": (int(config.experiment.save_every), 6_255),
+        "save_every": (int(config.experiment.save_every), 12_510),
+        "save_ema_eval_every": (
+            int(config.experiment.save_ema_eval_every),
+            12_510,
+        ),
         "val_every": (int(config.experiment.val_every), 12_510),
         "validation_image_every": (int(config.experiment.validation_image_every), 12_510),
         "checkpoints_total_limit": (int(config.experiment.checkpoints_total_limit), 3),
+        "checkpoint_milestone_every": (
+            int(config.experiment.checkpoint_milestone_every),
+            125_100,
+        ),
         "learning_rate": (float(config.optimizer.params.learning_rate), 4e-5),
         "backbone_learning_rate": (float(config.optimizer.params.backbone_learning_rate), 30e-5),
         "projector_learning_rate": (float(config.optimizer.params.projector_learning_rate), 4e-5),
@@ -91,6 +99,16 @@ def validate_config(config, *, world_size: int) -> dict[str, object]:
         "special_token_learning_rate": (float(config.optimizer.params.special_token_learning_rate), 30e-5),
         "ema_decay": (float(config.training.ema_decay), 0.9999),
         "ema_update_after_step": (int(config.training.ema_update_after_step), 0),
+        "ema_save_hf_model": (bool(config.training.ema_save_hf_model), True),
+        "ema_eval_dtype": (str(config.experiment.ema_eval_dtype).lower(), "bf16"),
+        "save_image_flow_adapter": (
+            bool(config.experiment.save_image_flow_adapter),
+            False,
+        ),
+        "save_final_image_flow_adapter": (
+            bool(config.experiment.save_final_image_flow_adapter),
+            True,
+        ),
         "evaluation_samples": (int(config.evaluation.samples), VALIDATION_IMAGES),
         "evaluation_sampling_steps": (int(config.evaluation.sampling_steps), 100),
     }

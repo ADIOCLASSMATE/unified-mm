@@ -248,3 +248,35 @@ def test_training_checkpoint_commit_marker_is_strict_and_invalidated(tmp_path):
     assert not marker.exists()
     with pytest.raises(RuntimeError, match="incomplete checkpoint"):
         _validate_checkpoint_complete(tmp_path, expected_global_step=7)
+
+
+def test_ema_export_cast_preserves_tied_tensor_aliases():
+    from utils.sharded_ema import cast_state_dict_floating_dtype
+
+    shared = torch.randn(3, 4, dtype=torch.float32)
+    state = {
+        "embed.weight": shared,
+        "lm_head.weight": shared,
+        "counter": torch.tensor(7, dtype=torch.int64),
+    }
+
+    converted = cast_state_dict_floating_dtype(state, torch.bfloat16)
+
+    assert converted["embed.weight"].dtype == torch.bfloat16
+    assert converted["embed.weight"] is converted["lm_head.weight"]
+    assert converted["counter"] is state["counter"]
+
+
+def test_ema_export_marks_bfloat16_hf_config(tmp_path):
+    from utils.sharded_ema import mark_hf_ema_config_dtype
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps({"dtype": "float32", "torch_dtype": "float32"})
+    )
+
+    mark_hf_ema_config_dtype(tmp_path, torch.bfloat16)
+
+    config = json.loads(config_path.read_text())
+    assert config["dtype"] == "bfloat16"
+    assert config["torch_dtype"] == "bfloat16"

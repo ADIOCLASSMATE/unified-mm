@@ -46,8 +46,9 @@ from utils.sharded_ema import (
     DEFAULT_EMA_CHUNK_NUMEL,
     RankShardedEMA,
     build_sharded_ema_layout,
+    cast_state_dict_floating_dtype,
     load_ema_manifest,
-    mark_hf_ema_config_fp32,
+    mark_hf_ema_config_dtype,
     merge_sharded_ema_state_dict,
     read_sharded_ema_rows,
 )
@@ -238,8 +239,32 @@ def _write_image_flow_adapter(state, config, global_step):
     logger.info(f"Saved image-flow adapter to {path}")
 
 
-def _save_image_flow_adapter(model, config, accelerator, global_step):
-    if not config.training.get("save_image_flow_adapter", False):
+def _image_flow_adapter_save_enabled(config, *, final: bool) -> bool:
+    periodic = bool(
+        config.experiment.get(
+            "save_image_flow_adapter",
+            config.training.get("save_image_flow_adapter", False),
+        )
+    )
+    if not final:
+        return periodic
+    return bool(
+        config.experiment.get(
+            "save_final_image_flow_adapter",
+            config.training.get("save_final_image_flow_adapter", periodic),
+        )
+    )
+
+
+def _save_image_flow_adapter(
+    model,
+    config,
+    accelerator,
+    global_step,
+    *,
+    final: bool = False,
+):
+    if not _image_flow_adapter_save_enabled(config, final=final):
         return
     if not accelerator.is_main_process:
         return
@@ -271,8 +296,10 @@ def _save_ema_image_flow_adapter(
     config,
     accelerator,
     global_step,
+    *,
+    final: bool = False,
 ) -> None:
-    if not config.training.get("save_image_flow_adapter", False):
+    if not _image_flow_adapter_save_enabled(config, final=final):
         return
     if accelerator.is_main_process:
         manifest = load_ema_manifest(ema_directory)
@@ -334,6 +361,28 @@ def _ema_decay(config) -> float:
     return decay
 
 
+def _ema_eval_export_dtype(config) -> torch.dtype:
+    name = str(
+        config.experiment.get(
+            "ema_eval_dtype",
+            config.training.get("ema_eval_dtype", "bf16"),
+        )
+    ).strip().lower()
+    dtypes = {
+        "bf16": torch.bfloat16,
+        "bfloat16": torch.bfloat16,
+        "fp32": torch.float32,
+        "float32": torch.float32,
+    }
+    dtype = dtypes.get(name)
+    if dtype is None:
+        raise ValueError(
+            "training.ema_eval_dtype must be one of "
+            f"{sorted(dtypes)}, got {name!r}"
+        )
+    return dtype
+
+
 def _ema_state_directory(config, global_step) -> Path:
     output_dir = Path(config.experiment.output_dir)
     if isinstance(global_step, int):
@@ -368,6 +417,10 @@ def _save_ema_hf_model(
     accelerator,
     global_step,
     ema_directory: Path | None,
+    *,
+    floating_dtype: torch.dtype = torch.float32,
+    save_name: str | None = None,
+    export_kind: str = "training",
 ) -> None:
     if ema is None or not ema.started or not bool(config.training.get("ema_save_hf_model", True)):
         return
@@ -375,16 +428,43 @@ def _save_ema_hf_model(
         ema_directory = _save_ema_state(ema, config, accelerator, global_step)
     if accelerator.is_main_process:
         merged_state = merge_sharded_ema_state_dict(ema_directory)
-        save_path = Path(config.experiment.output_dir) / f"hf_model-{global_step}-ema"
+        if floating_dtype != torch.float32:
+            source_state = merged_state
+            merged_state = cast_state_dict_floating_dtype(
+                source_state,
+                floating_dtype,
+            )
+            del source_state
+        save_path = Path(config.experiment.output_dir) / (
+            save_name or f"hf_model-{global_step}-ema"
+        )
         unwrapped = accelerator.unwrap_model(model)
         unwrapped.save_pretrained(
             save_path,
             state_dict=merged_state,
             safe_serialization=True,
         )
-        mark_hf_ema_config_fp32(save_path)
+        mark_hf_ema_config_dtype(save_path, floating_dtype)
         tokenizer.save_pretrained(save_path)
-        logger.info(f"Saved EMA HF model to {save_path}")
+        manifest = load_ema_manifest(ema_directory)
+        runtime = manifest.get("runtime") or {}
+        metadata = {
+            "schema": "selfless_ema_hf_export_v1",
+            "export_kind": str(export_kind),
+            "floating_dtype": str(floating_dtype).removeprefix("torch."),
+            "source_ema_directory": str(ema_directory),
+            "source_global_step": runtime.get("global_step"),
+            "source_world_size": manifest["world_size"],
+            "layout_fingerprint": manifest["layout_fingerprint"],
+            "state_key_count": len(merged_state),
+        }
+        (save_path / "ema_export_metadata.json").write_text(
+            json.dumps(metadata, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        _log_info(
+            f"Saved {export_kind} EMA HF model ({floating_dtype}) to {save_path}"
+        )
         del merged_state
     accelerator.wait_for_everyone()
 
@@ -1638,15 +1718,43 @@ def main():
                     accelerator=accelerator,
                     global_step=global_step,
                 )
-                if ema is not None and ema.started and bool(config.training.get("ema_save_adapter", True)):
-                    _save_ema_image_flow_adapter(
-                        ema_directory,
-                        config,
-                        accelerator,
-                        global_step,
-                    )
-                else:
-                    _save_image_flow_adapter(model, config, accelerator, global_step)
+                if _image_flow_adapter_save_enabled(config, final=False):
+                    if ema is not None and ema.started and bool(config.training.get("ema_save_adapter", True)):
+                        _save_ema_image_flow_adapter(
+                            ema_directory,
+                            config,
+                            accelerator,
+                            global_step,
+                        )
+                    else:
+                        _save_image_flow_adapter(
+                            model,
+                            config,
+                            accelerator,
+                            global_step,
+                        )
+
+            save_ema_eval_every = int(
+                config.experiment.get("save_ema_eval_every", 0)
+            )
+            if save_ema_eval_every > 0 and global_step % save_ema_eval_every == 0:
+                ema_directory = (
+                    _ema_state_directory(config, global_step)
+                    if ema is not None
+                    else None
+                )
+                _save_ema_hf_model(
+                    ema,
+                    model,
+                    tokenizer,
+                    config,
+                    accelerator,
+                    global_step,
+                    ema_directory,
+                    floating_dtype=_ema_eval_export_dtype(config),
+                    save_name=f"hf_model-{global_step}-ema-eval",
+                    export_kind="evaluation",
+                )
             
             if global_step % config.experiment.save_hfmodel_every == 0:
                 save_hf_model(model, tokenizer, config, accelerator, global_step)
@@ -1815,15 +1923,23 @@ def main():
             "final",
             ema_directory,
         )
-        if ema is not None and ema.started and bool(config.training.get("ema_save_adapter", True)):
-            _save_ema_image_flow_adapter(
-                ema_directory,
-                config,
-                accelerator,
-                "final",
-            )
-        else:
-            _save_image_flow_adapter(model, config, accelerator, "final")
+        if _image_flow_adapter_save_enabled(config, final=True):
+            if ema is not None and ema.started and bool(config.training.get("ema_save_adapter", True)):
+                _save_ema_image_flow_adapter(
+                    ema_directory,
+                    config,
+                    accelerator,
+                    "final",
+                    final=True,
+                )
+            else:
+                _save_image_flow_adapter(
+                    model,
+                    config,
+                    accelerator,
+                    "final",
+                    final=True,
+                )
     accelerator.end_training()
 
 

@@ -12,11 +12,11 @@ cd "${REPO_ROOT}"
 
 CONFIG="configs/selfless/imagenet1k_class_pretrain_800ep_ascend_64npu_bs1024.yaml"
 ACCELERATE_CONFIG="accelerate_configs/64_npus_4nodes_deepspeed_zero2.yaml"
-PROJECT="selfless-flow-imagenet1k-ascend16-train-val-eval-smoke"
+PROJECT="${PROJECT:-selfless-flow-imagenet1k-ascend16-train-val-eval-smoke}"
 RUN_ROOT="output/${PROJECT}"
 EVAL_ROOT="output/${PROJECT}-fid-is"
-REPORT_PATH="public/datasets/imagenet_full/preparation/train_val_eval_smoke_report.json"
-STATUS_PATH="public/datasets/imagenet_full/preparation/train_val_eval_smoke.status"
+REPORT_PATH="${REPORT_PATH:-public/datasets/imagenet_full/preparation/train_val_eval_smoke_report.json}"
+STATUS_PATH="${STATUS_PATH:-public/datasets/imagenet_full/preparation/train_val_eval_smoke.status}"
 MASTER_PORT="${MASTER_PORT:-29617}"
 NPU_COUNT=16
 
@@ -83,6 +83,7 @@ env \
   experiment.log_every=1 \
   experiment.log_grad_norm_every=1 \
   experiment.checkpoints_total_limit=1 \
+  experiment.save_ema_eval_every=1 \
   experiment.save_hfmodel_every=1000000000 \
   experiment.save_final=true \
   experiment.val_every=1 \
@@ -111,7 +112,8 @@ env \
 
 TRAIN_CONFIG="${RUN_ROOT}/config.yaml"
 EMA_MODEL="${RUN_ROOT}/hf_model-final-ema"
-python - "${RUN_ROOT}" "${EMA_MODEL}" <<'PY'
+EMA_EVAL_MODEL="${RUN_ROOT}/hf_model-1-ema-eval"
+python - "${RUN_ROOT}" "${EMA_MODEL}" "${EMA_EVAL_MODEL}" <<'PY'
 import json
 import math
 import sys
@@ -119,6 +121,7 @@ from pathlib import Path
 
 run_root = Path(sys.argv[1])
 ema_model = Path(sys.argv[2])
+ema_eval_model = Path(sys.argv[3])
 checkpoint = json.loads((run_root / "checkpoint-1/checkpoint_complete.json").read_text())
 runtime = json.loads((run_root / "training_runtime_metrics.json").read_text())
 validation = json.loads((run_root / "validation_metrics_step_1.json").read_text())
@@ -130,6 +133,21 @@ if not math.isfinite(float(validation["metrics"]["val/loss_image_flow"])):
     raise SystemExit("validation loss is not finite")
 if not (ema_model / "model.safetensors").is_file():
     raise SystemExit("final EMA HF model was not exported")
+if not (ema_eval_model / "model.safetensors").is_file():
+    raise SystemExit("periodic EMA evaluation model was not exported")
+if not (run_root / "image_flow_adapter-final.pt").is_file():
+    raise SystemExit("final image-flow adapter was not exported")
+if (run_root / "image_flow_adapter-1.pt").exists():
+    raise SystemExit("intermediate image-flow adapter should be disabled")
+ema_eval_metadata = json.loads(
+    (ema_eval_model / "ema_export_metadata.json").read_text()
+)
+if (
+    ema_eval_metadata.get("source_global_step") != 1
+    or ema_eval_metadata.get("floating_dtype") != "bfloat16"
+    or ema_eval_metadata.get("export_kind") != "evaluation"
+):
+    raise SystemExit(f"invalid periodic EMA evaluation export: {ema_eval_metadata}")
 PY
 
 torchrun --standalone --nproc_per_node="${NPU_COUNT}" \
@@ -192,6 +210,8 @@ report = {
         "checkpoint_complete": str(run_root / "checkpoint-1/checkpoint_complete.json"),
         "raw_hf_model": str(run_root / "hf_model-final"),
         "ema_hf_model": str(run_root / "hf_model-final-ema"),
+        "periodic_ema_eval_model": str(run_root / "hf_model-1-ema-eval"),
+        "final_image_flow_adapter": str(run_root / "image_flow_adapter-final.pt"),
         "evaluation_metrics": str(eval_root / "metrics.json"),
     },
 }

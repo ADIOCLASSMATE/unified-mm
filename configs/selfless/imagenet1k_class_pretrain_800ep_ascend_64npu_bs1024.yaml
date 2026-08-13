@@ -7,10 +7,15 @@ experiment:
     name: "imagenet1k-class-800ep-seed42-64x910b-b16ga1-b1024-b30e5-f4e5"
     wandb_project: "unified-mm"
     output_dir: "output"
-    save_every: 6255
+    save_every: 12510
     log_every: 50
     log_grad_norm_every: 1251
     checkpoints_total_limit: 3
+    checkpoint_milestone_every: 125100
+    save_ema_eval_every: 12510
+    ema_eval_dtype: "bf16"
+    save_image_flow_adapter: false
+    save_final_image_flow_adapter: true
     save_hfmodel_every: 1000000000
     save_final: true
     val_every: 12510
@@ -119,6 +124,8 @@ training:
     ema_validate: false
     ema_save_adapter: true
     ema_save_hf_model: true
+    # Legacy resume-signature field; experiment.save_image_flow_adapter is the
+    # output-policy override for this run.
     save_image_flow_adapter: true
 
 evaluation:

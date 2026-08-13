@@ -69,6 +69,12 @@ def test_resume_signature_covers_future_training_controls():
     changed_output.experiment.output_dir = "/another/output"
     assert _signature(baseline) == _signature(changed_output)
 
+    changed_output_policy = _config()
+    changed_output_policy.experiment.save_ema_eval_every = 10
+    changed_output_policy.experiment.save_image_flow_adapter = False
+    changed_output_policy.experiment.save_final_image_flow_adapter = True
+    assert _signature(baseline) == _signature(changed_output_policy)
+
 
 def test_v3_resume_metadata_requires_exact_signature(tmp_path: Path):
     config = _config()
