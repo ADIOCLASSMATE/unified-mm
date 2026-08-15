@@ -90,27 +90,32 @@ def load_model_tokenizer(
     config: OmegaConf,
     logger=None,
     model_dtype: torch.dtype = torch.bfloat16,
+    *,
+    model_class=None,
+    model_config_class=None,
 ):
     from models.modeling_model.image_backbone import validate_image_data_layout
 
     architecture_variant = str(
         config.model.get("architecture_variant", "selfless_contextual")
     ).strip().lower()
-    if architecture_variant == "selfless_contextual":
+    if model_class is not None:
+        Qwen3ForCausalLM = model_class
+        implementation_label = model_class.__name__
+    elif architecture_variant == "selfless_contextual":
         from models.modeling_model.modeling_selfless_flow import Qwen3ForCausalLM
+
+        implementation_label = "selfless_contextual"
     elif architecture_variant == "positionwise_selfless":
         from models.modeling_model.modeling_positionwise_flow import (
             PositionwiseFlowQwen3ForCausalLM as Qwen3ForCausalLM,
         )
-    elif architecture_variant == "showo2_maskgit":
-        from models.modeling_model.modeling_showo2_maskgit import (
-            ShowO2MaskGITQwen3ForCausalLM as Qwen3ForCausalLM,
-        )
+
+        implementation_label = "positionwise_selfless"
     else:
         raise ValueError(
             f"Unknown model.architecture_variant={architecture_variant!r}; "
-            "expected selfless_contextual, positionwise_selfless, or "
-            "showo2_maskgit."
+            "expected selfless_contextual or positionwise_selfless."
         )
 
     validate_image_data_layout(config)
@@ -149,7 +154,7 @@ def load_model_tokenizer(
     config.model.image_mask_token_id = tokenizer.convert_tokens_to_ids(image_mask_token)
 
     if logger is not None:
-        logger.info("Using architecture variant: %s", architecture_variant)
+        logger.info("Using model implementation: %s", implementation_label)
         logger.info("Special tokens: %s", tokenizer.special_tokens_map)
         logger.info(
             "BOI token id: %s, EOI token id: %s, IMG_MASK token id: %s",
@@ -160,6 +165,7 @@ def load_model_tokenizer(
 
     multimodal_config_keys = (
         "architecture_variant",
+        "dynamic_xt_contract",
         "boi_token_id",
         "eoi_token_id",
         "image_mask_token_id",
@@ -180,14 +186,21 @@ def load_model_tokenizer(
         "image_input_noise_strength",
         "image_uncond_prob",
         "backbone_attention_output_gate",
-        "maskgit_generation_steps",
-        "maskgit_validation_mask_ratio",
     )
 
-    model_config = AutoConfig.from_pretrained(
+    source_config = AutoConfig.from_pretrained(
         config.model.model_path,
         trust_remote_code=True,
     )
+    if model_config_class is None or isinstance(source_config, model_config_class):
+        model_config = source_config
+    else:
+        source_payload = source_config.to_dict()
+        source_payload.pop("model_type", None)
+        model_config = model_config_class(**source_payload)
+    if model_config_class is not None:
+        model_config.model_type = model_config_class.model_type
+        model_config.architectures = [Qwen3ForCausalLM.__name__]
     source_has_image_flow = hasattr(model_config, "image_flow_width")
     source_attention_gate = str(
         getattr(model_config, "backbone_attention_output_gate", "none")

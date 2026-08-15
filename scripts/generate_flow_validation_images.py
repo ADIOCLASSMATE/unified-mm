@@ -412,6 +412,7 @@ def load_adapter(model, adapter_path: str):
         head_state = {}
         condition_proj_state = {}
         projector_state = {}
+        backbone_flow_time_state = {}
         projector_target = model.image_token_embedder.state_dict()
 
         def maybe_add_projector_key(name, value):
@@ -428,6 +429,10 @@ def load_adapter(model, adapter_path: str):
                     condition_proj_state[key[len("model.image_flow_condition_proj."):]] = f.get_tensor(key)
                 elif key.startswith("model.image_token_embedder."):
                     maybe_add_projector_key(key[len("model.image_token_embedder."):], f.get_tensor(key))
+                elif key.startswith("model.backbone_flow_time_embedder."):
+                    backbone_flow_time_state[
+                        key[len("model.backbone_flow_time_embedder."):]
+                    ] = f.get_tensor(key)
 
         report["image_flow_head"] = _migrate_head_state(model, head_state)
         if condition_proj_state:
@@ -436,6 +441,22 @@ def load_adapter(model, adapter_path: str):
             missing, unexpected = model.image_token_embedder.load_state_dict(projector_state, strict=False)
             report["image_token_embedder_missing"] = list(missing)
             report["image_token_embedder_unexpected"] = list(unexpected)
+        backbone_flow_time_embedder = getattr(
+            model.model, "backbone_flow_time_embedder", None
+        )
+        if backbone_flow_time_embedder is not None:
+            if not backbone_flow_time_state:
+                raise ValueError(
+                    "Dynamic-XT safetensors adapter is missing "
+                    "model.backbone_flow_time_embedder"
+                )
+            backbone_flow_time_embedder.load_state_dict(
+                backbone_flow_time_state,
+                strict=True,
+            )
+            report["backbone_flow_time_embedder"] = len(
+                backbone_flow_time_state
+            )
         return report
 
     state = torch.load(path, map_location="cpu")
@@ -447,6 +468,21 @@ def load_adapter(model, adapter_path: str):
         missing, unexpected = model.image_token_embedder.load_state_dict(state["image_token_embedder"], strict=False)
         report["image_token_embedder_missing"] = list(missing)
         report["image_token_embedder_unexpected"] = list(unexpected)
+    backbone_flow_time_embedder = getattr(
+        model.model, "backbone_flow_time_embedder", None
+    )
+    if backbone_flow_time_embedder is not None:
+        if "backbone_flow_time_embedder" not in state:
+            raise ValueError(
+                "Dynamic-XT adapter is missing backbone_flow_time_embedder"
+            )
+        backbone_flow_time_embedder.load_state_dict(
+            state["backbone_flow_time_embedder"],
+            strict=True,
+        )
+        report["backbone_flow_time_embedder"] = len(
+            state["backbone_flow_time_embedder"]
+        )
     if "special_token_embeddings" in state and "special_token_ids" in state:
         with torch.no_grad():
             embed = model.model.embed_tokens.weight

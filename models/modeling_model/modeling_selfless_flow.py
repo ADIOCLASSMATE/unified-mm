@@ -1597,6 +1597,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         latent_mixer_cache: dict | None = None,
         latent_mixer_cache_is_paired: bool = False,
         initial_noise: torch.Tensor | None = None,
+        condition_evaluator=None,
         debug_finite: bool = False,
         debug_label: str = "",
     ) -> torch.Tensor:
@@ -1616,6 +1617,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 latent_mixer_cache=latent_mixer_cache,
                 latent_mixer_cache_is_paired=latent_mixer_cache_is_paired,
                 initial_noise=initial_noise,
+                condition_evaluator=condition_evaluator,
                 debug_finite=debug_finite,
                 debug_label=debug_label,
             )
@@ -1643,9 +1645,15 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             latent_mixer_cache=latent_mixer_cache,
             latent_mixer_cache_is_paired=latent_mixer_cache_is_paired,
             initial_noise=initial_noise,
+            condition_evaluator=condition_evaluator,
             debug_finite=debug_finite,
             debug_label=debug_label,
         )
+
+    def _make_backbone_flow_condition_evaluator(self, **_generation_state):
+        """Optional inference hook; the default static model keeps fixed ``z``."""
+
+        return None
 
     def tie_weights(
         self, missing_keys: set[str] | None = None, recompute_mapping: bool = True
@@ -2594,6 +2602,8 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         for _ in range(image_tokens_per_img):
             _debug_check("current_sigma", current_sigma, step_idx)
             _debug_check("work_latents_before_backbone", work_latents, step_idx)
+            attention_mask = None
+            uncond_attention_mask = None
             if backbone_cache_enabled:
                 pending_will_commit = (
                     backbone_pending_local_positions is not None
@@ -2850,6 +2860,32 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                         _debug_check(
                             f"flow_context.{context_name}", context_value, step_idx
                         )
+                condition_evaluator = self._make_backbone_flow_condition_evaluator(
+                    selected_input_ids=selected_input_ids,
+                    selected_token_types=selected_token_types,
+                    current_sigma=current_sigma,
+                    work_latents=work_latents,
+                    base_image_latent_mask=base_image_latent_mask,
+                    filled=filled,
+                    span_starts=span_starts,
+                    sample_indices=sample_indices,
+                    seq_positions=seq_positions,
+                    local_positions=local_positions_for_condition,
+                    attention_mask=attention_mask,
+                    uncond_attention_mask=uncond_attention_mask,
+                    use_flow_cfg=use_flow_cfg,
+                    backbone_cache_enabled=backbone_cache_enabled,
+                    backbone_cond_cache=backbone_cond_cache,
+                    backbone_uncond_cache=backbone_uncond_cache,
+                    backbone_key_sigma=backbone_key_sigma,
+                    backbone_key_valid=backbone_key_valid,
+                    backbone_key_is_image=backbone_key_is_image,
+                    backbone_max_cache_len=backbone_max_cache_len,
+                    full_position_ids=full_position_ids,
+                    image_tokens_per_img=image_tokens_per_img,
+                    debug_finite=debug_finite,
+                    generation_step=step_idx,
+                )
                 pred = Qwen3ForCausalLM.sample_image_flow_with_cfg(
                     self,
                     z,
@@ -2867,6 +2903,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                         if selected_initial_noise is not None
                         else None
                     ),
+                    condition_evaluator=condition_evaluator,
                     **flow_context,
                     debug_finite=debug_finite,
                     debug_label=(

@@ -9,8 +9,7 @@ BASELINE = CONFIG_DIR / "imagenet1k_class_pretrain_800ep_ascend_64npu_bs1024.yam
 ABLATIONS = {
     "positionwise_head": CONFIG_DIR
     / "imagenet1k_class_pretrain_800ep_ascend_64npu_bs1024_positionwise_head.yaml",
-    "showo2_maskgit": CONFIG_DIR
-    / "imagenet1k_class_pretrain_800ep_ascend_64npu_bs1024_showo2_maskgit.yaml",
+    "dynamic_xt": CONFIG_DIR / "imagenet1k_class_dynamic_xt_800ep.yaml",
 }
 
 
@@ -37,11 +36,12 @@ def test_ablation_configs_match_every_shared_baseline_setting():
     }
     variant_exceptions = {
         "positionwise_head": set(),
-        "showo2_maskgit": {
-            "evaluation.strategies",
-            "experiment.validation_single_stream_order_strategies",
-            "model.maskgit_generation_steps",
-            "model.maskgit_validation_mask_ratio",
+        "dynamic_xt": {
+            "model.dynamic_xt_contract",
+            "training.target_epochs",
+            "training.steps_per_epoch",
+            "training.target_train_steps",
+            "training.effective_samples_seen",
         },
     }
 

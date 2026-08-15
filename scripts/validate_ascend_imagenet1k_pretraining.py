@@ -66,6 +66,15 @@ def validate_config(config, *, world_size: int) -> dict[str, object]:
     architecture_variant = str(
         config.model.get("architecture_variant", "selfless_contextual")
     ).lower()
+    if (
+        str(config.model.get("dynamic_xt_contract", ""))
+        == "backbone_in_flow_loop_v1"
+    ):
+        if config.model.get("architecture_variant", None) is not None:
+            raise RuntimeError(
+                "Dynamic-XT formal config must not use architecture_variant"
+            )
+        architecture_variant = "dynamic_xt"
     image_sigma_order = str(params.get("image_sigma_order", "random")).lower()
     project_by_variant = {
         ("selfless_contextual", "random"): (
@@ -78,9 +87,8 @@ def validate_config(config, *, world_size: int) -> dict[str, object]:
             "selfless-flow-imagenet1k-class-ascend64-b1024-800ep-"
             "positionwise-head"
         ),
-        ("showo2_maskgit", "random"): (
-            "selfless-flow-imagenet1k-class-ascend64-b1024-800ep-"
-            "showo2-maskgit"
+        ("dynamic_xt", "random"): (
+            "selfless-flow-imagenet1k-class-dynamic-xt-ascend64-b1024-800ep"
         ),
     }
     variant_key = (architecture_variant, image_sigma_order)
@@ -91,9 +99,7 @@ def validate_config(config, *, world_size: int) -> dict[str, object]:
             f"image_sigma_order={image_sigma_order!r}"
         )
     expected_project = project_by_variant[variant_key]
-    if architecture_variant == "showo2_maskgit":
-        expected_generation_strategy = "maskgit"
-    elif image_sigma_order == "sequential":
+    if image_sigma_order == "sequential":
         expected_generation_strategy = "sequential"
     else:
         expected_generation_strategy = "spatial_halton"
@@ -157,13 +163,19 @@ def validate_config(config, *, world_size: int) -> dict[str, object]:
     for label, (actual, expected) in required.items():
         if actual != expected:
             raise RuntimeError(f"config {label} mismatch: {actual!r} != {expected!r}")
-    if architecture_variant == "showo2_maskgit":
-        if int(config.model.maskgit_generation_steps) != 18:
-            raise RuntimeError("formal Show-o2 ablation requires 18 MaskGIT rounds")
-        if float(config.model.maskgit_validation_mask_ratio) != 0.5:
-            raise RuntimeError(
-                "formal Show-o2 ablation requires fixed 0.5 validation mask ratio"
-            )
+    if architecture_variant == "dynamic_xt":
+        accounting = {
+            "target_epochs": EPOCHS,
+            "steps_per_epoch": STEPS_PER_EPOCH,
+            "target_train_steps": MAX_STEPS,
+            "effective_samples_seen": TRAIN_SAMPLES_PER_EPOCH * EPOCHS,
+        }
+        for key, expected in accounting.items():
+            actual = int(config.training.get(key, -1))
+            if actual != expected:
+                raise RuntimeError(
+                    f"Dynamic-XT training.{key} mismatch: {actual} != {expected}"
+                )
     if str(config.model.model_path) != "public/models/Qwen--Qwen3-0.6B-Base":
         raise RuntimeError("formal pretraining must initialize from Qwen3-0.6B-Base")
     expected_evaluation_checkpoint = f"output/{expected_project}/hf_model-final-ema"

@@ -14,15 +14,20 @@ from transformers import Qwen3Config
 from models.modeling_model.modeling_positionwise_flow import (
     PositionwiseFlowQwen3ForCausalLM,
 )
-from models.modeling_model.modeling_showo2_maskgit import (
-    ShowO2MaskGITQwen3ForCausalLM,
+from models.modeling_model.modeling_selfless_flow_dynamic_xt import (
+    DynamicXtQwen3ForCausalLM,
+    SelflessFlowDynamicXtConfig,
 )
-from utils.showo2_maskgit import get_showo2_attention_mask
 from utils.utils import get_selfless_mask
 
 
-def tiny_config(architecture_variant: str) -> Qwen3Config:
-    config = Qwen3Config(
+def tiny_config(model_label: str) -> Qwen3Config:
+    config_class = (
+        SelflessFlowDynamicXtConfig
+        if model_label == "dynamic_xt"
+        else Qwen3Config
+    )
+    config = config_class(
         vocab_size=32,
         hidden_size=32,
         intermediate_size=64,
@@ -35,7 +40,8 @@ def tiny_config(architecture_variant: str) -> Qwen3Config:
         bos_token_id=1,
         eos_token_id=9,
     )
-    config.architecture_variant = architecture_variant
+    if model_label == "positionwise_selfless":
+        config.architecture_variant = model_label
     config.mask_token_id = 7
     config.image_mask_token_id = 8
     config.boi_token_id = 11
@@ -45,7 +51,7 @@ def tiny_config(architecture_variant: str) -> Qwen3Config:
     config.image_flow_width = 32
     config.image_flow_depth = 2
     config.image_flow_num_sampling_steps = "1"
-    config.image_flow_batch_mul = 1
+    config.image_flow_batch_mul = 4 if model_label == "dynamic_xt" else 1
     config.image_flow_time_scale = 1000.0
     config.image_flow_time_sampling = "uniform"
     config.image_flow_time_eps = 1.0e-4
@@ -54,8 +60,6 @@ def tiny_config(architecture_variant: str) -> Qwen3Config:
     config.image_input_noise_strength = 1.0e-2
     config.image_uncond_prob = 0.1
     config.backbone_attention_output_gate = "none"
-    config.maskgit_generation_steps = 2
-    config.maskgit_validation_mask_ratio = 0.5
     config.use_flex_attention = True
     config.use_cache = False
     return config
@@ -102,24 +106,19 @@ def batch(device: torch.device) -> dict[str, torch.Tensor]:
 
 def run_variant(
     model_class,
-    architecture_variant: str,
+    model_label: str,
     device: torch.device,
 ) -> dict[str, object]:
     payload = batch(device)
-    model = model_class(tiny_config(architecture_variant)).to(
+    model = model_class(tiny_config(model_label)).to(
         device=device,
         dtype=torch.bfloat16,
     )
-    if architecture_variant == "showo2_maskgit":
-        attention_mask = get_showo2_attention_mask(payload["token_types"])
-        attention_kwargs = {"attention_mask_contract": "showo2"}
-    else:
-        attention_mask = get_selfless_mask(
-            payload["sigma"],
-            payload["input_ids"].shape[1],
-            device,
-        )
-        attention_kwargs = {}
+    attention_mask = get_selfless_mask(
+        payload["sigma"],
+        payload["input_ids"].shape[1],
+        device,
+    )
 
     model.train()
     output = model(
@@ -131,14 +130,19 @@ def run_variant(
         image_local_positions=payload["image_local_positions"],
         image_span_table=payload["image_span_table"],
         flow_sigma=payload["sigma"],
-        **attention_kwargs,
     )
     if not bool(torch.isfinite(output.loss).item()):
-        raise AssertionError(f"{architecture_variant} training loss is not finite")
+        raise AssertionError(f"{model_label} training loss is not finite")
     output.loss.backward()
     final_grad = model.image_flow_head.net.final_layer.linear.weight.grad
     if final_grad is None or not bool(torch.isfinite(final_grad).all().item()):
-        raise AssertionError(f"{architecture_variant} flow backward failed")
+        raise AssertionError(f"{model_label} flow backward failed")
+    if model_label == "dynamic_xt":
+        time_grad = (
+            model.model.backbone_flow_time_embedder.mlp[0].weight.grad
+        )
+        if time_grad is None or not bool(torch.isfinite(time_grad).all().item()):
+            raise AssertionError("Dynamic-XT time embedder backward failed")
 
     model.eval()
     generated, trace = model.sample_image_latents_single_stream(
@@ -148,25 +152,31 @@ def run_variant(
         spans=[(0, 2, 6)],
         image_latent_dim=4,
         flow_temperature=1.0,
-        flow_cfg=1.0,
-        flow_solver="euler",
+        flow_cfg=2.0 if model_label == "dynamic_xt" else 1.0,
+        flow_solver="heun" if model_label == "dynamic_xt" else "euler",
         flow_num_steps=1,
         parallel_rate=1,
-        order_strategy=(
-            "maskgit" if architecture_variant == "showo2_maskgit" else "sigma"
-        ),
-        use_backbone_cache=False,
+        order_strategy="sigma",
+        use_backbone_cache=model_label == "dynamic_xt",
         return_trace=True,
+        _debug_max_generation_steps=(1 if model_label == "dynamic_xt" else None),
     )
     torch.npu.synchronize()
     if tuple(generated.shape) != (1, 4, 2, 2):
         raise AssertionError(
-            f"{architecture_variant} generated shape mismatch: {generated.shape}"
+            f"{model_label} generated shape mismatch: {generated.shape}"
         )
     if not bool(torch.isfinite(generated).all().item()):
-        raise AssertionError(f"{architecture_variant} generation is not finite")
+        raise AssertionError(f"{model_label} generation is not finite")
+    if model_label == "dynamic_xt":
+        if trace["dynamic_xt_conditional_velocity_evaluations"] != 2:
+            raise AssertionError("Heun must recompute conditional XT twice")
+        if trace["dynamic_xt_unconditional_velocity_evaluations"] != 2:
+            raise AssertionError("Heun must recompute unconditional XT twice")
+        if trace["dynamic_xt_query_cache_policy"] != "read_only_x0_kv":
+            raise AssertionError("Dynamic-XT query cache policy changed")
     return {
-        "architecture_variant": architecture_variant,
+        "architecture_variant": model_label,
         "loss": float(output.loss.detach().cpu()),
         "generation_steps": int(trace["generation_step"].max().cpu()),
         "flow_head_architecture": trace["flow_head_architecture"],
@@ -184,8 +194,8 @@ def main() -> None:
             device,
         ),
         run_variant(
-            ShowO2MaskGITQwen3ForCausalLM,
-            "showo2_maskgit",
+            DynamicXtQwen3ForCausalLM,
+            "dynamic_xt",
             device,
         ),
     ]

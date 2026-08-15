@@ -1,10 +1,12 @@
-# Ablation 2: replace the selfless two-stream backbone with a Show-o2-style
-# single Qwen stream. Text is ordinary AR (diagonal included), image latents
-# use MaskGIT, and the flow head is the same position-wise AdaLN MLP as
-# ablation 1. All shared optimization/data settings match the formal baseline.
+# Dynamic-XT ImageNet-1K class-conditioned ablation on 64 Ascend 910B NPUs.
+# 16 samples/rank * 64 ranks * GA 1 = global batch 1024.
+# 1,281,024 samples/epoch / 1024 = 1,251 optimizer steps/epoch.
+# WSD phases are exactly 5 warmup + 595 stable + 200 decay epochs.
+# Training/evaluation values mirror the static contract; identity, the
+# Dynamic-XT contract marker, and explicit accounting metadata differ.
 experiment:
-    project: "selfless-flow-imagenet1k-class-ascend64-b1024-800ep-showo2-maskgit"
-    name: "imagenet1k-class-800ep-seed42-64x910b-b16ga1-b1024-showo2-maskgit"
+    project: "selfless-flow-imagenet1k-class-dynamic-xt-ascend64-b1024-800ep"
+    name: "imagenet1k-class-dynamic-xt-800ep-seed42-64x910b-b16ga1-b1024-b30e5-f4e5"
     wandb_project: "unified-mm"
     output_dir: "output"
     save_every: 12510
@@ -30,14 +32,14 @@ experiment:
     validation_save_debug_images: false
     validation_single_stream_images: true
     validation_single_stream_parallel_rate: 1
-    validation_single_stream_order_strategies: ["maskgit"]
+    validation_single_stream_order_strategies: ["spatial_halton"]
     validation_vae_module_root: "public/code/mar"
     validation_vae_path: "public/vae/mar-kl16/kl16.ckpt"
     validation_vae_scaling_factor: 0.2325
     resume_from_checkpoint: none
 
 model:
-    architecture_variant: "showo2_maskgit"
+    dynamic_xt_contract: "backbone_in_flow_loop_v1"
     model_path: "public/models/Qwen--Qwen3-0.6B-Base"
     use_flex_attention: true
     image_tokens_per_img: 256
@@ -56,8 +58,6 @@ model:
     image_flow_solver: "heun"
     image_input_noise_strength: 1.0e-2
     image_uncond_prob: 0.1
-    maskgit_generation_steps: 18
-    maskgit_validation_mask_ratio: 0.5
     pretrained_image_flow_adapter: none
 
 dataset:
@@ -69,13 +69,14 @@ dataset:
         conditioning_mode: "class"
         image_tokens_per_img: 256
         image_latent_dim: 16
-        image_sigma_order: "random"
         max_seq_length: 320
         pad_to_length: 320
         pad_to_multiple_of: 64
         split_strategy: "stratified"
         split_seed: 42
         val_samples_per_class: 50
+        # The 50K probe rows remain in the training population. A shallow
+        # validation view keeps posterior/reveal RNG fixed at epoch zero.
         validation_overlap_train: true
     preprocessing:
         max_seq_length: 320
@@ -115,6 +116,10 @@ training:
     optimizer_steps_per_epoch: 1251
     num_train_epochs: 800
     max_train_steps: 1000800
+    target_epochs: 800
+    steps_per_epoch: 1251
+    target_train_steps: 1000800
+    effective_samples_seen: 1024819200
     max_grad_norm: 1.0
     use_gradient_checkpointing: false
     step_scheduler_with_optimizer: false
@@ -126,10 +131,12 @@ training:
     ema_validate: false
     ema_save_adapter: true
     ema_save_hf_model: true
+    # Legacy resume-signature field; experiment.save_image_flow_adapter is the
+    # output-policy override for this run.
     save_image_flow_adapter: true
 
 evaluation:
-    checkpoint: "output/selfless-flow-imagenet1k-class-ascend64-b1024-800ep-showo2-maskgit/hf_model-final-ema"
+    checkpoint: "output/selfless-flow-imagenet1k-class-dynamic-xt-ascend64-b1024-800ep/hf_model-final-ema"
     model_dtype: "bf16"
     samples: 50000
     batch_size: 4096
@@ -141,7 +148,7 @@ evaluation:
     cfg_schedule: "constant"
     flow_solver: "heun"
     parallel_rate: 1
-    strategies: "maskgit"
+    strategies: "spatial_halton"
     seed: 42
     inception_weights_path: "public/models/torch-fidelity/weights-inception-2015-12-05-6726825d.pth"
     real_stats_path: "public/datasets/imagenet_full/fid_stats/inception_v3_2048_imagenet_val50000_256.pt"

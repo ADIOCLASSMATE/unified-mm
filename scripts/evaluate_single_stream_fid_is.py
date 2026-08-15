@@ -1655,7 +1655,7 @@ def warm_inception_cache_if_needed(
 
 
 @torch.no_grad()
-def main():
+def main(*, model_loader=None):
     args = parse_args()
     torch.set_float32_matmul_precision("highest")
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -1731,7 +1731,9 @@ def main():
         "fp32": torch.float32,
     }[args.model_dtype]
     stored_checkpoint_dtypes = checkpoint_weight_dtypes(config.model.model_path)
-    model, tokenizer = load_model_tokenizer(
+    if model_loader is None:
+        model_loader = load_model_tokenizer
+    model, tokenizer = model_loader(
         config,
         model_dtype=requested_model_dtype,
     )

@@ -11,6 +11,10 @@ from .image_position_utils import (
     build_local_row_col_rope,
     rotate_half,
 )
+from .rectified_flow_state import (
+    RectifiedFlowTrainingState,
+    sample_rectified_flow_training_state,
+)
 
 
 def _xavier_uniform_init_fp32_(tensor: torch.Tensor):
@@ -1523,6 +1527,18 @@ class FlowLoss(nn.Module):
             )
         return t.clamp(self.time_eps, 1.0 - self.time_eps)
 
+    def sample_training_state(
+        self,
+        target: torch.Tensor,
+    ) -> RectifiedFlowTrainingState:
+        """Sample RF variables once for static or Dynamic-XT training."""
+
+        return sample_rectified_flow_training_state(
+            target,
+            sample_times=self._sample_times,
+            device=self.net.input_proj.weight.device,
+        )
+
     def _scale_time(self, t: torch.Tensor) -> torch.Tensor:
         return t.to(dtype=torch.float32) * self.time_scale
 
@@ -1698,6 +1714,7 @@ class FlowLoss(nn.Module):
         image_positions=None,
         context_latents=None,
         record_stats: bool = True,
+        training_state: RectifiedFlowTrainingState | None = None,
     ):
         model_dtype = self.net.input_proj.weight.dtype
         model_device = self.net.input_proj.weight.device
@@ -1713,16 +1730,22 @@ class FlowLoss(nn.Module):
         if context_latents is not None:
             context_latents = context_latents.to(device=model_device, dtype=model_dtype)
 
-        batch_shape = target_model.shape[:-1]
-        t = self._sample_times(int(math.prod(batch_shape)), model_device).view(batch_shape)
-        noise = torch.randn(
-            target_float.shape,
-            device=model_device,
-            dtype=torch.float32,
-        )
-        t_view = t.unsqueeze(-1).float()
-        x_t = (1.0 - t_view) * noise + t_view * target_float
-        v_target = target_float - noise
+        if training_state is None:
+            training_state = self.sample_training_state(target_float)
+        expected_time_shape = target_model.shape[:-1]
+        if tuple(training_state.t.shape) != tuple(expected_time_shape):
+            raise ValueError(
+                "RF training-state time shape must match target batch shape: "
+                f"t={tuple(training_state.t.shape)}, target={tuple(target_model.shape)}"
+            )
+        if tuple(training_state.x_t.shape) != tuple(target_float.shape):
+            raise ValueError(
+                "RF training-state x_t must match target shape: "
+                f"x_t={tuple(training_state.x_t.shape)}, target={tuple(target_float.shape)}"
+            )
+        t = training_state.t.to(device=model_device, dtype=torch.float32)
+        x_t = training_state.x_t.to(device=model_device, dtype=torch.float32)
+        v_target = training_state.v_target.to(device=model_device, dtype=torch.float32)
         context_kwargs = self._training_context(target_model, sigma, image_positions, context_latents=context_latents)
         v_pred = self.velocity(
             x_t,
@@ -2049,6 +2072,7 @@ class FlowLoss(nn.Module):
         latent_mixer_cache: dict | None = None,
         latent_mixer_cache_is_paired: bool = False,
         initial_noise: torch.Tensor | None = None,
+        condition_evaluator=None,
         debug_finite: bool = False,
         debug_label: str = "",
     ):
@@ -2201,10 +2225,20 @@ class FlowLoss(nn.Module):
             t_next = times[idx + 1].expand(x_shape)
             dt = time_deltas[idx]
             cfg_t = cfg_values[idx]
+            current_z = (
+                z
+                if condition_evaluator is None
+                else condition_evaluator(x.to(dtype=model_dtype), t)
+            )
+            if tuple(current_z.shape) != tuple(z.shape):
+                raise ValueError(
+                    "dynamic flow condition must preserve the static condition shape: "
+                    f"dynamic={tuple(current_z.shape)}, static={tuple(z.shape)}"
+                )
             v = self._guided_velocity(
                 x.to(dtype=model_dtype),
                 t,
-                z,
+                current_z,
                 cfg_t,
                 context_kwargs,
                 context_is_paired=context_is_paired,
@@ -2213,7 +2247,9 @@ class FlowLoss(nn.Module):
                 debug_phase="predictor_",
                 context_prepared=True,
             ).float()
-            _debug_check("guided_velocity", v, idx, {"state": x, "condition": z})
+            _debug_check(
+                "guided_velocity", v, idx, {"state": x, "condition": current_z}
+            )
             if solver == "euler":
                 x = x + dt * v
                 _debug_check("euler_state", x, idx, {"velocity": v, "condition": z})
@@ -2221,10 +2257,23 @@ class FlowLoss(nn.Module):
                 x_euler = x + dt * v
                 _debug_check("heun_euler_predictor", x_euler, idx, {"velocity": v, "condition": z})
                 cfg_t_next = cfg_values[idx + 1]
+                next_z = (
+                    z
+                    if condition_evaluator is None
+                    else condition_evaluator(
+                        x_euler.to(dtype=model_dtype),
+                        t_next,
+                    )
+                )
+                if tuple(next_z.shape) != tuple(z.shape):
+                    raise ValueError(
+                        "dynamic Heun corrector condition changed shape: "
+                        f"dynamic={tuple(next_z.shape)}, static={tuple(z.shape)}"
+                    )
                 v_next = self._guided_velocity(
                     x_euler.to(dtype=model_dtype),
                     t_next,
-                    z,
+                    next_z,
                     cfg_t_next,
                     context_kwargs,
                     context_is_paired=context_is_paired,

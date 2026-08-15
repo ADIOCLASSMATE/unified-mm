@@ -148,7 +148,7 @@ not implicitly mount the official dataset.
 - Both architecture controls preserve the formal 64-NPU, global-batch-1024,
   800-epoch optimization/data contract. A config-parity test permits only the
   architecture identity, run/output names, and architecture-required
-  generation fields to differ from the baseline.
+  accounting fields to differ from the baseline.
 - The position-wise-head control keeps the random-sigma selfless two-stream
   Qwen backbone and replaces only the contextual flow head with a vectorized
   MAR/NextStep-style AdaLN MLP. The head has no cross-token attention, content
@@ -157,21 +157,25 @@ not implicitly mount the official dataset.
   `configs/selfless/imagenet1k_class_pretrain_800ep_ascend_64npu_bs1024_positionwise_head.yaml`
   and
   `script/selfless/pretraining_imagenet1k_class_ascend_64npu_bs1024_800ep_positionwise_head.sh`.
-- The Show-o2/MaskGIT control uses one Qwen stream, ordinary AR text attention
-  including the diagonal, full bidirectional attention within each image
-  span, cosine MaskGIT training, 18-round MaskGIT generation, and the same
-  position-wise flow head. Its NPU path reuses compact-GQA
-  `npu_fusion_attention`; mask ordering uses one FP32 `argsort` plus `scatter`
-  so no integer-argsort AiCPU fallback remains.
-- Show-o2/MaskGIT config and launcher:
-  `configs/selfless/imagenet1k_class_pretrain_800ep_ascend_64npu_bs1024_showo2_maskgit.yaml`
-  and
-  `script/selfless/pretraining_imagenet1k_class_ascend_64npu_bs1024_800ep_showo2_maskgit.sh`.
-- Both 16-NPU one-step train/validation/16-image evaluation smokes passed on
-  `dev-wjx-ascend`. Retained reports are
-  `public/datasets/imagenet_full/preparation/positionwise_head_smoke_report.json`
-  and
-  `public/datasets/imagenet_full/preparation/showo2_maskgit_smoke_report.json`.
+- The Dynamic-XT control keeps the same strict selfless X0/XT backbone and
+  contextual dual-stream flow head. It replaces only predicted-image XT
+  queries with `image_token_embedder(x_t) + backbone_flow_time_embedder(t)`;
+  Heun predictor/corrector evaluations recompute XT while reading fixed X0
+  K/V without committing XT to the cache.
+- Dynamic-XT config and launcher:
+  `configs/selfless/imagenet1k_class_dynamic_xt_800ep.yaml` and
+  `script/selfless/pretraining_imagenet_class_dynamic_xt_800ep.sh`.
+- Its 16-NPU official 50K FID/IS launcher is
+  `script/selfless/evaluate_imagenet1k_dynamic_xt_ema_ascend16.sh`; it uses the
+  dedicated Dynamic-XT evaluator entry while retaining the static protocol.
+- The position-wise-head retained smoke report is
+  `public/datasets/imagenet_full/preparation/positionwise_head_smoke_report.json`.
+  Dynamic-XT passed the tiny train/backward plus Heun-CFG-cache NPU smoke and
+  the exact formal per-rank shape (`B=16`, `L=320`, 256 image tokens,
+  latent dim 16, flow batch multiplier 4) forward/backward smoke on
+  `dev-wjx-ascend`. Dynamic-only backbone activation rematerialization keeps
+  that exact batch contract within device memory; flow-head checkpointing and
+  the underlying NPU attention/operator paths remain unchanged.
 
 ## Waiting
 

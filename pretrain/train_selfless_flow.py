@@ -52,7 +52,6 @@ from utils.sharded_ema import (
     merge_sharded_ema_state_dict,
     read_sharded_ema_rows,
 )
-from utils.showo2_maskgit import get_showo2_attention_mask
 from models.logging import set_verbosity_info, set_verbosity_error
 from utils.utils import (
     flatten_omega_conf,
@@ -105,6 +104,7 @@ def _load_image_flow_adapter(model, adapter_path, config):
         head_state = {}
         condition_proj_state = {}
         projector_state = {}
+        backbone_flow_time_state = {}
 
         with safe_open(str(adapter_path), framework="pt", device="cpu") as f:
             for key in f.keys():
@@ -115,6 +115,9 @@ def _load_image_flow_adapter(model, adapter_path, config):
                 elif key.startswith("model.image_token_embedder."):
                     name = key[len("model.image_token_embedder."):]
                     projector_state[name] = f.get_tensor(key)
+                elif key.startswith("model.backbone_flow_time_embedder."):
+                    name = key[len("model.backbone_flow_time_embedder."):]
+                    backbone_flow_time_state[name] = f.get_tensor(key)
         model.image_flow_head.load_state_dict(head_state, strict=True)
         model.image_flow_condition_proj.load_state_dict(
             condition_proj_state, strict=True
@@ -122,6 +125,14 @@ def _load_image_flow_adapter(model, adapter_path, config):
         model.image_token_embedder.load_state_dict(
             projector_state, strict=True
         )
+        backbone_flow_time_embedder = getattr(
+            model.model, "backbone_flow_time_embedder", None
+        )
+        if backbone_flow_time_embedder is not None:
+            backbone_flow_time_embedder.load_state_dict(
+                backbone_flow_time_state,
+                strict=True,
+            )
         _log_info(f"Loaded finalized image-flow modules from {adapter_path}")
         return
 
@@ -132,6 +143,8 @@ def _load_image_flow_adapter(model, adapter_path, config):
         "image_token_embedder",
         "special_token_embeddings",
     }
+    if hasattr(model.model, "backbone_flow_time_embedder"):
+        required.add("backbone_flow_time_embedder")
     missing = required - set(state)
     if missing:
         raise ValueError(
@@ -144,6 +157,10 @@ def _load_image_flow_adapter(model, adapter_path, config):
     model.image_token_embedder.load_state_dict(
         state["image_token_embedder"], strict=True
     )
+    if hasattr(model.model, "backbone_flow_time_embedder"):
+        model.model.backbone_flow_time_embedder.load_state_dict(
+            state["backbone_flow_time_embedder"], strict=True
+        )
     token_ids = _special_token_ids(config)
     if set(state["special_token_embeddings"]) != set(token_ids):
         raise ValueError(
@@ -289,6 +306,15 @@ def _save_image_flow_adapter(
             for name, token_id in token_ids.items()
         },
     }
+    backbone_flow_time_embedder = getattr(
+        unwrapped.model, "backbone_flow_time_embedder", None
+    )
+    if backbone_flow_time_embedder is not None:
+        state["model_type"] = "selfless_flow_dynamic_xt"
+        state["backbone_flow_time_embedder"] = {
+            key: value.detach().cpu()
+            for key, value in backbone_flow_time_embedder.state_dict().items()
+        }
     _write_image_flow_adapter(state, config, global_step)
 
 
@@ -308,6 +334,7 @@ def _save_ema_image_flow_adapter(
             "image_flow_head.",
             "image_flow_condition_proj.",
             "model.image_token_embedder.",
+            "model.backbone_flow_time_embedder.",
         )
         selected_names = [
             name
@@ -346,6 +373,14 @@ def _save_ema_image_flow_adapter(
                 for name, token_id in token_ids.items()
             },
         }
+        backbone_flow_time_state = {
+            name.removeprefix("model.backbone_flow_time_embedder."): value
+            for name, value in selected_state.items()
+            if name.startswith("model.backbone_flow_time_embedder.")
+        }
+        if backbone_flow_time_state:
+            state["model_type"] = "selfless_flow_dynamic_xt"
+            state["backbone_flow_time_embedder"] = backbone_flow_time_state
         _write_image_flow_adapter(state, config, global_step)
         del selected_state, embedding_rows, state
     accelerator.wait_for_everyone()
@@ -650,7 +685,7 @@ def _set_caption_dataloader_epoch(dataloader, *, epoch: int, seed: int) -> None:
             sampler_generator.manual_seed(int(seed) + int(epoch))
 
 
-def main():
+def main(*, model_loader=None):
     #########################
     #      SETUP Config     #
     #########################
@@ -783,7 +818,9 @@ def main():
     # MODELS and TOKENIZER  #
     #########################
     logger.info("Loading tokenizer and model")
-    model, tokenizer = load_model_tokenizer(
+    if model_loader is None:
+        model_loader = load_model_tokenizer
+    model, tokenizer = model_loader(
         config=config,
         logger=logger,
         model_dtype=torch.bfloat16,
@@ -1301,28 +1338,17 @@ def main():
                 ) & has_image
                 image_uncond_rows = sampled_rows
 
-            architecture_variant = str(
-                config.model.get("architecture_variant", "selfless_contextual")
-            ).lower()
-            if architecture_variant == "showo2_maskgit":
-                selfless_attention_mask = get_showo2_attention_mask(
-                    token_types,
-                    segment_ids=segment_ids,
-                    image_uncond_rows=image_uncond_rows,
-                    image_uncond_mask=image_uncond_mask,
-                )
-            else:
-                selfless_attention_mask = get_selfless_mask(
-                    sigma=sigma,
-                    seq_len=L,
-                    device=accelerator.device,
-                    input_ids=input_ids,
-                    token_types=token_types,
-                    boi_token_id=int(config.model.boi_token_id),
-                    image_uncond_rows=image_uncond_rows,
-                    segment_ids=segment_ids,
-                    image_uncond_mask=image_uncond_mask,
-                )
+            selfless_attention_mask = get_selfless_mask(
+                sigma=sigma,
+                seq_len=L,
+                device=accelerator.device,
+                input_ids=input_ids,
+                token_types=token_types,
+                boi_token_id=int(config.model.boi_token_id),
+                image_uncond_rows=image_uncond_rows,
+                segment_ids=segment_ids,
+                image_uncond_mask=image_uncond_mask,
+            )
 
             if global_step == 0 and accelerator.is_main_process and not hasattr(main, '_logged_first_batch'):
                 main._logged_first_batch = True
@@ -1407,21 +1433,9 @@ def main():
                 "labels": labels if is_multimodal else input_ids,
                 "attention_mask": selfless_attention_mask,
             }
-            if architecture_variant == "showo2_maskgit":
-                forward_kwargs["attention_mask_contract"] = "showo2"
             if token_types is not None:
                 forward_kwargs["token_types"] = token_types
                 forward_kwargs["flow_sigma"] = sigma
-                # Architecture-specific models may need to construct their
-                # own attention contract.  These tensors are no-ops for the
-                # production selfless model, whose prepared mask above remains
-                # authoritative.
-                if segment_ids is not None:
-                    forward_kwargs["segment_ids"] = segment_ids
-                if image_uncond_rows is not None:
-                    forward_kwargs["image_uncond_rows"] = image_uncond_rows
-                if image_uncond_mask is not None:
-                    forward_kwargs["image_uncond_mask"] = image_uncond_mask
                 if position_ids is not None:
                     forward_kwargs["position_ids"] = position_ids
                 if image_local_positions is not None:
