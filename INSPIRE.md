@@ -123,6 +123,26 @@ not implicitly mount the official dataset.
 - W&B remains enabled. `WANDB_MODE` defaults to `offline` and may be set to
   `online` for a platform environment with working W&B credentials/network.
 
+### ImageNet-1K sequential image-sigma ablation
+
+- This run keeps the formal 64-NPU, global-batch-1024, 800-epoch contract
+  unchanged while setting `dataset.params.image_sigma_order: sequential`.
+- Image sigma follows serialized latent-token order with strict
+  `sigma[kv] < sigma[q]`: the diagonal is hidden, and EOI is ordered before
+  every image token so image queries can still see EOI.
+- Config:
+  `configs/selfless/imagenet1k_class_pretrain_800ep_ascend_64npu_bs1024_seq_sigma.yaml`.
+- Launcher:
+  `script/selfless/pretraining_imagenet1k_class_ascend_64npu_bs1024_800ep_seq_sigma.sh`.
+- Training-time validation and offline evaluation both use the fixed
+  `sequential` generation strategy; the model asserts the exact 1..256 order
+  at runtime for a complete sequential generation.
+- The 16-NPU one-step train/validation/16-image evaluation smoke passed on
+  `dev-wjx-ascend`. The retained report is
+  `public/datasets/imagenet_full/preparation/seq_sigma_train_val_eval_smoke_report_v2.json`;
+  run the retained one-off smoke launcher with
+  `script/selfless/smoke_imagenet1k_seq_sigma_train_val_eval_ascend16.sh`.
+
 ## Waiting
 
 After one initial configuration/status check, wait with one blocking process:

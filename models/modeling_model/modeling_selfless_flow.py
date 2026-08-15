@@ -2194,6 +2194,18 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         fill_counter = torch.ones(len(spans), device=device, dtype=torch.long)
         step_idx = 1
         fixed_orders = {
+            "sequential": torch.arange(
+                image_tokens_per_img, device=device, dtype=torch.long
+            ),
+            "raster": torch.arange(
+                image_tokens_per_img, device=device, dtype=torch.long
+            ),
+            "row_major": torch.arange(
+                image_tokens_per_img, device=device, dtype=torch.long
+            ),
+            "prefix": torch.arange(
+                image_tokens_per_img, device=device, dtype=torch.long
+            ),
             "spatial_halton": _halton_order(),
             "halton": _halton_order(),
             "spatial_uniform": _spatial_uniform_order(),
@@ -2778,8 +2790,8 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                     else:
                         raise ValueError(
                             f"Unknown single-stream order_strategy={order_strategy!r}; "
-                            "expected one of: hidden_norm, latent_proj_cosine, spatial_halton, "
-                            "spatial_uniform, sigma, causal_sigma, random."
+                            "expected one of: sequential, hidden_norm, latent_proj_cosine, "
+                            "spatial_halton, spatial_uniform, sigma, causal_sigma, random."
                         )
 
                     fill_local_positions.append((sample_idx, positions, scores, None))
@@ -2987,6 +2999,19 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 flow_cache_divergence_count = (
                     len(spans)
                     * int(flow_content_cache["layers"][0]["k"].shape[2])
+                )
+
+        if order_strategy == "sequential" and _debug_max_generation_steps is None:
+            expected_generation_order = torch.arange(
+                1,
+                image_tokens_per_img + 1,
+                device=device,
+                dtype=generation_order.dtype,
+            ).unsqueeze(0).expand(len(spans), -1)
+            if not torch.equal(generation_order, expected_generation_order):
+                raise AssertionError(
+                    "sequential image generation did not follow serialized "
+                    "latent-token order"
                 )
 
         generated = generated.view(len(spans), side, side, image_latent_dim).permute(

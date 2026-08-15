@@ -30,7 +30,9 @@ def build_selfless_sigma(
     The physical sequence is ``prefix, BOI, image, EOI, suffix, EOS`` while
     sigma deliberately orders EOI before every image token. Consequently EOI
     cannot see image content, and image queries can see prefix/BOI/EOI plus
-    only image tokens revealed earlier by the deterministic permutation.
+    only image tokens revealed earlier by the configured image order. The
+    default ``random`` order is a deterministic per-sample permutation;
+    ``sequential`` follows the serialized latent-token order.
     """
 
     length = int(item["input_ids"].shape[0])
@@ -63,11 +65,20 @@ def build_selfless_sigma(
     sigma[prompt_len] = prompt_len
     sigma[eoi_pos] = prompt_len + 1
 
-    generator = torch.Generator(device="cpu")
-    generator.manual_seed(scalar_int(item, "reveal_seed"))
-    reveal_order = torch.rand(
-        int(image_tokens), generator=generator
-    ).argsort()
+    image_sigma_order = str(item.get("image_sigma_order", "random")).strip().lower()
+    if image_sigma_order == "random":
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(scalar_int(item, "reveal_seed"))
+        reveal_order = torch.rand(
+            int(image_tokens), generator=generator
+        ).argsort()
+    elif image_sigma_order == "sequential":
+        reveal_order = torch.arange(int(image_tokens), dtype=torch.long)
+    else:
+        raise ValueError(
+            f"Unknown image_sigma_order={image_sigma_order!r}; "
+            "expected 'random' or 'sequential'."
+        )
     sigma[image_start:eoi_pos] = prompt_len + 2 + reveal_order
 
     suffix_sigma_start = prompt_len + int(image_tokens) + 2

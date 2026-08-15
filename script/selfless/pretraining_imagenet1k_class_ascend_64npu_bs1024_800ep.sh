@@ -68,7 +68,7 @@ if [[ "${NPU_AVAILABLE}" != "1" || "${LOCAL_NPUS}" != "${NPROC_PER_NODE}" ]]; th
   exit 8
 fi
 
-RUN_ROOT="output/selfless-flow-imagenet1k-class-ascend64-b1024-800ep"
+RUN_ROOT="${RUN_ROOT:-output/selfless-flow-imagenet1k-class-ascend64-b1024-800ep}"
 AUDIT_DIR="${RUN_ROOT}/prelaunch_audit/node-${NODE_RANK}"
 mkdir -p "${AUDIT_DIR}"
 

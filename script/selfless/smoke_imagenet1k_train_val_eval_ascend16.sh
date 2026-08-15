@@ -10,9 +10,10 @@ export UNIFIED_MM_VENV="${UNIFIED_MM_VENV:-.venv}"
 source "${REPO_ROOT}/script/offline_env.sh"
 cd "${REPO_ROOT}"
 
-CONFIG="configs/selfless/imagenet1k_class_pretrain_800ep_ascend_64npu_bs1024.yaml"
+CONFIG="${CONFIG:-configs/selfless/imagenet1k_class_pretrain_800ep_ascend_64npu_bs1024.yaml}"
 ACCELERATE_CONFIG="accelerate_configs/64_npus_4nodes_deepspeed_zero2.yaml"
 PROJECT="${PROJECT:-selfless-flow-imagenet1k-ascend16-train-val-eval-smoke}"
+GENERATION_STRATEGY="${GENERATION_STRATEGY:-spatial_halton}"
 RUN_ROOT="output/${PROJECT}"
 EVAL_ROOT="output/${PROJECT}-fid-is"
 REPORT_PATH="${REPORT_PATH:-public/datasets/imagenet_full/preparation/train_val_eval_smoke_report.json}"
@@ -94,6 +95,7 @@ env \
   experiment.validation_flow_probe_times='[0.5]' \
   experiment.validation_save_debug_images=true \
   experiment.validation_single_stream_parallel_rate=1 \
+  "experiment.validation_single_stream_order_strategies=[${GENERATION_STRATEGY}]" \
   model.image_flow_num_sampling_steps=2 \
   model.image_flow_batch_mul=1 \
   model.image_flow_solver=euler \
@@ -113,7 +115,7 @@ env \
 TRAIN_CONFIG="${RUN_ROOT}/config.yaml"
 EMA_MODEL="${RUN_ROOT}/hf_model-final-ema"
 EMA_EVAL_MODEL="${RUN_ROOT}/hf_model-1-ema-eval"
-python - "${RUN_ROOT}" "${EMA_MODEL}" "${EMA_EVAL_MODEL}" <<'PY'
+python - "${RUN_ROOT}" "${EMA_MODEL}" "${EMA_EVAL_MODEL}" "${GENERATION_STRATEGY}" <<'PY'
 import json
 import math
 import sys
@@ -122,6 +124,7 @@ from pathlib import Path
 run_root = Path(sys.argv[1])
 ema_model = Path(sys.argv[2])
 ema_eval_model = Path(sys.argv[3])
+generation_strategy = sys.argv[4]
 checkpoint = json.loads((run_root / "checkpoint-1/checkpoint_complete.json").read_text())
 runtime = json.loads((run_root / "training_runtime_metrics.json").read_text())
 validation = json.loads((run_root / "validation_metrics_step_1.json").read_text())
@@ -131,6 +134,23 @@ if runtime.get("steps_this_run") != 1:
     raise SystemExit("training runtime did not record exactly one optimizer step")
 if not math.isfinite(float(validation["metrics"]["val/loss_image_flow"])):
     raise SystemExit("validation loss is not finite")
+strategy_image = (
+    run_root
+    / "validation_flow_images"
+    / f"step-00000001-strategy_{generation_strategy}.png"
+)
+if not strategy_image.is_file():
+    raise SystemExit(f"validation strategy image was not generated: {strategy_image}")
+generation_order_image = (
+    run_root
+    / "validation_flow_images"
+    / f"step-00000001-single_stream_order_{generation_strategy}.png"
+)
+if not generation_order_image.is_file():
+    raise SystemExit(
+        "validation generation-order trace was not generated: "
+        f"{generation_order_image}"
+    )
 if not (ema_model / "model.safetensors").is_file():
     raise SystemExit("final EMA HF model was not exported")
 if not (ema_eval_model / "model.safetensors").is_file():
@@ -165,7 +185,7 @@ torchrun --standalone --nproc_per_node="${NPU_COUNT}" \
   --cfg_schedule constant \
   --flow_solver euler \
   --parallel_rate 1 \
-  --strategies spatial_halton \
+  --strategies "${GENERATION_STRATEGY}" \
   --vae_dtype fp32 \
   --vae_decode_batch_size 1 \
   --inception_weights_path public/models/torch-fidelity/weights-inception-2015-12-05-6726825d.pth \
@@ -174,17 +194,18 @@ torchrun --standalone --nproc_per_node="${NPU_COUNT}" \
   --allow_nonofficial_fid \
   --canonical_pairing
 
-python - "${RUN_ROOT}" "${EVAL_ROOT}" "${REPORT_PATH}" <<'PY'
+python - "${RUN_ROOT}" "${EVAL_ROOT}" "${REPORT_PATH}" "${GENERATION_STRATEGY}" <<'PY'
 import json
 import math
 import sys
 from pathlib import Path
 
-run_root, eval_root, report_path = map(Path, sys.argv[1:])
+run_root, eval_root, report_path = map(Path, sys.argv[1:4])
+generation_strategy = sys.argv[4]
 runtime = json.loads((run_root / "training_runtime_metrics.json").read_text())
 validation = json.loads((run_root / "validation_metrics_step_1.json").read_text())
 evaluation = json.loads((eval_root / "metrics.json").read_text())
-strategy = evaluation["strategies"]["spatial_halton"]
+strategy = evaluation["strategies"][generation_strategy]
 required = {
     "fid": strategy["fid"],
     "inception_score_mean": strategy["inception_score_mean"],
@@ -202,7 +223,7 @@ report = {
         "samples_evaluated": evaluation["samples_evaluated"],
         "real_source": evaluation["real_source"],
         "target_decode_skipped": evaluation["target_decode_skipped"],
-        "strategy": "spatial_halton",
+        "strategy": generation_strategy,
         **required,
         "generation_step_max": strategy["generation_step_max"],
     },

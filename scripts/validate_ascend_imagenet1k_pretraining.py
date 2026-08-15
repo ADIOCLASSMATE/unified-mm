@@ -63,10 +63,26 @@ def require_hash(path: Path, expected: str, label: str) -> str:
 def validate_config(config, *, world_size: int) -> dict[str, object]:
     validate_wsd_contract(config)
     params = config.dataset.params
+    image_sigma_order = str(params.get("image_sigma_order", "random")).lower()
+    project_by_image_sigma_order = {
+        "random": "selfless-flow-imagenet1k-class-ascend64-b1024-800ep",
+        "sequential": (
+            "selfless-flow-imagenet1k-class-ascend64-b1024-800ep-seq-sigma"
+        ),
+    }
+    if image_sigma_order not in project_by_image_sigma_order:
+        raise RuntimeError(
+            f"unsupported image_sigma_order={image_sigma_order!r}; "
+            "expected 'random' or 'sequential'"
+        )
+    expected_project = project_by_image_sigma_order[image_sigma_order]
+    expected_generation_strategy = (
+        "sequential" if image_sigma_order == "sequential" else "spatial_halton"
+    )
     required = {
         "project": (
             str(config.experiment.project),
-            "selfless-flow-imagenet1k-class-ascend64-b1024-800ep",
+            expected_project,
         ),
         "conditioning_mode": (str(params.conditioning_mode), "class"),
         "validation_overlap_train": (bool(params.validation_overlap_train), True),
@@ -111,16 +127,21 @@ def validate_config(config, *, world_size: int) -> dict[str, object]:
         ),
         "evaluation_samples": (int(config.evaluation.samples), VALIDATION_IMAGES),
         "evaluation_sampling_steps": (int(config.evaluation.sampling_steps), 100),
+        "evaluation_strategies": (
+            str(config.evaluation.strategies),
+            expected_generation_strategy,
+        ),
+        "validation_single_stream_order_strategies": (
+            list(config.experiment.validation_single_stream_order_strategies),
+            [expected_generation_strategy],
+        ),
     }
     for label, (actual, expected) in required.items():
         if actual != expected:
             raise RuntimeError(f"config {label} mismatch: {actual!r} != {expected!r}")
     if str(config.model.model_path) != "public/models/Qwen--Qwen3-0.6B-Base":
         raise RuntimeError("formal pretraining must initialize from Qwen3-0.6B-Base")
-    expected_evaluation_checkpoint = (
-        "output/selfless-flow-imagenet1k-class-ascend64-b1024-800ep/"
-        "hf_model-final-ema"
-    )
+    expected_evaluation_checkpoint = f"output/{expected_project}/hf_model-final-ema"
     if str(config.evaluation.checkpoint) != expected_evaluation_checkpoint:
         raise RuntimeError(
             "formal evaluation checkpoint mismatch: "
@@ -152,6 +173,7 @@ def validate_config(config, *, world_size: int) -> dict[str, object]:
         "optimizer_steps_per_epoch": STEPS_PER_EPOCH,
         "epochs": EPOCHS,
         "max_optimizer_steps": MAX_STEPS,
+        "image_sigma_order": image_sigma_order,
         "wsd_epochs": {"warmup": 5, "stable": 595, "decay": 200},
         "ema_decay": decay,
         "ema_half_life_steps": half_life_steps,

@@ -1,5 +1,6 @@
 from typing import ClassVar
 
+import pytest
 import torch
 from accelerate.data_loader import BatchSamplerShard
 from omegaconf import OmegaConf
@@ -34,7 +35,7 @@ class _Tokenizer:
         return [self._token_ids[word] for word in text.split()]
 
 
-def _make_dataset(tmp_path):
+def _make_dataset(tmp_path, **overrides):
     means = torch.zeros((1, 4, 1), dtype=torch.float16)
     stds = torch.ones_like(means)
     cache_path = tmp_path / "posterior.pt"
@@ -59,7 +60,7 @@ def _make_dataset(tmp_path):
         '{"path": "n00000001/n00000001_1.JPEG", '
         '"recaption_short": "test caption"}\n'
     )
-    return ImageNetFlowCacheDataset(
+    arguments = dict(
         cache_path=str(cache_path),
         tokenizer=_Tokenizer(),
         boi_token_id=11,
@@ -74,6 +75,8 @@ def _make_dataset(tmp_path):
         seed=2,
         max_seq_length=16,
     )
+    arguments.update(overrides)
+    return ImageNetFlowCacheDataset(**arguments)
 
 
 def test_epoch_updates_reach_persistent_workers_for_posterior_sampling(tmp_path):
@@ -168,6 +171,44 @@ def test_training_reveal_order_changes_with_epoch(tmp_path):
     second = collate_imagenet_flow_cache([dataset[0]])
 
     assert not torch.equal(first["sigma"], second["sigma"])
+
+
+def test_sequential_image_sigma_is_strict_and_keeps_eoi_visible(tmp_path):
+    dataset = _make_dataset(tmp_path, image_sigma_order="sequential")
+    item = dataset[0]
+    batch = collate_imagenet_flow_cache([item])
+
+    image_start = item["image_start"].item()
+    image_end = image_start + dataset.image_tokens_per_img
+    eoi_position = image_end
+    sigma = batch["sigma"][0, : item["input_ids"].numel()]
+
+    assert torch.equal(
+        sigma[image_start:image_end],
+        torch.arange(
+            sigma[eoi_position].item() + 1,
+            sigma[eoi_position].item() + 1 + dataset.image_tokens_per_img,
+        ),
+    )
+    allowed = sigma.unsqueeze(0) < sigma.unsqueeze(1)
+    assert not bool(torch.diagonal(allowed).any())
+    assert bool(allowed[image_start:image_end, eoi_position].all())
+    assert torch.equal(
+        allowed[image_start:image_end, image_start:image_end],
+        torch.tril(
+            torch.ones(
+                dataset.image_tokens_per_img,
+                dataset.image_tokens_per_img,
+                dtype=torch.bool,
+            ),
+            diagonal=-1,
+        ),
+    )
+
+
+def test_image_sigma_order_rejects_unknown_strategy(tmp_path):
+    with pytest.raises(ValueError, match="expected 'random' or 'sequential'"):
+        _make_dataset(tmp_path, image_sigma_order="diagonal")
 
 
 def test_exact_epoch_budget_has_no_partial_gradient_accumulation_step():

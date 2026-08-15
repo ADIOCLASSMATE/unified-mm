@@ -15,7 +15,7 @@ This loader supports exactly two conditioning modes:
 import hashlib
 import json
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 from torch.utils.data import Dataset
@@ -59,6 +59,7 @@ class ImageNetFlowCacheDataset(Dataset):
         caption_manifest_sha256: Optional[str] = None,
         max_samples: int = -1,
         seed: int = 42,
+        image_sigma_order: str = "random",
         emit_audit_metadata: bool = True,
     ):
         self.cache_path = Path(cache_path)
@@ -150,6 +151,12 @@ class ImageNetFlowCacheDataset(Dataset):
             int(model_context_length) if model_context_length else 32768
         )
         self.seed = int(seed)
+        self.image_sigma_order = str(image_sigma_order).strip().lower()
+        if self.image_sigma_order not in {"random", "sequential"}:
+            raise ValueError(
+                f"Unknown image_sigma_order={image_sigma_order!r}; "
+                "expected 'random' or 'sequential'."
+            )
         self.emit_audit_metadata = bool(emit_audit_metadata)
         # DataLoader workers keep their own Dataset object, so a plain Python
         # integer would become stale when persistent_workers=True.  Tensor
@@ -628,7 +635,7 @@ class ImageNetFlowCacheDataset(Dataset):
             self.sequence_cache[serialized_prompt] = sequence
         return sequence, caption_index, caption_count
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
         # Capture one shared epoch value so every stochastic choice for this
         # sample uses the same epoch even if the parent advances immediately.
         current_epoch = self.epoch
@@ -680,6 +687,7 @@ class ImageNetFlowCacheDataset(Dataset):
             "caption_index": torch.tensor(caption_index, dtype=torch.long),
             "caption_count": torch.tensor(caption_count, dtype=torch.long),
             "reveal_seed": torch.tensor(reveal_seed, dtype=torch.long),
+            "image_sigma_order": self.image_sigma_order,
             "cfg_dropout_seed": torch.tensor(cfg_dropout_seed, dtype=torch.long),
         }
         if self.emit_audit_metadata:
@@ -696,6 +704,7 @@ class ImageNetFlowCacheDataset(Dataset):
                         "sample_index": int(idx),
                         "caption_index": int(caption_index),
                         "caption_count": int(caption_count),
+                        "image_sigma_order": self.image_sigma_order,
                     },
                     sort_keys=True,
                     separators=(",", ":"),

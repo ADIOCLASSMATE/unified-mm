@@ -4,6 +4,7 @@ import importlib.util
 import json
 import math
 import os
+import sys
 from pathlib import Path
 
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
@@ -16,10 +17,8 @@ import torch
 import torch.nn.functional as F
 from omegaconf import OmegaConf
 from safetensors import safe_open
-from tqdm.auto import tqdm
 from torchvision.utils import make_grid, save_image
-
-import sys
+from tqdm.auto import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -68,6 +67,15 @@ def parse_args():
     parser.add_argument("--cfg_schedule", choices=["constant", "linear"], default="constant")
     parser.add_argument("--flow_solver", choices=["heun", "euler"], default="heun")
     parser.add_argument("--probe_times", default="0.25,0.5,0.75,0.95")
+    parser.add_argument(
+        "--diagnostic_ablations",
+        default="",
+        help=(
+            "Comma-separated full-sample ablations: shuffle_z, zero_z, no_context, "
+            "shuffle_context, zero_context, or all. Every variant reuses the exact "
+            "same initial noise as the normal full sample."
+        ),
+    )
     parser.add_argument("--single_stream", action="store_true")
     parser.add_argument(
         "--oracle_reveal_ratios",
@@ -121,6 +129,71 @@ def parse_float_list(value: str) -> list[float]:
             raise ValueError(f"values must be in [0, 1], got {value_float}")
         out.append(value_float)
     return out
+
+
+def parse_diagnostic_ablations(value: str) -> list[str]:
+    allowed = [
+        "shuffle_z",
+        "zero_z",
+        "no_context",
+        "shuffle_context",
+        "zero_context",
+    ]
+    requested = [item.strip().lower() for item in value.split(",") if item.strip()]
+    if "all" in requested:
+        requested = allowed
+    unknown = sorted(set(requested) - set(allowed))
+    if unknown:
+        raise ValueError(
+            f"Unknown diagnostic ablations: {unknown}; expected {allowed} or 'all'."
+        )
+    return [name for name in allowed if name in requested]
+
+
+def seeded_cpu_noise_like(reference: torch.Tensor, seed: int) -> torch.Tensor:
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(int(seed))
+    return torch.randn(
+        tuple(reference.shape),
+        generator=generator,
+        device="cpu",
+        dtype=torch.float32,
+    ).to(device=reference.device)
+
+
+def context_bucket_metrics(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    span_sigma: torch.Tensor,
+) -> dict:
+    per_token_mse = (pred.float() - target.float()).square().mean(dim=-1)
+    sigma_values = span_sigma.to(device=pred.device, dtype=torch.float32)
+    context_counts = (
+        sigma_values.unsqueeze(0) < sigma_values.unsqueeze(1)
+    ).sum(dim=-1)
+    bucket_bounds = {
+        "0": (0, 0),
+        "1": (1, 1),
+        "2_4": (2, 4),
+        "5_16": (5, 16),
+        "17_64": (17, 64),
+        "65_plus": (65, None),
+    }
+    buckets = {}
+    for tag, (lower, upper) in bucket_bounds.items():
+        mask = context_counts >= lower
+        if upper is not None:
+            mask = mask & (context_counts <= upper)
+        count = int(mask.sum().item())
+        buckets[tag] = {
+            "tokens": count,
+            "mse": float(per_token_mse[mask].mean().item()) if count else None,
+        }
+    return {
+        "context_count_min": int(context_counts.min().item()),
+        "context_count_max": int(context_counts.max().item()),
+        "buckets": buckets,
+    }
 
 
 def _halton(index: int, base: int) -> float:
@@ -177,7 +250,7 @@ def _oracle_order(strategy: str, sigma_row: torch.Tensor, start: int, end: int, 
         return _halton_order(side, device)
     if strategy in {"spatial_uniform", "uniform"}:
         return _spatial_uniform_order(side, device)
-    if strategy in {"prefix", "raster", "row_major"}:
+    if strategy in {"sequential", "prefix", "raster", "row_major"}:
         return torch.arange(image_tokens, device=device, dtype=torch.long)
     return torch.argsort(sigma_row[start:end].to(device=device, dtype=torch.float32))
 
@@ -193,7 +266,7 @@ def build_oracle_initial_mask(
     seed: int,
 ) -> torch.Tensor:
     mask = torch.zeros_like(token_types, dtype=torch.bool)
-    reveal_count = max(0, min(image_tokens, int(math.floor(float(ratio) * image_tokens))))
+    reveal_count = max(0, min(image_tokens, math.floor(float(ratio) * image_tokens)))
     if reveal_count == 0:
         return mask
     side = int(image_tokens ** 0.5)
@@ -222,31 +295,54 @@ def sequence_mixer_context(
     target: torch.Tensor,
     span_sigma: torch.Tensor,
     local_positions: torch.Tensor,
+    conditions: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
+    if conditions is not None and conditions.shape[0] != target.shape[0]:
+        raise ValueError(
+            "context conditions must align with target tokens, "
+            f"got target={tuple(target.shape)}, conditions={tuple(conditions.shape)}"
+        )
     sigma_row = span_sigma.to(device=target.device, dtype=torch.float32).unsqueeze(0)
     positions = local_positions.to(device=target.device, dtype=torch.long).unsqueeze(0)
-    return {
+    context = {
         "context_latents": target.unsqueeze(0),
         "context_mask": sigma_row.unsqueeze(1) < sigma_row.unsqueeze(2),
         "query_positions": positions,
         "context_positions": positions,
     }
+    if conditions is not None:
+        context["context_conditions"] = conditions.to(device=target.device).unsqueeze(0)
+    return context
 
 
 def flat_query_mixer_context(
     target: torch.Tensor,
     span_sigma: torch.Tensor,
     local_positions: torch.Tensor,
+    conditions: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     query_count = target.shape[0]
+    if conditions is not None and conditions.shape[0] != query_count:
+        raise ValueError(
+            "context conditions must align with target tokens, "
+            f"got target={tuple(target.shape)}, conditions={tuple(conditions.shape)}"
+        )
     sigma_values = span_sigma.to(device=target.device, dtype=torch.float32)
     positions = local_positions.to(device=target.device, dtype=torch.long)
-    return {
+    context = {
         "context_latents": target.unsqueeze(0).expand(query_count, -1, -1).contiguous(),
         "context_mask": (sigma_values.unsqueeze(0) < sigma_values.unsqueeze(1)).unsqueeze(1),
         "query_positions": positions,
         "context_positions": positions.unsqueeze(0).expand(query_count, -1).contiguous(),
     }
+    if conditions is not None:
+        context["context_conditions"] = (
+            conditions.to(device=target.device)
+            .unsqueeze(0)
+            .expand(query_count, -1, -1)
+            .contiguous()
+        )
+    return context
 
 
 def _migrate_head_state(model, head_state: dict[str, torch.Tensor]):
@@ -323,7 +419,7 @@ def load_adapter(model, adapter_path: str):
                 projector_state[name] = value
 
         with safe_open(str(path), framework="pt", device="cpu") as f:
-            for key in f.keys():
+            for key in f:
                 if key.startswith("image_flow_head."):
                     head_state[key[len("image_flow_head."):]] = f.get_tensor(key)
                 elif key.startswith("image_flow_condition_proj."):
@@ -484,7 +580,7 @@ def refine_single_stream_latents(
         ratio = float(ratio)
         if ratio <= 0.0:
             continue
-        remask_count = max(1, min(image_tokens, int(round(ratio * image_tokens))))
+        remask_count = max(1, min(image_tokens, round(ratio * image_tokens)))
         target_masks = []
         for sample_idx in range(len(spans)):
             generator = torch.Generator(device=device).manual_seed(seed + round_idx * 1_000_003 + sample_idx * 97)
@@ -604,6 +700,7 @@ def main():
     oracle_reveal_ratios = parse_float_list(args.oracle_reveal_ratios)
     refine_ratios = parse_float_list(args.refine_ratios)
     probe_times = parse_float_list(args.probe_times)
+    diagnostic_ablations = parse_diagnostic_ablations(args.diagnostic_ablations)
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
     if device.type == "npu":
@@ -725,6 +822,7 @@ def main():
         "cfg_schedule": args.cfg_schedule,
         "flow_solver": args.flow_solver,
         "probe_times": probe_times,
+        "diagnostic_ablations_requested": diagnostic_ablations,
         "oracle_reveal_ratios": oracle_reveal_ratios,
         "oracle_reveal_order": args.oracle_reveal_order,
         "refine_ratios": refine_ratios,
@@ -739,6 +837,7 @@ def main():
     target_latents = []
     full_sample_latents = []
     probe_x0_latents = {time_value: [] for time_value in probe_times}
+    diagnostic_latents = {name: [] for name in diagnostic_ablations}
 
     sample_iter = tqdm(list(enumerate(spans)), desc="Flow sampling", dynamic_ncols=True, disable=not progress)
     with torch.no_grad():
@@ -752,7 +851,16 @@ def main():
                 )
             target = image_latents[batch_idx, start:end].to(dtype=z.dtype)
             span_sigma = sigma[batch_idx, start:end].to(device=device, dtype=torch.float32)
-            torch.manual_seed(args.seed + 2000 + sample_idx)
+            initial_noise = seeded_cpu_noise_like(
+                target,
+                args.seed + 2000 + sample_idx,
+            )
+            teacher_context = flat_query_mixer_context(
+                target,
+                span_sigma,
+                local_positions,
+                conditions=z,
+            )
             full_sample = model.sample_image_flow_with_cfg(
                 z,
                 z_uncond=z_uncond,
@@ -760,7 +868,8 @@ def main():
                 cfg=args.cfg,
                 cfg_schedule=args.cfg_schedule,
                 solver=args.flow_solver,
-                **flat_query_mixer_context(target, span_sigma, local_positions),
+                initial_noise=initial_noise,
+                **teacher_context,
             ).to(dtype=target.dtype)
 
             sample_metrics = {
@@ -769,11 +878,95 @@ def main():
                 "target": tensor_stats(target),
                 "full_sample": tensor_stats(full_sample),
                 "full_sample_mse_to_target": float(F.mse_loss(full_sample.float(), target.float()).item()),
+                "full_sample_context_buckets": context_bucket_metrics(
+                    full_sample,
+                    target,
+                    span_sigma,
+                ),
+                "z": tensor_stats(z),
                 "probes": {},
+                "diagnostic_ablations": {},
             }
+            if diagnostic_ablations:
+                generator = torch.Generator(device="cpu")
+                generator.manual_seed(args.seed + 5000 + sample_idx)
+                permutation = torch.randperm(
+                    target.shape[0],
+                    generator=generator,
+                    device="cpu",
+                ).to(device=device)
+                for ablation_name in diagnostic_ablations:
+                    ablation_z = z
+                    ablation_z_uncond = z_uncond
+                    ablation_context = teacher_context
+                    if ablation_name == "shuffle_z":
+                        ablation_z = z[permutation]
+                        if z_uncond is not None:
+                            ablation_z_uncond = z_uncond[permutation]
+                        ablation_context = flat_query_mixer_context(
+                            target,
+                            span_sigma,
+                            local_positions,
+                            conditions=ablation_z,
+                        )
+                    elif ablation_name == "zero_z":
+                        ablation_z = torch.zeros_like(z)
+                        if z_uncond is not None:
+                            ablation_z_uncond = torch.zeros_like(z_uncond)
+                        ablation_context = flat_query_mixer_context(
+                            target,
+                            span_sigma,
+                            local_positions,
+                            conditions=ablation_z,
+                        )
+                    elif ablation_name == "no_context":
+                        ablation_context = {"query_positions": local_positions}
+                    elif ablation_name in {"shuffle_context", "zero_context"}:
+                        context_target = (
+                            target[permutation]
+                            if ablation_name == "shuffle_context"
+                            else torch.zeros_like(target)
+                        )
+                        ablation_context = flat_query_mixer_context(
+                            context_target,
+                            span_sigma,
+                            local_positions,
+                            conditions=z,
+                        )
+                    ablation_sample = model.sample_image_flow_with_cfg(
+                        ablation_z,
+                        z_uncond=ablation_z_uncond,
+                        temperature=args.temperature,
+                        cfg=args.cfg,
+                        cfg_schedule=args.cfg_schedule,
+                        solver=args.flow_solver,
+                        initial_noise=initial_noise,
+                        **ablation_context,
+                    ).to(dtype=target.dtype)
+                    sample_metrics["diagnostic_ablations"][ablation_name] = {
+                        "latent_mse_to_target": float(
+                            F.mse_loss(ablation_sample.float(), target.float()).item()
+                        ),
+                        "latent_mse_to_full_sample": float(
+                            F.mse_loss(ablation_sample.float(), full_sample.float()).item()
+                        ),
+                        "stats": tensor_stats(ablation_sample),
+                        "context_buckets": context_bucket_metrics(
+                            ablation_sample,
+                            target,
+                            span_sigma,
+                        ),
+                    }
+                    diagnostic_latents[ablation_name].append(
+                        ablation_sample.view(side, side, -1).permute(2, 0, 1)
+                    )
             for time_value in probe_times:
                 t = torch.full((target.shape[0],), time_value, device=device, dtype=torch.float32)
-                noise = torch.randn_like(target)
+                probe_index = probe_times.index(time_value)
+                noise = seeded_cpu_noise_like(
+                    target,
+                    args.seed + 20_000 + sample_idx * 1000 + probe_index,
+                ).to(dtype=target.dtype)
                 t_view = t.view(-1, 1).to(dtype=target.dtype)
                 x_t = (1.0 - t_view) * noise + t_view * target
                 v_target = target - noise
@@ -781,13 +974,23 @@ def main():
                     x_t.unsqueeze(0),
                     t.unsqueeze(0),
                     z.unsqueeze(0),
-                    **sequence_mixer_context(target, span_sigma, local_positions),
+                    **sequence_mixer_context(
+                        target,
+                        span_sigma,
+                        local_positions,
+                        conditions=z,
+                    ),
                 ).squeeze(0).to(dtype=target.dtype)
                 x0_est = x_t + (1.0 - t_view) * v_pred
                 sample_metrics["probes"][str(time_value)] = {
                     "v_mse": float(F.mse_loss(v_pred.float(), v_target.float()).item()),
                     "x0_est_mse": float(F.mse_loss(x0_est.float(), target.float()).item()),
                     "x0_est": tensor_stats(x0_est),
+                    "context_buckets": context_bucket_metrics(
+                        x0_est,
+                        target,
+                        span_sigma,
+                    ),
                 }
                 probe_x0_latents[time_value].append(x0_est.view(side, side, -1).permute(2, 0, 1))
 
@@ -815,6 +1018,33 @@ def main():
             save_image(probe_img, out_dir / f"flow_x0_est_{tag}.png")
     overview_columns.append(("full_sample", full_sample_img))
     save_image(full_sample_img, out_dir / "full_sample.png")
+    full_sample_batch = torch.stack(full_sample_latents).float()
+    metrics["full_sample"] = {
+        "latent_mse_to_target": float(
+            F.mse_loss(full_sample_batch, target_chw).item()
+        ),
+        "latent_rms": float(full_sample_batch.pow(2).mean().sqrt().item()),
+    }
+    metrics["diagnostic_ablations"] = {}
+    for name, latents in diagnostic_latents.items():
+        if not latents:
+            continue
+        latent_batch = torch.stack(latents).float()
+        ablation_img = decode_latents(vae, latent_batch, scaling_factor)
+        save_image(ablation_img, out_dir / f"diagnostic_{name}.png")
+        overview_columns.append((f"diagnostic_{name}", ablation_img))
+        metrics["diagnostic_ablations"][name] = {
+            "latent_mse_to_target": float(
+                F.mse_loss(latent_batch, target_chw).item()
+            ),
+            "latent_mse_to_full_sample": float(
+                F.mse_loss(
+                    latent_batch,
+                    full_sample_batch,
+                ).item()
+            ),
+            "latent_rms": float(latent_batch.pow(2).mean().sqrt().item()),
+        }
 
     if args.single_stream and strategies:
         strategy_iter = tqdm(strategies, desc="Single-stream strategies", dynamic_ncols=True, disable=not progress)
