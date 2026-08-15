@@ -52,6 +52,7 @@ from utils.sharded_ema import (
     merge_sharded_ema_state_dict,
     read_sharded_ema_rows,
 )
+from utils.showo2_maskgit import get_showo2_attention_mask
 from models.logging import set_verbosity_info, set_verbosity_error
 from utils.utils import (
     flatten_omega_conf,
@@ -1300,17 +1301,28 @@ def main():
                 ) & has_image
                 image_uncond_rows = sampled_rows
 
-            selfless_attention_mask = get_selfless_mask(
-                sigma=sigma,
-                seq_len=L,
-                device=accelerator.device,
-                input_ids=input_ids,
-                token_types=token_types,
-                boi_token_id=int(config.model.boi_token_id),
-                image_uncond_rows=image_uncond_rows,
-                segment_ids=segment_ids,
-                image_uncond_mask=image_uncond_mask,
-            )
+            architecture_variant = str(
+                config.model.get("architecture_variant", "selfless_contextual")
+            ).lower()
+            if architecture_variant == "showo2_maskgit":
+                selfless_attention_mask = get_showo2_attention_mask(
+                    token_types,
+                    segment_ids=segment_ids,
+                    image_uncond_rows=image_uncond_rows,
+                    image_uncond_mask=image_uncond_mask,
+                )
+            else:
+                selfless_attention_mask = get_selfless_mask(
+                    sigma=sigma,
+                    seq_len=L,
+                    device=accelerator.device,
+                    input_ids=input_ids,
+                    token_types=token_types,
+                    boi_token_id=int(config.model.boi_token_id),
+                    image_uncond_rows=image_uncond_rows,
+                    segment_ids=segment_ids,
+                    image_uncond_mask=image_uncond_mask,
+                )
 
             if global_step == 0 and accelerator.is_main_process and not hasattr(main, '_logged_first_batch'):
                 main._logged_first_batch = True
@@ -1395,9 +1407,21 @@ def main():
                 "labels": labels if is_multimodal else input_ids,
                 "attention_mask": selfless_attention_mask,
             }
+            if architecture_variant == "showo2_maskgit":
+                forward_kwargs["attention_mask_contract"] = "showo2"
             if token_types is not None:
                 forward_kwargs["token_types"] = token_types
                 forward_kwargs["flow_sigma"] = sigma
+                # Architecture-specific models may need to construct their
+                # own attention contract.  These tensors are no-ops for the
+                # production selfless model, whose prepared mask above remains
+                # authoritative.
+                if segment_ids is not None:
+                    forward_kwargs["segment_ids"] = segment_ids
+                if image_uncond_rows is not None:
+                    forward_kwargs["image_uncond_rows"] = image_uncond_rows
+                if image_uncond_mask is not None:
+                    forward_kwargs["image_uncond_mask"] = image_uncond_mask
                 if position_ids is not None:
                     forward_kwargs["position_ids"] = position_ids
                 if image_local_positions is not None:

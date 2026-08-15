@@ -63,22 +63,40 @@ def require_hash(path: Path, expected: str, label: str) -> str:
 def validate_config(config, *, world_size: int) -> dict[str, object]:
     validate_wsd_contract(config)
     params = config.dataset.params
+    architecture_variant = str(
+        config.model.get("architecture_variant", "selfless_contextual")
+    ).lower()
     image_sigma_order = str(params.get("image_sigma_order", "random")).lower()
-    project_by_image_sigma_order = {
-        "random": "selfless-flow-imagenet1k-class-ascend64-b1024-800ep",
-        "sequential": (
+    project_by_variant = {
+        ("selfless_contextual", "random"): (
+            "selfless-flow-imagenet1k-class-ascend64-b1024-800ep"
+        ),
+        ("selfless_contextual", "sequential"): (
             "selfless-flow-imagenet1k-class-ascend64-b1024-800ep-seq-sigma"
         ),
+        ("positionwise_selfless", "random"): (
+            "selfless-flow-imagenet1k-class-ascend64-b1024-800ep-"
+            "positionwise-head"
+        ),
+        ("showo2_maskgit", "random"): (
+            "selfless-flow-imagenet1k-class-ascend64-b1024-800ep-"
+            "showo2-maskgit"
+        ),
     }
-    if image_sigma_order not in project_by_image_sigma_order:
+    variant_key = (architecture_variant, image_sigma_order)
+    if variant_key not in project_by_variant:
         raise RuntimeError(
-            f"unsupported image_sigma_order={image_sigma_order!r}; "
-            "expected 'random' or 'sequential'"
+            "unsupported formal architecture/sigma pair: "
+            f"architecture_variant={architecture_variant!r}, "
+            f"image_sigma_order={image_sigma_order!r}"
         )
-    expected_project = project_by_image_sigma_order[image_sigma_order]
-    expected_generation_strategy = (
-        "sequential" if image_sigma_order == "sequential" else "spatial_halton"
-    )
+    expected_project = project_by_variant[variant_key]
+    if architecture_variant == "showo2_maskgit":
+        expected_generation_strategy = "maskgit"
+    elif image_sigma_order == "sequential":
+        expected_generation_strategy = "sequential"
+    else:
+        expected_generation_strategy = "spatial_halton"
     required = {
         "project": (
             str(config.experiment.project),
@@ -139,6 +157,13 @@ def validate_config(config, *, world_size: int) -> dict[str, object]:
     for label, (actual, expected) in required.items():
         if actual != expected:
             raise RuntimeError(f"config {label} mismatch: {actual!r} != {expected!r}")
+    if architecture_variant == "showo2_maskgit":
+        if int(config.model.maskgit_generation_steps) != 18:
+            raise RuntimeError("formal Show-o2 ablation requires 18 MaskGIT rounds")
+        if float(config.model.maskgit_validation_mask_ratio) != 0.5:
+            raise RuntimeError(
+                "formal Show-o2 ablation requires fixed 0.5 validation mask ratio"
+            )
     if str(config.model.model_path) != "public/models/Qwen--Qwen3-0.6B-Base":
         raise RuntimeError("formal pretraining must initialize from Qwen3-0.6B-Base")
     expected_evaluation_checkpoint = f"output/{expected_project}/hf_model-final-ema"
@@ -173,6 +198,7 @@ def validate_config(config, *, world_size: int) -> dict[str, object]:
         "optimizer_steps_per_epoch": STEPS_PER_EPOCH,
         "epochs": EPOCHS,
         "max_optimizer_steps": MAX_STEPS,
+        "architecture_variant": architecture_variant,
         "image_sigma_order": image_sigma_order,
         "wsd_epochs": {"warmup": 5, "stable": 595, "decay": 200},
         "ema_decay": decay,

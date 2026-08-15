@@ -92,7 +92,26 @@ def load_model_tokenizer(
     model_dtype: torch.dtype = torch.bfloat16,
 ):
     from models.modeling_model.image_backbone import validate_image_data_layout
-    from models.modeling_model.modeling_selfless_flow import Qwen3ForCausalLM
+
+    architecture_variant = str(
+        config.model.get("architecture_variant", "selfless_contextual")
+    ).strip().lower()
+    if architecture_variant == "selfless_contextual":
+        from models.modeling_model.modeling_selfless_flow import Qwen3ForCausalLM
+    elif architecture_variant == "positionwise_selfless":
+        from models.modeling_model.modeling_positionwise_flow import (
+            PositionwiseFlowQwen3ForCausalLM as Qwen3ForCausalLM,
+        )
+    elif architecture_variant == "showo2_maskgit":
+        from models.modeling_model.modeling_showo2_maskgit import (
+            ShowO2MaskGITQwen3ForCausalLM as Qwen3ForCausalLM,
+        )
+    else:
+        raise ValueError(
+            f"Unknown model.architecture_variant={architecture_variant!r}; "
+            "expected selfless_contextual, positionwise_selfless, or "
+            "showo2_maskgit."
+        )
 
     validate_image_data_layout(config)
     if model_dtype not in {torch.bfloat16, torch.float32}:
@@ -130,7 +149,7 @@ def load_model_tokenizer(
     config.model.image_mask_token_id = tokenizer.convert_tokens_to_ids(image_mask_token)
 
     if logger is not None:
-        logger.info("Using the finalized selfless-flow model.")
+        logger.info("Using architecture variant: %s", architecture_variant)
         logger.info("Special tokens: %s", tokenizer.special_tokens_map)
         logger.info(
             "BOI token id: %s, EOI token id: %s, IMG_MASK token id: %s",
@@ -140,6 +159,7 @@ def load_model_tokenizer(
         )
 
     multimodal_config_keys = (
+        "architecture_variant",
         "boi_token_id",
         "eoi_token_id",
         "image_mask_token_id",
@@ -160,6 +180,8 @@ def load_model_tokenizer(
         "image_input_noise_strength",
         "image_uncond_prob",
         "backbone_attention_output_gate",
+        "maskgit_generation_steps",
+        "maskgit_validation_mask_ratio",
     )
 
     model_config = AutoConfig.from_pretrained(
