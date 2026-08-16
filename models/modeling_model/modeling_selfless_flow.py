@@ -3098,7 +3098,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                     .detach()
                     .cpu()
                     .tolist()
-                    if use_flow_cfg
+                    if flow_cache_divergence_sum is not None
                     else None
                 ),
             }

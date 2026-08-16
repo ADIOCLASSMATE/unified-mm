@@ -152,7 +152,11 @@ def run_variant(
         spans=[(0, 2, 6)],
         image_latent_dim=4,
         flow_temperature=1.0,
-        flow_cfg=2.0 if model_label == "dynamic_xt" else 1.0,
+        flow_cfg=(
+            2.0
+            if model_label in {"positionwise_selfless", "dynamic_xt"}
+            else 1.0
+        ),
         flow_solver="heun" if model_label == "dynamic_xt" else "euler",
         flow_num_steps=1,
         parallel_rate=1,
