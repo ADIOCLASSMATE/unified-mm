@@ -122,6 +122,13 @@ not implicitly mount the official dataset.
   Its 16-sample FID/IS values are pipeline diagnostics, not paper metrics.
 - W&B remains enabled. `WANDB_MODE` defaults to `offline` and may be set to
   `online` for a platform environment with working W&B credentials/network.
+- The final EMA HF model completed the canonical official ImageNet-1K
+  evaluation on 2026-08-19: 50,000 samples, deterministic canonical pairing,
+  CFG 3.5, 100-step Heun, and the frozen official-val moments. The result is
+  FID `18.996944032440638` and IS `450.06854248046875 ± 4.259687366514454`.
+  The retained result is
+  `output/selfless-flow-imagenet1k-class-ascend64-b1024-800ep-fid-is/metrics.json`
+  (SHA256 `d6f066bffad8a4e3032ccc3aac4b9445e9589e21691c3519bdf5e2e722d506f8`).
 
 ### ImageNet-1K sequential image-sigma ablation
 

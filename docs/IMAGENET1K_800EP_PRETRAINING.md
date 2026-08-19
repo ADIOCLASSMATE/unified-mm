@@ -198,3 +198,20 @@ inspire --json job wait <job-name> \
 
 Do not repeatedly invoke `job wait`, status, events, logs, or utilization while
 that blocking process remains active.
+
+## Final EMA evaluation result
+
+The final EMA HF export completed the canonical official evaluation on
+2026-08-19. All 50,000 requested samples were evaluated with deterministic
+canonical pairing, CFG 3.5, 100-step Heun, `spatial_halton`, and the frozen
+official ImageNet-val moments.
+
+| Metric | Result |
+| --- | ---: |
+| FID | `18.996944032440638` |
+| Inception Score | `450.06854248046875 ± 4.259687366514454` |
+| Generation throughput | `4.228181407150334 samples/s` |
+
+The retained machine-readable result is
+`output/selfless-flow-imagenet1k-class-ascend64-b1024-800ep-fid-is/metrics.json`
+(SHA256 `d6f066bffad8a4e3032ccc3aac4b9445e9589e21691c3519bdf5e2e722d506f8`).
