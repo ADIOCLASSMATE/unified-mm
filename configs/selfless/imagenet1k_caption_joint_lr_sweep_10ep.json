@@ -10,7 +10,7 @@
     "validation_steps": [2404, 4808, 7212, 9616, 12020],
     "primary_metrics": ["val/loss_text", "val/loss_image_flow"],
     "require_gradient_probe": true,
-    "rule": "exclude instability/T2I regression first; at stage boundaries use mean rank across text loss, image-flow loss, and gradient-balance log error; rank final/best text and image-flow losses for finalists; final generation uses Pareto/mean-rank over Caption CLIP (max), FID (min), and IS (max), with validation loss only as tie-break",
+    "rule": "exclude instability/T2I regression first; at stage boundaries use mean rank across text loss, image-flow loss, gradient-balance log error, and shared-backbone negative-cosine conflict; rank final/best text and image-flow losses for finalists; final generation uses Pareto/mean-rank over Caption CLIP (max), FID (min), and IS (max), with validation loss only as tie-break",
     "top_k_for_generation_evaluation": 3,
     "generation_metrics": ["caption_clip_score", "fid", "inception_score_mean"],
     "generation_protocol": {

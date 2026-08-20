@@ -70,6 +70,19 @@ def collect_stage(
             summary["ratio_g_image_over_g_text"]["median"], "gradient ratio"
         )
         cosine = _finite(summary["cosine"]["median"], "gradient cosine")
+        task_conflict = summary["task_conflict"]
+        persistent_negative = bool(task_conflict.get("persistent_negative", False))
+        negative_fraction = _finite(
+            task_conflict.get(
+                "negative_fraction",
+                1.0 if persistent_negative else 0.0,
+            ),
+            "negative cosine fraction",
+        )
+        if not 0.0 <= negative_fraction <= 1.0:
+            raise ValueError(
+                f"negative cosine fraction must be in [0, 1], got {negative_fraction}"
+            )
         row = {
             "id": run_id,
             "backbone_lr": float(candidate["backbone_lr"]),
@@ -82,7 +95,8 @@ def collect_stage(
             "gradient_ratio": ratio,
             "gradient_cosine": cosine,
             "gradient_balance_log_error": abs(math.log(float(lambda_text) / ratio)),
-            "task_conflict": summary["task_conflict"],
+            "gradient_conflict_score": negative_fraction + max(0.0, -cosine),
+            "task_conflict": task_conflict,
             "health": health,
             "metrics_path": str(metrics_path),
             "probe_path": str(probe_path),
@@ -97,15 +111,18 @@ def collect_stage(
         text_ranks = _average_tie_ranks(rows, "text_loss")
         image_ranks = _average_tie_ranks(rows, "image_loss")
         balance_ranks = _average_tie_ranks(rows, "gradient_balance_log_error")
+        conflict_ranks = _average_tie_ranks(rows, "gradient_conflict_score")
         for row in rows:
             row["text_rank"] = text_ranks[row["id"]]
             row["image_rank"] = image_ranks[row["id"]]
             row["gradient_balance_rank"] = balance_ranks[row["id"]]
+            row["gradient_conflict_rank"] = conflict_ranks[row["id"]]
             row["mean_rank"] = (
                 row["text_rank"]
                 + row["image_rank"]
                 + row["gradient_balance_rank"]
-            ) / 3.0
+                + row["gradient_conflict_rank"]
+            ) / 4.0
         rows.sort(
             key=lambda row: (
                 row["mean_rank"],
@@ -122,7 +139,8 @@ def collect_stage(
         "lambda_text": float(lambda_text),
         "selection_rule": (
             "exclude instability, then mean-rank text loss, image-flow loss, "
-            "and |log(lambda_text / median(g_image/g_text))|"
+            "|log(lambda_text / median(g_image/g_text))|, and shared-backbone "
+            "negative-cosine conflict"
         ),
         "expected_candidates": len(sweep["candidates"]),
         "eligible_candidates": len(rows),
