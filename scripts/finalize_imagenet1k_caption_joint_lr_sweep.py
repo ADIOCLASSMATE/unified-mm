@@ -12,6 +12,10 @@ from typing import Any
 
 VALIDATION_SCHEMA = "selfless_imagenet1k_caption_joint_lr_ranking_v1"
 CAPTION_SCHEMA = "selfless_imagenet1k_i2t_clip_metrics_v1"
+DEFAULT_INITIALIZATION_METRICS = Path(
+    "output/selfless-flow-imagenet1k-class-ascend64-b1024-800ep-fid-is/"
+    "metrics.json"
+)
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -59,12 +63,20 @@ def _average_tie_ranks(
     return ranks
 
 
+def _direction(delta: float, *, lower_is_better: bool) -> str:
+    if math.isclose(float(delta), 0.0, rel_tol=0.0, abs_tol=1.0e-12):
+        return "unchanged"
+    improved = delta < 0.0 if lower_is_better else delta > 0.0
+    return "improved" if improved else "degraded"
+
+
 def collect_final(
     validation_ranking_path: Path,
     output_root: Path,
     *,
     require_complete: bool,
     strategy: str = "spatial_halton",
+    initialization_metrics_path: Path = DEFAULT_INITIALIZATION_METRICS,
 ) -> dict[str, Any]:
     validation = _read_json(validation_ranking_path)
     if validation.get("schema") != VALIDATION_SCHEMA:
@@ -79,13 +91,50 @@ def collect_final(
     validation_rows = {
         str(row["id"]): row for row in validation.get("ranking", [])
     }
+    initialization = _read_json(initialization_metrics_path)
+    if initialization.get("official_protocol") is not True:
+        raise ValueError(
+            "initialization T2I metrics are not official-protocol: "
+            f"{initialization_metrics_path}"
+        )
+    if int(initialization.get("samples_evaluated", -1)) != 50_000:
+        raise ValueError("initialization T2I comparison requires 50,000 samples")
+    initialization_strategy = initialization.get("strategies", {}).get(strategy)
+    if not isinstance(initialization_strategy, dict):
+        raise ValueError(
+            f"initialization metrics are missing strategy={strategy!r}: "
+            f"{initialization_metrics_path}"
+        )
+    initialization_fid = _finite(
+        initialization_strategy["fid"],
+        label="initialization fid",
+        path=initialization_metrics_path,
+    )
+    initialization_is = _finite(
+        initialization_strategy["inception_score_mean"],
+        label="initialization inception score",
+        path=initialization_metrics_path,
+    )
+    initialization_is_std = _finite(
+        initialization_strategy["inception_score_std"],
+        label="initialization inception score std",
+        path=initialization_metrics_path,
+    )
+    clear_fid_regression = max(1.0, 0.05 * initialization_fid)
+    clear_is_regression = max(initialization_is_std, 0.01 * initialization_is)
 
     rows: list[dict[str, Any]] = []
     missing: list[dict[str, str]] = []
+    excluded: list[dict[str, Any]] = []
     for run_id in top_k:
-        run_root = output_root / (
-            f"selfless-flow-imagenet1k-caption-joint-sweep-{run_id}"
+        validation_row = validation_rows[run_id]
+        run_project = str(
+            validation_row.get(
+                "run_project",
+                f"selfless-flow-imagenet1k-caption-joint-sweep-{run_id}",
+            )
         )
+        run_root = output_root / run_project
         caption_path = run_root / "generation-evaluation/i2t-clip/metrics.json"
         image_path = run_root / "generation-evaluation/t2i-fid-is/metrics.json"
         absent = [
@@ -99,42 +148,99 @@ def collect_final(
         caption = _read_json(caption_path)
         if caption.get("schema") != CAPTION_SCHEMA:
             raise ValueError(f"caption metric schema mismatch: {caption_path}")
+        if int(caption.get("samples", -1)) != 1_000:
+            raise ValueError(f"Caption CLIP requires 1,000 samples: {caption_path}")
+        class_balance = caption.get("class_balance", {})
+        expected_balance = {
+            "class_count": 1_000,
+            "min_samples_per_class": 1,
+            "max_samples_per_class": 1,
+        }
+        for key, expected in expected_balance.items():
+            if int(class_balance.get(key, -1)) != expected:
+                raise ValueError(
+                    f"Caption CLIP is not one-sample-per-class balanced "
+                    f"({key}): {caption_path}"
+                )
         image = _read_json(image_path)
         if image.get("official_protocol") is not True:
             raise ValueError(f"T2I metrics are not official-protocol: {image_path}")
+        if int(image.get("samples_evaluated", -1)) != 50_000:
+            raise ValueError(f"T2I FID/IS requires 50,000 samples: {image_path}")
         strategy_metrics = image.get("strategies", {}).get(strategy)
         if not isinstance(strategy_metrics, dict):
             raise ValueError(
                 f"missing T2I strategy={strategy!r}: {image_path}"
             )
-        validation_row = validation_rows[run_id]
-        rows.append(
-            {
-                "id": run_id,
-                "backbone_lr": float(validation_row["backbone_lr"]),
-                "flow_lr": float(validation_row["flow_lr"]),
-                "validation_rank": int(validation_row["overall_rank"]),
-                "caption_clip_score": _finite(
-                    caption["clip"]["caption_clip_score"],
-                    label="caption_clip_score",
-                    path=caption_path,
-                ),
-                "fid": _finite(
-                    strategy_metrics["fid"],
-                    label="fid",
-                    path=image_path,
-                ),
-                "inception_score_mean": _finite(
-                    strategy_metrics["inception_score_mean"],
-                    label="inception_score_mean",
-                    path=image_path,
-                ),
-                "caption_samples": int(caption["samples"]),
-                "image_samples": int(image["samples_evaluated"]),
-                "caption_metrics_path": str(caption_path),
-                "image_metrics_path": str(image_path),
-            }
+        if int(strategy_metrics.get("count", -1)) != 50_000:
+            raise ValueError(
+                f"T2I strategy count must be 50,000: {image_path}"
+            )
+        fid = _finite(strategy_metrics["fid"], label="fid", path=image_path)
+        inception_score = _finite(
+            strategy_metrics["inception_score_mean"],
+            label="inception_score_mean",
+            path=image_path,
         )
+        fid_delta = fid - initialization_fid
+        inception_delta = inception_score - initialization_is
+        fid_direction = _direction(fid_delta, lower_is_better=True)
+        is_direction = _direction(inception_delta, lower_is_better=False)
+        result_row = {
+            "id": run_id,
+            "run_project": run_project,
+            "backbone_lr": float(validation_row["backbone_lr"]),
+            "flow_lr": float(validation_row["flow_lr"]),
+            **(
+                {"lambda_text": float(validation_row["lambda_text"])}
+                if "lambda_text" in validation_row
+                else {}
+            ),
+            "validation_rank": int(validation_row["overall_rank"]),
+            "caption_clip_score": _finite(
+                caption["clip"]["caption_clip_score"],
+                label="caption_clip_score",
+                path=caption_path,
+            ),
+            "fid": fid,
+            "inception_score_mean": inception_score,
+            "t2i_vs_initialization": {
+                "fid_delta": fid_delta,
+                "fid_status": fid_direction,
+                "inception_score_delta": inception_delta,
+                "inception_score_status": is_direction,
+                "joint_status": (
+                    "improved_both"
+                    if fid_direction == is_direction == "improved"
+                    else (
+                        "degraded_both"
+                        if fid_direction == is_direction == "degraded"
+                        else "mixed_or_unchanged"
+                    )
+                ),
+            },
+            "caption_samples": int(caption["samples"]),
+            "image_samples": int(image["samples_evaluated"]),
+            "caption_metrics_path": str(caption_path),
+            "image_metrics_path": str(image_path),
+        }
+        if (
+            fid_delta > clear_fid_regression
+            and inception_delta < -clear_is_regression
+        ):
+            excluded.append(
+                {
+                    "id": run_id,
+                    "reason": "clear T2I regression versus initialization",
+                    "thresholds": {
+                        "fid_increase": clear_fid_regression,
+                        "inception_score_decrease": clear_is_regression,
+                    },
+                    "metrics": result_row,
+                }
+            )
+            continue
+        rows.append(result_row)
 
     if require_complete and missing:
         raise FileNotFoundError(
@@ -169,21 +275,37 @@ def collect_final(
         for index, row in enumerate(rows, start=1):
             row["final_rank"] = index
 
-    complete = len(rows) == len(top_k) and not missing
+    complete = len(rows) + len(excluded) == len(top_k) and not missing
     return {
         "schema": "selfless_imagenet1k_caption_joint_final_selection_v1",
         "status": "complete" if complete else "incomplete",
         "validation_ranking": str(validation_ranking_path),
-        "validation_winner": validation.get("winner"),
+        "validation_leader": (
+            validation.get("validation_leader")
+            or validation.get("winner")
+        ),
         "top_k": top_k,
         "generation_strategy": strategy,
+        "initialization_t2i_baseline": {
+            "path": str(initialization_metrics_path),
+            "samples": 50_000,
+            "fid": initialization_fid,
+            "inception_score_mean": initialization_is,
+            "inception_score_std": initialization_is_std,
+        },
+        "clear_t2i_regression_rule": {
+            "requires_both": True,
+            "fid_increase_threshold": clear_fid_regression,
+            "inception_score_decrease_threshold": clear_is_regression,
+        },
         "selection_rule": (
             "lowest mean rank across caption CLIP (higher is better), FID "
             "(lower), and Inception Score (higher); validation rank breaks ties"
         ),
         "missing": missing,
+        "excluded": excluded,
         "ranking": rows,
-        "winner": rows[0]["id"] if complete else None,
+        "winner": rows[0]["id"] if complete and rows else None,
     }
 
 
@@ -192,6 +314,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--validation_ranking", type=Path, required=True)
     parser.add_argument("--output_root", type=Path, default=Path("output"))
     parser.add_argument("--strategy", default="spatial_halton")
+    parser.add_argument(
+        "--initialization_metrics",
+        type=Path,
+        default=DEFAULT_INITIALIZATION_METRICS,
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--require_complete", action="store_true")
     return parser.parse_args()
@@ -204,6 +331,7 @@ def main() -> None:
         args.output_root,
         require_complete=bool(args.require_complete),
         strategy=str(args.strategy),
+        initialization_metrics_path=args.initialization_metrics,
     )
     rendered = json.dumps(report, indent=2, sort_keys=True) + "\n"
     args.output.parent.mkdir(parents=True, exist_ok=True)

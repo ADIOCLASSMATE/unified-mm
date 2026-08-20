@@ -104,6 +104,24 @@ not implicitly mount the official dataset.
   `configs/selfless/imagenet1k_caption_joint_sweep_10ep_ascend16_b1024.yaml`,
   `configs/selfless/imagenet1k_caption_joint_lr_sweep_10ep.json`, and
   `script/selfless/pretraining_imagenet1k_caption_joint_sweep_ascend16.sh`.
+- The LR sweep is staged with the unchanged 12,020-step WSD horizon: all nine
+  candidates stop at 2,404, the validation/probe Top 4 continue to 4,808, and
+  the Top 2–3 continue to 12,020. `training.stop_after_steps` is operational
+  and excluded from the numerical resume signature; optimizer, scheduler,
+  FP32 sharded EMA, RNG, epoch, and dataloader offset remain strict.
+- The fixed-checkpoint no-optimizer gradient probe and NPU smoke entry are
+  `script/selfless/probe_imagenet1k_caption_joint_gradients_ascend.sh` and
+  `tests/smoke_npu_joint_gradient_probe.py`. The formal JSON contains 16–32
+  per-batch task-separated gradients plus summary quantiles and derives the
+  bounded lambda candidates around median `g_image / g_text`.
+- LR selection precedes the short lambda sweep; do not submit their Cartesian
+  product. Build the lambda manifest with
+  `scripts/build_imagenet1k_caption_joint_lambda_sweep.py` and launch one row
+  with `script/selfless/pretraining_imagenet1k_caption_joint_lambda_ascend16.sh`.
+- Validation-only ranking is never a final winner. The final Top 3 require one
+  I2T CLIP sample per ImageNet class and official 50,000-sample T2I FID/IS;
+  `scripts/finalize_imagenet1k_caption_joint_lr_sweep.py` reports FID/IS deltas
+  against the initialization checkpoint and applies generation mean-rank.
 
 ### Formal ImageNet-1K 800-epoch pretraining
 

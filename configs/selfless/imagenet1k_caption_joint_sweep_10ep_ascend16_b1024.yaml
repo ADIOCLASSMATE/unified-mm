@@ -132,6 +132,10 @@ training:
     optimizer_steps_per_epoch: 1202
     num_train_epochs: 10
     max_train_steps: 12020
+    # Operational stage boundary only. The scheduler always retains the
+    # complete 10-epoch/12020-step horizon, and this field is deliberately
+    # excluded from the numerical resume signature.
+    stop_after_steps: 12020
     max_grad_norm: 1.0
     use_gradient_checkpointing: false
     step_scheduler_with_optimizer: false

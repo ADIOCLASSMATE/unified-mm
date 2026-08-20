@@ -13,6 +13,39 @@ NO_DECAY_NAME_FRAGMENTS = (
 )
 
 
+def optimizer_parameter_role(name: str) -> str:
+    """Return the non-overlapping LR role for a canonical parameter name."""
+
+    if name.startswith("image_flow_head."):
+        return "flow_head"
+    if "image_token_embedder" in name or name.startswith(
+        "image_flow_condition_proj."
+    ):
+        return "image_projector"
+    if name in {"model.embed_tokens.weight", "lm_head.weight"}:
+        # Qwen ties these names to one complete matrix.  AdamW cannot assign a
+        # separate LR to only the special-token rows of a single parameter.
+        return "tied_lm_head_embedding"
+    return "backbone"
+
+
+def learning_rate_for_parameter(
+    name: str,
+    *,
+    backbone_lr: float,
+    flow_lr: float,
+    projector_lr: float,
+    special_token_lr: float,
+) -> float:
+    role = optimizer_parameter_role(name)
+    return {
+        "backbone": float(backbone_lr),
+        "flow_head": float(flow_lr),
+        "image_projector": float(projector_lr),
+        "tied_lm_head_embedding": float(special_token_lr),
+    }[role]
+
+
 def weight_decay_for_parameter(
     name: str,
     global_weight_decay: float,

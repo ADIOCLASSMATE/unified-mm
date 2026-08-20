@@ -396,6 +396,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run_id", required=True)
     parser.add_argument("--backbone_lr", required=True, type=float)
     parser.add_argument("--flow_lr", required=True, type=float)
+    parser.add_argument(
+        "--stop_after_steps",
+        required=True,
+        type=int,
+        choices=(2_404, 4_808, 12_020),
+    )
+    parser.add_argument("--lambda_text", type=float, default=0.2)
     parser.add_argument("--world_size", type=int, default=16)
     parser.add_argument("--require_npu_count", type=int, default=None)
     parser.add_argument("--require_hccl_intra_roce", action="store_true")
@@ -406,6 +413,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if not 0.025 <= float(args.lambda_text) <= 0.4:
+        raise ValueError(
+            f"lambda_text must be in the probe contract [0.025, 0.4], got {args.lambda_text}"
+        )
     config_path = require_file(Path(args.config), "joint sweep config")
     config = OmegaConf.load(config_path)
     validate_candidate(args.run_id, args.backbone_lr, args.flow_lr)
@@ -418,6 +429,9 @@ def main() -> None:
             "special_token_lr": args.backbone_lr,
             "flow_lr": args.flow_lr,
             "projector_lr": args.flow_lr,
+            "stop_after_steps": args.stop_after_steps,
+            "lambda_text": args.lambda_text,
+            "lambda_image": 1.0,
         },
         "training": validate_config(config, world_size=args.world_size),
     }

@@ -33,12 +33,18 @@ from accelerate.utils import DistributedType, set_seed
 
 from utils.dataset_utils import get_dataloaders
 from utils.wsd_schedule import get_wsd_schedule
-from utils.selfless_flow_optimizer import weight_decay_for_parameter
+from utils.selfless_flow_optimizer import (
+    learning_rate_for_parameter,
+    optimizer_parameter_role,
+    weight_decay_for_parameter,
+)
 from utils.selfless_training_runtime import (
     RESUME_SCHEMA,
     RESUME_SIGNATURE_VERSION,
     TrainingWindow,
     build_resume_signature,
+    gradient_norm_log_payload,
+    training_stop_step,
     validate_resume_metadata,
     validate_wsd_contract,
 )
@@ -693,12 +699,19 @@ def main(*, model_loader=None):
     validate_wsd_contract(config)
 
     log_every = int(config.experiment.log_every)
+    log_grad_norm_every = int(config.experiment.log_grad_norm_every)
     flow_stats_every = int(config.experiment.get("flow_stats_every", 0))
     backbone_gate_stats_every = int(
         config.experiment.get("backbone_gate_stats_every", 0)
     )
     if log_every <= 0:
         raise ValueError(f"experiment.log_every must be positive, got {log_every}")
+    if log_grad_norm_every <= 0:
+        raise ValueError(
+            "experiment.log_grad_norm_every must be positive, got "
+            f"{log_grad_norm_every}"
+        )
+    stop_after_steps = training_stop_step(config)
     for name, frequency in (
         ("flow_stats_every", flow_stats_every),
         ("backbone_gate_stats_every", backbone_gate_stats_every),
@@ -898,16 +911,8 @@ def main(*, model_loader=None):
     flow_weight_decay = float(
         optimizer_config.get("flow_weight_decay", global_weight_decay)
     )
-    def lr_for_param(name):
-        if name.startswith("image_flow_head."):
-            return flow_lr
-        if "image_token_embedder" in name or name.startswith("image_flow_condition_proj."):
-            return projector_lr
-        if "embed_tokens.weight" in name:
-            return special_token_lr
-        return backbone_lr
-
     grouped = {}
+    optimizer_role_numel = {}
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
@@ -916,7 +921,18 @@ def main(*, model_loader=None):
             global_weight_decay=global_weight_decay,
             flow_weight_decay=flow_weight_decay,
         )
-        key = (lr_for_param(name), weight_decay)
+        role = optimizer_parameter_role(name)
+        optimizer_role_numel[role] = optimizer_role_numel.get(role, 0) + int(
+            param.numel()
+        )
+        learning_rate = learning_rate_for_parameter(
+            name,
+            backbone_lr=backbone_lr,
+            flow_lr=flow_lr,
+            projector_lr=projector_lr,
+            special_token_lr=special_token_lr,
+        )
+        key = (learning_rate, weight_decay)
         grouped.setdefault(key, []).append(param)
 
     optimizer_grouped_parameters = [
@@ -930,6 +946,25 @@ def main(*, model_loader=None):
         f"special_tokens={special_token_lr:g}; "
         f"weight_decay={global_weight_decay:g}, "
         f"flow_weight_decay={flow_weight_decay:g}"
+    )
+    tied_embedding = model.lm_head.weight is model.model.embed_tokens.weight
+    if not tied_embedding:
+        raise RuntimeError(
+            "Joint training expects lm_head.weight and embed_tokens.weight to be tied"
+        )
+    logger.info(
+        "Optimizer parameter coverage: "
+        + ", ".join(
+            f"{role}={optimizer_role_numel.get(role, 0):,}"
+            for role in (
+                "backbone",
+                "tied_lm_head_embedding",
+                "image_projector",
+                "flow_head",
+            )
+        )
+        + "; lm_head/embed_tokens tied=true; special_token_learning_rate "
+        "applies to the complete tied matrix"
     )
 
     optimizer_type = config.optimizer.name
@@ -1177,7 +1212,8 @@ def main(*, model_loader=None):
         * accelerator.num_processes * accelerator.gradient_accumulation_steps
     )
     logger.info("***** Running selfless pretraining *****")
-    logger.info(f"  Num training steps = {config.training.max_train_steps}")
+    logger.info(f"  WSD training horizon = {config.training.max_train_steps}")
+    logger.info(f"  Stop after step = {stop_after_steps}")
     logger.info(f"  Instantaneous batch size per device = {total_batch_size_per_gpu}")
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     logger.info(f"  Gradient Accumulation steps = {accelerator.gradient_accumulation_steps}")
@@ -1255,7 +1291,7 @@ def main(*, model_loader=None):
 
     epoch = resume_epoch
     batches_consumed_in_epoch = batches_to_skip
-    while global_step < config.training.max_train_steps:
+    while global_step < stop_after_steps:
         data_wait_started = time.perf_counter()
         try:
             batch = next(train_iter)
@@ -1538,7 +1574,7 @@ def main(*, model_loader=None):
                     )
                     if (
                         (global_step + 1)
-                        % int(config.experiment.log_grad_norm_every)
+                        % log_grad_norm_every
                         == 0
                         and not bool(
                             torch.isfinite(torch.as_tensor(grad_norm_value)).all()
@@ -1554,7 +1590,7 @@ def main(*, model_loader=None):
                 if (
                     accelerator.distributed_type == DistributedType.DEEPSPEED
                     and (global_step + 1)
-                    % int(config.experiment.log_grad_norm_every)
+                    % log_grad_norm_every
                     == 0
                 ):
                     if hasattr(model, "get_global_grad_norm"):
@@ -1584,6 +1620,31 @@ def main(*, model_loader=None):
             global_step += 1
             training_window.record_optimizer_step()
             did_log = global_step % log_every == 0
+            sampled_grad_norm_value = None
+            grad_norm_logs = (
+                gradient_norm_log_payload(
+                    global_step=global_step,
+                    every=log_grad_norm_every,
+                    pre_clip_norm=grad_norm_value,
+                    max_norm=float(config.training.max_grad_norm),
+                )
+                if grad_norm_value is not None
+                else None
+            )
+            if grad_norm_logs is not None:
+                sampled_grad_norm_value = grad_norm_logs[
+                    "train/global_grad_norm_pre_clip"
+                ]
+                clip_limit = grad_norm_logs["train/grad_clip_max_norm"]
+                accelerator.log(grad_norm_logs, step=global_step)
+                if accelerator.is_main_process:
+                    logger.info(
+                        "GradientNorm: Step: %d | PreClip: %.6f | MaxNorm: %.6f | Clipped: %s",
+                        global_step,
+                        sampled_grad_norm_value,
+                        clip_limit,
+                        bool(grad_norm_logs["train/grad_clip_applied"]),
+                    )
 
             # Logging
             if did_log:
@@ -1758,16 +1819,6 @@ def main(*, model_loader=None):
                     ):
                         logs[f"train/{key}"] = stat
 
-                if (
-                    grad_norm_value is not None
-                    and global_step
-                    % int(config.experiment.log_grad_norm_every)
-                    == 0
-                ):
-                    logs["train/global_grad_norm"] = float(
-                        torch.as_tensor(grad_norm_value).detach().float().item()
-                    )
-
                 accelerator.log(logs, step=global_step)
 
                 if accelerator.is_main_process:
@@ -1782,8 +1833,8 @@ def main(*, model_loader=None):
                             f" | FlowMSE: {global_flow_stats.get('flow/v_mse', 0.0):0.4f}"
                             f" | FlowPredVRMS: {global_flow_stats.get('flow/v_pred_rms', 0.0):0.4f}"
                         )
-                    if grad_norm_value is not None:
-                        msg += f" | GradNorm: {float(torch.as_tensor(grad_norm_value).detach().float().item()):0.4f}"
+                    if sampled_grad_norm_value is not None:
+                        msg += f" | GradNormPreClip: {sampled_grad_norm_value:0.4f}"
                     msg += (
                         f" | LR: {lr_scheduler.get_last_lr()[0]:0.6f} | "
                         f"Sec/Step: {logs['seconds/optimizer_step']:0.4f} | "
@@ -1916,7 +1967,7 @@ def main(*, model_loader=None):
             acc_flow_stat_batches.zero_()
             acc_backbone_gate_stats.clear()
             acc_backbone_gate_stat_batches.zero_()
-            if global_step >= config.training.max_train_steps:
+            if global_step >= stop_after_steps:
                 break
 
     training_runtime_elapsed = time.time() - training_runtime_started_at

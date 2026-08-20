@@ -17,7 +17,13 @@ cd "${REPO_ROOT}"
 RUN_ID="${RUN_ID:?RUN_ID is required}"
 EVAL_ONLY="${EVAL_ONLY:-both}"
 CONFIG="${CONFIG:-configs/selfless/imagenet1k_caption_joint_sweep_10ep_ascend16_b1024.yaml}"
-RUN_ROOT="output/selfless-flow-imagenet1k-caption-joint-sweep-${RUN_ID}"
+if [[ "${RUN_ID}" == *-lt* ]]; then
+  DEFAULT_RUN_PROJECT="selfless-flow-imagenet1k-caption-joint-lambda-${RUN_ID}"
+else
+  DEFAULT_RUN_PROJECT="selfless-flow-imagenet1k-caption-joint-sweep-${RUN_ID}"
+fi
+RUN_PROJECT="${RUN_PROJECT:-${DEFAULT_RUN_PROJECT}}"
+RUN_ROOT="output/${RUN_PROJECT}"
 MODEL_PATH="${RUN_ROOT}/hf_model-final-ema"
 EVAL_ROOT="${RUN_ROOT}/generation-evaluation"
 I2T_ROOT="${EVAL_ROOT}/i2t-clip"
@@ -26,9 +32,13 @@ CLIP_MODEL="${CLIP_MODEL:-public/models/openai--clip-vit-base-patch32}"
 EXPECTED_CLIP_WEIGHT_SHA256="a63082132ba4f97a80bea76823f544493bffa8082296d62d71581a4feff1576f"
 NPU_COUNT=16
 
-if [[ ! "${RUN_ID}" =~ ^b(5e6|1e5|2e5)-f(1e5|2e5|4e5)$ ]]; then
+if [[ ! "${RUN_ID}" =~ ^b(5e6|1e5|2e5)-f(1e5|2e5|4e5)(-lt[0-9]+p[0-9]+)?$ ]]; then
   echo "ERROR: invalid sweep RUN_ID=${RUN_ID}" >&2
   exit 2
+fi
+if [[ ! "${RUN_PROJECT}" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+  echo "ERROR: unsafe RUN_PROJECT=${RUN_PROJECT}" >&2
+  exit 7
 fi
 if [[ "${EVAL_ONLY}" != "both" && "${EVAL_ONLY}" != "i2t" && "${EVAL_ONLY}" != "t2i" ]]; then
   echo "ERROR: EVAL_ONLY must be both, i2t, or t2i; got ${EVAL_ONLY}" >&2

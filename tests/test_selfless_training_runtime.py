@@ -11,6 +11,8 @@ from utils.selfless_training_runtime import (
     TrainingWindow,
     build_legacy_resume_signature,
     build_resume_signature,
+    gradient_norm_log_payload,
+    training_stop_step,
     validate_resume_metadata,
     validate_wsd_contract,
 )
@@ -74,6 +76,40 @@ def test_resume_signature_covers_future_training_controls():
     changed_output_policy.experiment.save_image_flow_adapter = False
     changed_output_policy.experiment.save_final_image_flow_adapter = True
     assert _signature(baseline) == _signature(changed_output_policy)
+
+
+def test_stage_stop_boundary_does_not_change_resume_signature():
+    baseline = _config()
+    staged = _config()
+    staged.training.stop_after_steps = 20
+    assert _signature(staged) == _signature(baseline)
+    assert training_stop_step(staged) == 20
+
+    staged.training.stop_after_steps = 101
+    with pytest.raises(ValueError, match="stop_after_steps"):
+        training_stop_step(staged)
+
+
+def test_grad_norm_event_is_independent_of_loss_log_cadence():
+    # 1202 is intentionally not divisible by the production loss log cadence
+    # of 50.  The event must still be emitted at its own exact step.
+    payload = gradient_norm_log_payload(
+        global_step=1202,
+        every=1202,
+        pre_clip_norm=torch.tensor(1.5),
+        max_norm=1.0,
+    )
+    assert payload == {
+        "train/global_grad_norm_pre_clip": 1.5,
+        "train/grad_clip_max_norm": 1.0,
+        "train/grad_clip_applied": 1.0,
+    }
+    assert gradient_norm_log_payload(
+        global_step=1200,
+        every=1202,
+        pre_clip_norm=1.5,
+        max_norm=1.0,
+    ) is None
 
 
 def test_v3_resume_metadata_requires_exact_signature(tmp_path: Path):

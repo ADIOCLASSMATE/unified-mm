@@ -9,6 +9,8 @@ import math
 from pathlib import Path
 from typing import Any
 
+from utils.joint_sweep_health import training_health
+
 
 DEFAULT_SWEEP = Path(
     "configs/selfless/imagenet1k_caption_joint_lr_sweep_10ep.json"
@@ -57,6 +59,7 @@ def collect(
     output_root: Path,
     *,
     require_complete: bool,
+    candidate_selection_path: Path | None = None,
 ) -> dict[str, Any]:
     sweep = _read_json(sweep_path)
     candidates = sweep.get("candidates")
@@ -65,16 +68,37 @@ def collect(
         raise ValueError(f"sweep has no candidates: {sweep_path}")
     if not isinstance(selection, dict):
         raise ValueError(f"sweep has no selection contract: {sweep_path}")
+    candidate_selection: dict[str, Any] | None = None
+    if candidate_selection_path is not None:
+        candidate_selection = _read_json(candidate_selection_path)
+        selected_ids = [str(value) for value in candidate_selection.get("selected", [])]
+        if not selected_ids:
+            raise ValueError(
+                f"candidate selection has no selected IDs: {candidate_selection_path}"
+            )
+        by_id = {str(candidate["id"]): candidate for candidate in candidates}
+        unknown = sorted(set(selected_ids).difference(by_id))
+        if unknown:
+            raise ValueError(
+                f"candidate selection contains IDs absent from sweep: {unknown}"
+            )
+        candidates = [by_id[run_id] for run_id in selected_ids]
     validation_steps = [int(step) for step in selection["validation_steps"]]
     final_step = validation_steps[-1]
+    require_gradient_probe = bool(selection.get("require_gradient_probe", False))
 
     rows: list[dict[str, Any]] = []
     missing: list[dict[str, Any]] = []
+    excluded: list[dict[str, Any]] = []
     for candidate in candidates:
         run_id = str(candidate["id"])
-        run_root = output_root / (
-            f"selfless-flow-imagenet1k-caption-joint-sweep-{run_id}"
+        run_project = str(
+            candidate.get(
+                "run_project",
+                f"selfless-flow-imagenet1k-caption-joint-sweep-{run_id}",
+            )
         )
+        run_root = output_root / run_project
         checkpoints: list[dict[str, float | int]] = []
         missing_steps: list[int] = []
         for step in validation_steps:
@@ -99,12 +123,58 @@ def collect(
                     ),
                 }
             )
-        if missing_steps:
-            missing.append(
+        probe_path = (
+            run_root
+            / "gradient_probe"
+            / f"checkpoint-{final_step}"
+            / "probe.json"
+        )
+        missing_probe = require_gradient_probe and not probe_path.is_file()
+        if missing_steps or missing_probe:
+            missing_row: dict[str, Any] = {
+                "id": run_id,
+                "run_root": str(run_root),
+                "missing_validation_steps": missing_steps,
+            }
+            if missing_probe:
+                missing_row["missing_gradient_probe"] = str(probe_path)
+            missing.append(missing_row)
+            continue
+        probe_summary: dict[str, Any] | None = None
+        if require_gradient_probe:
+            probe = _read_json(probe_path)
+            if probe.get("schema") != "selfless_caption_t2i_gradient_probe_v1":
+                raise ValueError(f"gradient probe schema mismatch: {probe_path}")
+            if probe.get("status") != "complete":
+                raise ValueError(f"gradient probe is incomplete: {probe_path}")
+            probe_summary = probe["summary"]
+            ratio_median = float(
+                probe_summary["ratio_g_image_over_g_text"]["median"]
+            )
+            cosine_median = float(probe_summary["cosine"]["median"])
+            if (
+                not math.isfinite(ratio_median)
+                or ratio_median <= 0.0
+                or not math.isfinite(cosine_median)
+                or not -1.0 <= cosine_median <= 1.0
+            ):
+                excluded.append(
+                    {
+                        "id": run_id,
+                        "run_project": run_project,
+                        "reason": "invalid gradient probe",
+                        "probe_path": str(probe_path),
+                    }
+                )
+                continue
+        health = training_health(run_root)
+        if not health["passed"]:
+            excluded.append(
                 {
                     "id": run_id,
-                    "run_root": str(run_root),
-                    "missing_validation_steps": missing_steps,
+                    "run_project": run_project,
+                    "reason": "training instability",
+                    "health": health,
                 }
             )
             continue
@@ -116,13 +186,32 @@ def collect(
         rows.append(
             {
                 "id": run_id,
+                "run_project": run_project,
                 "backbone_lr": float(candidate["backbone_lr"]),
                 "flow_lr": float(candidate["flow_lr"]),
+                **(
+                    {"lambda_text": float(candidate["lambda_text"])}
+                    if "lambda_text" in candidate
+                    else {}
+                ),
                 "final_step": final_step,
                 "final_text_loss": final_text,
                 "final_image_loss": final_image,
                 "best_text_loss": best_text,
                 "best_image_loss": best_image,
+                "health": health,
+                **(
+                    {
+                        "gradient_probe": {
+                            "path": str(probe_path),
+                            "ratio_median": ratio_median,
+                            "cosine_median": cosine_median,
+                            "task_conflict": probe_summary["task_conflict"],
+                        }
+                    }
+                    if probe_summary is not None
+                    else {}
+                ),
                 "mean_normalized_final_regression": 0.5
                 * (
                     (final_text - best_text) / max(abs(best_text), 1.0e-12)
@@ -142,21 +231,36 @@ def collect(
             "schema": "selfless_imagenet1k_caption_joint_lr_ranking_v1",
             "status": "incomplete",
             "sweep": str(sweep_path),
+            "candidate_selection": (
+                str(candidate_selection_path)
+                if candidate_selection_path is not None
+                else None
+            ),
             "completed_candidates": 0,
             "expected_candidates": len(candidates),
             "missing": missing,
+            "excluded": excluded,
             "ranking": [],
             "top_k": [],
+            "validation_leader": None,
             "winner": None,
         }
 
-    text_ranks = _average_tie_ranks(rows, "final_text_loss")
-    image_ranks = _average_tie_ranks(rows, "final_image_loss")
+    final_text_ranks = _average_tie_ranks(rows, "final_text_loss")
+    final_image_ranks = _average_tie_ranks(rows, "final_image_loss")
+    best_text_ranks = _average_tie_ranks(rows, "best_text_loss")
+    best_image_ranks = _average_tie_ranks(rows, "best_image_loss")
     for row in rows:
-        row["text_rank"] = text_ranks[str(row["id"])]
-        row["image_rank"] = image_ranks[str(row["id"])]
-        row["mean_rank"] = 0.5 * (
-            float(row["text_rank"]) + float(row["image_rank"])
+        run_id = str(row["id"])
+        row["final_text_rank"] = final_text_ranks[run_id]
+        row["final_image_rank"] = final_image_ranks[run_id]
+        row["best_text_rank"] = best_text_ranks[run_id]
+        row["best_image_rank"] = best_image_ranks[run_id]
+        row["mean_rank"] = 0.25 * (
+            float(row["final_text_rank"])
+            + float(row["final_image_rank"])
+            + float(row["best_text_rank"])
+            + float(row["best_image_rank"])
         )
     rows.sort(
         key=lambda row: (
@@ -167,20 +271,35 @@ def collect(
     )
     for rank, row in enumerate(rows, start=1):
         row["overall_rank"] = rank
-    top_k_count = int(selection.get("top_k_for_generation_evaluation", 3))
+    top_k_count = min(
+        int(selection.get("top_k_for_generation_evaluation", 3)),
+        len(rows),
+    )
     status = "complete" if not missing else "incomplete"
     return {
         "schema": "selfless_imagenet1k_caption_joint_lr_ranking_v1",
         "status": status,
         "sweep": str(sweep_path),
+        "candidate_selection": (
+            str(candidate_selection_path)
+            if candidate_selection_path is not None
+            else None
+        ),
         "completed_candidates": len(rows),
         "expected_candidates": len(candidates),
         "final_step": final_step,
         "selection_rule": selection["rule"],
         "missing": missing,
+        "excluded": excluded,
         "ranking": rows,
         "top_k": [row["id"] for row in rows[:top_k_count]],
-        "winner": rows[0]["id"] if status == "complete" else None,
+        "validation_leader": rows[0]["id"] if status == "complete" else None,
+        "winner": None,
+        "selection_status": (
+            "validation_only_not_final"
+            if status == "complete"
+            else "incomplete"
+        ),
     }
 
 
@@ -188,6 +307,15 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sweep", type=Path, default=DEFAULT_SWEEP)
     parser.add_argument("--output_root", type=Path, default=Path("output"))
+    parser.add_argument(
+        "--candidate_selection",
+        type=Path,
+        default=None,
+        help=(
+            "Optional staged-selection JSON. Only its selected IDs must have "
+            "the full validation history."
+        ),
+    )
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--require_complete", action="store_true")
     return parser.parse_args()
@@ -199,6 +327,7 @@ def main() -> None:
         args.sweep,
         args.output_root,
         require_complete=bool(args.require_complete),
+        candidate_selection_path=args.candidate_selection,
     )
     rendered = json.dumps(report, indent=2, sort_keys=True) + "\n"
     if args.output is not None:

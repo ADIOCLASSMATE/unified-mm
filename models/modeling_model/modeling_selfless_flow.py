@@ -1711,6 +1711,9 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         calculate_likelihood = calculate_likelihood or labels is not None
         return_logits = bool(kwargs.pop("return_logits", True))
         model_kwargs = dict(kwargs)
+        return_per_modality_loss_graph = bool(
+            model_kwargs.pop("return_per_modality_loss_graph", False)
+        )
         image_loss_mask_arg = model_kwargs.pop("image_loss_mask", None)
         image_span_table_arg = model_kwargs.get("image_span_table", None)
         image_local_positions_arg = model_kwargs.get(
@@ -1930,6 +1933,14 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 "text_loss": text_loss.detach(),
                 "image_loss": image_loss.detach(),
             }
+            if return_per_modality_loss_graph:
+                # Cold-path diagnostic hook used by the standalone gradient
+                # probe.  The normal training/validation API remains detached
+                # so callers cannot accidentally retain both task graphs.
+                output["per_modality_loss_graph"] = {
+                    "text_loss": text_loss,
+                    "image_loss": image_loss,
+                }
             output["per_modality_count"] = {
                 "text_tokens": text_token_count.detach(),
                 "image_tokens": image_token_count.detach(),

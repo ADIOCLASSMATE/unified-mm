@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,6 +49,11 @@ def build_resume_signature(
 ) -> str:
     """Hash every configuration field that can affect training continuation."""
 
+    training = OmegaConf.to_container(config.training, resolve=True)
+    # ``stop_after_steps`` is an operational stage boundary, not a numerical
+    # training control.  Excluding it lets a checkpoint continue from Stage 1
+    # to Stage 2 while every optimizer/scheduler/data/EMA control stays strict.
+    training.pop("stop_after_steps", None)
     payload = {
         "signature_version": RESUME_SIGNATURE_VERSION,
         "model": OmegaConf.to_container(config.model, resolve=True),
@@ -59,7 +65,7 @@ def build_resume_signature(
         ),
         # Hash the complete training section so future numerical controls are
         # strict by default instead of requiring an allow-list update.
-        "training": OmegaConf.to_container(config.training, resolve=True),
+        "training": training,
         "world_size": int(world_size),
         "gradient_accumulation_steps": int(gradient_accumulation_steps),
     }
@@ -180,6 +186,45 @@ def validate_wsd_contract(config) -> None:
         raise ValueError(
             f"WSD min_lr_scale must be in [0, 1], got {min_lr_ratio}"
         )
+
+
+def training_stop_step(config) -> int:
+    """Resolve a resumable stage boundary without changing the WSD horizon."""
+
+    total = int(config.training.max_train_steps)
+    stop = int(config.training.get("stop_after_steps", total))
+    if stop <= 0 or stop > total:
+        raise ValueError(
+            "training.stop_after_steps must be in (0, max_train_steps], "
+            f"got {stop} with max_train_steps={total}"
+        )
+    return stop
+
+
+def gradient_norm_log_payload(
+    *,
+    global_step: int,
+    every: int,
+    pre_clip_norm,
+    max_norm: float,
+) -> dict[str, float] | None:
+    """Build a standalone grad-norm event independent of loss log cadence."""
+
+    if int(every) <= 0:
+        raise ValueError(f"gradient norm cadence must be positive, got {every}")
+    if int(global_step) % int(every):
+        return None
+    value = float(torch.as_tensor(pre_clip_norm).detach().float().item())
+    limit = float(max_norm)
+    if not math.isfinite(value):
+        raise FloatingPointError(
+            f"non-finite pre-clip gradient norm at global_step={global_step}"
+        )
+    return {
+        "train/global_grad_norm_pre_clip": value,
+        "train/grad_clip_max_norm": limit,
+        "train/grad_clip_applied": float(value > limit),
+    }
 
 
 @dataclass

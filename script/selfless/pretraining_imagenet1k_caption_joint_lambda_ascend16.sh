@@ -16,12 +16,12 @@ cd "${REPO_ROOT}"
 
 CONFIG="${CONFIG:-configs/selfless/imagenet1k_caption_joint_sweep_10ep_ascend16_b1024.yaml}"
 ACCELERATE_CONFIG="${ACCELERATE_CONFIG:-accelerate_configs/16_npus_1node_deepspeed_zero2.yaml}"
-RUN_ID="${RUN_ID:?RUN_ID is required}"
+TOP_LR_ID="${TOP_LR_ID:?TOP_LR_ID is required}"
 BACKBONE_LR="${BACKBONE_LR:?BACKBONE_LR is required}"
 FLOW_LR="${FLOW_LR:?FLOW_LR is required}"
-RESUME_FROM="${RESUME_FROM:-none}"
+LAMBDA_TEXT="${LAMBDA_TEXT:?LAMBDA_TEXT is required}"
+LAMBDA_TAG="${LAMBDA_TAG:?LAMBDA_TAG is required, for example 0p1}"
 STOP_AFTER_STEPS="${STOP_AFTER_STEPS:-2404}"
-SAVE_EMA_EVAL_EVERY="${SAVE_EMA_EVAL_EVERY:-2404}"
 WANDB_MODE="${WANDB_MODE:-offline}"
 
 NODE_RANK="${PET_NODE_RANK:-}"
@@ -37,33 +37,33 @@ export HCCL_INTRA_ROCE_ENABLE="${HCCL_INTRA_ROCE_ENABLE:-1}"
 export HCCL_CONNECT_TIMEOUT="${HCCL_CONNECT_TIMEOUT:-600}"
 unset CUDA_VISIBLE_DEVICES PYTORCH_CUDA_ALLOC_CONF
 
-if [[ "${NODE_RANK}" != "0" ]]; then
-  echo "ERROR: expected PET_NODE_RANK=0, got ${NODE_RANK:-<unset>}" >&2
+if [[ "${NODE_RANK}" != "0" || "${NUM_MACHINES}" != "${EXPECTED_NUM_MACHINES}" ]]; then
+  echo "ERROR: lambda sweep requires one platform node with rank 0" >&2
   exit 2
-fi
-if [[ "${NUM_MACHINES}" != "${EXPECTED_NUM_MACHINES}" ]]; then
-  echo "ERROR: expected PET_NNODES=1, got ${NUM_MACHINES:-<unset>}" >&2
-  exit 3
 fi
 if [[ "${PLATFORM_NPROC_PER_NODE}" != "0" && "${PLATFORM_NPROC_PER_NODE}" != "16" ]]; then
   echo "ERROR: expected PET_NPROC_PER_NODE=0 or 16, got ${PLATFORM_NPROC_PER_NODE}" >&2
-  exit 4
+  exit 3
 fi
 if [[ -z "${MAIN_PROCESS_IP}" || -z "${MAIN_PROCESS_PORT}" ]]; then
   echo "ERROR: platform master address/port is missing" >&2
+  exit 4
+fi
+if [[ ! "${TOP_LR_ID}" =~ ^b(5e6|1e5|2e5)-f(1e5|2e5|4e5)$ ]]; then
+  echo "ERROR: invalid TOP_LR_ID=${TOP_LR_ID}" >&2
   exit 5
 fi
-if [[ ! "${RUN_ID}" =~ ^b(5e6|1e5|2e5)-f(1e5|2e5|4e5)$ ]]; then
-  echo "ERROR: invalid sweep RUN_ID=${RUN_ID}" >&2
+if [[ ! "${LAMBDA_TAG}" =~ ^[0-9]+p[0-9]+$ ]]; then
+  echo "ERROR: LAMBDA_TAG must be filename-safe decimal form, got ${LAMBDA_TAG}" >&2
   exit 6
 fi
-if [[ "${STOP_AFTER_STEPS}" != "2404" && "${STOP_AFTER_STEPS}" != "4808" && "${STOP_AFTER_STEPS}" != "12020" ]]; then
-  echo "ERROR: STOP_AFTER_STEPS must be 2404, 4808, or 12020; got ${STOP_AFTER_STEPS}" >&2
-  exit 9
+if [[ "${STOP_AFTER_STEPS}" != "2404" && "${STOP_AFTER_STEPS}" != "4808" ]]; then
+  echo "ERROR: lambda short sweep stop must be 2404 or 4808" >&2
+  exit 7
 fi
 if [[ ! -f "${CONFIG}" || ! -f "${ACCELERATE_CONFIG}" ]]; then
-  echo "ERROR: missing CONFIG=${CONFIG} or ACCELERATE_CONFIG=${ACCELERATE_CONFIG}" >&2
-  exit 7
+  echo "ERROR: missing config" >&2
+  exit 8
 fi
 
 read -r NPU_AVAILABLE LOCAL_NPUS <<< "$(python - <<'PY'
@@ -74,19 +74,20 @@ PY
 )"
 if [[ "${NPU_AVAILABLE}" != "1" || "${LOCAL_NPUS}" != "${NPROC_PER_NODE}" ]]; then
   echo "ERROR: expected 16 visible NPUs, got available=${NPU_AVAILABLE}, count=${LOCAL_NPUS}" >&2
-  exit 8
+  exit 9
 fi
 
-RUN_PROJECT="selfless-flow-imagenet1k-caption-joint-sweep-${RUN_ID}"
+RUN_PROJECT="selfless-flow-imagenet1k-caption-joint-lambda-${TOP_LR_ID}-lt${LAMBDA_TAG}"
 RUN_ROOT="output/${RUN_PROJECT}"
 AUDIT_DIR="${RUN_ROOT}/prelaunch_audit/stage-${STOP_AFTER_STEPS}"
 mkdir -p "${AUDIT_DIR}"
 
 python scripts/validate_ascend_imagenet1k_caption_joint_sweep.py \
   --config "${CONFIG}" \
-  --run_id "${RUN_ID}" \
+  --run_id "${TOP_LR_ID}" \
   --backbone_lr "${BACKBONE_LR}" \
   --flow_lr "${FLOW_LR}" \
+  --lambda_text "${LAMBDA_TEXT}" \
   --stop_after_steps "${STOP_AFTER_STEPS}" \
   --world_size "${EXPECTED_WORLD_SIZE}" \
   --require_npu_count "${NPROC_PER_NODE}" \
@@ -107,8 +108,10 @@ COMMAND=(
   "config=${CONFIG}"
   "experiment.project=${RUN_PROJECT}"
   "experiment.name=${RUN_PROJECT}-seed42-16x910b-b16ga4-b1024"
-  "experiment.resume_from_checkpoint=${RESUME_FROM}"
-  "experiment.save_ema_eval_every=${SAVE_EMA_EVAL_EVERY}"
+  "experiment.resume_from_checkpoint=none"
+  "experiment.save_ema_eval_every=2404"
+  "model.lambda_text=${LAMBDA_TEXT}"
+  "model.lambda_image=1.0"
   "optimizer.params.learning_rate=${FLOW_LR}"
   "optimizer.params.backbone_learning_rate=${BACKBONE_LR}"
   "optimizer.params.special_token_learning_rate=${BACKBONE_LR}"

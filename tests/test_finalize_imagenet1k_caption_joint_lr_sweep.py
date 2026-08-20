@@ -14,6 +14,11 @@ def _write_generation_metrics(root, run_id, *, clip, fid, inception):
             {
                 "schema": "selfless_imagenet1k_i2t_clip_metrics_v1",
                 "samples": 1000,
+                "class_balance": {
+                    "class_count": 1000,
+                    "min_samples_per_class": 1,
+                    "max_samples_per_class": 1,
+                },
                 "clip": {"caption_clip_score": clip},
             }
         ),
@@ -26,14 +31,38 @@ def _write_generation_metrics(root, run_id, *, clip, fid, inception):
                 "samples_evaluated": 50000,
                 "strategies": {
                     "spatial_halton": {
+                        "count": 50000,
                         "fid": fid,
                         "inception_score_mean": inception,
+                        "inception_score_std": 3.0,
                     }
                 },
             }
         ),
         encoding="utf-8",
     )
+
+
+def _write_initialization_metrics(root):
+    path = root / "initialization-metrics.json"
+    path.write_text(
+        json.dumps(
+            {
+                "official_protocol": True,
+                "samples_evaluated": 50000,
+                "strategies": {
+                    "spatial_halton": {
+                        "count": 50000,
+                        "fid": 25.0,
+                        "inception_score_mean": 150.0,
+                        "inception_score_std": 4.0,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
 
 
 def test_finalizer_balances_caption_fid_and_inception_ranks(tmp_path):
@@ -83,11 +112,20 @@ def test_finalizer_balances_caption_fid_and_inception_ranks(tmp_path):
         validation_path,
         tmp_path,
         require_complete=True,
+        initialization_metrics_path=_write_initialization_metrics(tmp_path),
     )
 
     assert report["status"] == "complete"
     assert report["winner"] == "balanced"
-    assert report["ranking"][0]["generation_mean_rank"] == 5.0 / 3.0
+    assert report["ranking"][0]["generation_mean_rank"] == 4.0 / 3.0
+    assert report["excluded"][0]["id"] == "caption"
+    assert report["ranking"][0]["t2i_vs_initialization"] == {
+        "fid_delta": -5.0,
+        "fid_status": "improved",
+        "inception_score_delta": 50.0,
+        "inception_score_status": "improved",
+        "joint_status": "improved_both",
+    }
 
 
 def test_finalizer_reports_missing_generation_metrics(tmp_path):
@@ -116,6 +154,7 @@ def test_finalizer_reports_missing_generation_metrics(tmp_path):
         validation_path,
         tmp_path,
         require_complete=False,
+        initialization_metrics_path=_write_initialization_metrics(tmp_path),
     )
 
     assert report["status"] == "incomplete"

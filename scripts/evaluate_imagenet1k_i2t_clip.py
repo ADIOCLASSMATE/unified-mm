@@ -11,6 +11,7 @@ auditable JSONL shards; rank zero merges them into one metrics artifact.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import hashlib
 import json
 import math
@@ -602,6 +603,12 @@ def main() -> None:
         reference_scores = [
             float(row["reference_clip_image_text_cosine"]) for row in rows
         ]
+        class_counts = Counter(str(row["synset"]) for row in rows)
+        class_counts_payload = json.dumps(
+            dict(sorted(class_counts.items())),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
         metrics = {
             "schema": "selfless_imagenet1k_i2t_clip_metrics_v1",
             "samples": len(rows),
@@ -612,6 +619,12 @@ def main() -> None:
                     config.dataset.params.val_samples_per_class
                 ),
                 "validation_overlap_train": False,
+            },
+            "class_balance": {
+                "class_count": len(class_counts),
+                "min_samples_per_class": min(class_counts.values()),
+                "max_samples_per_class": max(class_counts.values()),
+                "counts_sha256": hashlib.sha256(class_counts_payload).hexdigest(),
             },
             "generation": {
                 "max_new_tokens": int(args.max_new_tokens),

@@ -1,5 +1,5 @@
 {
-  "schema": "selfless_imagenet1k_caption_joint_lr_sweep_v1",
+  "schema": "selfless_imagenet1k_caption_joint_lr_sweep_v2",
   "base_config": "configs/selfless/imagenet1k_caption_joint_sweep_10ep_ascend16_b1024.yaml",
   "initialization": "output/selfless-flow-imagenet1k-class-ascend64-b1024-800ep/hf_model-final-ema",
   "coupling": {
@@ -9,9 +9,39 @@
   "selection": {
     "validation_steps": [2404, 4808, 7212, 9616, 12020],
     "primary_metrics": ["val/loss_text", "val/loss_image_flow"],
-    "rule": "lowest mean rank across final I2T text CE and T2I flow loss; break ties by the smaller mean normalized regression from each metric's best observed checkpoint",
+    "require_gradient_probe": true,
+    "rule": "exclude instability/T2I regression first; at stage boundaries use mean rank across text loss, image-flow loss, and gradient-balance log error; rank final/best text and image-flow losses for finalists; final generation uses Pareto/mean-rank over Caption CLIP (max), FID (min), and IS (max), with validation loss only as tie-break",
     "top_k_for_generation_evaluation": 3,
-    "generation_metrics": ["caption_clip_score", "fid", "inception_score_mean"]
+    "generation_metrics": ["caption_clip_score", "fid", "inception_score_mean"],
+    "generation_protocol": {
+      "caption": "one deterministic I2T sample for each of 1000 ImageNet classes",
+      "t2i": "official ImageNet val 50000 canonical-pairing FID/IS",
+      "initialization_baseline": "output/selfless-flow-imagenet1k-class-ascend64-b1024-800ep-fid-is/metrics.json",
+      "clear_t2i_regression": "exclude only when FID rises by max(1.0, 5% of baseline) and IS falls by max(baseline IS std, 1% of baseline IS)"
+    }
+  },
+  "staged_training": {
+    "scheduler_horizon_steps": 12020,
+    "stage_boundaries": [2404, 4808, 12020],
+    "top_k_to_continue": {"2404": 4, "4808": 3, "12020": 3},
+    "resume_contract": "optimizer+scheduler+EMA+RNG+sampler; stop_after_steps is operational and excluded from the numerical signature",
+    "existing_candidates_past_boundary": "reuse checkpoint and metrics; never stop, modify, or duplicate-submit"
+  },
+  "gradient_probe": {
+    "batches": 16,
+    "seed": 424242,
+    "optimizer_steps": 0,
+    "shared_backbone_metrics": ["g_text", "g_image", "ratio_g_image_over_g_text", "cosine"],
+    "summary_statistics": ["mean", "median", "p25", "p75"]
+  },
+  "lambda_text_sweep": {
+    "after_lr_selection": true,
+    "lambda_image": 1.0,
+    "center": "median(g_image/g_text) on the fixed checkpoint probe",
+    "multipliers": [0.5, 1.0, 2.0],
+    "bounds": [0.025, 0.4],
+    "reference_points": [0.05, 0.1, 0.2],
+    "cartesian_product_with_lr": false
   },
   "candidates": [
     {"id": "b5e6-f1e5", "backbone_lr": 5e-6, "flow_lr": 1e-5},
