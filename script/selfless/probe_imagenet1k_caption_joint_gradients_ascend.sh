@@ -16,6 +16,7 @@ cd "${REPO_ROOT}"
 
 CONFIG="${CONFIG:-configs/selfless/imagenet1k_caption_joint_sweep_10ep_ascend16_b1024.yaml}"
 PROBE_CHECKPOINT="${PROBE_CHECKPOINT:-output/selfless-flow-imagenet1k-class-ascend64-b1024-800ep/hf_model-final-ema}"
+PROBE_EMA_DIR="${PROBE_EMA_DIR:-}"
 PROBE_OUTPUT="${PROBE_OUTPUT:-output/selfless-flow-imagenet1k-caption-joint-gradient-probe/init/probe.json}"
 PROBE_BATCHES="${PROBE_BATCHES:-16}"
 PROBE_BATCH_SIZE="${PROBE_BATCH_SIZE:-16}"
@@ -31,9 +32,22 @@ if [[ "${NPU_AVAILABLE}" != "1" || "${LOCAL_NPUS}" -lt 1 ]]; then
   echo "ERROR: gradient probe requires at least one visible Ascend NPU" >&2
   exit 2
 fi
-if [[ ! -f "${CONFIG}" || ! -f "${PROBE_CHECKPOINT}/model.safetensors" ]]; then
-  echo "ERROR: missing config or HF checkpoint" >&2
+if [[ ! -f "${CONFIG}" ]]; then
+  echo "ERROR: missing config: ${CONFIG}" >&2
   exit 3
+fi
+if [[ -n "${PROBE_EMA_DIR}" ]]; then
+  if [[ ! -f "${PROBE_EMA_DIR}/ema_manifest.json" ]]; then
+    echo "ERROR: missing sharded EMA checkpoint: ${PROBE_EMA_DIR}" >&2
+    exit 3
+  fi
+  PROBE_SOURCE_ARGS=(--ema_dir "${PROBE_EMA_DIR}")
+else
+  if [[ ! -f "${PROBE_CHECKPOINT}/model.safetensors" ]]; then
+    echo "ERROR: missing HF checkpoint: ${PROBE_CHECKPOINT}" >&2
+    exit 3
+  fi
+  PROBE_SOURCE_ARGS=(--checkpoint "${PROBE_CHECKPOINT}")
 fi
 
 AUDIT_DIR="$(dirname "${PROBE_OUTPUT}")"
@@ -43,7 +57,7 @@ python tests/smoke_npu_joint_gradient_probe.py \
 
 python scripts/probe_imagenet1k_caption_joint_gradients.py \
   --config "${CONFIG}" \
-  --checkpoint "${PROBE_CHECKPOINT}" \
+  "${PROBE_SOURCE_ARGS[@]}" \
   --output "${PROBE_OUTPUT}" \
   --num_batches "${PROBE_BATCHES}" \
   --batch_size "${PROBE_BATCH_SIZE}" \

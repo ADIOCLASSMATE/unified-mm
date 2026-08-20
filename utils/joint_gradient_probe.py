@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 from collections.abc import Callable, Iterable, Sequence
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -14,6 +16,21 @@ from utils.selfless_flow_optimizer import optimizer_parameter_role
 LAMBDA_TEXT_MIN = 0.025
 LAMBDA_TEXT_MAX = 0.4
 REFERENCE_LAMBDA_TEXT = (0.05, 0.1, 0.2)
+
+
+def checkpoint_bundle_sha256(paths: Sequence[Path], *, root: Path) -> str:
+    """Hash relative file names, sizes, and bytes for a sharded checkpoint."""
+
+    digest = hashlib.sha256()
+    for path in sorted(paths, key=lambda item: item.relative_to(root).as_posix()):
+        relative = path.relative_to(root).as_posix().encode("utf-8")
+        digest.update(len(relative).to_bytes(8, byteorder="big"))
+        digest.update(relative)
+        digest.update(path.stat().st_size.to_bytes(8, byteorder="big"))
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+                digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _unique_trainable(parameters: Iterable[torch.nn.Parameter]) -> list[torch.nn.Parameter]:

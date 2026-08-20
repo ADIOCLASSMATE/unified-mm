@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import json
 import os
@@ -29,6 +30,7 @@ from omegaconf import OmegaConf
 
 from utils.dataset_utils import get_dataloaders
 from utils.joint_gradient_probe import (
+    checkpoint_bundle_sha256,
     measure_gradient_probe_batch,
     summarize_probe_batches,
 )
@@ -36,6 +38,7 @@ from utils.selfless_flow_optimizer import (
     learning_rate_for_parameter,
     optimizer_parameter_role,
 )
+from utils.sharded_ema import load_ema_manifest, merge_sharded_ema_state_dict
 from utils.utils import get_selfless_mask, load_model_tokenizer
 
 
@@ -55,7 +58,14 @@ DEFAULT_OUTPUT = Path(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
-    parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--checkpoint", type=Path, default=None)
+    source.add_argument(
+        "--ema_dir",
+        type=Path,
+        default=None,
+        help="Rank-sharded EMA checkpoint directory to probe without exporting it.",
+    )
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--num_batches", type=int, default=16)
     parser.add_argument("--batch_size", type=int, default=None)
@@ -70,6 +80,51 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _checkpoint_contract(
+    *,
+    checkpoint: Path | None,
+    ema_dir: Path | None,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    if ema_dir is None:
+        checkpoint = checkpoint or DEFAULT_CHECKPOINT
+        for filename in ("model.safetensors", "config.json", "tokenizer.json"):
+            if not (checkpoint / filename).is_file():
+                raise FileNotFoundError(checkpoint / filename)
+        return (
+            {
+                "kind": "hf",
+                "path": str(checkpoint),
+                "model_sha256": sha256_file(checkpoint / "model.safetensors"),
+                "config_sha256": sha256_file(checkpoint / "config.json"),
+            },
+            None,
+        )
+
+    manifest_path = ema_dir / "ema_manifest.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(manifest_path)
+    manifest = load_ema_manifest(ema_dir)
+    shards = sorted(ema_dir.glob("ema_shard_rank_*.safetensors"))
+    expected_shards = int(manifest["world_size"])
+    if len(shards) != expected_shards:
+        raise RuntimeError(
+            f"EMA shard count mismatch: found={len(shards)}, expected={expected_shards}"
+        )
+    bundle_paths = [manifest_path, *shards]
+    return (
+        {
+            "kind": "sharded_ema",
+            "path": str(ema_dir),
+            "bundle_sha256": checkpoint_bundle_sha256(bundle_paths, root=ema_dir),
+            "manifest_sha256": sha256_file(manifest_path),
+            "layout_fingerprint": manifest["layout_fingerprint"],
+            "world_size": expected_shards,
+            "global_step": int((manifest.get("runtime") or {})["global_step"]),
+        },
+        manifest,
+    )
 
 
 def _atomic_write(path: Path, payload: dict[str, Any]) -> None:
@@ -151,16 +206,24 @@ def main() -> None:
         raise ValueError(f"--num_batches must be in [16, 32], got {args.num_batches}")
     if not args.config.is_file():
         raise FileNotFoundError(args.config)
-    for filename in ("model.safetensors", "config.json", "tokenizer.json"):
-        if not (args.checkpoint / filename).is_file():
-            raise FileNotFoundError(args.checkpoint / filename)
     if not torch.npu.is_available():
         raise RuntimeError("Ascend NPU is required for the formal gradient probe")
 
     device = torch.device(args.device)
     torch.npu.set_device(device)
     config = OmegaConf.load(args.config)
-    config.model.model_path = str(args.checkpoint)
+    checkpoint = args.checkpoint
+    if checkpoint is None and args.ema_dir is None:
+        checkpoint = DEFAULT_CHECKPOINT
+    checkpoint_report, ema_manifest = _checkpoint_contract(
+        checkpoint=checkpoint,
+        ema_dir=args.ema_dir,
+    )
+    base_checkpoint = checkpoint or Path(str(config.model.model_path))
+    for filename in ("model.safetensors", "config.json", "tokenizer.json"):
+        if not (base_checkpoint / filename).is_file():
+            raise FileNotFoundError(base_checkpoint / filename)
+    config.model.model_path = str(base_checkpoint)
     if args.batch_size is not None:
         if args.batch_size <= 0:
             raise ValueError("--batch_size must be positive")
@@ -176,6 +239,16 @@ def main() -> None:
         config=config,
         model_dtype=torch.bfloat16,
     )
+    if args.ema_dir is not None:
+        model_keys = list(model.state_dict().keys())
+        if model_keys != list(ema_manifest["state_keys"]):
+            raise RuntimeError("EMA/model state keys or ordering do not match")
+        ema_state = merge_sharded_ema_state_dict(args.ema_dir)
+        incompatible = model.load_state_dict(ema_state, strict=True)
+        if incompatible.missing_keys or incompatible.unexpected_keys:
+            raise RuntimeError(f"strict EMA load was incompatible: {incompatible}")
+        del ema_state
+        gc.collect()
     model = model.to(device=device).train()
     if float(model.lambda_text) <= 0.0 or float(model.lambda_image) <= 0.0:
         raise RuntimeError("probe requires both model task losses to be enabled")
@@ -198,11 +271,7 @@ def main() -> None:
         "schema": "selfless_caption_t2i_gradient_probe_v1",
         "status": "running",
         "config": str(args.config),
-        "checkpoint": {
-            "path": str(args.checkpoint),
-            "model_sha256": sha256_file(args.checkpoint / "model.safetensors"),
-            "config_sha256": sha256_file(args.checkpoint / "config.json"),
-        },
+        "checkpoint": checkpoint_report,
         "contract": {
             "optimizer_steps": 0,
             "model_dtype": "bfloat16",

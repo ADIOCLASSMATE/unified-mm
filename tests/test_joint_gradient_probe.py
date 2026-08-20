@@ -6,11 +6,25 @@ from torch import nn
 
 from utils.joint_gradient_probe import (
     build_lambda_text_candidates,
+    checkpoint_bundle_sha256,
     measure_gradient_probe_batch,
     optimizer_parameter_role,
     summarize_probe_batches,
 )
 from utils.selfless_flow_optimizer import learning_rate_for_parameter
+
+
+def test_checkpoint_bundle_sha256_is_order_invariant_and_content_sensitive(tmp_path):
+    first = tmp_path / "a.bin"
+    second = tmp_path / "b.bin"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+
+    digest = checkpoint_bundle_sha256([second, first], root=tmp_path)
+    assert digest == checkpoint_bundle_sha256([first, second], root=tmp_path)
+
+    second.write_bytes(b"changed")
+    assert digest != checkpoint_bundle_sha256([first, second], root=tmp_path)
 
 
 class _Body(nn.Module):
