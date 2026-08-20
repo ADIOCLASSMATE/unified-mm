@@ -418,7 +418,7 @@ def add_clip_scores(
     model = CLIPModel.from_pretrained(
         clip_model_dir,
         local_files_only=True,
-        dtype=torch.float32,
+        torch_dtype=torch.float32,
     ).to(device)
     model.eval()
     processor = CLIPProcessor.from_pretrained(
