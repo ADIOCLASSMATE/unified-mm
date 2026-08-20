@@ -22,6 +22,23 @@ from utils.joint_gradient_probe import measure_gradient_probe_batch  # noqa: E40
 from utils.utils import get_selfless_mask  # noqa: E402
 
 
+def _open_tiny_flow_condition_path(model: Qwen3ForCausalLM) -> None:
+    """Undo the production flow head's deliberate zero-output init for this smoke.
+
+    A freshly constructed flow head starts with both the final projection and
+    its adaptive conditioning projection at zero.  Consequently its first
+    backward pass cannot reach the backbone condition, even though a trained
+    checkpoint can.  The smoke tests the probe machinery, so make that path
+    non-zero deterministically instead of mistaking the expected cold-start
+    behavior for a broken probe.
+    """
+
+    final_layer = model.image_flow_head.net.final_layer
+    with torch.no_grad():
+        final_layer.linear.weight.normal_(mean=0.0, std=0.02)
+        final_layer.adaLN_modulation[-1].weight.normal_(mean=0.0, std=0.02)
+
+
 def main() -> None:
     if not torch.npu.is_available():
         raise SystemExit("Ascend NPU is required")
@@ -32,6 +49,8 @@ def main() -> None:
         device=device,
         dtype=torch.bfloat16,
     ).train()
+    torch.npu.manual_seed_all(424242)
+    _open_tiny_flow_condition_path(model)
     attention_mask = get_selfless_mask(
         sigma=payload["sigma"],
         seq_len=payload["input_ids"].shape[1],
@@ -67,6 +86,8 @@ def main() -> None:
     )
     if not all(parameter.grad is None for parameter in model.parameters()):
         raise AssertionError("probe failed to clear gradients")
+    if result["shared_backbone"]["g_image"] <= 0.0:
+        raise AssertionError("probe did not measure the open T2I/backbone path")
     torch.npu.synchronize()
     print(json.dumps(result, indent=2, sort_keys=True))
     print("JOINT GRADIENT PROBE NPU SMOKE PASS")
