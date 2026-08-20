@@ -3,14 +3,23 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+import sys
 
 import torch
 import torch_npu  # noqa: F401
 
-from tests.smoke_npu_joint_caption import joint_batch, tiny_config
-from models.modeling_model.modeling_selfless_flow import Qwen3ForCausalLM
-from utils.joint_gradient_probe import measure_gradient_probe_batch
-from utils.utils import get_selfless_mask
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+TEST_ROOT = REPO_ROOT / "tests"
+if str(TEST_ROOT) not in sys.path:
+    sys.path.insert(0, str(TEST_ROOT))
+
+from smoke_npu_joint_caption import joint_batch, tiny_config  # noqa: E402
+from models.modeling_model.modeling_selfless_flow import Qwen3ForCausalLM  # noqa: E402
+from utils.joint_gradient_probe import measure_gradient_probe_batch  # noqa: E402
+from utils.utils import get_selfless_mask  # noqa: E402
 
 
 def main() -> None:
