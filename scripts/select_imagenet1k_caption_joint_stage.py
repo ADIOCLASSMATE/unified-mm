@@ -35,16 +35,47 @@ def collect_stage(
     step: int,
     lambda_text: float,
     require_complete: bool,
+    candidate_selection_path: Path | None = None,
 ) -> dict[str, Any]:
     sweep = _read_json(sweep_path)
     stages = sweep["staged_training"]
     if int(step) not in map(int, stages["stage_boundaries"]):
         raise ValueError(f"unsupported stage step {step}")
     top_k = int(stages["top_k_to_continue"][str(step)])
+    candidates = sweep["candidates"]
+    upstream_selection: dict[str, Any] | None = None
+    if candidate_selection_path is not None:
+        upstream_selection = _read_json(candidate_selection_path)
+        if (
+            upstream_selection.get("schema")
+            != "selfless_caption_t2i_stage_selection_v1"
+        ):
+            raise ValueError(
+                f"candidate selection schema mismatch: {candidate_selection_path}"
+            )
+        if upstream_selection.get("status") != "complete":
+            raise ValueError("candidate selection must be complete")
+        upstream_step = int(upstream_selection.get("stage_step", -1))
+        if upstream_step >= int(step):
+            raise ValueError(
+                f"candidate selection step {upstream_step} must precede {step}"
+            )
+        selected_ids = [
+            str(value) for value in upstream_selection.get("selected", [])
+        ]
+        if not selected_ids:
+            raise ValueError("candidate selection has no selected IDs")
+        by_id = {str(candidate["id"]): candidate for candidate in candidates}
+        unknown = sorted(set(selected_ids).difference(by_id))
+        if unknown:
+            raise ValueError(
+                f"candidate selection contains IDs absent from sweep: {unknown}"
+            )
+        candidates = [by_id[run_id] for run_id in selected_ids]
     rows: list[dict[str, Any]] = []
     missing: list[dict[str, Any]] = []
     excluded: list[dict[str, Any]] = []
-    for candidate in sweep["candidates"]:
+    for candidate in candidates:
         run_id = str(candidate["id"])
         run_root = output_root / f"selfless-flow-imagenet1k-caption-joint-sweep-{run_id}"
         metrics_path = run_root / f"validation_metrics_step_{step}.json"
@@ -137,12 +168,24 @@ def collect_stage(
         "status": "complete" if not missing else "incomplete",
         "stage_step": int(step),
         "lambda_text": float(lambda_text),
+        "candidate_selection": (
+            {
+                "path": str(candidate_selection_path),
+                "stage_step": int(upstream_selection["stage_step"]),
+                "selected": [
+                    str(value) for value in upstream_selection["selected"]
+                ],
+            }
+            if upstream_selection is not None
+            and candidate_selection_path is not None
+            else None
+        ),
         "selection_rule": (
             "exclude instability, then mean-rank text loss, image-flow loss, "
             "|log(lambda_text / median(g_image/g_text))|, and shared-backbone "
             "negative-cosine conflict"
         ),
-        "expected_candidates": len(sweep["candidates"]),
+        "expected_candidates": len(candidates),
         "eligible_candidates": len(rows),
         "missing": missing,
         "excluded": excluded,
@@ -162,6 +205,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_root", type=Path, default=Path("output"))
     parser.add_argument("--step", type=int, required=True)
     parser.add_argument("--lambda_text", type=float, default=0.2)
+    parser.add_argument(
+        "--candidate_selection",
+        type=Path,
+        default=None,
+        help="Completed prior-stage selection; only its selected IDs are ranked.",
+    )
     parser.add_argument("--require_complete", action="store_true")
     parser.add_argument("--output", type=Path, default=None)
     return parser.parse_args()
@@ -175,6 +224,7 @@ def main() -> None:
         step=args.step,
         lambda_text=args.lambda_text,
         require_complete=args.require_complete,
+        candidate_selection_path=args.candidate_selection,
     )
     rendered = json.dumps(report, indent=2, sort_keys=True) + "\n"
     if args.output is not None:
