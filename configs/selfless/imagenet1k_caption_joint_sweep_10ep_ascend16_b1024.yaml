@@ -55,8 +55,9 @@ model:
     image_flow_solver: "heun"
     image_input_noise_strength: 1.0e-2
     image_uncond_prob: 0.1
-    # I2T CE is naturally larger than flow MSE; retain the historical 0.2:1
-    # modality scale while sweeping optimizer LRs independently.
+    # Keep the pre-existing 0.2:1 scale only as the controlled LR-sweep
+    # baseline.  It is not treated as optimal; the post-LR short sweep uses
+    # the fixed-checkpoint shared-backbone gradient probe as its center.
     lambda_text: 0.2
     lambda_image: 1.0
     pretrained_image_flow_adapter: none
