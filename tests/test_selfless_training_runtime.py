@@ -9,10 +9,12 @@ from utils.selfless_training_runtime import (
     RESUME_SCHEMA,
     RESUME_SIGNATURE_VERSION,
     TrainingWindow,
+    build_sampler_resume_state,
     build_legacy_resume_signature,
     build_resume_signature,
     gradient_norm_log_payload,
     training_stop_step,
+    validate_sampler_resume_state,
     validate_resume_metadata,
     validate_wsd_contract,
 )
@@ -110,6 +112,30 @@ def test_grad_norm_event_is_independent_of_loss_log_cadence():
         pre_clip_norm=1.5,
         max_norm=1.0,
     ) is None
+
+
+def test_sampler_resume_state_round_trip_is_strict():
+    state = build_sampler_resume_state(
+        epoch=2,
+        batches_consumed_in_epoch=17,
+        shuffle_seed=42,
+        prepared_dataloader_length=4808,
+    )
+    validate_sampler_resume_state(
+        state,
+        epoch=2,
+        batches_consumed_in_epoch=17,
+        shuffle_seed=42,
+        prepared_dataloader_length=4808,
+    )
+    with pytest.raises(RuntimeError, match="inexact continuation"):
+        validate_sampler_resume_state(
+            state,
+            epoch=2,
+            batches_consumed_in_epoch=18,
+            shuffle_seed=42,
+            prepared_dataloader_length=4808,
+        )
 
 
 def test_v3_resume_metadata_requires_exact_signature(tmp_path: Path):

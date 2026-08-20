@@ -16,6 +16,7 @@ from omegaconf import OmegaConf
 RESUME_SIGNATURE_VERSION = 3
 LEGACY_RESUME_SCHEMA = "selfless_caption_training_checkpoint_v2"
 RESUME_SCHEMA = "selfless_caption_training_checkpoint_v3"
+SAMPLER_RESUME_SCHEMA = "selfless_caption_sampler_resume_v1"
 
 _LEGACY_TRAINING_KEYS = (
     "batch_size",
@@ -199,6 +200,54 @@ def training_stop_step(config) -> int:
             f"got {stop} with max_train_steps={total}"
         )
     return stop
+
+
+def build_sampler_resume_state(
+    *,
+    epoch: int,
+    batches_consumed_in_epoch: int,
+    shuffle_seed: int,
+    prepared_dataloader_length: int,
+) -> dict[str, Any]:
+    """Describe the deterministic sampler cursor used for exact continuation."""
+
+    epoch = int(epoch)
+    offset = int(batches_consumed_in_epoch)
+    length = int(prepared_dataloader_length)
+    if epoch < 0 or offset < 0 or length <= 0 or offset > length:
+        raise ValueError(
+            "invalid sampler resume cursor: "
+            f"epoch={epoch}, offset={offset}, dataloader_length={length}"
+        )
+    return {
+        "schema": SAMPLER_RESUME_SCHEMA,
+        "epoch": epoch,
+        "batches_consumed_in_epoch": offset,
+        "shuffle_seed": int(shuffle_seed),
+        "prepared_dataloader_length": length,
+        "restore_method": "reseed_epoch_then_skip_prepared_batches",
+    }
+
+
+def validate_sampler_resume_state(
+    state: dict[str, Any],
+    *,
+    epoch: int,
+    batches_consumed_in_epoch: int,
+    shuffle_seed: int,
+    prepared_dataloader_length: int,
+) -> None:
+    expected = build_sampler_resume_state(
+        epoch=epoch,
+        batches_consumed_in_epoch=batches_consumed_in_epoch,
+        shuffle_seed=shuffle_seed,
+        prepared_dataloader_length=prepared_dataloader_length,
+    )
+    if state != expected:
+        raise RuntimeError(
+            "Sampler resume state differs from the deterministic data cursor; "
+            "refusing an inexact continuation."
+        )
 
 
 def gradient_norm_log_payload(

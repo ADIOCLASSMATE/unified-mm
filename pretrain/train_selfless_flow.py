@@ -42,9 +42,11 @@ from utils.selfless_training_runtime import (
     RESUME_SCHEMA,
     RESUME_SIGNATURE_VERSION,
     TrainingWindow,
+    build_sampler_resume_state,
     build_resume_signature,
     gradient_norm_log_payload,
     training_stop_step,
+    validate_sampler_resume_state,
     validate_resume_metadata,
     validate_wsd_contract,
 )
@@ -532,6 +534,8 @@ def _write_training_checkpoint_metadata(
     global_step: int,
     epoch: int,
     batches_consumed_in_epoch: int,
+    sampler_shuffle_seed: int,
+    prepared_dataloader_length: int,
     config_signature: str,
     ema_layout,
     cumulative_training_wall_seconds: float,
@@ -543,6 +547,12 @@ def _write_training_checkpoint_metadata(
             "global_step": int(global_step),
             "epoch": int(epoch),
             "batches_consumed_in_epoch": int(batches_consumed_in_epoch),
+            "sampler_state": build_sampler_resume_state(
+                epoch=epoch,
+                batches_consumed_in_epoch=batches_consumed_in_epoch,
+                shuffle_seed=sampler_shuffle_seed,
+                prepared_dataloader_length=prepared_dataloader_length,
+            ),
             "world_size": int(accelerator.num_processes),
             "gradient_accumulation_steps": int(
                 accelerator.gradient_accumulation_steps
@@ -1228,6 +1238,9 @@ def main(*, model_loader=None):
         else:
             logging.info(f"Keeping existing immutable run config at {config_path}")
 
+    caption_shuffle_seed = int(
+        config.training.get("dataloader_shuffle_seed", config.training.seed)
+    )
     batches_to_skip = 0
     resume_epoch = 0
     initial_train_dataloader = train_dataloader
@@ -1247,11 +1260,28 @@ def main(*, model_loader=None):
             f"Resuming from step {resume_step}: dataloader_len={dataloader_len}, "
             f"resume_epoch={resume_epoch}, skipping {batches_to_skip} prepared batches."
         )
+        sampler_state = resume_metadata.get("sampler_state")
+        if sampler_state is not None:
+            validate_sampler_resume_state(
+                sampler_state,
+                epoch=resume_epoch,
+                batches_consumed_in_epoch=batches_to_skip,
+                shuffle_seed=caption_shuffle_seed,
+                prepared_dataloader_length=dataloader_len,
+            )
+            logger.info(
+                "Validated deterministic sampler state: epoch=%d, offset=%d, seed=%d.",
+                resume_epoch,
+                batches_to_skip,
+                caption_shuffle_seed,
+            )
+        else:
+            logger.info(
+                "Checkpoint predates explicit sampler metadata; restoring its "
+                "validated epoch/offset cursor deterministically."
+            )
         if _is_multimodal_ds:
             ds.set_epoch(resume_epoch)
-    caption_shuffle_seed = int(
-        config.training.get("dataloader_shuffle_seed", config.training.seed)
-    )
     _set_caption_dataloader_epoch(
         train_dataloader,
         epoch=resume_epoch,
@@ -1862,6 +1892,8 @@ def main(*, model_loader=None):
                     global_step=global_step,
                     epoch=epoch,
                     batches_consumed_in_epoch=batches_consumed_in_epoch,
+                    sampler_shuffle_seed=caption_shuffle_seed,
+                    prepared_dataloader_length=len(train_dataloader),
                     config_signature=config_signature,
                     ema_layout=ema_layout,
                     cumulative_training_wall_seconds=(
