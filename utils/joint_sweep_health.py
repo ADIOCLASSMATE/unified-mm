@@ -49,9 +49,11 @@ def training_health(
                 errors.append(line[-500:])
             match = GRAD_PATTERN.search(line)
             if match:
+                gradient_step = int(match.group(1))
+                latest_step = max(latest_step, gradient_step)
                 grad_norms.append(
                     {
-                        "step": int(match.group(1)),
+                        "step": gradient_step,
                         "pre_clip": float(match.group(2)),
                     }
                 )

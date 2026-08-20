@@ -37,3 +37,13 @@ def test_health_reports_available_preclip_norm(tmp_path):
     )
     assert health["gradient_log_status"] == "available"
     assert health["pre_clip_grad_norms"] == [{"step": 1202, "pre_clip": 2.5}]
+    assert health["latest_logged_step"] == 1250
+
+
+def test_gradient_event_advances_latest_step_between_loss_logs(tmp_path):
+    health = _run(
+        tmp_path,
+        step=1200,
+        grad_line="GradientNorm: Step: 1202 | PreClip: 0.9 | MaxNorm: 1.0",
+    )
+    assert health["latest_logged_step"] == 1202
