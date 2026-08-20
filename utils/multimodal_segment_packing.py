@@ -147,6 +147,8 @@ def _cfg_dropout_for_item(
     item: Mapping[str, Any],
     probability: float,
 ) -> bool:
+    if str(item.get("task_mode", "t2i")) == "i2t":
+        return False
     if probability <= 0.0:
         return False
     if probability >= 1.0:
@@ -196,6 +198,9 @@ def collate_segment_packed(
     labels = torch.full(
         (row_count, physical_length), -100, dtype=torch.long
     )
+    image_loss_mask = torch.zeros(
+        (row_count, physical_length), dtype=torch.bool
+    )
     image_latents = torch.zeros(
         row_count,
         physical_length,
@@ -233,6 +238,7 @@ def collate_segment_packed(
             input_ids[row_index, cursor:end] = item["input_ids"]
             token_types[row_index, cursor:end] = item["token_types"]
             labels[row_index, cursor:end] = item["labels"]
+            image_loss_mask[row_index, cursor:end] = item["image_loss_mask"]
             segment_ids[row_index, cursor:end] = segment_id
             sigma[row_index, cursor:end] = build_selfless_sigma(
                 item,
@@ -300,6 +306,7 @@ def collate_segment_packed(
         "image_local_positions": image_local_positions,
         "segment_ids": segment_ids,
         "labels": labels,
+        "image_loss_mask": image_loss_mask,
         "image_latents": image_latents,
         "image_span_table": torch.tensor(span_rows, dtype=torch.long),
         "image_uncond_mask": image_uncond_mask,
@@ -308,6 +315,7 @@ def collate_segment_packed(
         "image_count": len(batch),
         "pack_capacity": int(nominal_capacity),
         "sample_img_ids": img_ids,
+        "task_modes": [str(item["task_mode"]) for item in batch],
         "pack_stats": (
             valid_tokens,
             image_token_count,

@@ -9,7 +9,12 @@ fixed posterior sample per image so checkpoint metrics remain comparable.
 
 This loader supports exactly two conditioning modes:
     class:    class_name <|boi|> image <|eoi|> <eos>
-    caption:  fixed_T2I_prefix caption <|boi|> image <|eoi|> <eos>
+    caption:
+        T2I: fixed_T2I_prefix caption <|boi|> image <|eoi|> <eos>
+        I2T: fixed_I2T_prefix <|boi|> image <|eoi|> caption <eos>
+
+Caption joint training uses disjoint targets. T2I rows supervise only image
+flow, while I2T rows supervise only caption tokens (and their final EOS).
 """
 
 import hashlib
@@ -25,9 +30,11 @@ from utils.imagenet_flow_dataloaders import (
     build_imagenet_flow_cache_dataloaders,
     build_training_data_generator,
 )
+from utils.imagenet_synthetic_text_index import ImageNetSyntheticTextIndex
 
 
 DEFAULT_CAPTION_PREFIX = "Generate an image matching this description:"
+DEFAULT_I2T_PREFIX = "Describe this image in one detailed caption:"
 POSTERIOR_CACHE_FORMAT = "imagenet_kl16_scaled_posterior_v1"
 POSTERIOR_STATS_LAYOUT = "scaled_mean_then_scaled_std"
 
@@ -53,6 +60,12 @@ class ImageNetFlowCacheDataset(Dataset):
         caption_path_key: str = "path",
         caption_id_key: str = "id",
         caption_validation_index: int = 0,
+        t2i_prompt_validation_index: int = 0,
+        caption_sequence_modes: Optional[Sequence[str]] = None,
+        synthetic_text_index_manifest: Optional[str] = None,
+        caption_t2i_prefix: str = DEFAULT_CAPTION_PREFIX,
+        caption_i2t_prefix: str = DEFAULT_I2T_PREFIX,
+        caption_include_original: bool = True,
         cache_caption_tokens: bool = False,
         max_seq_length: Optional[int] = None,
         model_context_length: Optional[int] = None,
@@ -176,6 +189,27 @@ class ImageNetFlowCacheDataset(Dataset):
         self.caption_validation_index = int(caption_validation_index)
         if self.caption_validation_index < 0:
             raise ValueError("caption_validation_index must be non-negative")
+        self.t2i_prompt_validation_index = int(t2i_prompt_validation_index)
+        if self.t2i_prompt_validation_index < 0:
+            raise ValueError("t2i_prompt_validation_index must be non-negative")
+        self.caption_sequence_modes = self._normalize_caption_modes(
+            caption_sequence_modes
+        )
+        self.synthetic_text_index_manifest = (
+            str(synthetic_text_index_manifest)
+            if synthetic_text_index_manifest
+            else None
+        )
+        self.synthetic_text_index: Optional[ImageNetSyntheticTextIndex] = None
+        self.caption_t2i_prefix = self._normalize_caption_prefix(
+            caption_t2i_prefix,
+            "caption_t2i_prefix",
+        )
+        self.caption_i2t_prefix = self._normalize_caption_prefix(
+            caption_i2t_prefix,
+            "caption_i2t_prefix",
+        )
+        self.caption_include_original = bool(caption_include_original)
         self.caption_manifest_sha256 = (
             str(caption_manifest_sha256).strip().lower()
             if caption_manifest_sha256
@@ -203,11 +237,63 @@ class ImageNetFlowCacheDataset(Dataset):
             if not caption_jsonl:
                 raise ValueError("conditioning_mode='caption' requires caption_jsonl")
             self._validate_caption_manifest_digest(caption_jsonl)
-            self.captions = self._load_captions(caption_jsonl)
-            if not self.captions:
-                raise ValueError(
-                    f"No captions matched cache img_ids from {caption_jsonl}."
+            if self.synthetic_text_index_manifest:
+                self.synthetic_text_index = ImageNetSyntheticTextIndex(
+                    self.synthetic_text_index_manifest
                 )
+                if self.synthetic_text_index.row_count < len(self):
+                    raise ValueError(
+                        "synthetic text index is shorter than the posterior cache: "
+                        f"{self.synthetic_text_index.row_count} < {len(self)}"
+                    )
+                expected_ids = torch.arange(
+                    1,
+                    len(self) + 1,
+                    dtype=self.img_ids.dtype,
+                )
+                if not torch.equal(self.img_ids.cpu(), expected_ids):
+                    raise ValueError(
+                        "synthetic text seek index requires cache img_ids ordered "
+                        "contiguously from 1"
+                    )
+            else:
+                self.captions = self._load_captions(caption_jsonl)
+                if not self.captions:
+                    raise ValueError(
+                        f"No captions matched cache img_ids from {caption_jsonl}."
+                    )
+
+    @staticmethod
+    def _normalize_caption_modes(
+        modes: Optional[Sequence[str]],
+    ) -> Tuple[str, ...]:
+        # Preserve the existing caption-conditioned T2I contract unless a
+        # config explicitly opts into joint training.
+        if modes is None:
+            return ("t2i",)
+        normalized = tuple(
+            str(mode).strip().lower()
+            for mode in modes
+            if str(mode).strip()
+        )
+        if not normalized:
+            raise ValueError("caption_sequence_modes must not be empty")
+        invalid = sorted(set(normalized) - {"t2i", "i2t"})
+        if invalid:
+            raise ValueError(
+                "caption_sequence_modes supports only 't2i' and 'i2t', "
+                f"got {invalid}"
+            )
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("caption_sequence_modes must not contain duplicates")
+        return normalized
+
+    @staticmethod
+    def _normalize_caption_prefix(value: str, field: str) -> str:
+        normalized = " ".join(str(value).split())
+        if not normalized:
+            raise ValueError(f"{field} must not be empty")
+        return normalized
 
     def _load_manifest(
         self, manifest_jsonl: Optional[str]
@@ -272,6 +358,31 @@ class ImageNetFlowCacheDataset(Dataset):
                 "caption_manifest_sha256 requires exactly one frozen caption "
                 f"manifest, got {paths}"
             )
+        if self.synthetic_text_index_manifest:
+            index_manifest_path = Path(self.synthetic_text_index_manifest)
+            index_manifest = json.loads(
+                index_manifest_path.read_text(encoding="utf-8")
+            )
+            actual = str(index_manifest.get("caption", {}).get("sha256", ""))
+            if actual != self.caption_manifest_sha256:
+                raise ValueError(
+                    "caption manifest digest mismatch in synthetic text index: "
+                    f"expected={self.caption_manifest_sha256}, actual={actual}, "
+                    f"path={index_manifest_path}"
+                )
+            indexed_caption_path = Path(
+                index_manifest.get("caption", {}).get("path", "")
+            )
+            if not indexed_caption_path.is_absolute():
+                indexed_caption_path = (
+                    index_manifest_path.parent / indexed_caption_path
+                )
+            if indexed_caption_path.resolve() != paths[0].resolve():
+                raise ValueError(
+                    "caption JSONL differs from the synthetic text index source: "
+                    f"{paths[0]} != {indexed_caption_path}"
+                )
+            return
         digest = hashlib.sha256()
         with paths[0].open("rb") as handle:
             for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
@@ -305,6 +416,20 @@ class ImageNetFlowCacheDataset(Dataset):
                 if isinstance(item, str):
                     caption = item.strip()
                 elif isinstance(item, dict):
+                    if not self.caption_include_original:
+                        source = str(item.get("source", "")).strip().lower()
+                        caption_slot = item.get("caption_slot", None)
+                        is_original_slot = False
+                        if caption_slot is not None:
+                            try:
+                                is_original_slot = int(caption_slot) < 0
+                            except (TypeError, ValueError) as exc:
+                                raise ValueError(
+                                    f"{path}:{line_number} has invalid "
+                                    f"caption_slot={caption_slot!r}"
+                                ) from exc
+                        if source == "original" or is_original_slot:
+                            continue
                     caption = str(item.get(self.caption_list_text_key, "")).strip()
                 else:
                     raise ValueError(
@@ -538,7 +663,11 @@ class ImageNetFlowCacheDataset(Dataset):
         )
 
     def _make_sequence_tensors(
-        self, prefix_ids: torch.Tensor, suffix_ids: torch.Tensor
+        self,
+        prefix_ids: torch.Tensor,
+        suffix_ids: torch.Tensor,
+        *,
+        label_suffix: bool = False,
     ) -> Dict[str, torch.Tensor]:
         prefix_ids, suffix_ids = self._fit_text_ids(prefix_ids, suffix_ids)
         prefix_len = int(prefix_ids.numel())
@@ -559,10 +688,13 @@ class ImageNetFlowCacheDataset(Dataset):
                 self._special_token_type,
             ]
         )
-        # Flow-only training currently ignores CE targets. Keep the complete
-        # labels tensor and its -100 policy explicit so unified-modality CE can
-        # populate selected text positions without changing the batch schema.
         labels = torch.full_like(input_ids, -100)
+        if label_suffix:
+            if suffix_len <= 0:
+                raise ValueError("I2T caption supervision requires a non-empty suffix")
+            suffix_start = prefix_len + self.image_tokens_per_img + 2
+            labels[suffix_start : suffix_start + suffix_len] = suffix_ids
+            labels[-1] = self.eos_id
         return {
             "input_ids": input_ids,
             "token_types": token_types,
@@ -590,50 +722,147 @@ class ImageNetFlowCacheDataset(Dataset):
             self.sequence_cache[class_name] = cached
         return cached
 
+    def _indexed_caption_texts(
+        self,
+        idx: int,
+        img_id: int,
+    ) -> Tuple[str, ...]:
+        if self.synthetic_text_index is None:
+            captions = self.captions.get(int(img_id))
+            if captions is None:
+                raise KeyError(f"No caption for img_id={img_id}")
+            return captions
+        row = self.synthetic_text_index.read_caption(int(idx))
+        if int(row.get("manifest_index", -1)) != int(idx):
+            raise ValueError(
+                f"caption index identity mismatch at cache row {idx}: "
+                f"manifest_index={row.get('manifest_index')!r}"
+            )
+        if int(row.get("img_id", -1)) != int(img_id):
+            raise ValueError(
+                f"caption img_id mismatch at cache row {idx}: "
+                f"{row.get('img_id')!r} != {img_id}"
+            )
+        captions = self._captions_from_row(
+            row,
+            self._caption_jsonl_paths(self.caption_jsonl)[0],
+            int(idx) + 1,
+        )
+        if not captions:
+            raise ValueError(f"No selected synthetic captions for img_id={img_id}")
+        return captions
+
+    def _indexed_t2i_texts(
+        self,
+        idx: int,
+        img_id: int,
+    ) -> Tuple[str, ...]:
+        if self.synthetic_text_index is None:
+            return self._indexed_caption_texts(idx, img_id)
+        row = self.synthetic_text_index.read_t2i(int(idx))
+        expected_stem = Path(self.source_paths[int(img_id)]).stem
+        expected_image_id = f"train/{expected_stem}"
+        if row.get("image_id") != expected_image_id:
+            raise ValueError(
+                f"T2I image identity mismatch at cache row {idx}: "
+                f"{row.get('image_id')!r} != {expected_image_id!r}"
+            )
+        prompt_rows = row.get("model_result", {}).get("prompts")
+        if not isinstance(prompt_rows, list):
+            raise ValueError(f"T2I prompts are missing for img_id={img_id}")
+        prompts = tuple(
+            str(prompt.get("prompt", "")).strip()
+            for prompt in prompt_rows
+            if str(prompt.get("prompt", "")).strip()
+        )
+        if len(prompts) != len(prompt_rows) or not prompts:
+            raise ValueError(f"T2I prompts contain empty text for img_id={img_id}")
+        if len(set(prompts)) != len(prompts):
+            raise ValueError(f"T2I prompts contain duplicates for img_id={img_id}")
+        return prompts
+
     def _caption_sequence_tensors(
         self,
         img_id: int,
         idx: int,
         sample_epoch: int,
         is_training: bool,
-    ) -> Tuple[Dict[str, torch.Tensor], int, int]:
-        captions = self.captions.get(int(img_id))
-        if captions is None:
-            raise KeyError(f"No caption for img_id={img_id}")
-        caption_count = len(captions)
+    ) -> Tuple[Dict[str, torch.Tensor], int, int, str]:
+        if is_training and len(self.caption_sequence_modes) > 1:
+            task_offset = (
+                self._stable_sample_seed(int(idx), 0, "caption_task_offset")
+                % len(self.caption_sequence_modes)
+            )
+            task_phase = task_offset + int(sample_epoch)
+            task_index = task_phase % len(self.caption_sequence_modes)
+            task_occurrence = task_phase // len(self.caption_sequence_modes)
+        else:
+            task_index = (
+                self._stable_sample_seed(int(idx), 0, "caption_validation_task")
+                % len(self.caption_sequence_modes)
+            )
+            task_occurrence = 0
+        task_mode = self.caption_sequence_modes[task_index]
+        texts = (
+            self._indexed_t2i_texts(idx, img_id)
+            if task_mode == "t2i"
+            else self._indexed_caption_texts(idx, img_id)
+        )
+        caption_count = len(texts)
         if is_training and caption_count > 1:
             offset = (
-                self._stable_sample_seed(int(idx), 0, "caption_cycle_offset")
+                self._stable_sample_seed(
+                    int(idx),
+                    0,
+                    f"{task_mode}_text_cycle_offset",
+                )
                 % caption_count
             )
-            caption_index = (offset + int(sample_epoch)) % caption_count
+            caption_index = (offset + task_occurrence) % caption_count
         else:
-            caption_index = self.caption_validation_index
+            caption_index = (
+                self.t2i_prompt_validation_index
+                if task_mode == "t2i"
+                else self.caption_validation_index
+            )
             if caption_index >= caption_count:
                 raise ValueError(
-                    "caption_validation_index="
-                    f"{caption_index} is out of range for img_id={img_id} "
-                    f"with {caption_count} captions"
+                    f"{task_mode} validation index={caption_index} is out of "
+                    f"range for img_id={img_id} with {caption_count} texts"
                 )
-        caption = captions[caption_index]
-        serialized_prompt = f"{DEFAULT_CAPTION_PREFIX} {caption}"
+        caption = texts[caption_index]
+        if task_mode == "t2i":
+            serialized_prompt = f"{self.caption_t2i_prefix} {caption}"
+            prefix_ids = self._text_ids(
+                serialized_prompt,
+                cache=self.cache_caption_tokens,
+            )
+            suffix_ids = self._empty_text_ids
+        else:
+            serialized_prompt = f"{self.caption_i2t_prefix}\n{caption}"
+            prefix_ids = self._text_ids(
+                self.caption_i2t_prefix,
+                cache=self.cache_caption_tokens,
+            )
+            suffix_ids = self._text_ids(
+                caption,
+                cache=self.cache_caption_tokens,
+            )
         cached = (
             self.sequence_cache.get(serialized_prompt)
             if self.cache_caption_tokens
             else None
         )
         if cached is not None:
-            return cached, caption_index, caption_count
+            return cached, caption_index, caption_count, task_mode
         sequence = self._make_sequence_tensors(
-            self._text_ids(
-                serialized_prompt,
-                cache=self.cache_caption_tokens,
-            ),
-            self._empty_text_ids,
+            prefix_ids,
+            suffix_ids,
+            label_suffix=task_mode == "i2t",
         )
         if self.cache_caption_tokens:
             self.sequence_cache[serialized_prompt] = sequence
-        return sequence, caption_index, caption_count
+        return sequence, caption_index, caption_count, task_mode
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         # Capture one shared epoch value so every stochastic choice for this
@@ -654,8 +883,14 @@ class ImageNetFlowCacheDataset(Dataset):
             sequence = self._class_sequence_tensors(img_id)
             caption_index = -1
             caption_count = 0
+            task_mode = "class"
         else:
-            sequence, caption_index, caption_count = self._caption_sequence_tensors(
+            (
+                sequence,
+                caption_index,
+                caption_count,
+                task_mode,
+            ) = self._caption_sequence_tensors(
                 img_id=img_id,
                 idx=int(idx),
                 sample_epoch=sample_epoch,
@@ -673,10 +908,17 @@ class ImageNetFlowCacheDataset(Dataset):
                 f"Serialized sample length {length} exceeds model context "
                 f"window {self.model_context_length} for img_id={img_id}."
             )
+        image_loss_mask = torch.zeros(length, dtype=torch.bool)
+        if task_mode in {"class", "t2i"}:
+            image_start = int(sequence["image_start"].item())
+            image_loss_mask[
+                image_start : image_start + self.image_tokens_per_img
+            ] = True
         result = {
             "input_ids": sequence["input_ids"],
             "token_types": sequence["token_types"],
             "labels": sequence["labels"],
+            "image_loss_mask": image_loss_mask,
             "image_latents": latents,
             "prompt_len": sequence["prompt_len"],
             "suffix_len": sequence["suffix_len"],
@@ -686,6 +928,7 @@ class ImageNetFlowCacheDataset(Dataset):
             "serialized_length": torch.tensor(length, dtype=torch.long),
             "caption_index": torch.tensor(caption_index, dtype=torch.long),
             "caption_count": torch.tensor(caption_count, dtype=torch.long),
+            "task_mode": task_mode,
             "reveal_seed": torch.tensor(reveal_seed, dtype=torch.long),
             "image_sigma_order": self.image_sigma_order,
             "cfg_dropout_seed": torch.tensor(cfg_dropout_seed, dtype=torch.long),
@@ -704,6 +947,7 @@ class ImageNetFlowCacheDataset(Dataset):
                         "sample_index": int(idx),
                         "caption_index": int(caption_index),
                         "caption_count": int(caption_count),
+                        "task_mode": task_mode,
                         "image_sigma_order": self.image_sigma_order,
                     },
                     sort_keys=True,

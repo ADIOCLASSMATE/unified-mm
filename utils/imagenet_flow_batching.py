@@ -44,6 +44,9 @@ def collate_imagenet_flow_cache(
     labels = torch.full(
         (batch_size, max_len), -100, dtype=torch.long
     )
+    image_loss_mask = torch.zeros(
+        (batch_size, max_len), dtype=torch.bool
+    )
     image_latents = torch.zeros(
         batch_size,
         max_len,
@@ -70,6 +73,7 @@ def collate_imagenet_flow_cache(
         input_ids[row_index, :length] = item["input_ids"]
         token_types[row_index, :length] = item["token_types"]
         labels[row_index, :length] = item["labels"]
+        image_loss_mask[row_index, :length] = item["image_loss_mask"]
         image_latents[row_index, image_start:image_end] = item[
             "image_latents"
         ]
@@ -105,7 +109,9 @@ def collate_imagenet_flow_cache(
             image_span_rows, dtype=torch.long
         ),
         "labels": labels,
+        "image_loss_mask": image_loss_mask,
         "image_latents": image_latents,
+        "task_modes": [str(item["task_mode"]) for item in batch],
         "pack_stats": (
             int(valid_tokens),
             int(image_token_count),

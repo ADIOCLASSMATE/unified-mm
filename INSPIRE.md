@@ -6,7 +6,10 @@
 - Shared user root: `/inspire/sj-ssd3/project/high-dimensionaldata/wanjiaxin-253108030048`
 - Full ImageNet latent cache: `public/datasets/imagenet_full`
 - ImageNet-100 distilled captions: `public/datasets/imagenet_distilled_captions/imagenet100`
-- ImageNet-1k distilled captions: `public/datasets/imagenet_distilled_captions/imagenet1k`
+- ImageNet-1K synthetic caption/T2I dataset:
+  `public/datasets/imagenet1k_synthetic_v1`
+- Seekable joint-training text index:
+  `public/datasets/imagenet1k_synthetic_v1/indexed/train/manifest.json`
 
 ## Official dataset mount
 
@@ -78,6 +81,29 @@ not implicitly mount the official dataset.
   `71.04673767089844` under the canonical 10,000-sample, 100-step evaluation.
 - Sweep manifests、旧 checkpoint、评测产物、ImageNet-100 可执行配置和一次性
   launch 资产均已删除；仓库只保留结论。
+
+### ImageNet-1K synthetic caption/T2I joint LR sweep
+
+- Initialization is the completed class-conditioned EMA model at
+  `output/selfless-flow-imagenet1k-class-ascend64-b1024-800ep/hf_model-final-ema`.
+- Published synthetic data is frozen by
+  `public/datasets/imagenet1k_synthetic_v1/dataset_manifest.json`. Training
+  uses the six synthetic captions per train image (three Qwen plus three
+  MiniMax; original caption excluded) and all twelve aligned T2I prompts.
+- The one-time seek index above contains no copied images or posterior
+  tensors. It provides low-memory random access to the 7.27GB caption JSONL
+  and 64 decompressed train T2I shards; regenerate it with
+  `scripts/prepare_imagenet1k_synthetic_text_index.py`.
+- The LR grid couples Backbone/Special-token LR and Flow/Projector LR:
+  `{5e-6,1e-5,2e-5} × {1e-5,2e-5,4e-5}`. Each candidate uses one 16-NPU
+  instance, per-rank batch 16, GA 4, and global batch 1024.
+- Fifty train images per class are held out without training overlap for
+  joint I2T/T2I loss selection. The remaining train split supplies 1,230,848
+  samples and 1,202 optimizer steps per epoch; ten epochs total 12,020 steps.
+- Config, sweep contract, and launcher are
+  `configs/selfless/imagenet1k_caption_joint_sweep_10ep_ascend16_b1024.yaml`,
+  `configs/selfless/imagenet1k_caption_joint_lr_sweep_10ep.json`, and
+  `script/selfless/pretraining_imagenet1k_caption_joint_sweep_ascend16.sh`.
 
 ### Formal ImageNet-1K 800-epoch pretraining
 

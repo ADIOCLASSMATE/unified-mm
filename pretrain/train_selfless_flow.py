@@ -1240,6 +1240,10 @@ def main(*, model_loader=None):
 
     # Accumulators across gradient-accumulation micro-batches.
     acc_loss = torch.tensor(0.0, device=accelerator.device)
+    acc_text_loss_sum = torch.tensor(0.0, device=accelerator.device)
+    acc_text_tokens = torch.tensor(0.0, device=accelerator.device)
+    acc_image_loss_sum = torch.tensor(0.0, device=accelerator.device)
+    acc_image_tokens = torch.tensor(0.0, device=accelerator.device)
     acc_flow_stats = {}
     acc_flow_stat_batches = torch.tensor(0.0, device=accelerator.device)
     acc_backbone_gate_stats = {}
@@ -1292,6 +1296,11 @@ def main(*, model_loader=None):
             labels = batch["labels"].to(
                 accelerator.device, non_blocking=True
             )  # [B, L], pre-computed by dataloader
+            image_loss_mask = batch["image_loss_mask"].to(
+                accelerator.device,
+                dtype=torch.bool,
+                non_blocking=True,
+            )
             segment_ids = batch.get("segment_ids", None)
             if segment_ids is not None:
                 segment_ids = segment_ids.to(accelerator.device, non_blocking=True)
@@ -1442,6 +1451,7 @@ def main(*, model_loader=None):
                     forward_kwargs["image_local_positions"] = image_local_positions
                 if image_span_table is not None:
                     forward_kwargs["image_span_table"] = image_span_table
+                forward_kwargs["image_loss_mask"] = image_loss_mask
             if is_multimodal and image_latents is not None:
                 forward_kwargs["image_latents"] = image_latents
             record_backbone_gate_stats = (
@@ -1468,6 +1478,31 @@ def main(*, model_loader=None):
             # aten::_assert_async.msg, introducing a host/device synchronization
             # on every microbatch.
             finite_loss_microbatches_checked += 1
+
+            per_modality_loss = getattr(
+                model_output, "per_modality_loss", None
+            )
+            per_modality_count = getattr(
+                model_output, "per_modality_count", None
+            )
+            if per_modality_loss is None or per_modality_count is None:
+                raise RuntimeError(
+                    "joint image-text training requires per-modality loss/count output"
+                )
+            text_count = per_modality_count["text_tokens"].detach().to(
+                accelerator.device, dtype=torch.float32
+            )
+            image_count = per_modality_count["image_tokens"].detach().to(
+                accelerator.device, dtype=torch.float32
+            )
+            acc_text_loss_sum += (
+                per_modality_loss["text_loss"].detach().float() * text_count
+            )
+            acc_text_tokens += text_count
+            acc_image_loss_sum += (
+                per_modality_loss["image_loss"].detach().float() * image_count
+            )
+            acc_image_tokens += image_count
 
             flow_stats = getattr(model_output, "flow_debug_stats", None)
             if flow_stats:
@@ -1595,7 +1630,6 @@ def main(*, model_loader=None):
 
                 logs = {
                     "step_loss": global_avg_loss_value,
-                    "train/loss_image_flow": global_avg_loss_value,
                     "lr": lr_scheduler.get_last_lr()[0],
                     "samples/sec/gpu": samples_per_second_per_gpu,
                     "physical_rows/sec/gpu": (
@@ -1620,6 +1654,43 @@ def main(*, model_loader=None):
                         data_wait_total / world_size / window_seconds
                     ),
                 }
+                modality_totals = torch.stack(
+                    (
+                        acc_text_loss_sum,
+                        acc_text_tokens,
+                        acc_image_loss_sum,
+                        acc_image_tokens,
+                    )
+                )
+                modality_totals = accelerator.reduce(
+                    modality_totals,
+                    reduction="sum",
+                )
+                global_text_loss = (
+                    modality_totals[0]
+                    / modality_totals[1].clamp_min(1.0)
+                )
+                global_image_loss = (
+                    modality_totals[2]
+                    / modality_totals[3].clamp_min(1.0)
+                )
+                logs.update(
+                    {
+                        "train/loss_text": float(global_text_loss.item()),
+                        "train/ppl_text": math.exp(
+                            min(float(global_text_loss.item()), 100.0)
+                        ),
+                        "train/loss_image_flow": float(
+                            global_image_loss.item()
+                        ),
+                        "train/text_target_tokens": float(
+                            modality_totals[1].item()
+                        ),
+                        "train/image_target_tokens": float(
+                            modality_totals[3].item()
+                        ),
+                    }
+                )
                 if ema is not None:
                     logs["ema/decay"] = ema_decay_value
                     logs["ema/started"] = float(ema.started)
@@ -1703,6 +1774,8 @@ def main(*, model_loader=None):
                     msg = (
                         f"Step: {global_step} | "
                         f"Loss: {global_avg_loss_value:0.4f}"
+                        f" | Text: {float(global_text_loss.item()):0.4f}"
+                        f" | Image: {float(global_image_loss.item()):0.4f}"
                     )
                     if acc_flow_stats:
                         msg += (
@@ -1835,6 +1908,10 @@ def main(*, model_loader=None):
 
             # Reset per-step accumulators for the next optimizer step
             acc_loss.zero_()
+            acc_text_loss_sum.zero_()
+            acc_text_tokens.zero_()
+            acc_image_loss_sum.zero_()
+            acc_image_tokens.zero_()
             acc_flow_stats.clear()
             acc_flow_stat_batches.zero_()
             acc_backbone_gate_stats.clear()
@@ -2649,7 +2726,9 @@ def _save_validation_flow_images(
 
 @torch.no_grad()
 def _validate_multimodal(model, val_dataloader, accelerator, global_step, config=None):
-    local_weighted_loss = torch.tensor(0.0, device=accelerator.device)
+    local_weighted_text = torch.tensor(0.0, device=accelerator.device)
+    local_text_tokens = torch.tensor(0.0, device=accelerator.device)
+    local_weighted_image = torch.tensor(0.0, device=accelerator.device)
     local_image_tokens = torch.tensor(0.0, device=accelerator.device)
     local_flow_stat_sums = {}
     local_flow_stat_counts = {}
@@ -2685,6 +2764,12 @@ def _validate_multimodal(model, val_dataloader, accelerator, global_step, config
         )
         sigma = batch["sigma"].to(accelerator.device, non_blocking=True)
         labels = batch["labels"].to(accelerator.device, non_blocking=True)
+        host_image_loss_mask = batch["image_loss_mask"]
+        image_loss_mask = host_image_loss_mask.to(
+            accelerator.device,
+            dtype=torch.bool,
+            non_blocking=True,
+        )
         position_ids = batch["position_ids"].to(
             accelerator.device, non_blocking=True
         )
@@ -2702,9 +2787,6 @@ def _validate_multimodal(model, val_dataloader, accelerator, global_step, config
             )
         B, L = input_ids.shape
 
-        image_mask = token_types == 1
-        n_image = image_mask.sum().float()
-
         # Sigma and labels pre-computed by dataloader
         selfless_attention_mask = get_selfless_mask(
             sigma=sigma, seq_len=L, device=accelerator.device
@@ -2716,11 +2798,32 @@ def _validate_multimodal(model, val_dataloader, accelerator, global_step, config
             position_ids=position_ids,
             image_local_positions=image_local_positions,
             image_span_table=image_span_table,
+            image_loss_mask=image_loss_mask,
             image_latents=image_latents,
             flow_sigma=sigma,
             calculate_likelihood=True,
             record_flow_stats=(validation_batch_idx < diagnostic_batches),
         )
+        per_modality_loss = getattr(output, "per_modality_loss", None)
+        per_modality_count = getattr(output, "per_modality_count", None)
+        if per_modality_loss is None or per_modality_count is None:
+            raise RuntimeError(
+                "joint validation requires per-modality loss/count output"
+            )
+        text_count = per_modality_count["text_tokens"].to(
+            accelerator.device, dtype=torch.float32
+        )
+        image_count = per_modality_count["image_tokens"].to(
+            accelerator.device, dtype=torch.float32
+        )
+        local_weighted_text += (
+            per_modality_loss["text_loss"].float() * text_count
+        )
+        local_text_tokens += text_count
+        local_weighted_image += (
+            per_modality_loss["image_loss"].float() * image_count
+        )
+        local_image_tokens += image_count
         flow_stats = getattr(output, "flow_debug_stats", None) or {}
         for key, value in flow_stats.items():
             if not isinstance(value, torch.Tensor) or value.numel() != 1:
@@ -2741,35 +2844,66 @@ def _validate_multimodal(model, val_dataloader, accelerator, global_step, config
             not saved_validation_images
             and image_latents is not None
         ):
-            _save_validation_flow_images(
-                model=model,
-                output=output,
-                input_ids=input_ids,
-                token_types=token_types,
-                sigma=sigma,
-                image_span_table=host_image_span_table,
-                image_latents=image_latents,
-                accelerator=accelerator,
-                global_step=global_step,
-                config=config,
-            )
-            saved_validation_images = True
-        local_weighted_loss += output.loss.detach() * n_image
-        local_image_tokens += n_image
+            active_spans = []
+            for span in host_image_span_table.tolist():
+                row, _, start, end, *_ = map(int, span)
+                if bool(host_image_loss_mask[row, start:end].any()):
+                    active_spans.append(span)
+            active_span_table = torch.tensor(
+                active_spans,
+                dtype=host_image_span_table.dtype,
+            ).reshape(-1, host_image_span_table.shape[1])
+            if active_span_table.shape[0] > 0:
+                _save_validation_flow_images(
+                    model=model,
+                    output=output,
+                    input_ids=input_ids,
+                    token_types=token_types,
+                    sigma=sigma,
+                    image_span_table=active_span_table,
+                    image_latents=image_latents,
+                    accelerator=accelerator,
+                    global_step=global_step,
+                    config=config,
+                )
+                saved_validation_images = True
 
     if hasattr(diagnostic_head, "set_attention_diagnostics"):
         diagnostic_head.set_attention_diagnostics(False)
 
-    # Reduce across ranks using the number of image tokens as the weight.
-    global_weighted_loss = accelerator.reduce(local_weighted_loss, reduction="sum")
+    global_weighted_text = accelerator.reduce(
+        local_weighted_text, reduction="sum"
+    )
+    global_text_tokens = accelerator.reduce(
+        local_text_tokens, reduction="sum"
+    )
+    global_weighted_image = accelerator.reduce(
+        local_weighted_image, reduction="sum"
+    )
     global_image_tokens = accelerator.reduce(local_image_tokens, reduction="sum")
     if global_image_tokens.item() <= 0:
         raise RuntimeError("validation dataloader produced no image tokens")
-    avg_loss = (global_weighted_loss / global_image_tokens).item()
+    lambda_text = float(getattr(unwrapped_model, "lambda_text", 0.0))
+    lambda_image = float(getattr(unwrapped_model, "lambda_image", 1.0))
+    if lambda_text > 0.0 and global_text_tokens.item() <= 0:
+        raise RuntimeError(
+            "validation dataloader produced no caption targets while lambda_text > 0"
+        )
+    avg_text = (
+        global_weighted_text / global_text_tokens.clamp_min(1.0)
+    )
+    avg_image = global_weighted_image / global_image_tokens
+    avg_loss = float(
+        (lambda_text * avg_text + lambda_image * avg_image).item()
+    )
 
     logs = {
         "val/loss": avg_loss,
-        "val/loss_image_flow": avg_loss,
+        "val/loss_text": float(avg_text.item()),
+        "val/ppl_text": math.exp(min(float(avg_text.item()), 100.0)),
+        "val/loss_image_flow": float(avg_image.item()),
+        "val/text_target_tokens": float(global_text_tokens.item()),
+        "val/image_target_tokens": float(global_image_tokens.item()),
     }
     for key in sorted(local_flow_stat_sums):
         global_sum = accelerator.reduce(local_flow_stat_sums[key], reduction="sum")
@@ -2807,7 +2941,8 @@ def _validate_multimodal(model, val_dataloader, accelerator, global_step, config
             )
         logger.info(
             f"[Validation] Step {global_step} | "
-            f"ImageFlow: {avg_loss:.4f}"
+            f"Loss: {avg_loss:.4f} | Text: {float(avg_text.item()):.4f} | "
+            f"ImageFlow: {float(avg_image.item()):.4f}"
         )
 
     return avg_loss

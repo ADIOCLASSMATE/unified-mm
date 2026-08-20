@@ -240,6 +240,10 @@ def _build_dataset_subsets(
         # while keeping separate training masks. Validation therefore remains
         # deterministic even though its rows are also available to training.
         validation_dataset = copy.copy(dataset)
+        if dataset.synthetic_text_index is not None:
+            validation_dataset.synthetic_text_index = (
+                dataset.synthetic_text_index.clone()
+            )
         validation_dataset.set_training_indices([])
     dataset.set_training_indices(train_indices)
     return (
@@ -286,6 +290,24 @@ def build_imagenet_flow_cache_dataloaders(config, tokenizer):
         caption_id_key=params.get("caption_id_key", "id"),
         caption_validation_index=params.get(
             "caption_validation_index", 0
+        ),
+        t2i_prompt_validation_index=params.get(
+            "t2i_prompt_validation_index", 0
+        ),
+        caption_sequence_modes=params.get("caption_sequence_modes", None),
+        synthetic_text_index_manifest=params.get(
+            "synthetic_text_index_manifest", None
+        ),
+        caption_t2i_prefix=params.get(
+            "caption_t2i_prefix",
+            "Generate an image matching this description:",
+        ),
+        caption_i2t_prefix=params.get(
+            "caption_i2t_prefix",
+            "Describe this image in one detailed caption:",
+        ),
+        caption_include_original=params.get(
+            "caption_include_original", True
         ),
         cache_caption_tokens=params.get("cache_caption_tokens", False),
         max_seq_length=params.get(

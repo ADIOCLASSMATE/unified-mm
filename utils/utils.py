@@ -186,6 +186,8 @@ def load_model_tokenizer(
         "image_input_noise_strength",
         "image_uncond_prob",
         "backbone_attention_output_gate",
+        "lambda_text",
+        "lambda_image",
     )
 
     source_config = AutoConfig.from_pretrained(

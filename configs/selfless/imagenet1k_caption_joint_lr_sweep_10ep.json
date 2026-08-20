@@ -1,0 +1,27 @@
+{
+  "schema": "selfless_imagenet1k_caption_joint_lr_sweep_v1",
+  "base_config": "configs/selfless/imagenet1k_caption_joint_sweep_10ep_ascend16_b1024.yaml",
+  "initialization": "output/selfless-flow-imagenet1k-class-ascend64-b1024-800ep/hf_model-final-ema",
+  "coupling": {
+    "backbone_learning_rate": "special_token_learning_rate",
+    "flow_learning_rate": "projector_learning_rate"
+  },
+  "selection": {
+    "validation_steps": [2404, 4808, 7212, 9616, 12020],
+    "primary_metrics": ["val/loss_text", "val/loss_image_flow"],
+    "rule": "lowest mean rank across final I2T text CE and T2I flow loss; break ties by the smaller mean normalized regression from each metric's best observed checkpoint",
+    "top_k_for_generation_evaluation": 3,
+    "generation_metrics": ["caption_clip_score", "fid", "inception_score_mean"]
+  },
+  "candidates": [
+    {"id": "b5e6-f1e5", "backbone_lr": 5e-6, "flow_lr": 1e-5},
+    {"id": "b5e6-f2e5", "backbone_lr": 5e-6, "flow_lr": 2e-5},
+    {"id": "b5e6-f4e5", "backbone_lr": 5e-6, "flow_lr": 4e-5},
+    {"id": "b1e5-f1e5", "backbone_lr": 1e-5, "flow_lr": 1e-5},
+    {"id": "b1e5-f2e5", "backbone_lr": 1e-5, "flow_lr": 2e-5},
+    {"id": "b1e5-f4e5", "backbone_lr": 1e-5, "flow_lr": 4e-5},
+    {"id": "b2e5-f1e5", "backbone_lr": 2e-5, "flow_lr": 1e-5},
+    {"id": "b2e5-f2e5", "backbone_lr": 2e-5, "flow_lr": 2e-5},
+    {"id": "b2e5-f4e5", "backbone_lr": 2e-5, "flow_lr": 4e-5}
+  ]
+}

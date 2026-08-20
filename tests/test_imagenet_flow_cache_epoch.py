@@ -1,3 +1,5 @@
+import json
+import struct
 from typing import ClassVar
 
 import pytest
@@ -16,6 +18,7 @@ from utils.imagenet_flow_dataloaders import (
     _build_dataset_subsets,
     training_samples_per_epoch,
 )
+from utils.imagenet_synthetic_text_index import INDEX_SCHEMA
 
 
 class _Tokenizer:
@@ -29,6 +32,13 @@ class _Tokenizer:
         "description:": 107,
         "test": 102,
         "caption": 103,
+        "Describe": 108,
+        "in": 109,
+        "one": 110,
+        "detailed": 111,
+        "caption:": 112,
+        "synthetic": 113,
+        "second": 114,
     }
 
     def encode(self, text, add_special_tokens=False):
@@ -77,6 +87,81 @@ def _make_dataset(tmp_path, **overrides):
     )
     arguments.update(overrides)
     return ImageNetFlowCacheDataset(**arguments)
+
+
+def _write_offset_jsonl(path, rows):
+    offsets_path = path.with_suffix(path.suffix + ".offsets.u64")
+    position = 0
+    with path.open("wb") as output, offsets_path.open("wb") as offsets:
+        offsets.write(struct.pack("<Q", 0))
+        for row in rows:
+            encoded = (json.dumps(row) + "\n").encode()
+            output.write(encoded)
+            position += len(encoded)
+            offsets.write(struct.pack("<Q", position))
+    return offsets_path
+
+
+def _make_synthetic_text_index(tmp_path):
+    caption_path = tmp_path / "indexed-captions.jsonl"
+    caption_offsets = _write_offset_jsonl(
+        caption_path,
+        [
+            {
+                "manifest_index": 0,
+                "img_id": 1,
+                "path": "n00000001/n00000001_1.JPEG",
+                "captions": [
+                    {"source": "original", "text": "test caption"},
+                    {"source": "local_qwen", "text": "synthetic caption"},
+                    {"source": "api_distilled", "text": "second caption"},
+                ],
+            }
+        ],
+    )
+    t2i_path = tmp_path / "indexed-t2i.jsonl"
+    t2i_offsets = _write_offset_jsonl(
+        t2i_path,
+        [
+            {
+                "image_id": "train/n00000001_1",
+                "model_result": {
+                    "prompts": [
+                        {"prompt": "test caption"},
+                        {"prompt": "test synthetic"},
+                    ]
+                },
+            }
+        ],
+    )
+    mapping_path = tmp_path / "mapping.bi"
+    mapping_path.write_bytes(struct.pack("<BI", 0, 0))
+    manifest_path = tmp_path / "synthetic-index.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema": INDEX_SCHEMA,
+                "split": "train",
+                "records": 1,
+                "caption": {
+                    "path": caption_path.name,
+                    "offsets_path": caption_offsets.name,
+                },
+                "t2i": {
+                    "shards": [
+                        {
+                            "shard_index": 0,
+                            "path": t2i_path.name,
+                            "offsets_path": t2i_offsets.name,
+                            "records": 1,
+                        }
+                    ]
+                },
+                "mapping": {"path": mapping_path.name},
+            }
+        )
+    )
+    return caption_path, manifest_path
 
 
 def test_epoch_updates_reach_persistent_workers_for_posterior_sampling(tmp_path):
@@ -137,6 +222,114 @@ def test_validation_reveal_order_is_fixed_across_rng_and_epochs(tmp_path):
     second = collate_imagenet_flow_cache([dataset[0]])
 
     assert torch.equal(first["sigma"], second["sigma"])
+
+
+def test_joint_caption_tasks_use_disjoint_text_and_image_targets(tmp_path):
+    dataset = _make_dataset(
+        tmp_path,
+        caption_sequence_modes=["t2i", "i2t"],
+    )
+    dataset.set_training_indices([0])
+
+    first = dataset[0]
+    dataset.set_epoch(1)
+    second = dataset[0]
+    by_task = {first["task_mode"]: first, second["task_mode"]: second}
+
+    assert set(by_task) == {"t2i", "i2t"}
+    t2i = by_task["t2i"]
+    i2t = by_task["i2t"]
+    assert bool((t2i["labels"] == -100).all())
+    assert int(t2i["image_loss_mask"].sum()) == dataset.image_tokens_per_img
+    assert not bool(i2t["image_loss_mask"].any())
+
+    suffix_len = int(i2t["suffix_len"])
+    image_start = int(i2t["image_start"])
+    suffix_start = image_start + dataset.image_tokens_per_img + 1
+    assert suffix_len == 2
+    assert i2t["labels"][suffix_start : suffix_start + suffix_len].tolist() == [
+        102,
+        103,
+    ]
+    assert int(i2t["labels"][-1]) == _Tokenizer.eos_token_id
+    assert bool((i2t["labels"][:suffix_start] == -100).all())
+
+    i2t_batch = collate_imagenet_flow_cache([i2t])
+    sigma = i2t_batch["sigma"][0, : i2t["input_ids"].numel()]
+    image_end = image_start + dataset.image_tokens_per_img
+    assert bool(
+        (
+            sigma[image_start:image_end].unsqueeze(0)
+            < sigma[suffix_start : suffix_start + suffix_len].unsqueeze(1)
+        ).all()
+    )
+    assert torch.equal(
+        i2t_batch["image_loss_mask"][0, : i2t["input_ids"].numel()],
+        i2t["image_loss_mask"],
+    )
+
+
+def test_joint_index_uses_distinct_caption_and_t2i_text_sources(tmp_path):
+    caption_path, index_manifest = _make_synthetic_text_index(tmp_path)
+    dataset = _make_dataset(
+        tmp_path,
+        caption_jsonl=str(caption_path),
+        synthetic_text_index_manifest=str(index_manifest),
+        caption_include_original=False,
+        caption_sequence_modes=["t2i", "i2t"],
+    )
+    dataset.set_training_indices([0])
+
+    observed = {"t2i": [], "i2t": []}
+    for epoch in range(8):
+        dataset.set_epoch(epoch)
+        item = dataset[0]
+        observed[item["task_mode"]].append(item)
+
+    assert len(observed["t2i"]) == 4
+    assert len(observed["i2t"]) == 4
+    assert {int(item["caption_count"]) for item in observed["t2i"]} == {2}
+    assert {int(item["caption_count"]) for item in observed["i2t"]} == {2}
+    assert all(102 in item["input_ids"].tolist() for item in observed["t2i"])
+    assert all(102 not in item["labels"].tolist() for item in observed["i2t"])
+    assert {int(item["caption_index"]) for item in observed["t2i"]} == {0, 1}
+    assert {int(item["caption_index"]) for item in observed["i2t"]} == {0, 1}
+
+
+def test_caption_manifest_can_exclude_published_original_caption(tmp_path):
+    published = tmp_path / "published.jsonl"
+    published.write_text(
+        '{"img_id": 1, "path": "n00000001/n00000001_1.JPEG", '
+        '"captions": ['
+        '{"source": "original", "caption_slot": -1, "text": "test caption"}, '
+        '{"source": "local_qwen", "caption_slot": 0, "text": "synthetic caption"}, '
+        '{"source": "local_qwen", "caption_slot": 1, "text": "second caption"}'
+        ']}\n'
+    )
+
+    dataset = _make_dataset(
+        tmp_path,
+        caption_jsonl=str(published),
+        caption_include_original=False,
+    )
+
+    assert dataset.captions[1] == ("synthetic caption", "second caption")
+    assert int(dataset[0]["caption_count"]) == 2
+
+
+def test_validation_joint_task_is_fixed_across_epochs(tmp_path):
+    dataset = _make_dataset(
+        tmp_path,
+        caption_sequence_modes=["t2i", "i2t"],
+    )
+    dataset.set_training_indices([])
+    first = dataset[0]
+    dataset.set_epoch(7)
+    second = dataset[0]
+
+    assert first["task_mode"] == second["task_mode"]
+    assert torch.equal(first["labels"], second["labels"])
+    assert torch.equal(first["image_loss_mask"], second["image_loss_mask"])
 
 
 def test_overlapping_validation_view_remains_deterministic(tmp_path):

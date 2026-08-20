@@ -1507,6 +1507,15 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         self.vocab_size = config.vocab_size
         self.image_latent_dim = getattr(config, "image_latent_dim", 4)
         self.image_flow_batch_mul = int(getattr(config, "image_flow_batch_mul", 1))
+        self.lambda_text = float(getattr(config, "lambda_text", 0.0))
+        self.lambda_image = float(getattr(config, "lambda_image", 1.0))
+        if self.lambda_text < 0.0 or self.lambda_image < 0.0:
+            raise ValueError(
+                "lambda_text and lambda_image must be non-negative, got "
+                f"{self.lambda_text}/{self.lambda_image}"
+            )
+        if self.lambda_text == 0.0 and self.lambda_image == 0.0:
+            raise ValueError("lambda_text and lambda_image cannot both be zero")
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.image_flow_condition_proj = nn.Linear(
             config.hidden_size, config.hidden_size, bias=True
@@ -1691,8 +1700,9 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 Attention mask for selfless sigma-causal attention. The mask should be designed such that
                 query positions can only attend to key/value positions with lower sigma.
             labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
-                Enables training loss. With `token_types`, the finalized
-                image-flow path computes loss only for image spans.
+                Enables training loss. With `token_types`, non-ignored text
+                labels are combined with masked image-flow loss according to
+                `lambda_text` and `lambda_image`.
             image_latents (`torch.FloatTensor` of shape `(batch_size, sequence_length, image_latent_dim)`, *optional*):
                 Continuous VAE latent tokens aligned with `token_types == 1` positions.
             calculate_likelihood (`bool`, *optional*, defaults to `False`):
@@ -1754,6 +1764,22 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         if labels is not None:
             if token_types is not None:
                 token_types = token_types.to(hidden_states.device)
+                labels = labels.to(hidden_states.device)
+                text_loss = hidden_states.sum() * 0.0
+                valid_text_mask = (
+                    ((token_types == 0) | (token_types == 2))
+                    & (labels != -100)
+                )
+                text_token_count = valid_text_mask.sum()
+                if self.lambda_text > 0.0:
+                    text_hidden = hidden_states[valid_text_mask]
+                    text_targets = labels[valid_text_mask]
+                    text_logits = self.lm_head(text_hidden)
+                    text_loss = F.cross_entropy(
+                        text_logits,
+                        text_targets,
+                        reduction="sum",
+                    ) / text_token_count.clamp_min(1).to(text_logits.dtype)
                 if image_span_table_arg is None:
                     raise ValueError(
                         "Caption image-flow training requires image_span_table from "
@@ -1856,7 +1882,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                     )
                     if image_loss_mask is not None:
                         image_loss_mask = image_loss_mask.repeat(repeats, 1)
-                loss = self.image_flow_head(
+                image_loss = self.image_flow_head(
                     target=image_targets,
                     z=image_conditions,
                     mask=image_loss_mask,
@@ -1864,6 +1890,19 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                     image_positions=image_positions_for_flow,
                     context_latents=image_context_latents,
                     record_stats=record_flow_stats,
+                )
+                image_token_count = (
+                    image_loss_mask.sum()
+                    if image_loss_mask is not None
+                    else torch.tensor(
+                        image_targets.shape[0] * image_targets.shape[1],
+                        device=hidden_states.device,
+                        dtype=torch.long,
+                    )
+                )
+                loss = (
+                    self.lambda_text * text_loss
+                    + self.lambda_image * image_loss
                 )
             else:
                 loss = self.loss_function(
@@ -1887,6 +1926,14 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         if backbone_gate_stats:
             output["backbone_gate_stats"] = backbone_gate_stats
         if token_types is not None and loss is not None:
+            output["per_modality_loss"] = {
+                "text_loss": text_loss.detach(),
+                "image_loss": image_loss.detach(),
+            }
+            output["per_modality_count"] = {
+                "text_tokens": text_token_count.detach(),
+                "image_tokens": image_token_count.detach(),
+            }
             flow_debug_stats = {
                 key: value.detach()
                 for key, value in self.image_flow_head.last_forward_stats.items()

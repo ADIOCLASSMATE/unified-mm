@@ -241,6 +241,15 @@ def parse_args():
     )
     parser.add_argument("--samples", type=int, default=1024)
     parser.add_argument("--split", choices=["val", "train"], default="val")
+    parser.add_argument(
+        "--caption_sequence_mode",
+        choices=("config", "t2i", "i2t"),
+        default="config",
+        help=(
+            "Override caption-dataset serialization for evaluation. Use t2i "
+            "for caption-conditioned image generation from a joint I2T/T2I config."
+        ),
+    )
     parser.add_argument("--sampling_steps", default="10")
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--cfg", type=float, default=1.0)
@@ -787,6 +796,7 @@ def build_evaluation_resume_contract(
         },
         "dataset": {
             "split": str(args.split),
+            "caption_sequence_mode": str(args.caption_sequence_mode),
             "batch_size": int(args.batch_size),
             "vae_decode_batch_size": int(args.vae_decode_batch_size),
             "samples": int(args.samples),
@@ -1708,6 +1718,18 @@ def main(*, model_loader=None):
     canonical_pairing_enabled = bool(args.canonical_pairing)
     if args.model_path_override:
         config.model.model_path = args.model_path_override
+    if args.caption_sequence_mode != "config":
+        conditioning_mode = str(
+            config.dataset.params.get("conditioning_mode", "")
+        ).strip().lower()
+        if conditioning_mode != "caption":
+            raise ValueError(
+                "--caption_sequence_mode requires a caption-conditioned dataset, "
+                f"got conditioning_mode={conditioning_mode!r}"
+            )
+        config.dataset.params.caption_sequence_modes = [
+            str(args.caption_sequence_mode)
+        ]
     config.training.batch_size = int(local_batch_size)
     config.training.dataloader_workers = 0
     config.model.image_flow_num_sampling_steps = str(args.sampling_steps)
