@@ -70,6 +70,13 @@ def _direction(delta: float, *, lower_is_better: bool) -> str:
     return "improved" if improved else "degraded"
 
 
+def _safe_relative_subdir(value: Any, *, label: str) -> Path:
+    path = Path(str(value))
+    if path.is_absolute() or not path.parts or ".." in path.parts:
+        raise ValueError(f"{label} must be a safe relative path: {value!r}")
+    return path
+
+
 def collect_final(
     validation_ranking_path: Path,
     output_root: Path,
@@ -135,8 +142,14 @@ def collect_final(
             )
         )
         run_root = output_root / run_project
-        caption_path = run_root / "generation-evaluation/i2t-clip/metrics.json"
-        image_path = run_root / "generation-evaluation/t2i-fid-is/metrics.json"
+        evaluation_subdir = _safe_relative_subdir(
+            validation_row.get(
+                "generation_evaluation_subdir", "generation-evaluation"
+            ),
+            label="generation_evaluation_subdir",
+        )
+        caption_path = run_root / evaluation_subdir / "i2t-clip/metrics.json"
+        image_path = run_root / evaluation_subdir / "t2i-fid-is/metrics.json"
         absent = [
             str(path)
             for path in (caption_path, image_path)
@@ -189,6 +202,7 @@ def collect_final(
         result_row = {
             "id": run_id,
             "run_project": run_project,
+            "generation_evaluation_subdir": str(evaluation_subdir),
             "backbone_lr": float(validation_row["backbone_lr"]),
             "flow_lr": float(validation_row["flow_lr"]),
             **(

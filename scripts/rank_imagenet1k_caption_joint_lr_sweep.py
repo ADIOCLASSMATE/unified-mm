@@ -194,6 +194,24 @@ def collect(
                     if "lambda_text" in candidate
                     else {}
                 ),
+                **(
+                    {
+                        "evaluation_model_subdir": str(
+                            candidate["evaluation_model_subdir"]
+                        )
+                    }
+                    if "evaluation_model_subdir" in candidate
+                    else {}
+                ),
+                **(
+                    {
+                        "generation_evaluation_subdir": str(
+                            candidate["generation_evaluation_subdir"]
+                        )
+                    }
+                    if "generation_evaluation_subdir" in candidate
+                    else {}
+                ),
                 "final_step": final_step,
                 "final_text_loss": final_text,
                 "final_image_loss": final_image,

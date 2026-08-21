@@ -108,6 +108,10 @@ def build_manifest(
                 "run_project": run_project,
                 "source": source,
                 "reuse_existing_run": reuses_lr_baseline,
+                "evaluation_model_subdir": "hf_model-4808-ema-eval",
+                "generation_evaluation_subdir": (
+                    "generation-evaluation/lambda-step-4808"
+                ),
                 "top_lr_id": selected_lr,
                 "backbone_lr": float(lr_candidate["backbone_lr"]),
                 "flow_lr": float(lr_candidate["flow_lr"]),

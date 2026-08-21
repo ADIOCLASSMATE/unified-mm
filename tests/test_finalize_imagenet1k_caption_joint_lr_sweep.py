@@ -160,3 +160,80 @@ def test_finalizer_reports_missing_generation_metrics(tmp_path):
     assert report["status"] == "incomplete"
     assert report["winner"] is None
     assert report["missing"][0]["id"] == "candidate"
+
+
+def test_finalizer_uses_candidate_generation_evaluation_subdir(tmp_path):
+    validation_path = tmp_path / "validation-ranking.json"
+    project = "selfless-flow-imagenet1k-caption-joint-sweep-b1e5-f2e5"
+    evaluation_subdir = "generation-evaluation/lambda-step-4808"
+    validation_path.write_text(
+        json.dumps(
+            {
+                "schema": "selfless_imagenet1k_caption_joint_lr_ranking_v1",
+                "status": "complete",
+                "validation_leader": "b1e5-f2e5-lt0p2",
+                "top_k": ["b1e5-f2e5-lt0p2"],
+                "ranking": [
+                    {
+                        "id": "b1e5-f2e5-lt0p2",
+                        "run_project": project,
+                        "generation_evaluation_subdir": evaluation_subdir,
+                        "lambda_text": 0.2,
+                        "backbone_lr": 1e-5,
+                        "flow_lr": 2e-5,
+                        "overall_rank": 1,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    run_root = tmp_path / project / evaluation_subdir
+    caption_path = run_root / "i2t-clip/metrics.json"
+    image_path = run_root / "t2i-fid-is/metrics.json"
+    caption_path.parent.mkdir(parents=True)
+    image_path.parent.mkdir(parents=True)
+    caption_path.write_text(
+        json.dumps(
+            {
+                "schema": "selfless_imagenet1k_i2t_clip_metrics_v1",
+                "samples": 1000,
+                "class_balance": {
+                    "class_count": 1000,
+                    "min_samples_per_class": 1,
+                    "max_samples_per_class": 1,
+                },
+                "clip": {"caption_clip_score": 0.35},
+            }
+        ),
+        encoding="utf-8",
+    )
+    image_path.write_text(
+        json.dumps(
+            {
+                "official_protocol": True,
+                "samples_evaluated": 50000,
+                "strategies": {
+                    "spatial_halton": {
+                        "count": 50000,
+                        "fid": 20.0,
+                        "inception_score_mean": 200.0,
+                        "inception_score_std": 3.0,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = collect_final(
+        validation_path,
+        tmp_path,
+        require_complete=True,
+        initialization_metrics_path=_write_initialization_metrics(tmp_path),
+    )
+
+    assert report["status"] == "complete"
+    assert report["winner"] == "b1e5-f2e5-lt0p2"
+    assert report["ranking"][0]["generation_evaluation_subdir"] == evaluation_subdir
+    assert report["ranking"][0]["lambda_text"] == 0.2

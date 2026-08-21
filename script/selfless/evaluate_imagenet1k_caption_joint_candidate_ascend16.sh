@@ -24,8 +24,10 @@ else
 fi
 RUN_PROJECT="${RUN_PROJECT:-${DEFAULT_RUN_PROJECT}}"
 RUN_ROOT="output/${RUN_PROJECT}"
-MODEL_PATH="${RUN_ROOT}/hf_model-final-ema"
-EVAL_ROOT="${RUN_ROOT}/generation-evaluation"
+MODEL_SUBDIR="${MODEL_SUBDIR:-hf_model-final-ema}"
+EVAL_SUBDIR="${EVAL_SUBDIR:-generation-evaluation}"
+MODEL_PATH="${RUN_ROOT}/${MODEL_SUBDIR}"
+EVAL_ROOT="${RUN_ROOT}/${EVAL_SUBDIR}"
 I2T_ROOT="${EVAL_ROOT}/i2t-clip"
 T2I_ROOT="${EVAL_ROOT}/t2i-fid-is"
 CLIP_MODEL="${CLIP_MODEL:-public/models/openai--clip-vit-base-patch32}"
@@ -39,6 +41,14 @@ fi
 if [[ ! "${RUN_PROJECT}" =~ ^[a-zA-Z0-9._-]+$ ]]; then
   echo "ERROR: unsafe RUN_PROJECT=${RUN_PROJECT}" >&2
   exit 7
+fi
+if [[ ! "${MODEL_SUBDIR}" =~ ^[a-zA-Z0-9._/-]+$ || "${MODEL_SUBDIR}" == /* || "${MODEL_SUBDIR}" == *..* ]]; then
+  echo "ERROR: unsafe MODEL_SUBDIR=${MODEL_SUBDIR}" >&2
+  exit 8
+fi
+if [[ ! "${EVAL_SUBDIR}" =~ ^[a-zA-Z0-9._/-]+$ || "${EVAL_SUBDIR}" == /* || "${EVAL_SUBDIR}" == *..* ]]; then
+  echo "ERROR: unsafe EVAL_SUBDIR=${EVAL_SUBDIR}" >&2
+  exit 9
 fi
 if [[ "${EVAL_ONLY}" != "both" && "${EVAL_ONLY}" != "i2t" && "${EVAL_ONLY}" != "t2i" ]]; then
   echo "ERROR: EVAL_ONLY must be both, i2t, or t2i; got ${EVAL_ONLY}" >&2

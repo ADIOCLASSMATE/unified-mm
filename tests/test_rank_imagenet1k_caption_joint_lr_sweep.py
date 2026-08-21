@@ -143,6 +143,10 @@ def test_joint_sweep_ranker_supports_lambda_project_names(tmp_path):
                         "backbone_lr": 1e-5,
                         "flow_lr": 2e-5,
                         "lambda_text": 0.1,
+                        "evaluation_model_subdir": "hf_model-20-ema-eval",
+                        "generation_evaluation_subdir": (
+                            "generation-evaluation/lambda-step-20"
+                        ),
                     }
                 ],
             }
@@ -170,6 +174,12 @@ def test_joint_sweep_ranker_supports_lambda_project_names(tmp_path):
 
     assert report["ranking"][0]["run_project"] == project
     assert report["ranking"][0]["lambda_text"] == 0.1
+    assert report["ranking"][0]["evaluation_model_subdir"] == (
+        "hf_model-20-ema-eval"
+    )
+    assert report["ranking"][0]["generation_evaluation_subdir"] == (
+        "generation-evaluation/lambda-step-20"
+    )
 
 
 def test_joint_sweep_ranker_requires_final_gradient_probe_when_configured(tmp_path):

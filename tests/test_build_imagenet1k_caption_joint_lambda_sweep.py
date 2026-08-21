@@ -82,5 +82,14 @@ def test_lambda_manifest_uses_probe_candidates_and_one_top_lr(tmp_path):
     )
     assert by_lambda[0.1]["source"] == "lambda_sweep"
     assert by_lambda[0.1]["reuse_existing_run"] is False
+    assert all(
+        row["evaluation_model_subdir"] == "hf_model-4808-ema-eval"
+        for row in manifest["candidates"]
+    )
+    assert all(
+        row["generation_evaluation_subdir"]
+        == "generation-evaluation/lambda-step-4808"
+        for row in manifest["candidates"]
+    )
     assert manifest["lambda_policy"]["cartesian_product_with_lr"] is False
     assert manifest["source_probe"]["task_conflict"]["persistent_negative"] is True
