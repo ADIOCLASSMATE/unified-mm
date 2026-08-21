@@ -14,6 +14,28 @@ def is_disabled_path(value: object) -> bool:
     )
 
 
+def should_load_configured_adapter(
+    *,
+    adapter_path: str | Path | None,
+    configured_model_path: str | Path,
+    probe_model_path: str | Path,
+    ema_dir: str | Path | None = None,
+) -> bool:
+    """Return whether a probe still needs the configured split-init adapter.
+
+    A configured adapter belongs on top of the original text-only checkpoint.
+    A later full-model checkpoint (including a sharded EMA checkpoint) already
+    contains the trained image modules, so loading the original adapter again
+    would silently overwrite the state that the probe is supposed to measure.
+    """
+
+    if is_disabled_path(adapter_path) or not is_disabled_path(ema_dir):
+        return False
+    configured = Path(configured_model_path).expanduser().resolve(strict=False)
+    probed = Path(probe_model_path).expanduser().resolve(strict=False)
+    return configured == probed
+
+
 def _special_token_ids(config) -> dict[str, int]:
     ids = {
         "mask": int(config.model.mask_token_id),

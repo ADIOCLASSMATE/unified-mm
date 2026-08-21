@@ -5,7 +5,10 @@ import torch
 from omegaconf import OmegaConf
 from torch import nn
 
-from utils.selfless_flow_adapter import load_image_flow_adapter
+from utils.selfless_flow_adapter import (
+    load_image_flow_adapter,
+    should_load_configured_adapter,
+)
 from scripts.validate_ascend_imagenet1k_caption_joint_split_init import (
     validate_config,
 )
@@ -116,6 +119,34 @@ def test_adapter_only_load_rejects_tokenizer_id_mismatch(tmp_path):
 
     with pytest.raises(ValueError, match="special-token ids"):
         load_image_flow_adapter(model, path, _config())
+
+
+def test_probe_applies_adapter_only_to_configured_text_checkpoint(tmp_path):
+    text_checkpoint = tmp_path / "qwen-text"
+    trained_checkpoint = tmp_path / "checkpoint-2404"
+    adapter = tmp_path / "adapter.pt"
+
+    assert should_load_configured_adapter(
+        adapter_path=adapter,
+        configured_model_path=text_checkpoint,
+        probe_model_path=text_checkpoint,
+    )
+    assert not should_load_configured_adapter(
+        adapter_path=adapter,
+        configured_model_path=text_checkpoint,
+        probe_model_path=trained_checkpoint,
+    )
+    assert not should_load_configured_adapter(
+        adapter_path=adapter,
+        configured_model_path=text_checkpoint,
+        probe_model_path=text_checkpoint,
+        ema_dir=trained_checkpoint,
+    )
+    assert not should_load_configured_adapter(
+        adapter_path="none",
+        configured_model_path=text_checkpoint,
+        probe_model_path=text_checkpoint,
+    )
 
 
 def test_split_init_production_config_preserves_global_training_contract():
