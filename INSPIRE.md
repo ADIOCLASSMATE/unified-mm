@@ -123,6 +123,38 @@ not implicitly mount the official dataset.
   `scripts/finalize_imagenet1k_caption_joint_lr_sweep.py` reports FID/IS deltas
   against the initialization checkpoint and applies generation mean-rank.
 
+#### Text-backbone plus image-adapter split-init control
+
+- The implemented split initialization uses the untouched Qwen3-0.6B-Base
+  transformer/text embedding/LM head and loads only the completed class run's
+  image flow head, image projector, image-token embedder, and four multimodal
+  special-token rows. The source hashes are
+  `cd2a512003e2f9f3cd3c32a9c3573f820bb28c940f73c57b1ddaa983d9223eba`
+  for the Qwen model weights and
+  `3a20383c73070a9e1db607d5b1b211acc1f51c37ad05ea41c215d19902a15d4c`
+  for the image adapter.
+- The retained short control is
+  `output/selfless-flow-imagenet1k-caption-joint-text-backbone-adapter-b2e6-f2e5-lt0p4`.
+  Platform Job `sf-i1k-split-b2e6-f2e5-lt0p4-s2404` succeeded on one 16-NPU
+  node. It used Backbone/Special-token LR `2e-6`, Flow/Projector LR `2e-5`,
+  `lambda_text=0.4`, `lambda_image=1.0`, and the unchanged 12,020-step WSD
+  horizon while stopping at step 2,404.
+- Full validation improved from step 1,202 to 2,404: text loss
+  `2.4638998508 -> 2.1049699783` and image-flow loss
+  `1.0152550936 -> 0.9465371370`, with identical target counts and validation
+  seed. Pre-clip gradient norm was `25.660700` at step 1,202 and `23.113558`
+  at step 2,404; both were clipped at `1.0` and both non-`log_every` steps were
+  persisted correctly.
+- Fixed 16-batch, no-optimizer EMA probes at init/1,202/2,404 used the same
+  holdout digest. Median shared-backbone `g_image/g_text` was
+  `1.1190/1.0117/0.8415`, so the bounded lambda center remained `0.4`.
+  Median cosine was `+0.04535/-0.00732/-0.00141`, with negative batches
+  `0/16`, `16/16`, and `11/16`. The conflict weakened by step 2,404 but did
+  not disappear; do not respond by only increasing the text loss weight.
+- This control has two validation points and task-separated probes, but no
+  canonical Caption CLIP or 50,000-sample FID/IS result. Treat it as a viable
+  short-run candidate, not a final winner.
+
 ### Formal ImageNet-1K 800-epoch pretraining
 
 - Contract: `docs/IMAGENET1K_800EP_PRETRAINING.md`.
