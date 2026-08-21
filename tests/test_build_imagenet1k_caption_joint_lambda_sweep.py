@@ -71,5 +71,16 @@ def test_lambda_manifest_uses_probe_candidates_and_one_top_lr(tmp_path):
     assert all(
         row["top_lr_id"] == "b1e5-f2e5" for row in manifest["candidates"]
     )
+    by_lambda = {row["lambda_text"]: row for row in manifest["candidates"]}
+    assert by_lambda[0.2]["run_project"] == (
+        "selfless-flow-imagenet1k-caption-joint-sweep-b1e5-f2e5"
+    )
+    assert by_lambda[0.2]["source"] == "lr_sweep_baseline"
+    assert by_lambda[0.2]["reuse_existing_run"] is True
+    assert by_lambda[0.1]["run_project"] == (
+        "selfless-flow-imagenet1k-caption-joint-lambda-b1e5-f2e5-lt0p1"
+    )
+    assert by_lambda[0.1]["source"] == "lambda_sweep"
+    assert by_lambda[0.1]["reuse_existing_run"] is False
     assert manifest["lambda_policy"]["cartesian_product_with_lr"] is False
     assert manifest["source_probe"]["task_conflict"]["persistent_negative"] is True

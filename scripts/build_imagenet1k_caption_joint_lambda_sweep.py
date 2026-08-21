@@ -92,13 +92,22 @@ def build_manifest(
     for value in values:
         tag = lambda_tag(value)
         candidate_id = f"{selected_lr}-lt{tag}"
+        reuses_lr_baseline = math.isclose(value, 0.2, rel_tol=0.0, abs_tol=1e-12)
+        if reuses_lr_baseline:
+            run_project = f"selfless-flow-imagenet1k-caption-joint-sweep-{selected_lr}"
+            source = "lr_sweep_baseline"
+        else:
+            run_project = (
+                "selfless-flow-imagenet1k-caption-joint-lambda-"
+                f"{selected_lr}-lt{tag}"
+            )
+            source = "lambda_sweep"
         candidates.append(
             {
                 "id": candidate_id,
-                "run_project": (
-                    "selfless-flow-imagenet1k-caption-joint-lambda-"
-                    f"{selected_lr}-lt{tag}"
-                ),
+                "run_project": run_project,
+                "source": source,
+                "reuse_existing_run": reuses_lr_baseline,
                 "top_lr_id": selected_lr,
                 "backbone_lr": float(lr_candidate["backbone_lr"]),
                 "flow_lr": float(lr_candidate["flow_lr"]),
