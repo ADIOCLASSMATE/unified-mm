@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from scripts.finalize_imagenet1k_caption_joint_lr_sweep import collect_final
 
 
@@ -19,6 +21,7 @@ def _write_generation_metrics(root, run_id, *, clip, fid, inception):
                     "min_samples_per_class": 1,
                     "max_samples_per_class": 1,
                 },
+                "generation": {"seed": 424242},
                 "clip": {"caption_clip_score": clip},
             }
         ),
@@ -29,6 +32,8 @@ def _write_generation_metrics(root, run_id, *, clip, fid, inception):
             {
                 "official_protocol": True,
                 "samples_evaluated": 50000,
+                "seed": 42,
+                "sampling_steps": "100",
                 "strategies": {
                     "spatial_halton": {
                         "count": 50000,
@@ -50,6 +55,8 @@ def _write_initialization_metrics(root):
             {
                 "official_protocol": True,
                 "samples_evaluated": 50000,
+                "seed": 42,
+                "sampling_steps": 100,
                 "strategies": {
                     "spatial_halton": {
                         "count": 50000,
@@ -211,6 +218,13 @@ def test_finalizer_uses_candidate_generation_evaluation_subdir(tmp_path):
                     "min_samples_per_class": 1,
                     "max_samples_per_class": 1,
                 },
+                "generation": {"seed": 424242},
+                "split": {
+                    "strategy": "stratified",
+                    "seed": 42,
+                    "val_samples_per_class": 50,
+                    "validation_overlap_train": False,
+                },
                 "clip": {"caption_clip_score": 0.35},
             }
         ),
@@ -221,6 +235,8 @@ def test_finalizer_uses_candidate_generation_evaluation_subdir(tmp_path):
             {
                 "official_protocol": True,
                 "samples_evaluated": 50000,
+                "seed": 42,
+                "sampling_steps": "100",
                 "model_path": expected_model_path,
                 "strategies": {
                     "spatial_halton": {
@@ -262,3 +278,44 @@ def test_finalizer_uses_candidate_generation_evaluation_subdir(tmp_path):
         "hf_model-4808-ema-eval"
     )
     assert report["ranking"][0]["lambda_text"] == 0.2
+
+
+def test_finalizer_rejects_t2i_protocol_drift_from_initialization(tmp_path):
+    validation_path = tmp_path / "validation-ranking.json"
+    validation_path.write_text(
+        json.dumps(
+            {
+                "schema": "selfless_imagenet1k_caption_joint_lr_ranking_v1",
+                "status": "complete",
+                "top_k": ["candidate"],
+                "ranking": [
+                    {
+                        "id": "candidate",
+                        "backbone_lr": 1e-5,
+                        "flow_lr": 2e-5,
+                        "overall_rank": 1,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    _write_generation_metrics(
+        tmp_path, "candidate", clip=0.3, fid=20.0, inception=175.0
+    )
+    image_path = (
+        tmp_path
+        / "selfless-flow-imagenet1k-caption-joint-sweep-candidate"
+        / "generation-evaluation/t2i-fid-is/metrics.json"
+    )
+    image = json.loads(image_path.read_text(encoding="utf-8"))
+    image["seed"] = 43
+    image_path.write_text(json.dumps(image), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="protocol mismatch.*seed"):
+        collect_final(
+            validation_path,
+            tmp_path,
+            require_complete=True,
+            initialization_metrics_path=_write_initialization_metrics(tmp_path),
+        )

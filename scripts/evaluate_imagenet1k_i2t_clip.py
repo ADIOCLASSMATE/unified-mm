@@ -634,6 +634,7 @@ def main() -> None:
                 "counts_sha256": hashlib.sha256(class_counts_payload).hexdigest(),
             },
             "generation": {
+                "seed": int(args.seed),
                 "max_new_tokens": int(args.max_new_tokens),
                 "temperature": float(args.temperature),
                 "empty_caption_rate": sum(

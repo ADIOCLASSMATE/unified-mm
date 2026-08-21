@@ -12,10 +12,50 @@ from typing import Any
 
 VALIDATION_SCHEMA = "selfless_imagenet1k_caption_joint_lr_ranking_v1"
 CAPTION_SCHEMA = "selfless_imagenet1k_i2t_clip_metrics_v1"
+CAPTION_EVALUATION_SEED = 424242
 DEFAULT_INITIALIZATION_METRICS = Path(
     "output/selfless-flow-imagenet1k-class-ascend64-b1024-800ep-fid-is/"
     "metrics.json"
 )
+
+T2I_COMPARABILITY_FIELDS = (
+    "seed",
+    "split",
+    "sampling_steps",
+    "temperature",
+    "cfg",
+    "cfg_schedule",
+    "flow_solver",
+    "parallel_rate",
+    "batch_size",
+    "distributed.batch_size_global",
+    "distributed.batch_size_per_rank",
+    "distributed.world_size",
+    "backbone_kv_cache",
+    "real_image_size",
+    "real_source",
+    "target_decode_skipped",
+    "target_latents_are_placeholders",
+    "implementation_contracts.canonical_initial_noise_enabled",
+    "implementation_contracts.canonical_noise_manifest_schema",
+    "implementation_contracts.canonical_noise_manifest_sha256",
+    "implementation_contracts.evaluator_rng_contract_sha256",
+    "implementation_contracts.ordered_eval_sample_manifest_sha256",
+    "implementation_contracts.paired_sample_count",
+    "metric_protocol.fid_reducer",
+    "metric_protocol.is_split_assignment",
+    "metric_protocol.is_splits",
+    "metric_protocol.is_std",
+    "precision_protocol.flow_integrator_dtype",
+    "precision_protocol.metric_accumulation_dtype",
+    "precision_protocol.model_dtype",
+    "precision_protocol.vae_dtype",
+    "precision_protocol.vae_decode_batch_size",
+    "real_stats_metadata.feature.weights_sha256",
+    "real_stats_metadata.source.selected_records_sha256",
+)
+
+_MISSING = object()
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -75,6 +115,57 @@ def _safe_relative_subdir(value: Any, *, label: str) -> Path:
     if path.is_absolute() or not path.parts or ".." in path.parts:
         raise ValueError(f"{label} must be a safe relative path: {value!r}")
     return path
+
+
+def _nested_value(payload: dict[str, Any], dotted_path: str) -> Any:
+    value: Any = payload
+    for part in dotted_path.split("."):
+        if not isinstance(value, dict) or part not in value:
+            return _MISSING
+        value = value[part]
+    return value
+
+
+def _protocol_value(field: str, value: Any) -> Any:
+    if field == "sampling_steps":
+        return int(value)
+    return value
+
+
+def _verify_t2i_comparability(
+    initialization: dict[str, Any],
+    candidate: dict[str, Any],
+    *,
+    candidate_path: Path,
+) -> list[str]:
+    verified: list[str] = []
+    for field in T2I_COMPARABILITY_FIELDS:
+        expected = _nested_value(initialization, field)
+        # Lightweight/legacy baselines may not expose every contract. A field
+        # present in the baseline is mandatory in every candidate.
+        if expected is _MISSING:
+            continue
+        observed = _nested_value(candidate, field)
+        if observed is _MISSING:
+            raise ValueError(
+                f"candidate T2I metrics are missing baseline protocol field "
+                f"{field!r}: {candidate_path}"
+            )
+        expected = _protocol_value(field, expected)
+        observed = _protocol_value(field, observed)
+        if isinstance(expected, float) or isinstance(observed, float):
+            equal = math.isclose(
+                float(expected), float(observed), rel_tol=0.0, abs_tol=1.0e-12
+            )
+        else:
+            equal = expected == observed
+        if not equal:
+            raise ValueError(
+                f"candidate T2I protocol mismatch for {field!r}: "
+                f"expected {expected!r}, got {observed!r}: {candidate_path}"
+            )
+        verified.append(field)
+    return verified
 
 
 def collect_final(
@@ -175,6 +266,24 @@ def collect_final(
                     f"Caption CLIP is not one-sample-per-class balanced "
                     f"({key}): {caption_path}"
                 )
+        if "evaluation_model_subdir" in validation_row:
+            generation = caption.get("generation", {})
+            if int(generation.get("seed", -1)) != CAPTION_EVALUATION_SEED:
+                raise ValueError(
+                    f"Caption evaluation seed must be "
+                    f"{CAPTION_EVALUATION_SEED}: {caption_path}"
+                )
+            split = caption.get("split", {})
+            expected_split = {
+                "strategy": "stratified",
+                "seed": 42,
+                "val_samples_per_class": 50,
+                "validation_overlap_train": False,
+            }
+            if any(split.get(key) != value for key, value in expected_split.items()):
+                raise ValueError(
+                    f"Caption evaluation split contract mismatch: {caption_path}"
+                )
         image = _read_json(image_path)
         if image.get("official_protocol") is not True:
             raise ValueError(f"T2I metrics are not official-protocol: {image_path}")
@@ -189,6 +298,11 @@ def collect_final(
             raise ValueError(
                 f"T2I strategy count must be 50,000: {image_path}"
             )
+        verified_t2i_fields = _verify_t2i_comparability(
+            initialization,
+            image,
+            candidate_path=image_path,
+        )
         evaluation_model_subdir = validation_row.get("evaluation_model_subdir")
         if evaluation_model_subdir is not None:
             model_subdir = _safe_relative_subdir(
@@ -269,6 +383,10 @@ def collect_final(
             },
             "caption_samples": int(caption["samples"]),
             "image_samples": int(image["samples_evaluated"]),
+            "caption_evaluation_seed": int(
+                caption.get("generation", {}).get("seed", CAPTION_EVALUATION_SEED)
+            ),
+            "t2i_protocol_verified_against_initialization": verified_t2i_fields,
             "caption_metrics_path": str(caption_path),
             "image_metrics_path": str(image_path),
         }
