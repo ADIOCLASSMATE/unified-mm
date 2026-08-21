@@ -40,6 +40,7 @@ from utils.selfless_flow_optimizer import (
 )
 from utils.sharded_ema import load_ema_manifest, merge_sharded_ema_state_dict
 from utils.utils import get_selfless_mask, load_model_tokenizer
+from utils.selfless_flow_adapter import load_image_flow_adapter
 
 
 DEFAULT_CONFIG = Path(
@@ -239,6 +240,14 @@ def main() -> None:
         config=config,
         model_dtype=torch.bfloat16,
     )
+    adapter_report = load_image_flow_adapter(
+        model,
+        config.model.get("pretrained_image_flow_adapter", None),
+        config,
+    )
+    if adapter_report is not None:
+        adapter_report["sha256"] = sha256_file(Path(adapter_report["path"]))
+        checkpoint_report["adapter"] = adapter_report
     if args.ema_dir is not None:
         model_keys = list(model.state_dict().keys())
         if model_keys != list(ema_manifest["state_keys"]):

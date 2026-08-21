@@ -38,6 +38,7 @@ from utils.selfless_flow_optimizer import (
     optimizer_parameter_role,
     weight_decay_for_parameter,
 )
+from utils.selfless_flow_adapter import load_image_flow_adapter
 from utils.selfless_training_runtime import (
     RESUME_SCHEMA,
     RESUME_SIGNATURE_VERSION,
@@ -97,94 +98,6 @@ def _is_disabled_path(value):
     return value is None or (
         isinstance(value, str) and value.lower() in {"none", "null", "false", ""}
     )
-
-
-def _load_image_flow_adapter(model, adapter_path, config):
-    if _is_disabled_path(adapter_path):
-        return
-
-    adapter_path = Path(adapter_path)
-    if adapter_path.is_dir():
-        adapter_path = adapter_path / "model.safetensors"
-    if adapter_path.suffix == ".safetensors":
-        from safetensors import safe_open
-
-        head_state = {}
-        condition_proj_state = {}
-        projector_state = {}
-        backbone_flow_time_state = {}
-
-        with safe_open(str(adapter_path), framework="pt", device="cpu") as f:
-            for key in f.keys():
-                if key.startswith("image_flow_head."):
-                    head_state[key[len("image_flow_head."):]] = f.get_tensor(key)
-                elif key.startswith("image_flow_condition_proj."):
-                    condition_proj_state[key[len("image_flow_condition_proj."):]] = f.get_tensor(key)
-                elif key.startswith("model.image_token_embedder."):
-                    name = key[len("model.image_token_embedder."):]
-                    projector_state[name] = f.get_tensor(key)
-                elif key.startswith("model.backbone_flow_time_embedder."):
-                    name = key[len("model.backbone_flow_time_embedder."):]
-                    backbone_flow_time_state[name] = f.get_tensor(key)
-        model.image_flow_head.load_state_dict(head_state, strict=True)
-        model.image_flow_condition_proj.load_state_dict(
-            condition_proj_state, strict=True
-        )
-        model.image_token_embedder.load_state_dict(
-            projector_state, strict=True
-        )
-        backbone_flow_time_embedder = getattr(
-            model.model, "backbone_flow_time_embedder", None
-        )
-        if backbone_flow_time_embedder is not None:
-            backbone_flow_time_embedder.load_state_dict(
-                backbone_flow_time_state,
-                strict=True,
-            )
-        _log_info(f"Loaded finalized image-flow modules from {adapter_path}")
-        return
-
-    state = torch.load(adapter_path, map_location="cpu", weights_only=True)
-    required = {
-        "image_flow_head",
-        "image_flow_condition_proj",
-        "image_token_embedder",
-        "special_token_embeddings",
-    }
-    if hasattr(model.model, "backbone_flow_time_embedder"):
-        required.add("backbone_flow_time_embedder")
-    missing = required - set(state)
-    if missing:
-        raise ValueError(
-            f"Final image-flow adapter {adapter_path} is missing {sorted(missing)}"
-        )
-    model.image_flow_head.load_state_dict(state["image_flow_head"], strict=True)
-    model.image_flow_condition_proj.load_state_dict(
-        state["image_flow_condition_proj"], strict=True
-    )
-    model.image_token_embedder.load_state_dict(
-        state["image_token_embedder"], strict=True
-    )
-    if hasattr(model.model, "backbone_flow_time_embedder"):
-        model.model.backbone_flow_time_embedder.load_state_dict(
-            state["backbone_flow_time_embedder"], strict=True
-        )
-    token_ids = _special_token_ids(config)
-    if set(state["special_token_embeddings"]) != set(token_ids):
-        raise ValueError(
-            "Adapter special-token set does not match the finalized model: "
-            f"adapter={sorted(state['special_token_embeddings'])}, "
-            f"model={sorted(token_ids)}"
-        )
-    with torch.no_grad():
-        embed = model.model.embed_tokens.weight
-        for name, token_id in token_ids.items():
-            value = state["special_token_embeddings"][name].to(
-                device=embed.device,
-                dtype=embed.dtype,
-            )
-            embed[token_id].copy_(value)
-    _log_info(f"Loaded finalized image-flow adapter from {adapter_path}")
 
 
 def _apply_trainable_scope(model, config) -> dict[str, int | str]:
@@ -850,7 +763,25 @@ def main(*, model_loader=None):
     )
 
     flow_adapter = config.model.get("pretrained_image_flow_adapter", None)
-    _load_image_flow_adapter(model, flow_adapter, config)
+    adapter_initialization = load_image_flow_adapter(
+        model, flow_adapter, config, log=_log_info
+    )
+    if accelerator.is_main_process and adapter_initialization is not None:
+        output_dir = Path(config.experiment.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema": "selfless_split_initialization_v1",
+            "text_model_path": str(config.model.model_path),
+            "adapter": adapter_initialization,
+        }
+        path = output_dir / "initialization_report.json"
+        temp_path = output_dir / f".{path.name}.tmp-{os.getpid()}"
+        temp_path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temp_path, path)
+    accelerator.wait_for_everyone()
 
     trainability = _apply_trainable_scope(model, config)
     logger.info(
