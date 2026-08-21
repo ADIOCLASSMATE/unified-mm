@@ -86,6 +86,13 @@ def collect(
     validation_steps = [int(step) for step in selection["validation_steps"]]
     final_step = validation_steps[-1]
     require_gradient_probe = bool(selection.get("require_gradient_probe", False))
+    probe_contract = sweep.get("gradient_probe", {})
+    if not isinstance(probe_contract, dict):
+        raise ValueError(f"invalid gradient_probe contract: {sweep_path}")
+    default_lambda_text = float(probe_contract.get("training_lambda_text", 0.2))
+    default_lambda_image = float(probe_contract.get("training_lambda_image", 1.0))
+    if default_lambda_text <= 0.0 or default_lambda_image <= 0.0:
+        raise ValueError("training loss weights must be positive")
 
     rows: list[dict[str, Any]] = []
     missing: list[dict[str, Any]] = []
@@ -183,6 +190,33 @@ def collect(
         best_image = min(float(item["image_loss"]) for item in checkpoints)
         final_text = float(final["text_loss"])
         final_image = float(final["image_loss"])
+        gradient_diagnostics: dict[str, float] = {}
+        if probe_summary is not None:
+            candidate_lambda_text = float(
+                candidate.get("lambda_text", default_lambda_text)
+            )
+            target_ratio = candidate_lambda_text / default_lambda_image
+            task_conflict = probe_summary["task_conflict"]
+            negative_fraction = float(
+                task_conflict.get(
+                    "negative_fraction",
+                    float(bool(task_conflict.get("persistent_negative", False))),
+                )
+            )
+            pre_clip_norms = health.get("pre_clip_grad_norms", [])
+            clipped_events = sum(
+                float(item["pre_clip"]) > 1.0 for item in pre_clip_norms
+            )
+            gradient_diagnostics = {
+                "gradient_balance_target_ratio": target_ratio,
+                "gradient_balance_log_error": abs(
+                    math.log(ratio_median / target_ratio)
+                ),
+                "negative_cosine_fraction": negative_fraction,
+                "observed_clip_event_fraction": (
+                    clipped_events / len(pre_clip_norms) if pre_clip_norms else 0.0
+                ),
+            }
         rows.append(
             {
                 "id": run_id,
@@ -218,6 +252,7 @@ def collect(
                 "best_text_loss": best_text,
                 "best_image_loss": best_image,
                 "health": health,
+                **gradient_diagnostics,
                 **(
                     {
                         "gradient_probe": {
@@ -268,21 +303,43 @@ def collect(
     final_image_ranks = _average_tie_ranks(rows, "final_image_loss")
     best_text_ranks = _average_tie_ranks(rows, "best_text_loss")
     best_image_ranks = _average_tie_ranks(rows, "best_image_loss")
+    if require_gradient_probe:
+        gradient_balance_ranks = _average_tie_ranks(
+            rows, "gradient_balance_log_error"
+        )
+        conflict_ranks = _average_tie_ranks(rows, "negative_cosine_fraction")
+        clip_ranks = _average_tie_ranks(rows, "observed_clip_event_fraction")
     for row in rows:
         run_id = str(row["id"])
         row["final_text_rank"] = final_text_ranks[run_id]
         row["final_image_rank"] = final_image_ranks[run_id]
         row["best_text_rank"] = best_text_ranks[run_id]
         row["best_image_rank"] = best_image_ranks[run_id]
-        row["mean_rank"] = 0.25 * (
+        loss_rank_sum = (
             float(row["final_text_rank"])
             + float(row["final_image_rank"])
             + float(row["best_text_rank"])
             + float(row["best_image_rank"])
         )
+        row["validation_loss_mean_rank"] = loss_rank_sum / 4.0
+        if require_gradient_probe:
+            row["gradient_balance_rank"] = gradient_balance_ranks[run_id]
+            row["negative_cosine_conflict_rank"] = conflict_ranks[run_id]
+            row["clip_stability_rank"] = clip_ranks[run_id]
+            row["mean_rank"] = (
+                loss_rank_sum
+                + gradient_balance_ranks[run_id]
+                + conflict_ranks[run_id]
+                + clip_ranks[run_id]
+            ) / 7.0
+        else:
+            row["mean_rank"] = row["validation_loss_mean_rank"]
     rows.sort(
         key=lambda row: (
             float(row["mean_rank"]),
+            float(row.get("gradient_balance_log_error", 0.0)),
+            float(row.get("negative_cosine_fraction", 0.0)),
+            float(row.get("observed_clip_event_fraction", 0.0)),
             float(row["mean_normalized_final_regression"]),
             str(row["id"]),
         )

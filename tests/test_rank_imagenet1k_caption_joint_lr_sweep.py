@@ -21,6 +21,34 @@ def _write_metrics(root, run_id, step, text_loss, image_loss):
     )
 
 
+def _write_probe(root, run_id, step, *, ratio, negative_fraction):
+    path = (
+        root
+        / f"selfless-flow-imagenet1k-caption-joint-sweep-{run_id}"
+        / "gradient_probe"
+        / f"checkpoint-{step}"
+        / "probe.json"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "schema": "selfless_caption_t2i_gradient_probe_v1",
+                "status": "complete",
+                "summary": {
+                    "ratio_g_image_over_g_text": {"median": ratio},
+                    "cosine": {"median": -0.01},
+                    "task_conflict": {
+                        "persistent_negative": True,
+                        "negative_fraction": negative_fraction,
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
 def test_joint_sweep_ranker_balances_final_and_best_text_image_ranks(tmp_path):
     sweep = tmp_path / "sweep.json"
     sweep.write_text(
@@ -231,3 +259,42 @@ def test_joint_sweep_ranker_requires_final_gradient_probe_when_configured(tmp_pa
     complete = collect(sweep, tmp_path, require_complete=True)
     assert complete["status"] == "complete"
     assert complete["ranking"][0]["gradient_probe"]["cosine_median"] == -0.2
+
+
+def test_joint_sweep_ranker_breaks_loss_ties_with_gradient_diagnostics(tmp_path):
+    sweep = tmp_path / "sweep.json"
+    sweep.write_text(
+        json.dumps(
+            {
+                "gradient_probe": {
+                    "training_lambda_text": 0.2,
+                    "training_lambda_image": 1.0,
+                },
+                "selection": {
+                    "validation_steps": [20],
+                    "rule": "include gradient diagnostics",
+                    "require_gradient_probe": True,
+                    "top_k_for_generation_evaluation": 3,
+                },
+                "candidates": [
+                    {"id": "conflict", "backbone_lr": 2e-5, "flow_lr": 1e-5},
+                    {"id": "balanced", "backbone_lr": 2e-5, "flow_lr": 2e-5},
+                    {"id": "weak", "backbone_lr": 2e-5, "flow_lr": 4e-5},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    for run_id in ("conflict", "balanced", "weak"):
+        _write_metrics(tmp_path, run_id, 20, 1.0, 0.5)
+    _write_probe(tmp_path, "conflict", 20, ratio=0.15, negative_fraction=0.9)
+    _write_probe(tmp_path, "balanced", 20, ratio=0.19, negative_fraction=0.2)
+    _write_probe(tmp_path, "weak", 20, ratio=0.05, negative_fraction=0.1)
+
+    report = collect(sweep, tmp_path, require_complete=True)
+
+    assert report["validation_leader"] == "balanced"
+    leader = report["ranking"][0]
+    assert leader["validation_loss_mean_rank"] == 2.0
+    assert leader["gradient_balance_rank"] == 1.0
+    assert leader["negative_cosine_conflict_rank"] == 2.0

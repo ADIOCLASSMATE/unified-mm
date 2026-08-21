@@ -31,6 +31,8 @@
     "batches": 16,
     "seed": 424242,
     "optimizer_steps": 0,
+    "training_lambda_text": 0.2,
+    "training_lambda_image": 1.0,
     "shared_backbone_metrics": ["g_text", "g_image", "ratio_g_image_over_g_text", "cosine"],
     "summary_statistics": ["mean", "median", "p25", "p75"]
   },
