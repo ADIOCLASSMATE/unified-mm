@@ -174,7 +174,10 @@ def collect(
                     }
                 )
                 continue
-        health = training_health(run_root)
+        # Reused runs may have continued past this sweep gate. Restrict health
+        # and clipping diagnostics to the same sample budget as every other
+        # candidate.
+        health = training_health(run_root, max_step=final_step)
         if not health["passed"]:
             excluded.append(
                 {

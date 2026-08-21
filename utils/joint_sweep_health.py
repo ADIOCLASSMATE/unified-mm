@@ -34,22 +34,53 @@ def training_health(
     run_root: Path,
     *,
     abnormal_pre_clip_norm: float = 100.0,
+    max_step: int | None = None,
 ) -> dict[str, Any]:
+    if max_step is not None and max_step < 0:
+        raise ValueError("max_step must be non-negative")
     errors: list[str] = []
     grad_norms: list[dict[str, float | int]] = []
     latest_step = 0
     paths = sorted((run_root / "prelaunch_audit").glob("**/training.log"))
+    scanned_paths: list[Path] = []
     for path in paths:
         text = path.read_text(encoding="utf-8", errors="replace")
-        for line in text.splitlines():
+        lines = text.splitlines()
+        path_steps = [
+            int(match.group(1))
+            for line in lines
+            for pattern in (STEP_PATTERN, GRAD_PATTERN)
+            if (match := pattern.search(line)) is not None
+        ]
+        # A later continuation log is outside a shorter candidate's sample
+        # budget. This matters when a completed long run is reused at an
+        # earlier sweep gate.
+        if (
+            max_step is not None
+            and path_steps
+            and min(path_steps) > max_step
+        ):
+            continue
+        scanned_paths.append(path)
+        current_step: int | None = None
+        for line in lines:
             step_match = STEP_PATTERN.search(line)
             if step_match:
-                latest_step = max(latest_step, int(step_match.group(1)))
-            if ERROR_PATTERN.search(line):
+                current_step = int(step_match.group(1))
+                if max_step is None or current_step <= max_step:
+                    latest_step = max(latest_step, current_step)
+            if ERROR_PATTERN.search(line) and (
+                max_step is None
+                or current_step is None
+                or current_step <= max_step
+            ):
                 errors.append(line[-500:])
             match = GRAD_PATTERN.search(line)
             if match:
                 gradient_step = int(match.group(1))
+                current_step = gradient_step
+                if max_step is not None and gradient_step > max_step:
+                    continue
                 latest_step = max(latest_step, gradient_step)
                 grad_norms.append(
                     {
@@ -70,7 +101,8 @@ def training_health(
     else:
         gradient_log_status = "unavailable_or_legacy_cadence_bug"
     return {
-        "training_logs": [str(path) for path in paths],
+        "training_logs": [str(path) for path in scanned_paths],
+        "max_step": max_step,
         "error_lines": errors[:20],
         "pre_clip_grad_norms": grad_norms,
         "latest_logged_step": latest_step,
