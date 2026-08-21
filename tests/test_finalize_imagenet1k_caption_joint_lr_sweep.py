@@ -177,6 +177,7 @@ def test_finalizer_uses_candidate_generation_evaluation_subdir(tmp_path):
                     {
                         "id": "b1e5-f2e5-lt0p2",
                         "run_project": project,
+                        "evaluation_model_subdir": "hf_model-4808-ema-eval",
                         "generation_evaluation_subdir": evaluation_subdir,
                         "lambda_text": 0.2,
                         "backbone_lr": 1e-5,
@@ -189,6 +190,9 @@ def test_finalizer_uses_candidate_generation_evaluation_subdir(tmp_path):
         encoding="utf-8",
     )
     run_root = tmp_path / project / evaluation_subdir
+    expected_model_path = str(
+        tmp_path / project / "hf_model-4808-ema-eval"
+    )
     caption_path = run_root / "i2t-clip/metrics.json"
     image_path = run_root / "t2i-fid-is/metrics.json"
     caption_path.parent.mkdir(parents=True)
@@ -198,6 +202,10 @@ def test_finalizer_uses_candidate_generation_evaluation_subdir(tmp_path):
             {
                 "schema": "selfless_imagenet1k_i2t_clip_metrics_v1",
                 "samples": 1000,
+                "model": {
+                    "path": expected_model_path,
+                    "weights_sha256": "model-sha",
+                },
                 "class_balance": {
                     "class_count": 1000,
                     "min_samples_per_class": 1,
@@ -213,6 +221,7 @@ def test_finalizer_uses_candidate_generation_evaluation_subdir(tmp_path):
             {
                 "official_protocol": True,
                 "samples_evaluated": 50000,
+                "model_path": expected_model_path,
                 "strategies": {
                     "spatial_halton": {
                         "count": 50000,
@@ -221,6 +230,19 @@ def test_finalizer_uses_candidate_generation_evaluation_subdir(tmp_path):
                         "inception_score_std": 3.0,
                     }
                 },
+            }
+        ),
+        encoding="utf-8",
+    )
+    assets_path = run_root / "prelaunch_audit/assets.json"
+    assets_path.parent.mkdir(parents=True)
+    assets_path.write_text(
+        json.dumps(
+            {
+                "model": {
+                    "path": expected_model_path,
+                    "weights_sha256": "model-sha",
+                }
             }
         ),
         encoding="utf-8",
@@ -236,4 +258,7 @@ def test_finalizer_uses_candidate_generation_evaluation_subdir(tmp_path):
     assert report["status"] == "complete"
     assert report["winner"] == "b1e5-f2e5-lt0p2"
     assert report["ranking"][0]["generation_evaluation_subdir"] == evaluation_subdir
+    assert report["ranking"][0]["evaluation_model_subdir"] == (
+        "hf_model-4808-ema-eval"
+    )
     assert report["ranking"][0]["lambda_text"] == 0.2

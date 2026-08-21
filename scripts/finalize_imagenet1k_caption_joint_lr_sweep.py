@@ -189,6 +189,35 @@ def collect_final(
             raise ValueError(
                 f"T2I strategy count must be 50,000: {image_path}"
             )
+        evaluation_model_subdir = validation_row.get("evaluation_model_subdir")
+        if evaluation_model_subdir is not None:
+            model_subdir = _safe_relative_subdir(
+                evaluation_model_subdir,
+                label="evaluation_model_subdir",
+            )
+            expected_model_path = str(run_root / model_subdir)
+            assets_path = run_root / evaluation_subdir / "prelaunch_audit/assets.json"
+            if not assets_path.is_file():
+                raise FileNotFoundError(
+                    f"missing generation preflight identity: {assets_path}"
+                )
+            assets = _read_json(assets_path)
+            asset_model = assets.get("model", {})
+            caption_model = caption.get("model", {})
+            if str(asset_model.get("path", "")) != expected_model_path:
+                raise ValueError(
+                    f"preflight model path mismatch: {assets_path}"
+                )
+            if str(caption_model.get("path", "")) != expected_model_path:
+                raise ValueError(f"Caption model path mismatch: {caption_path}")
+            if str(image.get("model_path", "")) != expected_model_path:
+                raise ValueError(f"T2I model path mismatch: {image_path}")
+            if not str(asset_model.get("weights_sha256", "")) or str(
+                caption_model.get("weights_sha256", "")
+            ) != str(asset_model["weights_sha256"]):
+                raise ValueError(
+                    f"Caption/preflight model weight identity mismatch: {caption_path}"
+                )
         fid = _finite(strategy_metrics["fid"], label="fid", path=image_path)
         inception_score = _finite(
             strategy_metrics["inception_score_mean"],
@@ -203,6 +232,11 @@ def collect_final(
             "id": run_id,
             "run_project": run_project,
             "generation_evaluation_subdir": str(evaluation_subdir),
+            **(
+                {"evaluation_model_subdir": str(model_subdir)}
+                if evaluation_model_subdir is not None
+                else {}
+            ),
             "backbone_lr": float(validation_row["backbone_lr"]),
             "flow_lr": float(validation_row["flow_lr"]),
             **(

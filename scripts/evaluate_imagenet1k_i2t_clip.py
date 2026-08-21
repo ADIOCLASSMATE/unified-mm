@@ -612,6 +612,13 @@ def main() -> None:
         metrics = {
             "schema": "selfless_imagenet1k_i2t_clip_metrics_v1",
             "samples": len(rows),
+            "model": {
+                "path": str(args.model_path),
+                "config_sha256": file_sha256(args.model_path / "config.json"),
+                "weights_sha256": file_sha256(
+                    args.model_path / "model.safetensors"
+                ),
+            },
             "split": {
                 "strategy": str(config.dataset.params.split_strategy),
                 "seed": int(config.dataset.params.split_seed),
