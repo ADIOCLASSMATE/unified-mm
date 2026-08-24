@@ -5,13 +5,7 @@ import torch
 from omegaconf import OmegaConf
 from torch import nn
 
-from utils.selfless_flow_adapter import (
-    load_image_flow_adapter,
-    should_load_configured_adapter,
-)
-from scripts.validate_ascend_imagenet1k_caption_joint_split_init import (
-    validate_config,
-)
+from utils.selfless_flow_adapter import load_image_flow_adapter
 
 
 class _Body(nn.Module):
@@ -119,62 +113,3 @@ def test_adapter_only_load_rejects_tokenizer_id_mismatch(tmp_path):
 
     with pytest.raises(ValueError, match="special-token ids"):
         load_image_flow_adapter(model, path, _config())
-
-
-def test_probe_applies_adapter_only_to_configured_text_checkpoint(tmp_path):
-    text_checkpoint = tmp_path / "qwen-text"
-    trained_checkpoint = tmp_path / "checkpoint-2404"
-    adapter = tmp_path / "adapter.pt"
-
-    assert should_load_configured_adapter(
-        adapter_path=adapter,
-        configured_model_path=text_checkpoint,
-        probe_model_path=text_checkpoint,
-    )
-    assert not should_load_configured_adapter(
-        adapter_path=adapter,
-        configured_model_path=text_checkpoint,
-        probe_model_path=trained_checkpoint,
-    )
-    assert not should_load_configured_adapter(
-        adapter_path=adapter,
-        configured_model_path=text_checkpoint,
-        probe_model_path=text_checkpoint,
-        ema_dir=trained_checkpoint,
-    )
-    assert not should_load_configured_adapter(
-        adapter_path="none",
-        configured_model_path=text_checkpoint,
-        probe_model_path=text_checkpoint,
-    )
-
-
-def test_split_init_production_config_preserves_global_training_contract():
-    config = OmegaConf.load(
-        "configs/selfless/"
-        "imagenet1k_caption_joint_text_backbone_adapter_10ep_ascend16_b1024.yaml"
-    )
-    report = validate_config(config, world_size=16)
-    assert report["global_batch"] == 1024
-    assert report["gradient_accumulation_steps"] == 4
-    assert report["validation_every_steps"] == 1202
-    assert config.model.model_path == "public/models/Qwen--Qwen3-0.6B-Base"
-    assert str(config.model.pretrained_image_flow_adapter).endswith(
-        "image_flow_adapter-final.pt"
-    )
-    assert config.model.lambda_text == pytest.approx(0.4)
-    assert config.optimizer.params.backbone_learning_rate == pytest.approx(2e-6)
-    assert config.optimizer.params.flow_learning_rate == pytest.approx(2e-5)
-
-
-def test_split_init_config_rejects_full_joint_checkpoint_as_backbone():
-    config = OmegaConf.load(
-        "configs/selfless/"
-        "imagenet1k_caption_joint_text_backbone_adapter_10ep_ascend16_b1024.yaml"
-    )
-    config.model.model_path = (
-        "output/selfless-flow-imagenet1k-class-ascend64-b1024-800ep/"
-        "hf_model-final-ema"
-    )
-    with pytest.raises(RuntimeError, match="model_path"):
-        validate_config(config, world_size=16)

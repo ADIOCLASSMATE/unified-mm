@@ -42,7 +42,7 @@ from utils.utils import get_selfless_mask, load_model_tokenizer  # noqa: E402
 
 
 DEFAULT_CONFIG = Path(
-    "configs/selfless/imagenet1k_caption_joint_sweep_10ep_ascend16_b1024.yaml"
+    "configs/selfless/imagenet1k_caption_joint_10ep_ascend16_b1024.yaml"
 )
 DEFAULT_IMAGE_ROOT = Path(
     "public/dataset/imagenet/v1/ILSVRC/Data/CLS-LOC/train"

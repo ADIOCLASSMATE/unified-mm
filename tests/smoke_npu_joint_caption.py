@@ -50,7 +50,7 @@ def tiny_config() -> Qwen3Config:
     config.image_input_noise_strength = 0.0
     config.image_uncond_prob = 0.0
     config.backbone_attention_output_gate = "none"
-    config.lambda_text = 0.2
+    config.lambda_text = 0.05
     config.lambda_image = 1.0
     config.use_flex_attention = True
     config.use_cache = False

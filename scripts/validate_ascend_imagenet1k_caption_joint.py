@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Validate one 16-NPU ImageNet-1K joint-caption LR-sweep candidate."""
+"""Validate the selected 16-NPU ImageNet-1K Caption + T2I configuration."""
 
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
-import math
 import os
 from pathlib import Path
 
@@ -39,17 +38,8 @@ MODEL_CONFIG_SHA256 = (
 IMAGENET_MANIFEST_SHA256 = (
     "9d165263e8cf4ba6d537d084a8cc3b87af2eaf5ef9a5b59e1360a6228c840759"
 )
-CANDIDATES = {
-    "b5e6-f1e5": (5e-6, 1e-5),
-    "b5e6-f2e5": (5e-6, 2e-5),
-    "b5e6-f4e5": (5e-6, 4e-5),
-    "b1e5-f1e5": (1e-5, 1e-5),
-    "b1e5-f2e5": (1e-5, 2e-5),
-    "b1e5-f4e5": (1e-5, 4e-5),
-    "b2e5-f1e5": (2e-5, 1e-5),
-    "b2e5-f2e5": (2e-5, 2e-5),
-    "b2e5-f4e5": (2e-5, 4e-5),
-}
+SELECTED_LR = 2e-5
+SELECTED_LAMBDA_TEXT = 0.05
 
 
 def sha256_file(path: Path) -> str:
@@ -74,21 +64,6 @@ def require_hash(path: Path, expected: str, label: str) -> str:
             f"path={path}"
         )
     return actual
-
-
-def validate_candidate(run_id: str, backbone_lr: float, flow_lr: float) -> None:
-    if run_id not in CANDIDATES:
-        raise ValueError(f"unknown sweep candidate {run_id!r}")
-    expected_backbone, expected_flow = CANDIDATES[run_id]
-    if not math.isclose(backbone_lr, expected_backbone, rel_tol=0.0, abs_tol=1e-15):
-        raise ValueError(
-            f"candidate {run_id} backbone LR mismatch: "
-            f"{backbone_lr} != {expected_backbone}"
-        )
-    if not math.isclose(flow_lr, expected_flow, rel_tol=0.0, abs_tol=1e-15):
-        raise ValueError(
-            f"candidate {run_id} flow LR mismatch: {flow_lr} != {expected_flow}"
-        )
 
 
 def validate_config(config, *, world_size: int) -> dict[str, object]:
@@ -122,8 +97,32 @@ def validate_config(config, *, world_size: int) -> dict[str, object]:
             str(params.synthetic_text_index_manifest),
             "public/datasets/imagenet1k_synthetic_v1/indexed/train/manifest.json",
         ),
-        "lambda_text": (float(config.model.lambda_text), 0.2),
+        "lambda_text": (float(config.model.lambda_text), SELECTED_LAMBDA_TEXT),
         "lambda_image": (float(config.model.lambda_image), 1.0),
+        "pretrained_image_flow_adapter": (
+            str(config.model.pretrained_image_flow_adapter).lower(),
+            "none",
+        ),
+        "learning_rate": (
+            float(config.optimizer.params.learning_rate),
+            SELECTED_LR,
+        ),
+        "backbone_learning_rate": (
+            float(config.optimizer.params.backbone_learning_rate),
+            SELECTED_LR,
+        ),
+        "special_token_learning_rate": (
+            float(config.optimizer.params.special_token_learning_rate),
+            SELECTED_LR,
+        ),
+        "projector_learning_rate": (
+            float(config.optimizer.params.projector_learning_rate),
+            SELECTED_LR,
+        ),
+        "flow_learning_rate": (
+            float(config.optimizer.params.flow_learning_rate),
+            SELECTED_LR,
+        ),
         "total_batch_size": (int(config.training.total_batch_size), GLOBAL_BATCH),
         "batch_size": (int(config.training.batch_size), 16),
         "samples_per_epoch": (
@@ -136,10 +135,16 @@ def validate_config(config, *, world_size: int) -> dict[str, object]:
         ),
         "num_train_epochs": (int(config.training.num_train_epochs), EPOCHS),
         "max_train_steps": (int(config.training.max_train_steps), MAX_STEPS),
+        "stop_after_steps": (int(config.training.stop_after_steps), MAX_STEPS),
         "warmup_steps": (int(config.lr_scheduler.params.warmup_steps), 1_202),
         "decay_steps": (int(config.lr_scheduler.params.decay_steps), 3_606),
         "save_every": (int(config.experiment.save_every), 2_404),
         "val_every": (int(config.experiment.val_every), 2_404),
+        "log_every": (int(config.experiment.log_every), 50),
+        "log_grad_norm_every": (
+            int(config.experiment.log_grad_norm_every),
+            1_200,
+        ),
         "max_seq_length": (int(params.max_seq_length), 512),
         "pad_to_length": (int(params.pad_to_length), 512),
         "split_strategy": (str(params.split_strategy), "stratified"),
@@ -157,14 +162,24 @@ def validate_config(config, *, world_size: int) -> dict[str, object]:
             raise RuntimeError(f"config {label} mismatch: {actual!r} != {expected!r}")
     denominator = int(config.training.batch_size) * int(world_size)
     if GLOBAL_BATCH % denominator:
-        raise RuntimeError("global batch is not divisible by per-rank batch * world size")
+        raise RuntimeError(
+            "global batch is not divisible by per-rank batch * world size"
+        )
     accumulation = GLOBAL_BATCH // denominator
     if accumulation != 4:
-        raise RuntimeError(f"16-NPU sweep requires gradient accumulation 4, got {accumulation}")
+        raise RuntimeError(
+            "16-NPU training requires gradient accumulation 4, "
+            f"got {accumulation}"
+        )
     if bool(config.training.from_scratch):
-        raise RuntimeError("joint sweep must load the completed EMA initialization")
+        raise RuntimeError("joint training must load the completed EMA initialization")
     if not bool(config.training.use_ema):
-        raise RuntimeError("joint sweep requires EMA")
+        raise RuntimeError("joint training requires EMA")
+    if (
+        int(config.experiment.log_grad_norm_every)
+        % int(config.experiment.log_every)
+    ):
+        raise RuntimeError("gradient norm interval must align with log interval")
     return {
         "world_size": int(world_size),
         "microbatch_per_rank": int(config.training.batch_size),
@@ -390,19 +405,9 @@ def parse_args() -> argparse.Namespace:
         "--config",
         default=(
             "configs/selfless/"
-            "imagenet1k_caption_joint_sweep_10ep_ascend16_b1024.yaml"
+            "imagenet1k_caption_joint_10ep_ascend16_b1024.yaml"
         ),
     )
-    parser.add_argument("--run_id", required=True)
-    parser.add_argument("--backbone_lr", required=True, type=float)
-    parser.add_argument("--flow_lr", required=True, type=float)
-    parser.add_argument(
-        "--stop_after_steps",
-        required=True,
-        type=int,
-        choices=(2_404, 4_808, 12_020),
-    )
-    parser.add_argument("--lambda_text", type=float, default=0.2)
     parser.add_argument("--world_size", type=int, default=16)
     parser.add_argument("--require_npu_count", type=int, default=None)
     parser.add_argument("--require_hccl_intra_roce", action="store_true")
@@ -413,24 +418,18 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if not 0.025 <= float(args.lambda_text) <= 0.4:
-        raise ValueError(
-            f"lambda_text must be in the probe contract [0.025, 0.4], got {args.lambda_text}"
-        )
-    config_path = require_file(Path(args.config), "joint sweep config")
+    config_path = require_file(Path(args.config), "joint training config")
     config = OmegaConf.load(config_path)
-    validate_candidate(args.run_id, args.backbone_lr, args.flow_lr)
     report: dict[str, object] = {
         "status": "ok",
         "config": str(config_path),
-        "candidate": {
-            "run_id": args.run_id,
-            "backbone_lr": args.backbone_lr,
-            "special_token_lr": args.backbone_lr,
-            "flow_lr": args.flow_lr,
-            "projector_lr": args.flow_lr,
-            "stop_after_steps": args.stop_after_steps,
-            "lambda_text": args.lambda_text,
+        "selection": {
+            "backbone_lr": SELECTED_LR,
+            "special_token_lr": SELECTED_LR,
+            "flow_lr": SELECTED_LR,
+            "projector_lr": SELECTED_LR,
+            "stop_after_steps": MAX_STEPS,
+            "lambda_text": SELECTED_LAMBDA_TEXT,
             "lambda_image": 1.0,
         },
         "training": validate_config(config, world_size=args.world_size),

@@ -14,15 +14,9 @@ export UNIFIED_MM_VENV="${UNIFIED_MM_VENV:-.venv}"
 source "${REPO_ROOT}/script/offline_env.sh"
 cd "${REPO_ROOT}"
 
-RUN_ID="${RUN_ID:?RUN_ID is required}"
 EVAL_ONLY="${EVAL_ONLY:-both}"
-CONFIG="${CONFIG:-configs/selfless/imagenet1k_caption_joint_sweep_10ep_ascend16_b1024.yaml}"
-if [[ "${RUN_ID}" == *-lt* ]]; then
-  DEFAULT_RUN_PROJECT="selfless-flow-imagenet1k-caption-joint-lambda-${RUN_ID}"
-else
-  DEFAULT_RUN_PROJECT="selfless-flow-imagenet1k-caption-joint-sweep-${RUN_ID}"
-fi
-RUN_PROJECT="${RUN_PROJECT:-${DEFAULT_RUN_PROJECT}}"
+CONFIG="${CONFIG:-configs/selfless/imagenet1k_caption_joint_10ep_ascend16_b1024.yaml}"
+RUN_PROJECT="${RUN_PROJECT:-selfless-flow-imagenet1k-caption-joint}"
 RUN_ROOT="output/${RUN_PROJECT}"
 MODEL_SUBDIR="${MODEL_SUBDIR:-hf_model-final-ema}"
 EVAL_SUBDIR="${EVAL_SUBDIR:-generation-evaluation}"
@@ -34,10 +28,6 @@ CLIP_MODEL="${CLIP_MODEL:-public/models/openai--clip-vit-base-patch32}"
 EXPECTED_CLIP_WEIGHT_SHA256="a63082132ba4f97a80bea76823f544493bffa8082296d62d71581a4feff1576f"
 NPU_COUNT=16
 
-if [[ ! "${RUN_ID}" =~ ^b(5e6|1e5|2e5)-f(1e5|2e5|4e5)(-lt[0-9]+p[0-9]+)?$ ]]; then
-  echo "ERROR: invalid sweep RUN_ID=${RUN_ID}" >&2
-  exit 2
-fi
 if [[ ! "${RUN_PROJECT}" =~ ^[a-zA-Z0-9._-]+$ ]]; then
   echo "ERROR: unsafe RUN_PROJECT=${RUN_PROJECT}" >&2
   exit 7
@@ -92,7 +82,7 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 unset CUDA_VISIBLE_DEVICES PYTORCH_CUDA_ALLOC_CONF
 mkdir -p "${EVAL_ROOT}/prelaunch_audit"
 
-python - "${RUN_ID}" "${MODEL_PATH}" "${CLIP_MODEL}" >"${EVAL_ROOT}/prelaunch_audit/assets.json" <<'PY'
+python - "${RUN_PROJECT}" "${MODEL_PATH}" "${CLIP_MODEL}" >"${EVAL_ROOT}/prelaunch_audit/assets.json" <<'PY'
 import hashlib
 import json
 from pathlib import Path
@@ -105,10 +95,10 @@ def sha256(path):
             digest.update(chunk)
     return digest.hexdigest()
 
-run_id, model_path, clip_model = sys.argv[1:]
+run_project, model_path, clip_model = sys.argv[1:]
 payload = {
     "schema": "selfless_imagenet1k_caption_joint_generation_preflight_v1",
-    "run_id": run_id,
+    "run_project": run_project,
     "model": {
         "path": model_path,
         "weights_sha256": sha256(Path(model_path) / "model.safetensors"),

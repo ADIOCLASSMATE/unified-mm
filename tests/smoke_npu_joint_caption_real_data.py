@@ -15,7 +15,7 @@ from utils.utils import get_selfless_mask, load_model_tokenizer
 
 
 CONFIG_PATH = Path(
-    "configs/selfless/imagenet1k_caption_joint_sweep_10ep_ascend16_b1024.yaml"
+    "configs/selfless/imagenet1k_caption_joint_10ep_ascend16_b1024.yaml"
 )
 
 

@@ -82,78 +82,20 @@ not implicitly mount the official dataset.
 - Sweep manifests、旧 checkpoint、评测产物、ImageNet-100 可执行配置和一次性
   launch 资产均已删除；仓库只保留结论。
 
-### ImageNet-1K synthetic caption/T2I joint LR sweep
+### Final ImageNet-1K synthetic Caption/T2I joint training
 
-- Initialization is the completed class-conditioned EMA model at
-  `output/selfless-flow-imagenet1k-class-ascend64-b1024-800ep/hf_model-final-ema`.
-- Published synthetic data is frozen by
-  `public/datasets/imagenet1k_synthetic_v1/dataset_manifest.json`. Training
-  uses the six synthetic captions per train image (three Qwen plus three
-  MiniMax; original caption excluded) and all twelve aligned T2I prompts.
-- The one-time seek index above contains no copied images or posterior
-  tensors. It provides low-memory random access to the 7.27GB caption JSONL
-  and 64 decompressed train T2I shards; regenerate it with
-  `scripts/prepare_imagenet1k_synthetic_text_index.py`.
-- The LR grid couples Backbone/Special-token LR and Flow/Projector LR:
-  `{5e-6,1e-5,2e-5} × {1e-5,2e-5,4e-5}`. Each candidate uses one 16-NPU
-  instance, per-rank batch 16, GA 4, and global batch 1024.
-- Fifty train images per class are held out without training overlap for
-  joint I2T/T2I loss selection. The remaining train split supplies 1,230,848
-  samples and 1,202 optimizer steps per epoch; ten epochs total 12,020 steps.
-- Config, sweep contract, and launcher are
-  `configs/selfless/imagenet1k_caption_joint_sweep_10ep_ascend16_b1024.yaml`,
-  `configs/selfless/imagenet1k_caption_joint_lr_sweep_10ep.json`, and
-  `script/selfless/pretraining_imagenet1k_caption_joint_sweep_ascend16.sh`.
-- The LR sweep is staged with the unchanged 12,020-step WSD horizon: all nine
-  candidates stop at 2,404, the validation/probe Top 4 continue to 4,808, and
-  the Top 2–3 continue to 12,020. `training.stop_after_steps` is operational
-  and excluded from the numerical resume signature; optimizer, scheduler,
-  FP32 sharded EMA, RNG, epoch, and dataloader offset remain strict.
-- The fixed-checkpoint no-optimizer gradient probe and NPU smoke entry are
-  `script/selfless/probe_imagenet1k_caption_joint_gradients_ascend.sh` and
-  `tests/smoke_npu_joint_gradient_probe.py`. The formal JSON contains 16–32
-  per-batch task-separated gradients plus summary quantiles and derives the
-  bounded lambda candidates around median `g_image / g_text`.
-- LR selection precedes the short lambda sweep; do not submit their Cartesian
-  product. Build the lambda manifest with
-  `scripts/build_imagenet1k_caption_joint_lambda_sweep.py` and launch one row
-  with `script/selfless/pretraining_imagenet1k_caption_joint_lambda_ascend16.sh`.
-- Validation-only ranking is never a final winner. The final Top 3 require one
-  I2T CLIP sample per ImageNet class and official 50,000-sample T2I FID/IS;
-  `scripts/finalize_imagenet1k_caption_joint_lr_sweep.py` reports FID/IS deltas
-  against the initialization checkpoint and applies generation mean-rank.
-
-#### Text-backbone plus image-adapter split-init control
-
-- The implemented split initialization uses the untouched Qwen3-0.6B-Base
-  transformer/text embedding/LM head and loads only the completed class run's
-  image flow head, image projector, image-token embedder, and four multimodal
-  special-token rows. The source hashes are
-  `cd2a512003e2f9f3cd3c32a9c3573f820bb28c940f73c57b1ddaa983d9223eba`
-  for the Qwen model weights and
-  `3a20383c73070a9e1db607d5b1b211acc1f51c37ad05ea41c215d19902a15d4c`
-  for the image adapter.
-- The retained short control is
-  `output/selfless-flow-imagenet1k-caption-joint-text-backbone-adapter-b2e6-f2e5-lt0p4`.
-  Platform Job `sf-i1k-split-b2e6-f2e5-lt0p4-s2404` succeeded on one 16-NPU
-  node. It used Backbone/Special-token LR `2e-6`, Flow/Projector LR `2e-5`,
-  `lambda_text=0.4`, `lambda_image=1.0`, and the unchanged 12,020-step WSD
-  horizon while stopping at step 2,404.
-- Full validation improved from step 1,202 to 2,404: text loss
-  `2.4638998508 -> 2.1049699783` and image-flow loss
-  `1.0152550936 -> 0.9465371370`, with identical target counts and validation
-  seed. Pre-clip gradient norm was `25.660700` at step 1,202 and `23.113558`
-  at step 2,404; both were clipped at `1.0` and both non-`log_every` steps were
-  persisted correctly.
-- Fixed 16-batch, no-optimizer EMA probes at init/1,202/2,404 used the same
-  holdout digest. Median shared-backbone `g_image/g_text` was
-  `1.1190/1.0117/0.8415`, so the bounded lambda center remained `0.4`.
-  Median cosine was `+0.04535/-0.00732/-0.00141`, with negative batches
-  `0/16`, `16/16`, and `11/16`. The conflict weakened by step 2,404 but did
-  not disappear; do not respond by only increasing the text loss weight.
-- This control has two validation points and task-separated probes, but no
-  canonical Caption CLIP or 50,000-sample FID/IS result. Treat it as a viable
-  short-run candidate, not a final winner.
+- The selected default is
+  `configs/selfless/imagenet1k_caption_joint_10ep_ascend16_b1024.yaml`, launched
+  by `script/selfless/pretraining_imagenet1k_caption_joint_ascend16.sh`.
+- It starts from the completed class-conditioned EMA, uses `2e-5` for the
+  backbone, special-token rows, image projector, and flow head, with
+  `lambda_text=0.05` and `lambda_image=1.0`.
+- The fixed contract remains 16 NPUs, per-rank batch 16, GA 4, global batch
+  1024, 10-epoch WSD, 12,020 optimizer steps, fixed seeds/splits/data order,
+  six synthetic captions per train image, and twelve aligned T2I prompts.
+- The sweep evidence, generation metrics, T2I-regression caveat, and source
+  report hashes are retained in `docs/IMAGENET1K_CAPTION_JOINT_CONCLUSION.md`.
+  Sweep/probe/control checkpoints and one-use orchestration assets are deleted.
 
 ### Formal ImageNet-1K 800-epoch pretraining
 

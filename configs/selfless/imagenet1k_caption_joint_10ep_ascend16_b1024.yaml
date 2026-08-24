@@ -1,14 +1,15 @@
-# Ten-epoch I2T-caption + T2I-flow LR sweep initialized from the completed
-# ImageNet-1K class-conditioned EMA model. Each full-node candidate uses
-# 16 Ascend 910B NPUs with per-rank batch 16 and gradient accumulation 4.
+# Final ten-epoch I2T-caption + T2I-flow training configuration selected by
+# the completed LR/loss-weight sweep. It is initialized from the completed
+# ImageNet-1K class-conditioned EMA model and uses one 16-NPU full node.
 experiment:
-    project: "selfless-flow-imagenet1k-caption-joint-sweep-template"
-    name: "imagenet1k-caption-joint-sweep-template"
+    project: "selfless-flow-imagenet1k-caption-joint"
+    name: "imagenet1k-caption-joint"
     wandb_project: "unified-mm"
     output_dir: "output"
     save_every: 2404
     log_every: 50
-    log_grad_norm_every: 1202
+    # Must be divisible by log_every so the pre-clip norm reaches the logger.
+    log_grad_norm_every: 1200
     checkpoints_total_limit: 5
     checkpoint_milestone_every: 2404
     save_ema_eval_every: 0
@@ -55,10 +56,9 @@ model:
     image_flow_solver: "heun"
     image_input_noise_strength: 1.0e-2
     image_uncond_prob: 0.1
-    # Keep the pre-existing 0.2:1 scale only as the controlled LR-sweep
-    # baseline.  It is not treated as optimal; the post-LR short sweep uses
-    # the fixed-checkpoint shared-backbone gradient probe as its center.
-    lambda_text: 0.2
+    # With domain-transition T2I degradation accepted, generation mean-rank
+    # over Caption CLIP (higher), FID (lower), and IS (higher) selects 0.05.
+    lambda_text: 0.05
     lambda_image: 1.0
     pretrained_image_flow_adapter: none
 
@@ -102,10 +102,10 @@ optimizer:
     name: "adamw"
     params:
         learning_rate: 2.0e-5
-        backbone_learning_rate: 1.0e-5
+        backbone_learning_rate: 2.0e-5
         projector_learning_rate: 2.0e-5
         flow_learning_rate: 2.0e-5
-        special_token_learning_rate: 1.0e-5
+        special_token_learning_rate: 2.0e-5
         scale_lr: false
         beta1: 0.9
         beta2: 0.95
@@ -133,9 +133,6 @@ training:
     optimizer_steps_per_epoch: 1202
     num_train_epochs: 10
     max_train_steps: 12020
-    # Operational stage boundary only. The scheduler always retains the
-    # complete 10-epoch/12020-step horizon, and this field is deliberately
-    # excluded from the numerical resume signature.
     stop_after_steps: 12020
     max_grad_norm: 1.0
     use_gradient_checkpointing: false
@@ -152,7 +149,7 @@ training:
     save_image_flow_adapter: true
 
 evaluation:
-    checkpoint: "output/selfless-flow-imagenet1k-caption-joint-sweep-template/hf_model-final-ema"
+    checkpoint: "output/selfless-flow-imagenet1k-caption-joint/hf_model-final-ema"
     model_dtype: "bf16"
     samples: 5000
     batch_size: 4096
