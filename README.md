@@ -55,7 +55,7 @@ validation 保持一条样本一行。
 
 ## 评测
 
-正式 ImageNet-1K 协议是 50K samples、BF16、CFG 3.5、100-step Heun、
+正式 ImageNet-1K 协议是 50K samples、BF16、CFG 3.5、10-step Heun、
 `spatial_halton`。
 评测核心入口是 `scripts/evaluate_single_stream_fid_is.py`；global batch 会先按
 rank 切分，再进入 dataset collation。

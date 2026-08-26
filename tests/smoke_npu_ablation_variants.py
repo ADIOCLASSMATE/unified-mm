@@ -50,8 +50,8 @@ def tiny_config(model_label: str) -> Qwen3Config:
     config.image_tokens_per_img = 4
     config.image_flow_width = 32
     config.image_flow_depth = 2
-    config.image_flow_num_sampling_steps = "1"
-    config.image_flow_batch_mul = 4 if model_label == "dynamic_xt" else 1
+    config.image_flow_num_sampling_steps = "10"
+    config.image_flow_batch_mul = 1
     config.image_flow_time_scale = 1000.0
     config.image_flow_time_sampling = "uniform"
     config.image_flow_time_eps = 1.0e-4
@@ -121,6 +121,17 @@ def run_variant(
     )
 
     model.train()
+    backbone_calls = 0
+
+    def count_backbone_calls(_module, _args, _output):
+        nonlocal backbone_calls
+        backbone_calls += 1
+
+    hook = (
+        model.model.register_forward_hook(count_backbone_calls)
+        if model_label == "dynamic_xt"
+        else None
+    )
     output = model(
         X0_input_ids=payload["input_ids"],
         labels=payload["labels"],
@@ -134,6 +145,13 @@ def run_variant(
     if not bool(torch.isfinite(output.loss).item()):
         raise AssertionError(f"{model_label} training loss is not finite")
     output.loss.backward()
+    if hook is not None:
+        hook.remove()
+        if backbone_calls != 1:
+            raise AssertionError(
+                "Dynamic-XT training executed the backbone "
+                f"{backbone_calls} times"
+            )
     final_grad = model.image_flow_head.net.final_layer.linear.weight.grad
     if final_grad is None or not bool(torch.isfinite(final_grad).all().item()):
         raise AssertionError(f"{model_label} flow backward failed")

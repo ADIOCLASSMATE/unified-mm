@@ -1,5 +1,6 @@
 import inspect
 
+import pytest
 import torch
 from transformers import (
     AutoConfig,
@@ -48,7 +49,7 @@ def tiny_config(config_class=SelflessFlowDynamicXtConfig):
     config.image_tokens_per_img = 4
     config.image_flow_width = 32
     config.image_flow_depth = 2
-    config.image_flow_num_sampling_steps = "2"
+    config.image_flow_num_sampling_steps = "10"
     config.image_flow_batch_mul = 1
     config.image_flow_time_scale = 1000.0
     config.image_flow_time_sampling = "uniform"
@@ -92,7 +93,7 @@ def test_flow_head_accepts_presampled_state_without_resampling():
         z_channels=32,
         depth=1,
         width=32,
-        num_sampling_steps="2",
+        num_sampling_steps="10",
         time_sampling="uniform",
         uniform_mix=0.0,
         image_tokens_per_img=4,
@@ -144,6 +145,17 @@ def test_dynamic_model_has_distinct_type_and_only_time_embedder_capacity():
     assert not hasattr(Qwen3Model(tiny_config(Qwen3Config)), "backbone_flow_time_embedder")
 
 
+def test_dynamic_training_contract_requires_one_flow_state_without_rematerialization():
+    source = inspect.getsource(DynamicXtQwen3ForCausalLM.forward)
+    assert "for repeat_idx in range(repeats)" not in source
+    assert "checkpoint(" not in source
+
+    invalid = tiny_config()
+    invalid.image_flow_batch_mul = 4
+    with pytest.raises(ValueError, match="image_flow_batch_mul=1"):
+        DynamicXtQwen3ForCausalLM(invalid)
+
+
 def test_dynamic_only_initialization_preserves_static_parameters_and_rng():
     seed = 456
     torch.manual_seed(seed)
@@ -179,7 +191,7 @@ def test_dynamic_presampling_keeps_static_x0_then_rf_rng_order():
     source = inspect.getsource(DynamicXtQwen3ForCausalLM.forward)
     input_noise_offset = source.index("self._shared_noisy_image_latents")
     rf_state_offset = source.index("self.image_flow_head.sample_training_state")
-    backbone_offset = source.index("def run_backbone")
+    backbone_offset = source.index("hidden_states = self.model")
     assert input_noise_offset < rf_state_offset < backbone_offset
 
     static_config = tiny_config(Qwen3Config)
@@ -296,7 +308,7 @@ def test_heun_calls_dynamic_condition_for_predictor_and_corrector():
         z_channels=32,
         depth=1,
         width=32,
-        num_sampling_steps="1",
+        num_sampling_steps="10",
         time_sampling="uniform",
         uniform_mix=0.0,
         image_tokens_per_img=4,

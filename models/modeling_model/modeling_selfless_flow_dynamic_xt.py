@@ -1,8 +1,8 @@
-"""Isolated Dynamic-XT backbone-in-the-flow-loop Selfless-Flow ablation.
+"""Dynamic-XT successor backbone for Selfless-Flow.
 
-The default static implementation is intentionally not parameterized by this
-experiment.  Dynamic-XT keeps the clean X0 stream and strict selfless mask,
-but replaces image XT mask queries with ``embed(x_t) + time_embed(t)``.
+Dynamic-XT keeps the clean X0 stream and strict selfless mask, but replaces
+image XT mask queries with ``embed(x_t) + time_embed(t)``. Training uses one
+rectified-flow state per image and therefore one backbone execution per step.
 """
 
 from __future__ import annotations
@@ -10,7 +10,6 @@ from __future__ import annotations
 import torch
 from torch import nn
 from torch.nn.attention.flex_attention import create_block_mask
-from torch.utils.checkpoint import checkpoint
 from transformers import AutoConfig
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.modeling_outputs import (
@@ -314,6 +313,11 @@ class DynamicXtQwen3ForCausalLM(Qwen3ForCausalLM):
         self.image_flow_batch_mul = int(
             getattr(config, "image_flow_batch_mul", 1)
         )
+        if self.image_flow_batch_mul != 1:
+            raise ValueError(
+                "Dynamic-XT single-state training requires "
+                "image_flow_batch_mul=1"
+            )
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.image_flow_condition_proj = nn.Linear(
             config.hidden_size, config.hidden_size, bias=True
@@ -455,17 +459,13 @@ class DynamicXtQwen3ForCausalLM(Qwen3ForCausalLM):
             image_loss_mask=image_loss_mask,
         )
         targets = layout["targets"]
-        repeats = self.image_flow_batch_mul
-        repeated_targets = targets.repeat(repeats, 1, 1)
         # Preserve static RNG ordering: X0 input noise is sampled first.  The
         # complete RF state is still sampled before any backbone evaluation.
         context_image_latents = self._shared_noisy_image_latents(
             image_latents,
             token_types,
         )
-        training_state = self.image_flow_head.sample_training_state(
-            repeated_targets
-        )
+        training_state = self.image_flow_head.sample_training_state(targets)
         x0_inputs_embeds = self.model._build_x0_inputs_embeds(
             input_ids=X0_input_ids,
             token_types=token_types,
@@ -480,87 +480,53 @@ class DynamicXtQwen3ForCausalLM(Qwen3ForCausalLM):
         rows = layout["rows"]
         token_indices = layout["token_indices"]
         batch_size, seq_len = X0_input_ids.shape
-        num_images = int(rows.shape[0])
-        conditions = []
-        last_outputs = None
-        for repeat_idx in range(repeats):
-            state = training_state.slice(
-                repeat_idx * num_images,
-                (repeat_idx + 1) * num_images,
-            )
-            aligned_x_t = torch.zeros(
-                batch_size,
-                seq_len,
-                self.image_latent_dim,
-                device=X0_input_ids.device,
-                dtype=state.x_t.dtype,
-            )
-            aligned_t = torch.zeros(
-                batch_size,
-                seq_len,
-                device=X0_input_ids.device,
-                dtype=torch.float32,
-            )
-            query_mask = torch.zeros(
-                batch_size,
-                seq_len,
-                device=X0_input_ids.device,
-                dtype=torch.bool,
-            )
-            aligned_x_t[rows.unsqueeze(1), token_indices] = state.x_t
-            aligned_t[rows.unsqueeze(1), token_indices] = state.t
-            local_loss_mask = layout["loss_mask"]
-            if local_loss_mask is None:
-                query_mask[rows.unsqueeze(1), token_indices] = True
-            else:
-                query_mask[rows.unsqueeze(1), token_indices] = local_loss_mask
+        aligned_x_t = torch.zeros(
+            batch_size,
+            seq_len,
+            self.image_latent_dim,
+            device=X0_input_ids.device,
+            dtype=training_state.x_t.dtype,
+        )
+        aligned_t = torch.zeros(
+            batch_size,
+            seq_len,
+            device=X0_input_ids.device,
+            dtype=torch.float32,
+        )
+        query_mask = torch.zeros(
+            batch_size,
+            seq_len,
+            device=X0_input_ids.device,
+            dtype=torch.bool,
+        )
+        aligned_x_t[rows.unsqueeze(1), token_indices] = training_state.x_t
+        aligned_t[rows.unsqueeze(1), token_indices] = training_state.t
+        local_loss_mask = layout["loss_mask"]
+        if local_loss_mask is None:
+            query_mask[rows.unsqueeze(1), token_indices] = True
+        else:
+            query_mask[rows.unsqueeze(1), token_indices] = local_loss_mask
 
-            def run_backbone(x0_embeds, xt_latents, xt_times, xt_mask):
-                return self.model(
-                    X0_inputs_embeds=x0_embeds,
-                    XT_input_ids=X0_input_ids,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    past_key_values=None,
-                    use_cache=False,
-                    cache_position=cache_position,
-                    calculate_likelihood=True,
-                    xt_flow_latents=xt_latents,
-                    xt_flow_times=xt_times,
-                    xt_flow_query_mask=xt_mask,
-                    **model_kwargs,
-                ).last_hidden_state
-
-            if self.training and torch.is_grad_enabled():
-                # Four independent RF states require four dynamic backbone
-                # graphs. Rematerialize only this ablation-specific backbone
-                # region so the formal B16 contract fits without changing the
-                # flow head, batch, objective, or operator implementations.
-                hidden_states = checkpoint(
-                    run_backbone,
-                    x0_inputs_embeds,
-                    aligned_x_t,
-                    aligned_t,
-                    query_mask,
-                    use_reentrant=False,
-                    preserve_rng_state=True,
-                )
-            else:
-                hidden_states = run_backbone(
-                    x0_inputs_embeds,
-                    aligned_x_t,
-                    aligned_t,
-                    query_mask,
-                )
-            last_outputs = hidden_states
-            selected_hidden = torch.index_select(hidden_states, 0, rows)
-            gather_index = token_indices.unsqueeze(-1).expand(
-                -1, -1, hidden_states.shape[-1]
-            )
-            image_hidden = torch.gather(selected_hidden, 1, gather_index)
-            conditions.append(self._prepare_image_flow_condition(image_hidden))
-
-        image_conditions = torch.cat(conditions, dim=0)
+        hidden_states = self.model(
+            X0_inputs_embeds=x0_inputs_embeds,
+            XT_input_ids=X0_input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=None,
+            use_cache=False,
+            cache_position=cache_position,
+            calculate_likelihood=True,
+            xt_flow_latents=aligned_x_t,
+            xt_flow_times=aligned_t,
+            xt_flow_query_mask=query_mask,
+            **model_kwargs,
+        ).last_hidden_state
+        selected_hidden = torch.index_select(hidden_states, 0, rows)
+        gather_index = token_indices.unsqueeze(-1).expand(
+            -1, -1, hidden_states.shape[-1]
+        )
+        image_hidden = torch.gather(selected_hidden, 1, gather_index)
+        image_conditions = self._prepare_image_flow_condition(image_hidden)
         context_for_loss = (
             image_latents
             if context_image_latents is None
@@ -568,14 +534,12 @@ class DynamicXtQwen3ForCausalLM(Qwen3ForCausalLM):
         ).to(X0_input_ids.device)
         image_context = context_for_loss[
             rows.unsqueeze(1), token_indices
-        ].repeat(repeats, 1, 1)
-        sigmas = layout["sigmas"].repeat(repeats, 1)
-        positions = layout["positions"].repeat(repeats, 1)
+        ]
+        sigmas = layout["sigmas"]
+        positions = layout["positions"]
         loss_mask = layout["loss_mask"]
-        if loss_mask is not None:
-            loss_mask = loss_mask.repeat(repeats, 1)
         loss = self.image_flow_head(
-            target=repeated_targets,
+            target=targets,
             z=image_conditions,
             mask=loss_mask,
             sigma=sigmas,
@@ -589,7 +553,7 @@ class DynamicXtQwen3ForCausalLM(Qwen3ForCausalLM):
             logits=None,
             past_key_values=None,
         )
-        output["last_hidden_state"] = last_outputs
+        output["last_hidden_state"] = hidden_states
         output["flow_debug_stats"] = {
             key: value.detach()
             for key, value in self.image_flow_head.last_forward_stats.items()

@@ -3,7 +3,6 @@ from pathlib import Path
 
 from omegaconf import OmegaConf
 
-
 CONFIG_DIR = Path("configs/selfless")
 BASELINE = CONFIG_DIR / "imagenet1k_class_pretrain_800ep_ascend_64npu_bs1024.yaml"
 ABLATIONS = {
@@ -38,6 +37,7 @@ def test_ablation_configs_match_every_shared_baseline_setting():
         "positionwise_head": set(),
         "dynamic_xt": {
             "model.dynamic_xt_contract",
+            "model.image_flow_batch_mul",
             "training.target_epochs",
             "training.steps_per_epoch",
             "training.target_train_steps",

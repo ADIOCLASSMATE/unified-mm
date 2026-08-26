@@ -46,7 +46,7 @@ model:
     backbone_attention_output_gate: "none"
     image_flow_depth: 8
     image_flow_width: 1280
-    image_flow_num_sampling_steps: "100"
+    image_flow_num_sampling_steps: "10"
     image_flow_batch_mul: 4
     image_flow_time_scale: 1000.0
     image_flow_time_sampling: "logit_normal"
@@ -138,7 +138,7 @@ evaluation:
     batch_size: 4096
     batch_size_per_npu: 256
     vae_decode_batch_size: 16
-    sampling_steps: 100
+    sampling_steps: 10
     temperature: 1.0
     cfg: 3.5
     cfg_schedule: "constant"

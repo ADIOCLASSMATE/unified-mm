@@ -31,6 +31,19 @@ class PositionwiseFlowQwen3ForCausalLM(ContextualQwen3ForCausalLM):
         self.image_flow_batch_mul = int(
             getattr(config, "image_flow_batch_mul", 1)
         )
+        # Keep the inherited multimodal forward contract intact.  This class
+        # bypasses ContextualQwen3ForCausalLM.__init__ to avoid constructing the
+        # contextual head, so inherited scalar loss weights must be initialized
+        # explicitly as well.
+        self.lambda_text = float(getattr(config, "lambda_text", 0.0))
+        self.lambda_image = float(getattr(config, "lambda_image", 1.0))
+        if self.lambda_text < 0.0 or self.lambda_image < 0.0:
+            raise ValueError(
+                "lambda_text and lambda_image must be non-negative, got "
+                f"{self.lambda_text}/{self.lambda_image}"
+            )
+        if self.lambda_text == 0.0 and self.lambda_image == 0.0:
+            raise ValueError("lambda_text and lambda_image cannot both be zero")
         self.lm_head = nn.Linear(
             config.hidden_size,
             config.vocab_size,

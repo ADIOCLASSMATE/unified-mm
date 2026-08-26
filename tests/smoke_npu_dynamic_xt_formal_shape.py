@@ -97,6 +97,13 @@ def main() -> None:
         device,
         segment_ids=segment_ids,
     )
+    backbone_calls = 0
+
+    def count_backbone_calls(_module, _args, _output):
+        nonlocal backbone_calls
+        backbone_calls += 1
+
+    hook = model.model.register_forward_hook(count_backbone_calls)
     output = model(
         X0_input_ids=input_ids,
         labels=input_ids,
@@ -111,6 +118,11 @@ def main() -> None:
     if not bool(torch.isfinite(output.loss).item()):
         raise AssertionError("Dynamic-XT formal-shape loss is non-finite")
     output.loss.backward()
+    hook.remove()
+    if backbone_calls != 1:
+        raise AssertionError(
+            f"Dynamic-XT training executed the backbone {backbone_calls} times"
+        )
     torch.npu.synchronize()
     max_memory = int(torch.npu.max_memory_allocated(device))
     print(
@@ -118,6 +130,7 @@ def main() -> None:
             "batch_size": batch_size,
             "sequence_length": seq_len,
             "flow_batch_mul": int(model.image_flow_batch_mul),
+            "training_backbone_calls": backbone_calls,
             "loss": float(output.loss.detach().cpu()),
             "dynamic_xt_parameters": model.dynamic_xt_parameter_count(),
             "max_memory_allocated_bytes": max_memory,

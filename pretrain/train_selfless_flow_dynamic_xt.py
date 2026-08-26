@@ -1,4 +1,4 @@
-"""Dedicated training entry for the Dynamic-XT ImageNet ablation."""
+"""Dedicated training entry for the Dynamic-XT ImageNet successor backbone."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from models.modeling_model.modeling_selfless_flow_dynamic_xt import (
 from pretrain.train_selfless_flow import main as run_selfless_training
 from utils.utils import load_model_tokenizer
 
-DYNAMIC_XT_CONTRACT = "backbone_in_flow_loop_v1"
+DYNAMIC_XT_CONTRACT = "backbone_single_flow_state_v2"
 
 
 def load_dynamic_xt_model_tokenizer(

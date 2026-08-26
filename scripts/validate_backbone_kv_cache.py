@@ -43,7 +43,7 @@ def parse_args():
             "reduction numerics."
         ),
     )
-    parser.add_argument("--sampling_steps", type=int, default=1)
+    parser.add_argument("--sampling_steps", type=int, default=10)
     parser.add_argument("--max_generation_steps", type=int, default=0)
     parser.add_argument("--warmup_steps", type=int, default=0)
     parser.add_argument("--cfg", type=float, default=3.5)

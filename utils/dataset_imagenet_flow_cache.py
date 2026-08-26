@@ -788,14 +788,18 @@ class ImageNetFlowCacheDataset(Dataset):
         sample_epoch: int,
         is_training: bool,
     ) -> Tuple[Dict[str, torch.Tensor], int, int, str]:
-        if is_training and len(self.caption_sequence_modes) > 1:
+        if is_training:
+            task_count = len(self.caption_sequence_modes)
             task_offset = (
                 self._stable_sample_seed(int(idx), 0, "caption_task_offset")
-                % len(self.caption_sequence_modes)
+                % task_count
             )
             task_phase = task_offset + int(sample_epoch)
-            task_index = task_phase % len(self.caption_sequence_modes)
-            task_occurrence = task_phase // len(self.caption_sequence_modes)
+            task_index = task_phase % task_count
+            # Count how many times this sample has visited the selected task.
+            # For a single-mode T2I dataset this must advance every epoch;
+            # otherwise its per-image prompt would remain frozen forever.
+            task_occurrence = task_phase // task_count
         else:
             task_index = (
                 self._stable_sample_seed(int(idx), 0, "caption_validation_task")

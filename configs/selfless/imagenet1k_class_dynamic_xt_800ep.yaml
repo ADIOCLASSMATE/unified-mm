@@ -1,9 +1,9 @@
-# Dynamic-XT ImageNet-1K class-conditioned ablation on 64 Ascend 910B NPUs.
+# Dynamic-XT ImageNet-1K class-conditioned backbone training on 64 Ascend 910B NPUs.
 # 16 samples/rank * 64 ranks * GA 1 = global batch 1024.
 # 1,281,024 samples/epoch / 1024 = 1,251 optimizer steps/epoch.
 # WSD phases are exactly 5 warmup + 595 stable + 200 decay epochs.
-# Training/evaluation values mirror the static contract; identity, the
-# Dynamic-XT contract marker, and explicit accounting metadata differ.
+# This successor-backbone recipe intentionally uses one RF state per image so
+# each optimizer step executes the Dynamic-XT backbone exactly once.
 experiment:
     project: "selfless-flow-imagenet1k-class-dynamic-xt-ascend64-b1024-800ep"
     name: "imagenet1k-class-dynamic-xt-800ep-seed42-64x910b-b16ga1-b1024-b30e5-f4e5"
@@ -39,7 +39,7 @@ experiment:
     resume_from_checkpoint: none
 
 model:
-    dynamic_xt_contract: "backbone_in_flow_loop_v1"
+    dynamic_xt_contract: "backbone_single_flow_state_v2"
     model_path: "public/models/Qwen--Qwen3-0.6B-Base"
     use_flex_attention: true
     image_tokens_per_img: 256
@@ -47,8 +47,8 @@ model:
     backbone_attention_output_gate: "none"
     image_flow_depth: 8
     image_flow_width: 1280
-    image_flow_num_sampling_steps: "100"
-    image_flow_batch_mul: 4
+    image_flow_num_sampling_steps: "10"
+    image_flow_batch_mul: 1
     image_flow_time_scale: 1000.0
     image_flow_time_sampling: "logit_normal"
     image_flow_logit_mean: 0.0
@@ -142,7 +142,7 @@ evaluation:
     batch_size: 4096
     batch_size_per_npu: 256
     vae_decode_batch_size: 16
-    sampling_steps: 100
+    sampling_steps: 10
     temperature: 1.0
     cfg: 3.5
     cfg_schedule: "constant"

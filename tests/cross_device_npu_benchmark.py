@@ -53,7 +53,7 @@ def _production_config(flow_mul: int) -> Qwen3Config:
     config.image_tokens_per_img = 256
     config.image_flow_width = 1280
     config.image_flow_depth = 8
-    config.image_flow_num_sampling_steps = "100"
+    config.image_flow_num_sampling_steps = "10"
     config.image_flow_batch_mul = int(flow_mul)
     config.image_flow_time_scale = 1000.0
     config.image_flow_time_sampling = "logit_normal"
@@ -153,7 +153,7 @@ def prepare_fixture(path: Path, batch: int, flow_mul: int) -> None:
         z_channels=1024,
         depth=8,
         width=1280,
-        num_sampling_steps=100,
+        num_sampling_steps=10,
         time_scale=1000.0,
         time_sampling="logit_normal",
         logit_mean=0.0,
@@ -404,7 +404,7 @@ def _build_flow_step(fixture: dict[str, Any], device: torch.device):
         z_channels=1024,
         depth=8,
         width=1280,
-        num_sampling_steps=100,
+        num_sampling_steps=10,
         time_scale=1000.0,
         time_sampling="logit_normal",
         logit_mean=0.0,

@@ -96,7 +96,7 @@ env \
   experiment.validation_save_debug_images=true \
   experiment.validation_single_stream_parallel_rate=1 \
   "experiment.validation_single_stream_order_strategies=[${GENERATION_STRATEGY}]" \
-  model.image_flow_num_sampling_steps=2 \
+  model.image_flow_num_sampling_steps=10 \
   model.image_flow_batch_mul=1 \
   model.image_flow_solver=euler \
   dataset.params.max_samples=32 \
@@ -179,7 +179,7 @@ torchrun --standalone --nproc_per_node="${NPU_COUNT}" \
   --model_dtype bf16 \
   --samples 16 \
   --batch_size 16 \
-  --sampling_steps 2 \
+  --sampling_steps 10 \
   --temperature 1.0 \
   --cfg 1.0 \
   --cfg_schedule constant \

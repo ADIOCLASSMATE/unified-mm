@@ -11,6 +11,18 @@
 - Seekable joint-training text index:
   `public/datasets/imagenet1k_synthetic_v1/indexed/train/manifest.json`
 
+## Repository-wide generation default
+
+- All Selfless-Flow model variants and all training, validation, evaluation,
+  generalization, smoke, and benchmark configurations default to 10-step Heun
+  generation. Production YAMLs set both
+  `model.image_flow_num_sampling_steps=10` and
+  `evaluation.sampling_steps=10`; model-class fallbacks and CLI/launcher
+  defaults are also 10.
+- Explicit non-default step counts are experimental overrides and must use a
+  distinct output directory. Historical 100-step reports and artifacts retain
+  their original labels and metrics as completed-experiment evidence.
+
 ## Official dataset mount
 
 Any Notebook or Job that reads raw ImageNet must explicitly attach:
@@ -97,6 +109,79 @@ not implicitly mount the official dataset.
   report hashes are retained in `docs/IMAGENET1K_CAPTION_JOINT_CONCLUSION.md`.
   Sweep/probe/control checkpoints and one-use orchestration assets are deleted.
 
+### ImageNet-1K T2I-only 80-epoch training
+
+- The three formal configurations and launchers are paired as follows:
+  baseline uses
+  `configs/selfless/imagenet1k_t2i_baseline_80ep_ascend_64npu_bs1024.yaml`
+  with
+  `script/selfless/pretraining_imagenet1k_t2i_baseline_ascend_64npu_bs1024_80ep.sh`;
+  position-wise flow head uses
+  `configs/selfless/imagenet1k_t2i_positionwise_head_80ep_ascend_64npu_bs1024.yaml`
+  with
+  `script/selfless/pretraining_imagenet1k_t2i_positionwise_head_ascend_64npu_bs1024_80ep.sh`;
+  sequential sigma uses
+  `configs/selfless/imagenet1k_t2i_seq_sigma_80ep_ascend_64npu_bs1024.yaml`
+  with
+  `script/selfless/pretraining_imagenet1k_t2i_seq_sigma_ascend_64npu_bs1024_80ep.sh`.
+- Each run continues from its matching completed 800-epoch class-conditioned
+  EMA. Position-wise preserves `architecture_variant: positionwise_selfless`
+  with random image-sigma order and `spatial_halton` generation; sequential
+  sigma preserves the contextual flow head with sequential image-sigma and
+  generation order. Never cross-load another variant's EMA.
+- All three train only T2I image flow: `caption_sequence_modes: ["t2i"]`,
+  `lambda_text=0`, and `lambda_image=1`. None uses the joint-caption
+  checkpoint.
+- The fixed contract is 64 Ascend NPUs (`4 x 16`), per-rank batch 16, GA 1,
+  global batch 1024, 1,202 optimizer steps per epoch, 80 epochs, and 96,160
+  total optimizer steps. WSD uses 8 warmup + 48 stable + 24 decay epochs; all
+  trainable parameter groups use learning rate `2e-5`.
+- Training uses the aligned seek index at
+  `public/datasets/imagenet1k_synthetic_v1/indexed/train/manifest.json` and its
+  twelve synthetic T2I prompts per image. Every image receives a deterministic
+  random starting offset and rotates without replacement through all twelve
+  prompts before reuse; consecutive epochs never reuse its prompt. Epoch state
+  is shared with DataLoader workers and restored by the exact-resume cursor.
+- Canonical output roots are the matching
+  `output/selfless-flow-imagenet1k-t2i-{baseline,positionwise-head,seq-sigma}-ascend64-b1024-80ep`
+  directories.
+- The canonical T2I generation launchers are
+  `script/selfless/evaluate_imagenet1k_t2i_baseline_ascend16.sh`,
+  `script/selfless/evaluate_imagenet1k_t2i_positionwise_head_ascend16.sh`, and
+  `script/selfless/evaluate_imagenet1k_t2i_seq_sigma_ascend16.sh`. Each uses 16
+  Ascend NPUs, the matching final EMA HF export, 50,000 validation-image
+  synthetic T2I prompts, 10-step Heun, CFG 3.5, canonical paired noise, and
+  the frozen official ImageNet validation moments for FID/IS. Baseline and
+  position-wise use `spatial_halton`; sequential sigma uses `sequential`. Each
+  result is retained below its run root at
+  `generation-evaluation/heun10/t2i-fid-is/metrics.json`. The former 100-step
+  comparison result remains at `generation-evaluation/t2i-fid-is/metrics.json`.
+- A controlled 50,000-sample 10-step Heun evaluation completed on 2026-08-26
+  and established 10 steps as the repository-wide default.
+  It used the exact same model exports, prompts, canonical initial-noise
+  manifest, CFG, generation strategies, and real moments as the 100-step
+  evaluation; only `sampling_steps` changed. Results are retained at
+  `generation-evaluation/heun10/t2i-fid-is/metrics.json` under each run root.
+  The paired results are:
+
+  | Variant | FID (10 / 100) | IS (10 / 100) | 10-step speedup |
+  | --- | ---: | ---: | ---: |
+  | baseline | `7.08059539 / 7.16406866` | `291.19039612 / 290.10296936` | `3.745x` |
+  | position-wise | `6.32034850 / 6.35782419` | `277.25525208 / 277.88425598` | `1.351x` |
+  | sequential sigma | `6.53787385 / 6.89504184` | `200.10390015 / 190.78056335` | `3.788x` |
+
+  Ten steps caused no material quality regression, preserved both the FID and
+  IS architecture rankings, improved FID for all three variants, and improved
+  IS for baseline and sequential sigma. Launchers default to 10 steps and
+  accept `SAMPLING_STEPS` only as an explicit experimental override; use a
+  distinct `EVAL_SUBDIR` for any override to preserve paired results. The
+  10-step metrics SHA256 values are baseline
+  `1c49039290f78b78dcb75800bd0afef987d2df9f58c188f3486f455b07bf7c10`,
+  position-wise
+  `0ff65645f096d743925239651cc482362b21d8737a96f43f36e68235bca7b1be`,
+  and sequential sigma
+  `7d5c7c143c2edd79b301401e37a487033c5263a5183004ec4cd1fd56521fb362`.
+
 ### Formal ImageNet-1K 800-epoch pretraining
 
 - Contract: `docs/IMAGENET1K_800EP_PRETRAINING.md`.
@@ -167,13 +252,24 @@ not implicitly mount the official dataset.
   `public/datasets/imagenet_full/preparation/seq_sigma_train_val_eval_smoke_report_v2.json`;
   run the retained one-off smoke launcher with
   `script/selfless/smoke_imagenet1k_seq_sigma_train_val_eval_ascend16.sh`.
+- The sequential-image-sigma final EMA completed its canonical official 50K
+  evaluation on 2026-08-24 with deterministic canonical pairing, CFG 3.5,
+  100-step Heun, the required `sequential` generation strategy, and the frozen
+  official-val moments. Its FID is `8.633703493770327`, IS is
+  `247.52949981689454 ± 3.36128814432888`, and generation throughput is
+  `4.224009451221147 samples/s` on 16 NPUs. The retained result is
+  `output/selfless-flow-imagenet1k-class-ascend64-b1024-800ep-seq-sigma-fid-is/metrics.json`
+  (SHA256 `443a67f83ee365065eac074de45eadfb9ac00ff4ef8ed1cd2c4dcfec397e6458`).
+  Baseline and position-wise formal results use `spatial_halton`, so their
+  metric deltas against this result also include the inference-order change;
+  do not interpret those deltas as an isolated training-sigma ablation.
 
-### ImageNet-1K architecture ablations
+### ImageNet-1K architecture variants
 
-- Both architecture controls preserve the formal 64-NPU, global-batch-1024,
-  800-epoch optimization/data contract. A config-parity test permits only the
-  architecture identity, run/output names, and architecture-required
-  accounting fields to differ from the baseline.
+- The position-wise control preserves the formal 64-NPU, global-batch-1024,
+  800-epoch optimization/data contract. Dynamic-XT is instead a successor
+  backbone recipe and is not a controlled architecture comparison because it
+  intentionally uses one RF state per image rather than the baseline's four.
 - The position-wise-head control keeps the random-sigma selfless two-stream
   Qwen backbone and replaces only the contextual flow head with a vectorized
   MAR/NextStep-style AdaLN MLP. The head has no cross-token attention, content
@@ -182,11 +278,15 @@ not implicitly mount the official dataset.
   `configs/selfless/imagenet1k_class_pretrain_800ep_ascend_64npu_bs1024_positionwise_head.yaml`
   and
   `script/selfless/pretraining_imagenet1k_class_ascend_64npu_bs1024_800ep_positionwise_head.sh`.
-- The Dynamic-XT control keeps the same strict selfless X0/XT backbone and
+- The Dynamic-XT successor keeps the same strict selfless X0/XT backbone and
   contextual dual-stream flow head. It replaces only predicted-image XT
   queries with `image_token_embedder(x_t) + backbone_flow_time_embedder(t)`;
   Heun predictor/corrector evaluations recompute XT while reading fixed X0
   K/V without committing XT to the cache.
+- Its training contract is `backbone_single_flow_state_v2` with
+  `image_flow_batch_mul: 1`. A training step samples one `(x_t, t)`, executes
+  the backbone once, and executes the flow head once. The old four-state loop
+  and Dynamic-only backbone activation rematerialization are removed.
 - Dynamic-XT config and launcher:
   `configs/selfless/imagenet1k_class_dynamic_xt_800ep.yaml` and
   `script/selfless/pretraining_imagenet_class_dynamic_xt_800ep.sh`.
@@ -195,12 +295,21 @@ not implicitly mount the official dataset.
   dedicated Dynamic-XT evaluator entry while retaining the static protocol.
 - The position-wise-head retained smoke report is
   `public/datasets/imagenet_full/preparation/positionwise_head_smoke_report.json`.
-  Dynamic-XT passed the tiny train/backward plus Heun-CFG-cache NPU smoke and
-  the exact formal per-rank shape (`B=16`, `L=320`, 256 image tokens,
-  latent dim 16, flow batch multiplier 4) forward/backward smoke on
-  `dev-wjx-ascend`. Dynamic-only backbone activation rematerialization keeps
-  that exact batch contract within device memory; flow-head checkpointing and
-  the underlying NPU attention/operator paths remain unchanged.
+- The position-wise-head final EMA completed the canonical official 50K
+  evaluation on 2026-08-22 with deterministic canonical pairing, CFG 3.5,
+  100-step Heun, `spatial_halton`, and the frozen official-val moments. Its
+  FID is `18.2875253165069`, IS is
+  `438.955712890625 ± 3.8873937344382083`, and generation throughput is
+  `18.023885168137856 samples/s` on 16 NPUs. Relative to the same-protocol
+  baseline final EMA, FID improves by `0.7094187159337366` (`3.734%`), IS
+  decreases by `11.112829589843727` (`2.469%`), and throughput is `4.263x`.
+  The retained result is
+  `output/selfless-flow-imagenet1k-class-ascend64-b1024-800ep-positionwise-head-fid-is/metrics.json`
+  (SHA256 `a5850bc1072db7e5d5480ca02f6be33a849fb834682137e914bb1747fa405f83`).
+- The old four-state Dynamic-XT Job was stopped on 2026-08-26 and all of its
+  training and evaluation outputs were permanently deleted. The single-state
+  contract must start a fresh run and must never resume an old Dynamic-XT
+  checkpoint.
 
 ## Waiting
 

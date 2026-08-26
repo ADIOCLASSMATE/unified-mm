@@ -72,7 +72,7 @@ def build_config():
     cfg.backbone_attention_output_gate = "none"
     cfg.image_flow_depth = 8
     cfg.image_flow_width = 1280
-    cfg.image_flow_num_sampling_steps = "100"
+    cfg.image_flow_num_sampling_steps = "10"
     cfg.image_flow_batch_mul = int(os.environ.get("FLOW_MUL", "4"))
     cfg.image_flow_time_scale = 1000.0
     cfg.image_flow_time_sampling = "logit_normal"

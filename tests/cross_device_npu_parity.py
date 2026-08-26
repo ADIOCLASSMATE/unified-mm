@@ -50,7 +50,7 @@ def _config() -> Qwen3Config:
     config.image_tokens_per_img = 16
     config.image_flow_width = 128
     config.image_flow_depth = 2
-    config.image_flow_num_sampling_steps = "2"
+    config.image_flow_num_sampling_steps = "10"
     config.image_flow_batch_mul = 1
     config.image_flow_time_scale = 1000.0
     config.image_flow_time_sampling = "uniform"
@@ -173,7 +173,7 @@ def prepare_fixture(path: Path) -> None:
         z_channels=128,
         depth=2,
         width=128,
-        num_sampling_steps=2,
+        num_sampling_steps=10,
         time_sampling="uniform",
         uniform_mix=0.0,
         image_tokens_per_img=16,
@@ -270,7 +270,7 @@ def run_flow(
         z_channels=128,
         depth=2,
         width=128,
-        num_sampling_steps=2,
+        num_sampling_steps=10,
         time_sampling="uniform",
         uniform_mix=0.0,
         image_tokens_per_img=16,

@@ -102,7 +102,7 @@ def _write_offset_jsonl(path, rows):
     return offsets_path
 
 
-def _make_synthetic_text_index(tmp_path):
+def _make_synthetic_text_index(tmp_path, *, t2i_prompts=None):
     caption_path = tmp_path / "indexed-captions.jsonl"
     caption_offsets = _write_offset_jsonl(
         caption_path,
@@ -119,6 +119,8 @@ def _make_synthetic_text_index(tmp_path):
             }
         ],
     )
+    if t2i_prompts is None:
+        t2i_prompts = ["test caption", "test synthetic"]
     t2i_path = tmp_path / "indexed-t2i.jsonl"
     t2i_offsets = _write_offset_jsonl(
         t2i_path,
@@ -127,8 +129,7 @@ def _make_synthetic_text_index(tmp_path):
                 "image_id": "train/n00000001_1",
                 "model_result": {
                     "prompts": [
-                        {"prompt": "test caption"},
-                        {"prompt": "test synthetic"},
+                        {"prompt": prompt} for prompt in t2i_prompts
                     ]
                 },
             }
@@ -294,6 +295,43 @@ def test_joint_index_uses_distinct_caption_and_t2i_text_sources(tmp_path):
     assert all(102 not in item["labels"].tolist() for item in observed["i2t"])
     assert {int(item["caption_index"]) for item in observed["t2i"]} == {0, 1}
     assert {int(item["caption_index"]) for item in observed["i2t"]} == {0, 1}
+
+
+def test_t2i_only_prompts_rotate_without_replacement_across_epochs(tmp_path):
+    t2i_prompts = [" ".join(["test"] * length) for length in range(1, 13)]
+    caption_path, index_manifest = _make_synthetic_text_index(
+        tmp_path,
+        t2i_prompts=t2i_prompts,
+    )
+    dataset = _make_dataset(
+        tmp_path,
+        caption_jsonl=str(caption_path),
+        synthetic_text_index_manifest=str(index_manifest),
+        caption_include_original=False,
+        caption_sequence_modes=["t2i"],
+        max_seq_length=32,
+    )
+    dataset.set_training_indices([0])
+
+    prompt_indices = []
+    for epoch in range(25):
+        dataset.set_epoch(epoch)
+        item = dataset[0]
+        assert item["task_mode"] == "t2i"
+        assert int(item["caption_count"]) == 12
+        assert bool((item["labels"] == -100).all())
+        assert int(item["image_loss_mask"].sum()) == dataset.image_tokens_per_img
+        prompt_indices.append(int(item["caption_index"]))
+
+    # Each image receives a deterministic random starting offset, then uses
+    # every available prompt once before the cycle repeats. Adjacent epochs
+    # therefore never reuse a prompt when more than one prompt is available.
+    assert set(prompt_indices[:12]) == set(range(12))
+    assert prompt_indices[12:24] == prompt_indices[:12]
+    assert all(
+        current != following
+        for current, following in zip(prompt_indices, prompt_indices[1:])
+    )
 
 
 def test_caption_manifest_can_exclude_published_original_caption(tmp_path):

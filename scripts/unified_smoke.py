@@ -107,7 +107,7 @@ def tiny_config() -> Qwen3Config:
     config.image_tokens_per_img = 4
     config.image_flow_width = 32
     config.image_flow_depth = 1
-    config.image_flow_num_sampling_steps = "2"
+    config.image_flow_num_sampling_steps = "10"
     config.image_flow_batch_mul = 1
     config.image_flow_time_scale = 1000.0
     config.image_flow_time_sampling = "uniform"

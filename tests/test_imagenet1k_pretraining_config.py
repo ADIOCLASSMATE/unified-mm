@@ -23,6 +23,8 @@ def test_formal_imagenet1k_config_contract():
     assert report["optimizer_steps_per_epoch"] == 1251
     assert report["max_optimizer_steps"] == 1_000_800
     assert report["dropped_samples_per_epoch"] == 143
+    assert int(config.model.image_flow_num_sampling_steps) == 10
+    assert int(config.evaluation.sampling_steps) == 10
     assert report["wsd_epochs"] == {
         "warmup": 5,
         "stable": 595,

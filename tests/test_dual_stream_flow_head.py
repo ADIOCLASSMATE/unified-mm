@@ -13,7 +13,7 @@ def _flow(*, grad_checkpointing: bool = False) -> FlowLoss:
         z_channels=8,
         depth=3,
         width=32,
-        num_sampling_steps=2,
+        num_sampling_steps=10,
         grad_checkpointing=grad_checkpointing,
         image_tokens_per_img=4,
     )

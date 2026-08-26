@@ -18,6 +18,8 @@ def test_selected_joint_config_preserves_training_contract():
     assert report["global_batch"] == 1024
     assert report["gradient_accumulation_steps"] == 4
     assert report["max_optimizer_steps"] == 12020
+    assert int(config.model.image_flow_num_sampling_steps) == 10
+    assert int(config.evaluation.sampling_steps) == 10
     assert config.model.lambda_text == pytest.approx(0.05)
     assert config.model.lambda_image == pytest.approx(1.0)
     assert config.optimizer.params.backbone_learning_rate == pytest.approx(2e-5)

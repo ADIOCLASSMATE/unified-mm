@@ -40,6 +40,7 @@ IMAGENET_MANIFEST_SHA256 = (
 )
 SELECTED_LR = 2e-5
 SELECTED_LAMBDA_TEXT = 0.05
+DEFAULT_GENERATION_STEPS = 10
 
 
 def sha256_file(path: Path) -> str:
@@ -102,6 +103,14 @@ def validate_config(config, *, world_size: int) -> dict[str, object]:
         "pretrained_image_flow_adapter": (
             str(config.model.pretrained_image_flow_adapter).lower(),
             "none",
+        ),
+        "model_sampling_steps": (
+            int(config.model.image_flow_num_sampling_steps),
+            DEFAULT_GENERATION_STEPS,
+        ),
+        "evaluation_sampling_steps": (
+            int(config.evaluation.sampling_steps),
+            DEFAULT_GENERATION_STEPS,
         ),
         "learning_rate": (
             float(config.optimizer.params.learning_rate),

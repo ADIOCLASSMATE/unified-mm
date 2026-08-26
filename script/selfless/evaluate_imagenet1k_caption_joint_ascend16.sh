@@ -20,6 +20,8 @@ RUN_PROJECT="${RUN_PROJECT:-selfless-flow-imagenet1k-caption-joint}"
 RUN_ROOT="output/${RUN_PROJECT}"
 MODEL_SUBDIR="${MODEL_SUBDIR:-hf_model-final-ema}"
 EVAL_SUBDIR="${EVAL_SUBDIR:-generation-evaluation}"
+T2I_STRATEGIES="${T2I_STRATEGIES:-spatial_halton}"
+SAMPLING_STEPS="${SAMPLING_STEPS:-10}"
 MODEL_PATH="${RUN_ROOT}/${MODEL_SUBDIR}"
 EVAL_ROOT="${RUN_ROOT}/${EVAL_SUBDIR}"
 I2T_ROOT="${EVAL_ROOT}/i2t-clip"
@@ -43,6 +45,10 @@ fi
 if [[ "${EVAL_ONLY}" != "both" && "${EVAL_ONLY}" != "i2t" && "${EVAL_ONLY}" != "t2i" ]]; then
   echo "ERROR: EVAL_ONLY must be both, i2t, or t2i; got ${EVAL_ONLY}" >&2
   exit 3
+fi
+if [[ ! "${SAMPLING_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: SAMPLING_STEPS must be a positive integer; got ${SAMPLING_STEPS}" >&2
+  exit 10
 fi
 for required in \
   "${CONFIG}" \
@@ -149,13 +155,13 @@ run_t2i() {
     --batch_size 4096 \
     --split val \
     --caption_sequence_mode t2i \
-    --sampling_steps 100 \
+    --sampling_steps "${SAMPLING_STEPS}" \
     --temperature 1.0 \
     --cfg 3.5 \
     --cfg_schedule constant \
     --flow_solver heun \
     --parallel_rate 1 \
-    --strategies spatial_halton \
+    --strategies "${T2I_STRATEGIES}" \
     --vae_dtype fp32 \
     --vae_decode_batch_size 16 \
     --inception_weights_path public/models/torch-fidelity/weights-inception-2015-12-05-6726825d.pth \

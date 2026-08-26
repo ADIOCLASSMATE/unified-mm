@@ -160,7 +160,7 @@ RESUME_FROM=output/selfless-flow-imagenet1k-class-ascend64-b1024-800ep/checkpoin
 ```
 
 After training, formal FID/IS uses 50,000 generated samples, deterministic
-canonical noise pairing, CFG 3.5, 100-step Heun, and the frozen official-val
+canonical noise pairing, CFG 3.5, 10-step Heun, and the frozen official-val
 moments:
 
 The permanently retained 10-epoch EMA evaluation exports are complete model
@@ -174,10 +174,10 @@ torchrun --standalone --nproc_per_node=16 \
   scripts/evaluate_single_stream_fid_is.py \
   --config configs/selfless/imagenet1k_class_pretrain_800ep_ascend_64npu_bs1024.yaml \
   --model_path_override output/selfless-flow-imagenet1k-class-ascend64-b1024-800ep/hf_model-final-ema \
-  --output_dir output/selfless-flow-imagenet1k-class-ascend64-b1024-800ep-fid-is \
+  --output_dir output/selfless-flow-imagenet1k-class-ascend64-b1024-800ep-heun10-fid-is \
   --device npu --model_dtype bf16 \
   --samples 50000 --batch_size 4096 --vae_decode_batch_size 16 \
-  --sampling_steps 100 --temperature 1.0 --cfg 3.5 \
+  --sampling_steps 10 --temperature 1.0 --cfg 3.5 \
   --cfg_schedule constant --flow_solver heun \
   --parallel_rate 1 --strategies spatial_halton \
   --inception_weights_path public/models/torch-fidelity/weights-inception-2015-12-05-6726825d.pth \
@@ -215,3 +215,63 @@ official ImageNet-val moments.
 The retained machine-readable result is
 `output/selfless-flow-imagenet1k-class-ascend64-b1024-800ep-fid-is/metrics.json`
 (SHA256 `d6f066bffad8a4e3032ccc3aac4b9445e9589e21691c3519bdf5e2e722d506f8`).
+
+### Position-wise flow-head ablation
+
+The position-wise-head final EMA completed the same canonical official
+evaluation on 2026-08-22. It used the same 50,000 canonically paired samples,
+CFG 3.5, 100-step Heun solver, `spatial_halton` strategy, and frozen official
+ImageNet-val moments as the baseline above.
+
+| Metric | Position-wise | Baseline | Change |
+| --- | ---: | ---: | ---: |
+| FID | `18.2875253165069` | `18.996944032440638` | `-0.7094187159337366` (`-3.734%`) |
+| Inception Score | `438.955712890625 ± 3.8873937344382083` | `450.06854248046875 ± 4.259687366514454` | `-11.112829589843727` (`-2.469%`) |
+| Generation throughput | `18.023885168137856 samples/s` | `4.228181407150334 samples/s` | `4.263x` |
+
+Thus the position-wise head improves FID and substantially reduces generation
+cost, while its Inception Score is lower. The retained machine-readable result
+is
+`output/selfless-flow-imagenet1k-class-ascend64-b1024-800ep-positionwise-head-fid-is/metrics.json`
+(SHA256 `a5850bc1072db7e5d5480ca02f6be33a849fb834682137e914bb1747fa405f83`).
+
+### Sequential image-sigma ablation
+
+The sequential-image-sigma final EMA completed its canonical official
+evaluation on 2026-08-24. All 50,000 requested samples were evaluated with
+canonical initial noise and sample pairing, CFG 3.5, a 100-step Heun solver,
+the required `sequential` generation strategy, and the same frozen official
+ImageNet-val moments.
+
+| Metric | Seq-sigma (`sequential`) | Baseline (`spatial_halton`) | Descriptive change |
+| --- | ---: | ---: | ---: |
+| FID | `8.633703493770327` | `18.996944032440638` | `-10.363240538670311` (`-54.552%`) |
+| Inception Score | `247.52949981689454 ± 3.36128814432888` | `450.06854248046875 ± 4.259687366514454` | `-202.5390426635742` (`-45.002%`) |
+| Generation throughput | `4.224009451221147 samples/s` | `4.228181407150334 samples/s` | `0.999x` |
+
+The canonical noise and ordered sample manifests match the baseline, but the
+generation strategies do not. Consequently, these deltas describe the formal
+end-to-end recipes and cannot isolate the effect of training sigma order: a
+controlled attribution would also evaluate the baseline with `sequential`.
+The retained machine-readable seq-sigma result is
+`output/selfless-flow-imagenet1k-class-ascend64-b1024-800ep-seq-sigma-fid-is/metrics.json`
+(SHA256 `443a67f83ee365065eac074de45eadfb9ac00ff4ef8ed1cd2c4dcfec397e6458`).
+
+### Dynamic-XT successor-backbone contract
+
+Dynamic-XT adds `backbone_flow_time_embedder(t)` to predicted-image XT queries
+and recomputes XT-dependent backbone states during generation while retaining
+fixed X0 K/V context. It is intended as the backbone for the next training
+stage, not as a controlled comparison against the static baseline.
+
+Training uses contract `backbone_single_flow_state_v2` and
+`image_flow_batch_mul: 1`. Each optimizer step samples one rectified-flow
+state per image, calls the backbone once, and calls the contextual flow head
+once. The former four-state backbone loop and its Dynamic-only activation
+rematerialization have been removed. This changes the flow-loss sampling
+contract relative to the baseline by design.
+
+The old four-state Dynamic-XT training Job was stopped on 2026-08-26. Its
+checkpoint, validation, generation, and metric output directories were
+permanently deleted. Any new Dynamic-XT training must start from the configured
+Qwen base model and must not resume the deleted four-state run.

@@ -12,7 +12,7 @@ def _head() -> PositionwiseFlowLoss:
         z_channels=8,
         depth=3,
         width=32,
-        num_sampling_steps=2,
+        num_sampling_steps=10,
         image_tokens_per_img=4,
     )
     with torch.no_grad():

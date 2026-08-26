@@ -20,7 +20,7 @@
 
 ## Evaluation defaults
 
-- EMA checkpoint, BF16 model forward, CFG 3.5, constant schedule, 100-step
+- EMA checkpoint, BF16 model forward, CFG 3.5, constant schedule, 10-step
   Heun, `spatial_halton`, `parallel_rate=1`, seed 42.
 - Formal ImageNet-1K evaluation uses 50K samples on 16×Ascend 910B with HCCL.
 - Evaluator batch size is global before sharding: default 4096, or 256/rank.

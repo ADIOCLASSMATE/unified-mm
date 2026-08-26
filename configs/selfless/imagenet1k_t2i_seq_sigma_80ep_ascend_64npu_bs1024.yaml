@@ -1,25 +1,28 @@
-# Final ten-epoch I2T-caption + T2I-flow training configuration selected by
-# the completed LR/loss-weight sweep. It is initialized from the completed
-# ImageNet-1K class-conditioned EMA model and uses one 16-NPU full node.
+# ImageNet-1K T2I-only continuation of the completed sequential-sigma
+# class-conditioned model on 64 Ascend 910B NPUs.
+# 16 samples/rank * 64 ranks * GA 1 = global batch 1024.
+# The stratified 50K validation holdout leaves 1,231,167 training images;
+# 1,230,848 samples/epoch is the largest exact global-batch multiple.
+# WSD phases are 8 warmup + 48 stable + 24 decay epochs.
 experiment:
-    project: "selfless-flow-imagenet1k-caption-joint"
-    name: "imagenet1k-caption-joint"
+    project: "selfless-flow-imagenet1k-t2i-seq-sigma-ascend64-b1024-80ep"
+    name: "imagenet1k-t2i-seq-sigma-80ep-seed42-64x910b-b16ga1-b1024-lr2e5"
     wandb_project: "unified-mm"
     output_dir: "output"
-    save_every: 2404
+    save_every: 12020
     log_every: 50
     # Must be divisible by log_every so the pre-clip norm reaches the logger.
     log_grad_norm_every: 1200
-    checkpoints_total_limit: 5
-    checkpoint_milestone_every: 2404
-    save_ema_eval_every: 0
+    checkpoints_total_limit: 3
+    checkpoint_milestone_every: 24040
+    save_ema_eval_every: 12020
     ema_eval_dtype: "bf16"
     save_image_flow_adapter: false
     save_final_image_flow_adapter: true
     save_hfmodel_every: 1000000000
     save_final: true
-    val_every: 2404
-    validation_image_every: 2404
+    val_every: 12020
+    validation_image_every: 12020
     validation_seed: 424242
     validation_image_samples: 8
     validation_flow_temperature: 1.0
@@ -31,14 +34,16 @@ experiment:
     validation_save_debug_images: false
     validation_single_stream_images: true
     validation_single_stream_parallel_rate: 1
-    validation_single_stream_order_strategies: ["spatial_halton"]
+    validation_single_stream_order_strategies: ["sequential"]
     validation_vae_module_root: "public/code/mar"
     validation_vae_path: "public/vae/mar-kl16/kl16.ckpt"
     validation_vae_scaling_factor: 0.2325
     resume_from_checkpoint: none
 
 model:
-    model_path: "output/selfless-flow-imagenet1k-class-ascend64-b1024-800ep/hf_model-final-ema"
+    # Preserve the contextual flow head and load the completed sequential-
+    # sigma class-conditioned EMA.
+    model_path: "output/selfless-flow-imagenet1k-class-ascend64-b1024-800ep-seq-sigma/hf_model-final-ema"
     use_flex_attention: true
     image_tokens_per_img: 256
     image_latent_dim: 16
@@ -56,9 +61,8 @@ model:
     image_flow_solver: "heun"
     image_input_noise_strength: 1.0e-2
     image_uncond_prob: 0.1
-    # With domain-transition T2I degradation accepted, generation mean-rank
-    # over Caption CLIP (higher), FID (lower), and IS (higher) selects 0.05.
-    lambda_text: 0.05
+    # T2I rows have no language-model targets; only image flow is optimized.
+    lambda_text: 0.0
     lambda_image: 1.0
     pretrained_image_flow_adapter: none
 
@@ -68,6 +72,8 @@ dataset:
         cache_path: "public/datasets/imagenet_full/vae_posterior_mar_kl16/posterior_stats_imagenet1k_train_fp16.pt"
         manifest_jsonl: "public/datasets/imagenet_full/manifest.jsonl"
         conditioning_mode: "caption"
+        # caption_jsonl remains part of the frozen alignment/index contract;
+        # pure T2I samples read their 12 prompts from the seekable T2I shards.
         caption_jsonl: "public/datasets/imagenet1k_synthetic_v1/captions/imagenet1k_train_7captions.jsonl"
         caption_manifest_sha256: "c74f17cd6f8f85e74ae23606a4f0c3cc3eb1d4979413c910b5a63b2b327f6c3b"
         synthetic_text_index_manifest: "public/datasets/imagenet1k_synthetic_v1/indexed/train/manifest.json"
@@ -78,22 +84,20 @@ dataset:
         caption_include_original: false
         caption_validation_index: 0
         t2i_prompt_validation_index: 0
-        caption_sequence_modes: ["t2i", "i2t"]
+        caption_sequence_modes: ["t2i"]
         caption_t2i_prefix: "Generate an image matching this description:"
         caption_i2t_prefix: "Describe this image in one detailed caption:"
         cache_caption_tokens: false
         model_context_length: 32768
         image_tokens_per_img: 256
         image_latent_dim: 16
+        image_sigma_order: "sequential"
         max_seq_length: 512
         pad_to_length: 512
         pad_to_multiple_of: 64
         split_strategy: "stratified"
         split_seed: 42
         val_samples_per_class: 50
-        # Hold out exactly 50 images/class for unbiased joint-loss selection.
-        # Official ImageNet val has T2I prompts but no synthetic captions, so
-        # it remains the generation/FID set rather than the joint-loss set.
         validation_overlap_train: false
     preprocessing:
         max_seq_length: 512
@@ -117,8 +121,8 @@ lr_scheduler:
     scheduler: "wsd"
     params:
         learning_rate: ${optimizer.params.learning_rate}
-        warmup_steps: 1202
-        decay_steps: 3606
+        warmup_steps: 9616
+        decay_steps: 28848
         min_lr_scale: 0.1
 
 training:
@@ -131,9 +135,9 @@ training:
     dataloader_workers: 0
     samples_per_epoch: 1230848
     optimizer_steps_per_epoch: 1202
-    num_train_epochs: 10
-    max_train_steps: 12020
-    stop_after_steps: 12020
+    num_train_epochs: 80
+    max_train_steps: 96160
+    stop_after_steps: 96160
     max_grad_norm: 1.0
     use_gradient_checkpointing: false
     step_scheduler_with_optimizer: false
@@ -149,9 +153,9 @@ training:
     save_image_flow_adapter: true
 
 evaluation:
-    checkpoint: "output/selfless-flow-imagenet1k-caption-joint/hf_model-final-ema"
+    checkpoint: "output/selfless-flow-imagenet1k-t2i-seq-sigma-ascend64-b1024-80ep/hf_model-final-ema"
     model_dtype: "bf16"
-    samples: 5000
+    samples: 50000
     batch_size: 4096
     batch_size_per_npu: 256
     vae_decode_batch_size: 16
@@ -161,7 +165,7 @@ evaluation:
     cfg_schedule: "constant"
     flow_solver: "heun"
     parallel_rate: 1
-    strategies: "spatial_halton"
+    strategies: "sequential"
     seed: 42
     inception_weights_path: "public/models/torch-fidelity/weights-inception-2015-12-05-6726825d.pth"
     real_stats_path: "public/datasets/imagenet_full/fid_stats/inception_v3_2048_imagenet_val50000_256.pt"

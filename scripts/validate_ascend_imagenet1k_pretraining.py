@@ -35,6 +35,7 @@ STEPS_PER_EPOCH = 1_251
 EPOCHS = 800
 MAX_STEPS = 1_000_800
 VALIDATION_IMAGES = 50_000
+DEFAULT_GENERATION_STEPS = 10
 
 
 def sha256_file(path: Path) -> str:
@@ -68,7 +69,7 @@ def validate_config(config, *, world_size: int) -> dict[str, object]:
     ).lower()
     if (
         str(config.model.get("dynamic_xt_contract", ""))
-        == "backbone_in_flow_loop_v1"
+        == "backbone_single_flow_state_v2"
     ):
         if config.model.get("architecture_variant", None) is not None:
             raise RuntimeError(
@@ -149,8 +150,15 @@ def validate_config(config, *, world_size: int) -> dict[str, object]:
             bool(config.experiment.save_final_image_flow_adapter),
             True,
         ),
+        "model_sampling_steps": (
+            int(config.model.image_flow_num_sampling_steps),
+            DEFAULT_GENERATION_STEPS,
+        ),
         "evaluation_samples": (int(config.evaluation.samples), VALIDATION_IMAGES),
-        "evaluation_sampling_steps": (int(config.evaluation.sampling_steps), 100),
+        "evaluation_sampling_steps": (
+            int(config.evaluation.sampling_steps),
+            DEFAULT_GENERATION_STEPS,
+        ),
         "evaluation_strategies": (
             str(config.evaluation.strategies),
             expected_generation_strategy,
@@ -164,6 +172,11 @@ def validate_config(config, *, world_size: int) -> dict[str, object]:
         if actual != expected:
             raise RuntimeError(f"config {label} mismatch: {actual!r} != {expected!r}")
     if architecture_variant == "dynamic_xt":
+        if int(config.model.get("image_flow_batch_mul", -1)) != 1:
+            raise RuntimeError(
+                "Dynamic-XT successor-backbone training requires "
+                "model.image_flow_batch_mul=1"
+            )
         accounting = {
             "target_epochs": EPOCHS,
             "steps_per_epoch": STEPS_PER_EPOCH,

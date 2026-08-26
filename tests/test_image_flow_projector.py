@@ -31,7 +31,7 @@ def _tiny_config():
     config.image_tokens_per_img = 4
     config.image_flow_width = 32
     config.image_flow_depth = 1
-    config.image_flow_num_sampling_steps = "2"
+    config.image_flow_num_sampling_steps = "10"
     config.backbone_attention_output_gate = "none"
     return config
 

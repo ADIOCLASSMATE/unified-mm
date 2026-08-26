@@ -12,6 +12,12 @@ EVAL_ROOT="$2"
 CONFIG="configs/selfless/imagenet1k_class_pretrain_800ep_ascend_64npu_bs1024.yaml"
 CANN_SET_ENV="${CANN_SET_ENV:-/usr/local/Ascend/ascend-toolkit/set_env.sh}"
 NPU_COUNT=16
+SAMPLING_STEPS="${SAMPLING_STEPS:-10}"
+
+if [[ ! "${SAMPLING_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: SAMPLING_STEPS must be a positive integer; got ${SAMPLING_STEPS}" >&2
+  exit 6
+fi
 
 set +u
 source "${CANN_SET_ENV}"
@@ -57,7 +63,7 @@ env \
   --model_dtype bf16 \
   --samples 50000 \
   --batch_size 4096 \
-  --sampling_steps 100 \
+  --sampling_steps "${SAMPLING_STEPS}" \
   --temperature 1.0 \
   --cfg 3.5 \
   --cfg_schedule constant \
