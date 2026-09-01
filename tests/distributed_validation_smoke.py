@@ -1,4 +1,4 @@
-"""Run with torchrun to verify validation image work executes on every rank."""
+"""Verify latent validation on every rank and VAE decode only on rank zero."""
 
 from __future__ import annotations
 
@@ -17,16 +17,6 @@ from omegaconf import OmegaConf
 import pretrain.train_selfless_flow as training
 
 
-class _TinyFlowHead(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.anchor = torch.nn.Parameter(torch.zeros(()))
-
-    def velocity(self, x_t, t, z, **kwargs):
-        del t, z, kwargs
-        return torch.zeros_like(x_t) + self.anchor
-
-
 class _TinyModel(torch.nn.Module):
     def __init__(self, rank: int):
         super().__init__()
@@ -35,25 +25,41 @@ class _TinyModel(torch.nn.Module):
             image_tokens_per_img=4,
             image_flow_solver="euler",
         )
-        self.image_flow_head = _TinyFlowHead()
+        self.anchor = torch.nn.Parameter(torch.zeros(()))
 
-    @staticmethod
-    def _prepare_image_flow_condition(hidden_states):
-        return hidden_states[..., :4]
-
-    def sample_image_flow_with_cfg(self, z, **kwargs):
-        del kwargs
+    def generate(self, task, **kwargs):
+        assert task == "t2i"
+        assert kwargs["use_cache"] is True
+        count = len(kwargs["spans"])
         # Rank-dependent output proves every rank contributes to the reduced
         # metrics instead of waiting for rank 0 to run all image work.
-        return z.to(dtype=torch.float32) + float(self.rank)
+        latents = torch.full(
+            (count, 4, 2, 2),
+            float(self.rank),
+            device=kwargs["input_ids"].device,
+        )
+        return latents, {
+            "attention_contract": "selfless_strict",
+            "single_stream_content_self_diagonal": False,
+            "backbone_kv_cache_enabled": True,
+            "backbone_kv_cache_peak_bytes": 64,
+            "generation_step": torch.ones(
+                count,
+                2,
+                2,
+                device=latents.device,
+            ),
+        }
 
 
 class _TinyVAE(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.anchor = torch.nn.Parameter(torch.zeros(()), requires_grad=False)
+        self.decode_calls = 0
 
     def decode(self, latents):
+        self.decode_calls += 1
         return latents[:, :3] + self.anchor
 
 
@@ -111,15 +117,14 @@ def main() -> None:
                 "val_every": 1,
                 "validation_image_every": 1,
                 "validation_image_samples": 1,
-                "validation_flow_probe_times": [0.5],
                 "validation_flow_temperature": 1.0,
                 "validation_flow_cfg": 1.0,
                 "validation_flow_cfg_schedule": "constant",
                 "validation_flow_solver": "euler",
                 "validation_vae_dtype": "fp32",
                 "validation_vae_scaling_factor": 1.0,
-                "validation_single_stream_images": False,
-                "validation_save_debug_images": False,
+                "validation_single_stream_images": True,
+                "validation_single_stream_order_strategies": ["spatial_halton"],
                 "validation_release_vae_gpu": True,
             },
             "model": {
@@ -182,6 +187,15 @@ def main() -> None:
 
     completed = torch.ones((), device=device, dtype=torch.int32)
     dist.all_reduce(completed)
+    decode_calls = torch.tensor(
+        [training._VAE_CACHE.decode_calls],
+        device=device,
+        dtype=torch.int32,
+    )
+    gathered_decode_calls = [
+        torch.empty_like(decode_calls) for _ in range(dist.get_world_size())
+    ]
+    dist.all_gather(gathered_decode_calls, decode_calls)
     if rank == 0:
         images = list(
             (Path(output_directory[0]) / "validation_flow_images").glob(
@@ -189,8 +203,12 @@ def main() -> None:
             )
         )
         assert int(completed.item()) == dist.get_world_size()
-        assert len(images) == 1
+        assert len(images) == 4
         assert accelerator.logged
+        assert int(gathered_decode_calls[0].item()) > 0
+        assert all(
+            int(value.item()) == 0 for value in gathered_decode_calls[1:]
+        )
         print(
             f"parallel_ranks={int(completed.item())} "
             f"image_files={len(images)} numeric_logs={len(accelerator.logged)}"

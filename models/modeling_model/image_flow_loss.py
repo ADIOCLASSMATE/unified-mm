@@ -1,9 +1,21 @@
 import math
+import importlib.machinery
+import os
+import sys
+import types
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch_npu
+try:
+    import torch_npu
+except ImportError:  # CPU-only contract tests do not have the Ascend runtime.
+    os.environ.setdefault("DS_ACCELERATOR", "cpu")
+    torch_npu = types.ModuleType("torch_npu")
+    torch_npu.__spec__ = importlib.machinery.ModuleSpec(
+        "torch_npu", loader=None
+    )
+    sys.modules["torch_npu"] = torch_npu
 from torch.utils.checkpoint import checkpoint
 
 from .image_position_utils import (
@@ -264,7 +276,6 @@ class ContextualFlowBlock(nn.Module):
             "k": k,
             "v": v,
             "context_positions": context_positions,
-            "k_rotation_count": 1,
             "input_layout": input_layout,
         }
 
@@ -647,24 +658,6 @@ class ContextualFlowTransformerHead(nn.Module):
             "position_contract": self.position_contract(),
         }
 
-    @staticmethod
-    def _position_digest(positions):
-        weights = torch.arange(
-            1,
-            positions.shape[1] + 1,
-            device=positions.device,
-            dtype=torch.long,
-        )
-        return torch.stack(
-            [
-                positions.sum(dim=1),
-                (positions * weights).sum(dim=1),
-                positions.min(dim=1).values,
-                positions.max(dim=1).values,
-            ],
-            dim=1,
-        )
-
     def _validate_latent_mixer_cache(self, cache):
         expected = self.position_contract()
         actual = cache.get("position_contract")
@@ -870,7 +863,6 @@ class ContextualFlowTransformerHead(nn.Module):
             "layers": layers,
             "context_mask": context_mask,
             "context_positions": context_positions,
-            "position_digest": self._position_digest(context_positions),
             "position_contract": self.position_contract(),
             "cache_contract": self.cache_contract(),
         }
@@ -924,7 +916,6 @@ class ContextualFlowTransformerHead(nn.Module):
                     "k_storage": k_storage,
                     "v_storage": v_storage,
                     "context_positions": visible_positions,
-                    "k_rotation_count": 1,
                 }
             )
         mask_storage = torch.zeros(
@@ -946,7 +937,6 @@ class ContextualFlowTransformerHead(nn.Module):
             "active_length": 0,
             "context_mask_storage": mask_storage,
             "context_positions_storage": position_storage,
-            "position_digest": None,
             "position_contract": self.position_contract(),
             "cache_contract": self.cache_contract(),
         }
@@ -1039,7 +1029,6 @@ class ContextualFlowTransformerHead(nn.Module):
                             ],
                             dim=1,
                         ),
-                        "k_rotation_count": 1,
                     }
                 )
                 continue
@@ -1061,7 +1050,6 @@ class ContextualFlowTransformerHead(nn.Module):
                     "k_storage": k_storage,
                     "v_storage": v_storage,
                     "context_positions": None,
-                    "k_rotation_count": 1,
                 }
             )
         if cache_capacity is None:
@@ -1096,11 +1084,8 @@ class ContextualFlowTransformerHead(nn.Module):
             "active_length": previous_len + 1,
             "context_mask_storage": mask_storage,
             "context_positions_storage": position_storage,
-            "position_digest": self._position_digest(
-                positions[:, : previous_len + 1]
-            ),
-            "position_contract": self.position_contract(),
-            "cache_contract": self.cache_contract(),
+            "position_contract": cache["position_contract"],
+            "cache_contract": cache["cache_contract"],
         }
 
     def stack_latent_mixer_caches(self, caches):
@@ -1161,14 +1146,12 @@ class ContextualFlowTransformerHead(nn.Module):
                     "k": k,
                     "v": v,
                     "context_positions": positions,
-                    "k_rotation_count": 1,
                 }
             )
         return {
             "layers": layers,
             "context_mask": mask,
             "context_positions": positions,
-            "position_digest": None,
             "position_contract": self.position_contract(),
             "cache_contract": self.cache_contract(),
         }
@@ -1178,9 +1161,12 @@ class ContextualFlowTransformerHead(nn.Module):
         x,
         t,
         c,
+        condition_embedding=None,
+        time_embedding=None,
         context_latents=None,
         context_mask=None,
         query_positions=None,
+        query_rope=None,
         context_positions=None,
         context_conditions=None,
         latent_mixer_cache=None,
@@ -1191,11 +1177,20 @@ class ContextualFlowTransformerHead(nn.Module):
         c = c.to(device=x.device, dtype=model_dtype)
         batch_shape = x.shape[:-1]
         x, query_positions, squeeze = self._ensure_sequence(x, query_positions)
-        query_rope = self._build_rope(query_positions, model_dtype)
+        if query_rope is None:
+            query_rope = self._build_rope(query_positions, model_dtype)
         x = self.input_proj(x)
-        t = self._shape_time(t, batch_shape)
+        t = (
+            self._shape_time(t, batch_shape)
+            if time_embedding is None
+            else time_embedding
+        )
         raw_c = c
-        c = self.cond_embed(raw_c)
+        c = (
+            self.cond_embed(raw_c)
+            if condition_embedding is None
+            else condition_embedding
+        )
         y = t + c
         if y.dim() == 2:
             y = y.unsqueeze(1)
@@ -1257,7 +1252,9 @@ class ContextualFlowTransformerHead(nn.Module):
             )
             query_stats = []
             content_stats = []
-            direct_input_layout = "BSND" if x.is_npu else "BNSD"
+            direct_input_layout = (
+                "BSND" if getattr(x, "is_npu", False) else "BNSD"
+            )
             for block in self.blocks:
                 if self.grad_checkpointing and not torch.jit.is_scripting():
                     def _dual_step(content_hidden, query_hidden, block=block):
@@ -1337,19 +1334,40 @@ class ContextualFlowTransformerHead(nn.Module):
             out = self.final_layer(x, y)
             return out.squeeze(1) if squeeze else out
 
-        if use_direct_context:
-            latent_mixer_cache = self.prepare_latent_mixer_cache(
-                context_latents=context_latents,
-                context_mask=context_mask,
-                context_positions=context_positions,
-                context_conditions=context_conditions,
-            )
         context_layers = None
         context_mask = None
         if latent_mixer_cache is not None:
             self._validate_latent_mixer_cache(latent_mixer_cache)
             context_layers = latent_mixer_cache.get("layers")
             context_mask = latent_mixer_cache.get("context_mask")
+            if context_layers:
+                first_layer = context_layers[0]
+                input_layout = first_layer.get("input_layout", "BNSD")
+                key = first_layer["k"]
+                context_length = (
+                    key.shape[1]
+                    if input_layout == "BSND"
+                    else key.shape[2]
+                )
+                prepared_mask = latent_mixer_cache.get(
+                    "_prepared_context_mask"
+                )
+                if (
+                    prepared_mask is None
+                    or tuple(prepared_mask[0].shape)
+                    != (x.shape[0], x.shape[1], context_length)
+                ):
+                    prepared_mask = self.blocks[0].prepare_context_mask(
+                        context_mask,
+                        x.shape[0],
+                        x.shape[1],
+                        context_length,
+                        x.device,
+                    )
+                    latent_mixer_cache[
+                        "_prepared_context_mask"
+                    ] = prepared_mask
+                context_mask = prepared_mask
         gate_stats = []
         gate_token_stats = []
         attention_entropy_stats = []
@@ -1507,6 +1525,13 @@ class FlowLoss(nn.Module):
             endpoint_time=self.time_scale,
         )
         self.last_forward_stats = {}
+        self._inference_time_grids = {}
+        self._inference_time_embedding_cache = None
+
+    def _apply(self, fn, recurse=True):
+        self._inference_time_grids.clear()
+        self._inference_time_embedding_cache = None
+        return super()._apply(fn, recurse=recurse)
 
     @staticmethod
     def _rms_stat(x):
@@ -1569,9 +1594,7 @@ class FlowLoss(nn.Module):
                 return tuple(_convert(item, key) for item in value)
             if key == "context_mask":
                 return value.to(device=device, dtype=torch.bool)
-            if key is not None and (
-                key.endswith("positions") or key == "position_digest"
-            ):
+            if key is not None and key.endswith("positions"):
                 return value.to(device=device)
             if not isinstance(value, torch.Tensor):
                 return value
@@ -1682,7 +1705,14 @@ class FlowLoss(nn.Module):
             **context_kwargs,
         )
 
-    def _training_context(self, target, sigma, image_positions, context_latents=None):
+    def _training_context(
+        self,
+        target,
+        sigma,
+        image_positions,
+        context_latents=None,
+        context_mask=None,
+    ):
         if target.dim() != 3:
             return {}
         if context_latents is None:
@@ -1690,11 +1720,28 @@ class FlowLoss(nn.Module):
         else:
             context_latents = context_latents.to(device=target.device, dtype=target.dtype)
         batch_size, seq_len, _ = target.shape
-        if sigma is None:
-            order = torch.arange(seq_len, device=target.device, dtype=torch.float32)
-            sigma = order.unsqueeze(0).expand(batch_size, seq_len)
-        sigma = sigma.to(device=target.device, dtype=torch.float32)
-        context_mask = sigma.unsqueeze(1) < sigma.unsqueeze(2)
+        if context_mask is None:
+            if sigma is None:
+                order = torch.arange(
+                    seq_len, device=target.device, dtype=torch.float32
+                )
+                sigma = order.unsqueeze(0).expand(batch_size, seq_len)
+            sigma = sigma.to(device=target.device, dtype=torch.float32)
+            context_mask = sigma.unsqueeze(1) < sigma.unsqueeze(2)
+        else:
+            context_mask = context_mask.to(
+                device=target.device, dtype=torch.bool
+            )
+            if tuple(context_mask.shape) != (
+                batch_size,
+                seq_len,
+                seq_len,
+            ):
+                raise ValueError(
+                    "flow context_mask must have shape "
+                    f"{(batch_size, seq_len, seq_len)}, got "
+                    f"{tuple(context_mask.shape)}"
+                )
         if image_positions is None:
             image_positions = torch.arange(seq_len, device=target.device, dtype=torch.long).unsqueeze(0).expand(batch_size, seq_len)
         return {
@@ -1713,6 +1760,7 @@ class FlowLoss(nn.Module):
         sigma=None,
         image_positions=None,
         context_latents=None,
+        context_mask=None,
         record_stats: bool = True,
         training_state: RectifiedFlowTrainingState | None = None,
     ):
@@ -1729,6 +1777,8 @@ class FlowLoss(nn.Module):
             image_positions = image_positions.to(device=model_device)
         if context_latents is not None:
             context_latents = context_latents.to(device=model_device, dtype=model_dtype)
+        if context_mask is not None:
+            context_mask = context_mask.to(device=model_device, dtype=torch.bool)
 
         if training_state is None:
             training_state = self.sample_training_state(target_float)
@@ -1746,7 +1796,13 @@ class FlowLoss(nn.Module):
         t = training_state.t.to(device=model_device, dtype=torch.float32)
         x_t = training_state.x_t.to(device=model_device, dtype=torch.float32)
         v_target = training_state.v_target.to(device=model_device, dtype=torch.float32)
-        context_kwargs = self._training_context(target_model, sigma, image_positions, context_latents=context_latents)
+        context_kwargs = self._training_context(
+            target_model,
+            sigma,
+            image_positions,
+            context_latents=context_latents,
+            context_mask=context_mask,
+        )
         v_pred = self.velocity(
             x_t,
             t,
@@ -1938,6 +1994,13 @@ class FlowLoss(nn.Module):
                     current_z,
                     {
                         "query_positions": current_context.get("query_positions"),
+                        "query_rope": current_context.get("query_rope"),
+                        "condition_embedding": current_context.get(
+                            "condition_embedding"
+                        ),
+                        "time_embedding": current_context.get(
+                            "time_embedding"
+                        ),
                     },
                     current_context.get("latent_mixer_cache"),
                 )
@@ -2054,6 +2117,60 @@ class FlowLoss(nn.Module):
             return 1.0 + (cfg - 1.0) * progress
         raise ValueError(f"Unknown image flow cfg_schedule={schedule!r}; expected constant or linear.")
 
+    def _inference_time_grid(
+        self,
+        steps: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reuse the tiny ODE grid across all tokens in one inference run."""
+
+        key = (device.type, device.index, int(steps))
+        cached = self._inference_time_grids.get(key)
+        if cached is None:
+            times = torch.linspace(
+                0.0,
+                1.0,
+                steps + 1,
+                device=device,
+                dtype=torch.float32,
+            )
+            cached = (times, times[1:] - times[:-1])
+            self._inference_time_grids[key] = cached
+        return cached
+
+    def _inference_time_embeddings(
+        self,
+        times: torch.Tensor,
+        batch_shape: tuple[int, ...],
+    ) -> torch.Tensor:
+        versions = tuple(
+            parameter._version
+            for parameter in self.net.time_embed.parameters()
+        )
+        key = (
+            times.device.type,
+            times.device.index,
+            tuple(batch_shape),
+            int(times.numel()),
+            self.time_scale,
+            self.net.time_embed.mlp[0].weight.dtype,
+            versions,
+        )
+        cached = self._inference_time_embedding_cache
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        embeddings = torch.stack(
+            [
+                self.net._shape_time(
+                    self._scale_time(time.expand(batch_shape)),
+                    batch_shape,
+                )
+                for time in times
+            ]
+        )
+        self._inference_time_embedding_cache = (key, embeddings)
+        return embeddings
+
     def sample(
         self,
         z,
@@ -2071,7 +2188,9 @@ class FlowLoss(nn.Module):
         context_conditions: torch.Tensor | None = None,
         latent_mixer_cache: dict | None = None,
         latent_mixer_cache_is_paired: bool = False,
+        context_prepared: bool = False,
         initial_noise: torch.Tensor | None = None,
+        initial_noise_prevalidated: bool = False,
         condition_evaluator=None,
         debug_finite: bool = False,
         debug_label: str = "",
@@ -2147,11 +2266,17 @@ class FlowLoss(nn.Module):
                     "initial_noise must have a floating dtype, "
                     f"got {initial_noise.dtype}"
                 )
-            if not bool(torch.isfinite(initial_noise).all().item()):
+            if (
+                not initial_noise_prevalidated
+                and not bool(torch.isfinite(initial_noise).all().item())
+            ):
                 raise FloatingPointError("initial_noise contains non-finite values")
             x = initial_noise.to(device=z.device, dtype=torch.float32)
         x = x * temperature
-        if not bool(torch.isfinite(x).all().item()):
+        if (
+            not initial_noise_prevalidated
+            and not bool(torch.isfinite(x).all().item())
+        ):
             raise FloatingPointError(
                 "temperature scaling produced non-finite initial_noise values"
             )
@@ -2159,14 +2284,15 @@ class FlowLoss(nn.Module):
         if context_latents is not None:
             _debug_check("context_latents", context_latents)
         if latent_mixer_cache is not None:
-            latent_mixer_cache = self._cache_to_device(
-                latent_mixer_cache, z.device, z.dtype
-            )
-            query_positions = (
-                None
-                if query_positions is None
-                else query_positions.to(device=z.device)
-            )
+            if not context_prepared:
+                latent_mixer_cache = self._cache_to_device(
+                    latent_mixer_cache, z.device, z.dtype
+                )
+                query_positions = (
+                    None
+                    if query_positions is None
+                    else query_positions.to(device=z.device)
+                )
             context_kwargs = {
                 "query_positions": query_positions,
                 "latent_mixer_cache": latent_mixer_cache,
@@ -2207,16 +2333,35 @@ class FlowLoss(nn.Module):
             else:
                 context_kwargs = self._duplicate_context(context_kwargs)
                 context_is_paired = True
-        times = torch.linspace(0.0, 1.0, steps + 1, device=z.device, dtype=torch.float32)
-        time_deltas = times[1:] - times[:-1]
+        if context_kwargs.get("query_positions") is not None:
+            query_length = z.shape[1] if z.ndim > 2 else 1
+            context_kwargs["query_positions"] = self.net._positions(
+                context_kwargs["query_positions"],
+                z.shape[0],
+                query_length,
+                z.device,
+            )
+            context_kwargs["query_rope"] = self.net._build_rope(
+                context_kwargs["query_positions"],
+                model_dtype,
+            )
+        if condition_evaluator is None:
+            context_kwargs["condition_embedding"] = self.net.cond_embed(z)
+        times, time_deltas = self._inference_time_grid(steps, z.device)
+        time_embeddings = self._inference_time_embeddings(
+            times,
+            tuple(z.shape[:-1]),
+        )
         schedule_name = str(cfg_schedule or "constant").lower()
         if cfg == 1.0 or schedule_name in {"constant", "none", "off", ""}:
             cfg_values = [float(cfg)] * (steps + 1)
         else:
-            progress_values = times.detach().cpu().tolist()
+            # CFG scheduling is scalar control flow.  Deriving it from the
+            # already-known step count avoids a device-to-host synchronization
+            # for every generated image token.
             cfg_values = [
-                self._scheduled_cfg(cfg, cfg_schedule, progress)
-                for progress in progress_values
+                self._scheduled_cfg(cfg, cfg_schedule, index / steps)
+                for index in range(steps + 1)
             ]
 
         for idx in range(steps):
@@ -2225,6 +2370,7 @@ class FlowLoss(nn.Module):
             t_next = times[idx + 1].expand(x_shape)
             dt = time_deltas[idx]
             cfg_t = cfg_values[idx]
+            context_kwargs["time_embedding"] = time_embeddings[idx]
             current_z = (
                 z
                 if condition_evaluator is None
@@ -2257,6 +2403,7 @@ class FlowLoss(nn.Module):
                 x_euler = x + dt * v
                 _debug_check("heun_euler_predictor", x_euler, idx, {"velocity": v, "condition": z})
                 cfg_t_next = cfg_values[idx + 1]
+                context_kwargs["time_embedding"] = time_embeddings[idx + 1]
                 next_z = (
                     z
                     if condition_evaluator is None

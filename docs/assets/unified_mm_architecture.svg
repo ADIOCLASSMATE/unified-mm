@@ -1,0 +1,143 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1000" viewBox="0 0 1600 1000" font-family="WenQuanYi Zen Hei">
+  <defs>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="8" stdDeviation="10" flood-color="#182230" flood-opacity="0.10"/>
+    </filter>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L12,6 L0,12 Z" fill="#667085"/>
+    </marker>
+    <marker id="arrowBlue" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L12,6 L0,12 Z" fill="#4C6FFF"/>
+    </marker>
+    <marker id="arrowPurple" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L12,6 L0,12 Z" fill="#7A5AF8"/>
+    </marker>
+    <style>
+      text { font-family:'WenQuanYi Zen Hei','Droid Sans Fallback',sans-serif; }
+      .title { font-size:34px; font-weight:700; fill:#101828; }
+      .subtitle { font-size:19px; font-weight:400; fill:#667085; }
+      .stage { font-size:18px; font-weight:600; fill:#475467; letter-spacing:1px; }
+      .boxTitle { font-size:23px; font-weight:700; fill:#101828; }
+      .boxText { font-size:18px; font-weight:400; fill:#475467; }
+      .small { font-size:16px; font-weight:400; fill:#667085; }
+      .chip { font-size:16px; font-weight:600; }
+      .arrow { fill:none; stroke:#667085; stroke-width:3; marker-end:url(#arrow); }
+      .arrowBlue { fill:none; stroke:#4C6FFF; stroke-width:4; marker-end:url(#arrowBlue); }
+      .arrowPurple { fill:none; stroke:#7A5AF8; stroke-width:4; marker-end:url(#arrowPurple); }
+    </style>
+  </defs>
+
+  <rect width="1600" height="1000" fill="#F7F9FC"/>
+  <text x="64" y="62" class="title">Unified-MM 总体架构</text>
+  <text x="64" y="96" class="subtitle">同一条多模态序列、同一个语义 backbone；文本用 LM head，图像用条件 flow head</text>
+
+  <text x="64" y="148" class="stage">① 输入与表征</text>
+  <text x="360" y="148" class="stage">② 统一序列</text>
+  <text x="666" y="148" class="stage">③ 双流信息</text>
+  <text x="1008" y="148" class="stage">④ 语义建模</text>
+  <text x="1284" y="148" class="stage">⑤ 模态解码</text>
+
+  <rect x="48" y="174" width="250" height="202" rx="24" fill="#FFFFFF" stroke="#B2CCFF" stroke-width="2" filter="url(#shadow)"/>
+  <rect x="68" y="194" width="78" height="32" rx="16" fill="#EAF0FF"/>
+  <text x="107" y="216" text-anchor="middle" class="chip" fill="#3154CC">文本</text>
+  <text x="72" y="266" class="boxTitle">类别名 / Prompt</text>
+  <text x="72" y="304" class="boxText">T2I 描述</text>
+  <text x="72" y="338" class="boxText">I2T Caption</text>
+
+  <rect x="48" y="432" width="250" height="344" rx="24" fill="#FFFFFF" stroke="#D6BBFB" stroke-width="2" filter="url(#shadow)"/>
+  <rect x="68" y="452" width="78" height="32" rx="16" fill="#F4EBFF"/>
+  <text x="107" y="474" text-anchor="middle" class="chip" fill="#6941C6">图像</text>
+  <rect x="80" y="510" width="94" height="94" rx="12" fill="#F2F4F7" stroke="#98A2B3" stroke-width="2"/>
+  <path d="M90 586 L116 550 L136 573 L151 556 L165 586 Z" fill="#98A2B3"/>
+  <circle cx="148" cy="535" r="10" fill="#FDB022"/>
+  <text x="190" y="547" class="boxTitle">RGB</text>
+  <text x="190" y="579" class="boxText">256×256</text>
+  <path d="M173 624 L173 662" class="arrow"/>
+  <rect x="80" y="666" width="186" height="54" rx="14" fill="#F4EBFF" stroke="#D6BBFB"/>
+  <text x="173" y="700" text-anchor="middle" class="boxText">KL16 VAE Encoder</text>
+  <text x="173" y="750" text-anchor="middle" class="small">16×16 个连续 latent</text>
+
+  <rect x="344" y="254" width="252" height="438" rx="28" fill="#FFFFFF" stroke="#D0D5DD" stroke-width="2" filter="url(#shadow)"/>
+  <text x="470" y="300" text-anchor="middle" class="boxTitle">统一多模态序列</text>
+  <rect x="374" y="332" width="192" height="48" rx="12" fill="#EAF0FF"/>
+  <text x="470" y="363" text-anchor="middle" class="boxText">Prefix text</text>
+  <rect x="374" y="392" width="52" height="48" rx="12" fill="#FFF7E6"/>
+  <text x="400" y="423" text-anchor="middle" class="small">BOI</text>
+  <rect x="438" y="392" width="128" height="48" rx="12" fill="#F4EBFF"/>
+  <text x="502" y="423" text-anchor="middle" class="small">256 latent</text>
+  <rect x="374" y="452" width="52" height="48" rx="12" fill="#FFF7E6"/>
+  <text x="400" y="483" text-anchor="middle" class="small">EOI</text>
+  <rect x="438" y="452" width="128" height="48" rx="12" fill="#EAF0FF"/>
+  <text x="502" y="483" text-anchor="middle" class="small">Suffix text</text>
+  <line x1="374" y1="526" x2="566" y2="526" stroke="#EAECF0" stroke-width="2"/>
+  <text x="374" y="565" class="boxText">Token type</text>
+  <text x="374" y="600" class="boxText">统一 2D RoPE</text>
+  <text x="374" y="635" class="boxText">生成顺序 σ</text>
+  <rect x="372" y="650" width="196" height="26" rx="13" fill="#ECFDF3"/>
+  <text x="470" y="669" text-anchor="middle" class="chip" fill="#027A48">物理位置与生成顺序解耦</text>
+
+  <path d="M298 274 C318 274 322 350 344 350" class="arrowBlue"/>
+  <path d="M298 714 C320 714 320 548 344 548" class="arrowPurple"/>
+
+  <rect x="650" y="228" width="286" height="202" rx="24" fill="#ECFDF3" stroke="#6CE9A6" stroke-width="2" filter="url(#shadow)"/>
+  <circle cx="688" cy="266" r="18" fill="#12B76A"/>
+  <text x="688" y="273" text-anchor="middle" class="chip" fill="#FFFFFF">X0</text>
+  <text x="720" y="274" class="boxTitle">Content stream</text>
+  <text x="680" y="322" class="boxText">真实文本 embedding</text>
+  <text x="680" y="356" class="boxText">真实 / 已 reveal latent</text>
+  <text x="680" y="396" class="small">负责提供 K / V 与本地表示</text>
+
+  <rect x="650" y="486" width="286" height="202" rx="24" fill="#FFF7E6" stroke="#FEC84B" stroke-width="2" filter="url(#shadow)"/>
+  <circle cx="688" cy="524" r="18" fill="#F79009"/>
+  <text x="688" y="531" text-anchor="middle" class="chip" fill="#FFFFFF">XT</text>
+  <text x="720" y="532" class="boxTitle">Query stream</text>
+  <text x="680" y="580" class="boxText">文本 mask embedding</text>
+  <text x="680" y="614" class="boxText">图像 mask embedding</text>
+  <text x="680" y="654" class="small">负责产生待预测位置 hidden</text>
+
+  <path d="M596 398 C622 398 622 329 650 329" class="arrow"/>
+  <path d="M596 548 C622 548 622 587 650 587" class="arrow"/>
+
+  <rect x="990" y="266" width="240" height="390" rx="28" fill="#FFFFFF" stroke="#84ADFF" stroke-width="3" filter="url(#shadow)"/>
+  <rect x="1016" y="292" width="188" height="40" rx="20" fill="#EAF0FF"/>
+  <text x="1110" y="319" text-anchor="middle" class="chip" fill="#3154CC">共享语义空间</text>
+  <text x="1110" y="380" text-anchor="middle" class="boxTitle">28 层 Qwen</text>
+  <text x="1110" y="416" text-anchor="middle" class="boxText">无对角线双流注意力</text>
+  <line x1="1030" y1="452" x2="1190" y2="452" stroke="#D0D5DD" stroke-width="2"/>
+  <text x="1110" y="494" text-anchor="middle" class="boxText">严格条件：σⱼ &lt; σᵢ</text>
+  <text x="1110" y="532" text-anchor="middle" class="small">文本：递增顺序</text>
+  <text x="1110" y="564" text-anchor="middle" class="small">图像：随机 / 空间顺序</text>
+  <rect x="1024" y="594" width="172" height="36" rx="18" fill="#F2F4F7"/>
+  <text x="1110" y="618" text-anchor="middle" class="chip" fill="#475467">每个 hᵢ 预测 xᵢ</text>
+
+  <path d="M936 329 L990 384" class="arrow"/>
+  <path d="M936 587 L990 538" class="arrow"/>
+
+  <rect x="1280" y="194" width="270" height="216" rx="24" fill="#FFFFFF" stroke="#B2CCFF" stroke-width="2" filter="url(#shadow)"/>
+  <text x="1415" y="238" text-anchor="middle" class="boxTitle">文本路径</text>
+  <rect x="1314" y="264" width="202" height="50" rx="14" fill="#EAF0FF"/>
+  <text x="1415" y="296" text-anchor="middle" class="boxText">共享 LM Head</text>
+  <path d="M1415 314 L1415 342" class="arrowBlue"/>
+  <text x="1415" y="374" text-anchor="middle" class="boxText">文本 CE / 自回归文本</text>
+
+  <rect x="1280" y="468" width="270" height="382" rx="24" fill="#FFFFFF" stroke="#D6BBFB" stroke-width="2" filter="url(#shadow)"/>
+  <text x="1415" y="512" text-anchor="middle" class="boxTitle">图像路径</text>
+  <rect x="1314" y="536" width="202" height="48" rx="14" fill="#F4EBFF"/>
+  <text x="1415" y="567" text-anchor="middle" class="boxText">Condition projector</text>
+  <path d="M1415 584 L1415 612" class="arrowPurple"/>
+  <rect x="1314" y="616" width="202" height="72" rx="14" fill="#F4EBFF"/>
+  <text x="1415" y="646" text-anchor="middle" class="boxText">8 层 contextual</text>
+  <text x="1415" y="674" text-anchor="middle" class="boxText">rectified-flow head</text>
+  <path d="M1415 688 L1415 718" class="arrowPurple"/>
+  <rect x="1314" y="722" width="202" height="48" rx="14" fill="#F4EBFF"/>
+  <text x="1415" y="753" text-anchor="middle" class="boxText">KL16 VAE Decoder</text>
+  <path d="M1415 770 L1415 798" class="arrowPurple"/>
+  <text x="1415" y="826" text-anchor="middle" class="boxText">256×256 RGB 图像</text>
+
+  <path d="M1230 350 C1252 350 1252 302 1280 302" class="arrowBlue"/>
+  <path d="M1230 552 C1252 552 1252 608 1280 608" class="arrowPurple"/>
+
+  <rect x="344" y="842" width="886" height="92" rx="22" fill="#FFFFFF" stroke="#D0D5DD" stroke-width="2"/>
+  <text x="374" y="880" class="boxTitle">设计分工</text>
+  <text x="374" y="914" class="boxText">Backbone 专注统一语义与上下文；Flow head 专注连续图像 token 的生成质量。</text>
+</svg>

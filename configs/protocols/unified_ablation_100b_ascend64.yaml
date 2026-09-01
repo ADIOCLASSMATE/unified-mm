@@ -1,0 +1,102 @@
+# Formal a/b/c protocol.  The historical 0.6B LR winner is frozen as readable
+# constants; every arm starts from the same Qwen weights at optimizer step zero.
+schema: unified_ablation_100b_v2
+base_config: configs/selfless/unified_baseline_100b_ascend_64npu.yaml
+platform_project: "随机序语言建模-统一自回归与掩码扩散的随机顺序生成框架"
+world_size: 64
+nodes: 4
+npu_per_node: 16
+seed: 42
+target_text_tokens: 100000000000
+max_train_steps: 95415
+save_every: 2000
+save_ema_eval_every: 0
+validation_every: 2000
+checkpoints_total_limit: 3
+checkpoint_milestone_every: 0
+save_final_resumable_checkpoint: true
+qualitative_outputs:
+    generated_images: true
+    image_to_text_captions: true
+    every_steps: 2000
+    samples: 2
+runtime_hashing_enabled: false
+task_loss_logging:
+    normalization:
+        climbmix: mean_cross_entropy_over_valid_text_targets
+        t2i: mean_flow_velocity_mse_over_image_targets_and_latent_channels
+        i2t: mean_cross_entropy_over_valid_text_targets
+    model_weights:
+        text: 0.05
+        image: 1.0
+    accumulation:
+        source_schedule: [climbmix, t2i, climbmix, i2t]
+        gradient_accumulation_steps: 4
+        formula: mean_of_four_already_weighted_microbatch_losses
+    raw_normalized:
+        - train/loss_climbmix
+        - train/loss_t2i
+        - train/loss_i2t
+    weighted_contributions:
+        - train/weighted_contribution_climbmix
+        - train/weighted_contribution_t2i
+        - train/weighted_contribution_i2t
+    contribution_sum_matches: step_loss
+    persistent_jsonl: training_metrics.jsonl
+shared:
+    initialization: Qwen3-0.6B-Base
+    start: qwen_pretrained_step_0
+    resume_from_checkpoint: none
+    source_schedule: [climbmix, t2i, climbmix, i2t]
+    climbmix_tokenization: online
+    text_sequence_length: 2048
+    historical_lr_sweep:
+        rerun: false
+        winner_id: b30e5-f5e5
+        backbone_and_special_lr: 3.0e-4
+        flow_and_projector_lr: 5.0e-5
+    imagenet:
+        train:
+            split: train
+            records: 1281167
+        validation:
+            split: val
+            records: 50000
+            cached_kl16_posterior: true
+            tasks_per_image: [t2i, i2t]
+        train_validation_overlap_allowed: false
+comparability:
+    a_vs_b_only_allowed_difference: model.dual_stream_attention_contract
+    a_vs_c_only_allowed_difference: model.architecture_variant
+    query_stream_identical: true
+    initialization_identical: true
+    data_and_schedule_identical: true
+    optimizer_and_lr_identical: true
+    token_budget_identical: true
+run_projects:
+    a: unified-a-0p6b-100b-imagenet-split-s42-r1
+    b: unified-b-0p6b-100b-imagenet-split-s42-r1
+    c: unified-c-0p6b-100b-imagenet-split-s42-r1
+ablations:
+    a:
+        training_objective: selfless_dual_stream
+        query_attention: "sigma_kv < sigma_q"
+        content_attention: "sigma_kv < sigma_q"
+        start: qwen_pretrained_step_0
+    b:
+        training_objective: selfless_dual_stream
+        query_attention: "sigma_kv < sigma_q"
+        content_attention: "sigma_kv <= sigma_q"
+        start: qwen_pretrained_step_0
+    c:
+        architecture_variant: single_stream_text_ar
+        training_objective: selfless_dual_stream
+        text_stream: single_x0
+        text_attention: physical_position_causal
+        text_prediction: "hidden[j-1] -> token[j]"
+        image_stream: identical_to_a_selfless_dual_stream
+        image_attention: "sigma_kv < sigma_q"
+        image_loss_positions: identical_to_a
+        start: qwen_pretrained_step_0
+    g:
+        status: deferred

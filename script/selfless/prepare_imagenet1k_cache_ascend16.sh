@@ -10,7 +10,7 @@ export UNIFIED_MM_VENV="${UNIFIED_MM_VENV:-.venv}"
 source "${REPO_ROOT}/script/offline_env.sh"
 cd "${REPO_ROOT}"
 
-IMAGE_ROOT="${IMAGE_ROOT:-/inspire/sj-ssd3/project/high-dimensionaldata/public/dataset/imagenet/v1/ILSVRC/Data/CLS-LOC/train}"
+IMAGE_ROOT="${IMAGE_ROOT:-/inspire/sj-ssd3/global_user/wanjiaxin-253108030048/dataset/imagenet/v1/ILSVRC/Data/CLS-LOC/train}"
 MANIFEST="${MANIFEST:-public/datasets/imagenet_full/manifest.jsonl}"
 SHARD_DIR="${SHARD_DIR:-public/datasets/imagenet_full/vae_posterior_mar_kl16/shards}"
 CACHE_PATH="${CACHE_PATH:-public/datasets/imagenet_full/vae_posterior_mar_kl16/posterior_stats_imagenet1k_train_fp16.pt}"

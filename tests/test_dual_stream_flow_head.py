@@ -331,6 +331,88 @@ def test_forward_and_sampling_are_finite():
     assert torch.isfinite(sample).all()
 
 
+def test_cached_sampling_prepares_context_mask_once(monkeypatch):
+    flow = _flow()
+    content, _, condition, _, positions, _, strict_mask = _inputs()
+    cache = flow.prepare_latent_mixer_cache(
+        context_latents=content,
+        context_mask=strict_mask,
+        context_positions=positions,
+        context_conditions=condition,
+    )
+    prepare_calls = 0
+    rope_calls = 0
+    condition_embedding_calls = 0
+    original_prepare = flow.net.blocks[0].prepare_context_mask
+    original_rope = flow.net._build_rope
+    original_condition_embedding = flow.net.cond_embed.forward
+
+    def counted_prepare(*args, **kwargs):
+        nonlocal prepare_calls
+        prepare_calls += 1
+        return original_prepare(*args, **kwargs)
+
+    def counted_rope(*args, **kwargs):
+        nonlocal rope_calls
+        rope_calls += 1
+        return original_rope(*args, **kwargs)
+
+    def counted_condition_embedding(*args, **kwargs):
+        nonlocal condition_embedding_calls
+        condition_embedding_calls += 1
+        return original_condition_embedding(*args, **kwargs)
+
+    monkeypatch.setattr(
+        flow.net.blocks[0],
+        "prepare_context_mask",
+        counted_prepare,
+    )
+    monkeypatch.setattr(flow.net, "_build_rope", counted_rope)
+    monkeypatch.setattr(
+        flow.net.cond_embed,
+        "forward",
+        counted_condition_embedding,
+    )
+    flow.sample(
+        condition,
+        num_steps=3,
+        solver="euler",
+        cfg=1.0,
+        query_positions=positions,
+        latent_mixer_cache=cache,
+        initial_noise=torch.zeros_like(content),
+    )
+
+    assert prepare_calls == 1
+    assert rope_calls == 1
+    assert condition_embedding_calls == 1
+
+
+def test_sampling_reuses_timestep_embeddings(monkeypatch):
+    flow = _flow()
+    _, _, condition, _, positions, _, _ = _inputs()
+    time_embedding_calls = 0
+    original_forward = flow.net.time_embed.forward
+
+    def counted_forward(*args, **kwargs):
+        nonlocal time_embedding_calls
+        time_embedding_calls += 1
+        return original_forward(*args, **kwargs)
+
+    monkeypatch.setattr(flow.net.time_embed, "forward", counted_forward)
+    sample_kwargs = {
+        "num_steps": 3,
+        "solver": "heun",
+        "cfg": 1.0,
+        "query_positions": positions,
+        "initial_noise": torch.zeros(1, 4, 4),
+    }
+    flow.sample(condition, **sample_kwargs)
+    flow.sample(condition, **sample_kwargs)
+
+    assert time_embedding_calls == 4
+
+
 def test_training_uses_float32_flow_objective_and_bfloat16_network(monkeypatch):
     flow = _flow().to(dtype=torch.bfloat16)
     content, _, condition, _, positions, sigma, _ = _inputs()

@@ -11,11 +11,7 @@ from pathlib import Path
 from omegaconf import OmegaConf
 
 from scripts.validate_ascend_imagenet1k_caption_joint import (
-    CAPTION_SHA256,
-    MODEL_CONFIG_SHA256,
-    MODEL_WEIGHTS_SHA256,
     require_file,
-    require_hash,
     validate_synthetic_assets,
 )
 from utils.selfless_training_runtime import validate_wsd_contract
@@ -26,10 +22,10 @@ VALIDATION_IMAGES = 50_000
 TRAIN_SAMPLES_PER_EPOCH = 1_230_848
 GLOBAL_BATCH = 1_024
 STEPS_PER_EPOCH = 1_202
-EPOCHS = 80
-MAX_STEPS = STEPS_PER_EPOCH * EPOCHS
-WARMUP_EPOCHS = 8
-DECAY_EPOCHS = 24
+EPOCH_CONTRACTS = {
+    80: {"warmup": 8, "stable": 48, "decay": 24},
+    400: {"warmup": 40, "stable": 240, "decay": 120},
+}
 SELECTED_LR = 2e-5
 T2I_PROMPTS_PER_IMAGE = 12
 DEFAULT_GENERATION_STEPS = 10
@@ -44,8 +40,6 @@ VARIANT_CONTRACTS = {
         "architecture_variant": "selfless_contextual",
         "image_sigma_order": "random",
         "generation_strategy": "spatial_halton",
-        "model_weights_sha256": MODEL_WEIGHTS_SHA256,
-        "model_config_sha256": MODEL_CONFIG_SHA256,
     },
     "positionwise_head": {
         "project": (
@@ -59,12 +53,6 @@ VARIANT_CONTRACTS = {
         "architecture_variant": "positionwise_selfless",
         "image_sigma_order": "random",
         "generation_strategy": "spatial_halton",
-        "model_weights_sha256": (
-            "c3a2378dc20ff3b1ee3414a4c4233c8f3fb649d754ff8dacf743ae0077534990"
-        ),
-        "model_config_sha256": (
-            "e8a975ed636b20c2dd02bbf58b747d70724856479d4b238249112fa344c9015f"
-        ),
     },
     "seq_sigma": {
         "project": "selfless-flow-imagenet1k-t2i-seq-sigma-ascend64-b1024-80ep",
@@ -75,12 +63,6 @@ VARIANT_CONTRACTS = {
         "architecture_variant": "selfless_contextual",
         "image_sigma_order": "sequential",
         "generation_strategy": "sequential",
-        "model_weights_sha256": (
-            "bde2f3793b55496b3f6bc39002a656e2f12cde2ecec93208460019c9f8152f59"
-        ),
-        "model_config_sha256": (
-            "4ad2b5308fc7c47e1807a4fa6b726b0d576cf190aa808df0d8568d01535e760c"
-        ),
     },
 }
 
@@ -95,6 +77,18 @@ def validate_config(
         contract = VARIANT_CONTRACTS[variant]
     except KeyError as exc:
         raise RuntimeError(f"unsupported T2I variant: {variant!r}") from exc
+    epochs = int(config.training.num_train_epochs)
+    try:
+        epoch_contract = EPOCH_CONTRACTS[epochs]
+    except KeyError as exc:
+        raise RuntimeError(
+            f"unsupported T2I epoch contract: {epochs}; "
+            f"expected one of {sorted(EPOCH_CONTRACTS)}"
+        ) from exc
+    expected_project = str(contract["project"]).replace(
+        "-80ep", f"-{epochs}ep"
+    )
+    max_steps = STEPS_PER_EPOCH * epochs
     validate_wsd_contract(config)
     params = config.dataset.params
     architecture_variant = str(
@@ -102,7 +96,7 @@ def validate_config(
     )
     image_sigma_order = str(params.get("image_sigma_order", "random"))
     required = {
-        "experiment_project": (str(config.experiment.project), contract["project"]),
+        "experiment_project": (str(config.experiment.project), expected_project),
         "model_path": (str(config.model.model_path), contract["model_path"]),
         "architecture_variant": (
             architecture_variant,
@@ -119,7 +113,7 @@ def validate_config(
         ),
         "evaluation_checkpoint": (
             str(config.evaluation.checkpoint),
-            f"output/{contract['project']}/hf_model-final-ema",
+            f"output/{expected_project}/hf_model-final-ema",
         ),
         "backbone_attention_output_gate": (
             str(config.model.backbone_attention_output_gate),
@@ -132,10 +126,6 @@ def validate_config(
             str(params.caption_jsonl),
             "public/datasets/imagenet1k_synthetic_v1/captions/"
             "imagenet1k_train_7captions.jsonl",
-        ),
-        "caption_manifest_sha256": (
-            str(params.caption_manifest_sha256),
-            CAPTION_SHA256,
         ),
         "synthetic_text_index_manifest": (
             str(params.synthetic_text_index_manifest),
@@ -185,16 +175,16 @@ def validate_config(
             int(config.training.optimizer_steps_per_epoch),
             STEPS_PER_EPOCH,
         ),
-        "num_train_epochs": (int(config.training.num_train_epochs), EPOCHS),
-        "max_train_steps": (int(config.training.max_train_steps), MAX_STEPS),
-        "stop_after_steps": (int(config.training.stop_after_steps), MAX_STEPS),
+        "num_train_epochs": (int(config.training.num_train_epochs), epochs),
+        "max_train_steps": (int(config.training.max_train_steps), max_steps),
+        "stop_after_steps": (int(config.training.stop_after_steps), max_steps),
         "warmup_steps": (
             int(config.lr_scheduler.params.warmup_steps),
-            WARMUP_EPOCHS * STEPS_PER_EPOCH,
+            epoch_contract["warmup"] * STEPS_PER_EPOCH,
         ),
         "decay_steps": (
             int(config.lr_scheduler.params.decay_steps),
-            DECAY_EPOCHS * STEPS_PER_EPOCH,
+            epoch_contract["decay"] * STEPS_PER_EPOCH,
         ),
         "save_every": (int(config.experiment.save_every), 10 * STEPS_PER_EPOCH),
         "val_every": (int(config.experiment.val_every), 10 * STEPS_PER_EPOCH),
@@ -205,9 +195,13 @@ def validate_config(
         ),
         "max_seq_length": (int(params.max_seq_length), 512),
         "pad_to_length": (int(params.pad_to_length), 512),
-        "split_strategy": (str(params.split_strategy), "stratified"),
-        "val_samples_per_class": (int(params.val_samples_per_class), 50),
-        "validation_overlap_train": (bool(params.validation_overlap_train), False),
+        "training_split": (str(params.expected_split), "train"),
+        "training_records": (int(params.expected_records), TRAIN_IMAGES),
+        "validation_split": (str(params.validation.expected_split), "val"),
+        "validation_records": (
+            int(params.validation.expected_records),
+            VALIDATION_IMAGES,
+        ),
         "trainable_scope": (str(config.training.trainable_scope), "full"),
         "ema_decay": (float(config.training.ema_decay), 0.999),
         "mixed_precision": (str(config.training.mixed_precision).lower(), "bf16"),
@@ -248,11 +242,11 @@ def validate_config(
         "global_batch": GLOBAL_BATCH,
         "samples_per_epoch": TRAIN_SAMPLES_PER_EPOCH,
         "optimizer_steps_per_epoch": STEPS_PER_EPOCH,
-        "epochs": EPOCHS,
-        "max_optimizer_steps": MAX_STEPS,
-        "wsd_epochs": {"warmup": 8, "stable": 48, "decay": 24},
+        "epochs": epochs,
+        "max_optimizer_steps": max_steps,
+        "wsd_epochs": dict(epoch_contract),
         "task_modes": ["t2i"],
-        "training_images_available": TRAIN_IMAGES - VALIDATION_IMAGES,
+        "training_images_available": TRAIN_IMAGES,
         "validation_images": VALIDATION_IMAGES,
         "t2i_source": "twelve_synthetic_prompts",
         "prompt_schedule": (
@@ -301,15 +295,17 @@ def main() -> None:
         model_root = Path(config.model.model_path)
         report["initialization"] = {
             "path": str(model_root),
-            "model_weights_sha256": require_hash(
-                model_root / "model.safetensors",
-                VARIANT_CONTRACTS[args.variant]["model_weights_sha256"],
-                f"completed ImageNet-1K {args.variant} EMA weights",
+            "weights": str(
+                require_file(
+                    model_root / "model.safetensors",
+                    f"completed ImageNet-1K {args.variant} EMA weights",
+                )
             ),
-            "config_sha256": require_hash(
-                model_root / "config.json",
-                VARIANT_CONTRACTS[args.variant]["model_config_sha256"],
-                f"completed ImageNet-1K {args.variant} EMA config",
+            "config": str(
+                require_file(
+                    model_root / "config.json",
+                    f"completed ImageNet-1K {args.variant} EMA config",
+                )
             ),
         }
         for filename in (

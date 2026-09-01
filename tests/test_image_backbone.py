@@ -137,7 +137,8 @@ def test_dataset_signature_has_no_retired_layout_or_mode_switches():
     parameters = inspect.signature(ImageNetFlowCacheDataset).parameters
     assert "image_space_to_depth_factor" not in parameters
     assert "condition_payload" not in parameters
-    assert "caption_sequence_modes" not in parameters
+    # Caption task selection is part of the active T2I/I2T data contract.
+    assert "caption_sequence_modes" in parameters
     assert "caption_prefix" not in parameters
     assert "label_text" not in parameters
     assert "latent_hflip_prob" not in parameters

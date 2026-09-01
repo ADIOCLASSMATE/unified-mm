@@ -1,0 +1,135 @@
+# Qwen3-1.7B baseline-a LR sweep. All nine arms run for the same nominal 1B
+# text-target budget and are selected only after every arm is complete.
+# Training, checkpoint validation, and selection do not calculate hashes.
+schema: unified_lr_sweep_v1
+base_config: configs/selfless/unified_baseline_1p7b_100b_ascend_64npu.yaml
+platform_project: "随机序语言建模-统一自回归与掩码扩散的随机顺序生成框架"
+sweep_project: unified-a-1p7b-lr-sweep-1b-s42
+output_root: output/unified-a-1p7b-lr-sweep-1b-s42
+formal_output_root: output/unified-a-qwen3-1.7b-100b-s42-r1
+world_size: 64
+nodes: 4
+npu_per_node: 16
+seed: 42
+stop_after_steps: 955
+nominal_text_targets_per_step: 1048064
+nominal_text_targets_at_stop: 1000901120
+validation_step: 955
+validation_seed: 424242
+global_batch_policy:
+    name: preserve_0p6b_global_physical_rows_and_text_targets
+    physical_rows_per_optimizer_step: 2560
+    text_targets_per_optimizer_step: 1048064
+    per_rank_micro_batches:
+        climbmix: 4
+        t2i: 16
+        i2t: 16
+    gradient_accumulation_steps: 4
+    flow_head_gradient_checkpointing: true
+    backbone_gradient_checkpointing: false
+memory_policy:
+    allocator_env: PYTORCH_NPU_ALLOC_CONF
+    allocator_config: expandable_segments:True
+    preserve_micro_batches: true
+    preserve_gradient_accumulation_steps: true
+    verified_peak_reserved_gib_ascend16: 51.51
+task_loss_logging:
+    normalization:
+        climbmix: mean_cross_entropy_over_valid_text_targets
+        t2i: mean_flow_velocity_mse_over_image_targets_and_latent_channels
+        i2t: mean_cross_entropy_over_valid_text_targets
+    model_weights:
+        text: 0.05
+        image: 1.0
+    accumulation:
+        source_schedule: [climbmix, t2i, climbmix, i2t]
+        gradient_accumulation_steps: 4
+        formula: mean_of_four_already_weighted_microbatch_losses
+    raw_normalized:
+        - train/loss_climbmix
+        - train/loss_t2i
+        - train/loss_i2t
+    weighted_contributions:
+        - train/weighted_contribution_climbmix
+        - train/weighted_contribution_t2i
+        - train/weighted_contribution_i2t
+    contribution_sum_matches: step_loss
+    persistent_jsonl: training_metrics.jsonl
+lr_scaling:
+    reference_model: Qwen3-0.6B-Base
+    reference_hidden_size: 1024
+    target_model: Qwen3-1.7B-Base
+    target_hidden_size: 2048
+    reference_selected_backbone_lr: 3.0e-4
+    width_scaled_backbone_lr: 2.1213203435596424e-4
+    rule: reference_lr_div_sqrt_hidden_width_ratio
+    reference_selected_flow_lr: 5.0e-5
+    flow_rule: preserve_center_because_flow_head_and_global_image_batch_are_unchanged
+selection:
+    required_arms: 9
+    primary: mean_modality_rank
+    tie_breakers:
+        - worst_modality_rank
+        - relative_loss_sum
+        - arm_id
+    metrics:
+        - val/loss_text
+        - val/loss_image_flow
+    lower_is_better: true
+    require_all_arms: true
+    runtime_hashing_enabled: false
+formal_continuation:
+    auto_start_after_sweep: false
+    max_train_steps: 95415
+    resume_selected_checkpoint: true
+    restart_from_step_zero: false
+    save_every: 2000
+    checkpoints_total_limit: 3
+    validation_image_every: 2000
+    validation_i2t_every: 2000
+arms:
+    - id: b18e5-f4e5
+      backbone_lr: 1.8e-4
+      flow_lr: 4.0e-5
+      job_name: umm-a1p7-b18-f4-1b-s42
+      order: 1
+    - id: b18e5-f5e5
+      backbone_lr: 1.8e-4
+      flow_lr: 5.0e-5
+      job_name: umm-a1p7-b18-f5-1b-s42
+      order: 2
+    - id: b18e5-f6e5
+      backbone_lr: 1.8e-4
+      flow_lr: 6.0e-5
+      job_name: umm-a1p7-b18-f6-1b-s42
+      order: 3
+    - id: b21e5-f4e5
+      backbone_lr: 2.1e-4
+      flow_lr: 4.0e-5
+      job_name: umm-a1p7-b21-f4-1b-s42
+      order: 4
+    - id: b21e5-f5e5
+      backbone_lr: 2.1e-4
+      flow_lr: 5.0e-5
+      job_name: umm-a1p7-b21-f5-1b-s42
+      order: 5
+    - id: b21e5-f6e5
+      backbone_lr: 2.1e-4
+      flow_lr: 6.0e-5
+      job_name: umm-a1p7-b21-f6-1b-s42
+      order: 6
+    - id: b24e5-f4e5
+      backbone_lr: 2.4e-4
+      flow_lr: 4.0e-5
+      job_name: umm-a1p7-b24-f4-1b-s42
+      order: 7
+    - id: b24e5-f5e5
+      backbone_lr: 2.4e-4
+      flow_lr: 5.0e-5
+      job_name: umm-a1p7-b24-f5-1b-s42
+      order: 8
+    - id: b24e5-f6e5
+      backbone_lr: 2.4e-4
+      flow_lr: 6.0e-5
+      job_name: umm-a1p7-b24-f6-1b-s42
+      order: 9

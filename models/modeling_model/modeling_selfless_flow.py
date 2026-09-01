@@ -20,16 +20,26 @@
 # limitations under the License.
 
 import math
+import importlib.machinery
 import os
+import sys
+import types
 from typing import Optional, Union
 
 import torch
-import torch_npu
+try:
+    import torch_npu
+except ImportError:  # CPU-only contract tests do not have the Ascend runtime.
+    os.environ.setdefault("DS_ACCELERATOR", "cpu")
+    torch_npu = types.ModuleType("torch_npu")
+    torch_npu.__spec__ = importlib.machinery.ModuleSpec(
+        "torch_npu", loader=None
+    )
+    sys.modules["torch_npu"] = torch_npu
 from torch import nn
 from torch.nn import functional as F
 from torch.nn.attention.flex_attention import (
     BlockMask,
-    create_block_mask,
     flex_attention,
 )
 from transformers.activations import ACT2FN
@@ -62,6 +72,10 @@ from .image_backbone import (
 )
 from .image_position_utils import (
     build_row_col_position_ids,
+)
+from .modeling_selfless_generation import (
+    SelflessGenerationMixin,
+    SelflessStaticCache,
 )
 
 def auto_docstring(obj=None, **_kwargs):
@@ -164,7 +178,7 @@ class Qwen3RMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, hidden_states):
-        if hidden_states.is_npu:
+        if getattr(hidden_states, "is_npu", False):
             return torch_npu.npu_rms_norm(
                 hidden_states, self.weight, epsilon=self.variance_epsilon
             )[0]
@@ -200,7 +214,7 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
-def apply_rotary_pos_emb(X0_q, XT_q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+def apply_rotary_pos_emb(X0_q, XT_q, k, cos, sin, unsqueeze_dim=1):
     """Applies Rotary Position Embedding to the query and key tensors.
 
     Args:
@@ -208,8 +222,6 @@ def apply_rotary_pos_emb(X0_q, XT_q, k, cos, sin, position_ids=None, unsqueeze_d
         k (`torch.Tensor`): The key tensor.
         cos (`torch.Tensor`): The cosine part of the rotary embedding.
         sin (`torch.Tensor`): The sine part of the rotary embedding.
-        position_ids (`torch.Tensor`, *optional*):
-            Deprecated and unused.
         unsqueeze_dim (`int`, *optional*, defaults to 1):
             The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
             sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
@@ -417,130 +429,6 @@ def compiled_flex_attention(query, key, value, attention_mask, scaling, enable_g
     return out[0] * valid_rows.to(dtype=out[0].dtype)
 
 
-def dynamic_flex_attention(query, key, value, attention_mask, scaling, enable_gqa):
-    """NPU 原生融合注意力（eval / 动态长度路径）——与 compiled 版同实现。"""
-    return compiled_flex_attention(query, key, value, attention_mask, scaling, enable_gqa)
-
-
-class _SelflessStaticCacheLayer:
-    def __init__(self, max_cache_len: int):
-        self.max_cache_len = int(max_cache_len)
-        self.is_initialized = False
-        self.keys = None
-        self.values = None
-
-    def lazy_initialization(
-        self,
-        key_states: torch.Tensor,
-        value_states: torch.Tensor,
-    ) -> None:
-        self.keys = torch.zeros(
-            key_states.shape[0],
-            key_states.shape[1],
-            self.max_cache_len,
-            key_states.shape[-1],
-            device=key_states.device,
-            dtype=key_states.dtype,
-        )
-        self.values = torch.zeros(
-            value_states.shape[0],
-            value_states.shape[1],
-            self.max_cache_len,
-            value_states.shape[-1],
-            device=value_states.device,
-            dtype=value_states.dtype,
-        )
-        self.is_initialized = True
-
-
-class SelflessStaticCache(Cache):
-    """Static K/V cache that writes batch-specific original sequence slots."""
-
-    def __init__(self, config, max_cache_len: int):
-        super().__init__(
-            layers=[
-                _SelflessStaticCacheLayer(max_cache_len)
-                for _ in range(int(config.num_hidden_layers))
-            ]
-        )
-        self._max_cache_len = int(max_cache_len)
-
-    def get_seq_length(self, layer_idx: int = 0) -> int:
-        del layer_idx
-        return 0
-
-    def get_max_cache_shape(self) -> int:
-        return self._max_cache_len
-
-    def update(
-        self,
-        key_states: torch.Tensor,
-        value_states: torch.Tensor,
-        layer_idx: int,
-        *args,
-        **kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        cache_kwargs = args[0] if args else kwargs
-        cache_position = cache_kwargs.get("cache_position")
-        if cache_position is None:
-            raise ValueError(
-                "SelflessStaticCache requires explicit cache_position."
-            )
-        layer = self.layers[layer_idx]
-        if not layer.is_initialized:
-            layer.lazy_initialization(key_states, value_states)
-        cache_position = cache_position.to(
-            device=key_states.device,
-            dtype=torch.long,
-        )
-        if cache_position.ndim == 1:
-            cache_position = cache_position.unsqueeze(0).expand(
-                key_states.shape[0], -1
-            )
-        expected_shape = (key_states.shape[0], key_states.shape[-2])
-        if tuple(cache_position.shape) != expected_shape:
-            raise ValueError(
-                "cache_position must align with [batch, query_length]: "
-                f"{tuple(cache_position.shape)} != {expected_shape}"
-            )
-        key_indices = cache_position[:, None, :, None].expand(
-            -1,
-            key_states.shape[1],
-            -1,
-            key_states.shape[-1],
-        )
-        value_indices = cache_position[:, None, :, None].expand(
-            -1,
-            value_states.shape[1],
-            -1,
-            value_states.shape[-1],
-        )
-        cache_write_mask = cache_kwargs.get("cache_write_mask")
-        if cache_write_mask is not None:
-            cache_write_mask = cache_write_mask.to(
-                device=key_states.device,
-                dtype=torch.bool,
-            )
-            if tuple(cache_write_mask.shape) != expected_shape:
-                raise ValueError(
-                    "cache_write_mask must align with cache_position: "
-                    f"{tuple(cache_write_mask.shape)} != {expected_shape}"
-                )
-            key_states = torch.where(
-                cache_write_mask[:, None, :, None],
-                key_states,
-                layer.keys.gather(2, key_indices),
-            )
-            value_states = torch.where(
-                cache_write_mask[:, None, :, None],
-                value_states,
-                layer.values.gather(2, value_indices),
-            )
-        layer.keys.scatter_(2, key_indices, key_states)
-        layer.values.scatter_(2, value_indices, value_states)
-        return layer.keys, layer.values
-
-
 class Qwen3Attention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
@@ -741,9 +629,11 @@ class Qwen3Attention(nn.Module):
         XT_hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor,
+        content_attention_mask: torch.Tensor | None = None,
         past_key_values: Optional[Cache] = None,
         cache_read_only: bool = False,
         cache_write_mask: Optional[torch.BoolTensor] = None,
+        cache_write_prefix: Optional[int] = None,
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -756,7 +646,7 @@ class Qwen3Attention(nn.Module):
             str(kwargs.pop("backbone_gate_stats_level", "summary")).strip().lower()
             == "detailed"
         )
-        self.last_gate_stats = {}
+        self.last_gate_stats.clear()
         prefix = f"layers.{self.layer_idx}.self_attn"
         _debug_require_finite_tensor(
             debug_finite,
@@ -836,6 +726,7 @@ class Qwen3Attention(nn.Module):
                 "cos": cos,
                 "cache_position": cache_position,
                 "cache_write_mask": cache_write_mask,
+                "cache_write_prefix": cache_write_prefix,
             }
             X0_key_states, X0_value_states = past_key_values.update(
                 X0_key_states, X0_value_states, self.layer_idx, cache_kwargs
@@ -843,53 +734,33 @@ class Qwen3Attention(nn.Module):
 
         # 检查是否需要 GQA (Grouped Query Attention)
         enable_gqa = self.config.num_attention_heads != self.config.num_key_value_heads
+        x0_attention_mask = (
+            attention_mask
+            if content_attention_mask is None
+            else content_attention_mask
+        )
 
-        if not self.training:
-            X0_attn_output = dynamic_flex_attention(
-                query=X0_query_states,
-                key=X0_key_states,
-                value=X0_value_states,
-                attention_mask=attention_mask,  # dense bool mask (True=disallow)
-                scaling=self.scaling,  # 使用预定义的缩放因子
-                enable_gqa=enable_gqa,  # 如果 kv heads 少于 q heads，需要启用
+        X0_attn_output = compiled_flex_attention(
+            X0_query_states,
+            X0_key_states,
+            X0_value_states,
+            x0_attention_mask,
+            self.scaling,
+            enable_gqa,
+        )
+        XT_attn_output = (
+            compiled_flex_attention(
+                XT_query_states,
+                X0_key_states,
+                X0_value_states,
+                attention_mask,
+                self.scaling,
+                enable_gqa,
             )
-            XT_attn_output = (
-                dynamic_flex_attention(
-                    query=XT_query_states,
-                    key=X0_key_states,
-                    value=X0_value_states,
-                    attention_mask=attention_mask,  # dense bool mask (True=disallow)
-                    scaling=self.scaling,  # 使用预定义的缩放因子
-                    enable_gqa=enable_gqa,  # 如果 kv heads 少于 q heads，需要启用
-                )
-                if XT_query_states is not None
-                else None
-            )
-            attn_weights = None
-
-        else:
-            # 调用 flex_attention
-            X0_attn_output = compiled_flex_attention(
-                query=X0_query_states,
-                key=X0_key_states,
-                value=X0_value_states,
-                attention_mask=attention_mask,  # dense bool mask (True=disallow)
-                scaling=self.scaling,  # 使用预定义的缩放因子
-                enable_gqa=enable_gqa,  # 如果 kv heads 少于 q heads，需要启用
-            )
-            XT_attn_output = (
-                compiled_flex_attention(
-                    query=XT_query_states,
-                    key=X0_key_states,
-                    value=X0_value_states,
-                    attention_mask=attention_mask,  # dense bool mask (True=disallow)
-                    scaling=self.scaling,  # 使用预定义的缩放因子
-                    enable_gqa=enable_gqa,  # 如果 kv heads 少于 q heads，需要启用
-                )
-                if XT_query_states is not None
-                else None
-            )
-            attn_weights = None
+            if XT_query_states is not None
+            else None
+        )
+        attn_weights = None
 
         _debug_require_finite_tensor(
             debug_finite,
@@ -961,6 +832,7 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
         X0_hidden_states: torch.Tensor,
         XT_hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
+        content_attention_mask: torch.Tensor | None = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Cache] = None,
         use_cache: Optional[bool] = False,
@@ -983,6 +855,7 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
             X0_hidden_states=X0_hidden_states,
             XT_hidden_states=XT_hidden_states,
             attention_mask=attention_mask,
+            content_attention_mask=content_attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
             use_cache=use_cache,
@@ -1129,6 +1002,17 @@ class Qwen3Model(Qwen3PreTrainedModel):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
+        self.training_objective = str(
+            getattr(config, "training_objective", "selfless_dual_stream")
+        ).strip().lower()
+        if self.training_objective not in {
+            "selfless_dual_stream",
+            "showo_mae_flow",
+        }:
+            raise ValueError(
+                "training_objective must be selfless_dual_stream or "
+                f"showo_mae_flow, got {self.training_objective!r}"
+            )
 
         self.image_latent_dim = int(
             getattr(config, "image_latent_dim", CANONICAL_IMAGE_LATENT_DIM)
@@ -1346,12 +1230,96 @@ class Qwen3Model(Qwen3PreTrainedModel):
             )
         return inputs_embeds
 
+    def _resolve_text_ar_mode(
+        self,
+        *,
+        requested: bool | None,
+        calculate_likelihood: bool | None,
+        require_image_query_stream: bool | None,
+        token_types: torch.Tensor | None,
+        image_latent_mask: torch.Tensor | None,
+    ) -> bool:
+        """Return whether this call uses an ablation-specific text AR stream.
+
+        The production Selfless model never enables this mode.  A dedicated
+        ablation model can override the hook without adding a behavior switch
+        to the baseline implementation.
+        """
+
+        del (
+            requested,
+            calculate_likelihood,
+            require_image_query_stream,
+            token_types,
+            image_latent_mask,
+        )
+        return False
+
+    def _needs_query_stream(
+        self,
+        *,
+        calculate_likelihood: bool | None,
+        require_image_query_stream: bool | None,
+        text_ar_mode: bool,
+        image_spans_present: bool | None,
+    ) -> bool:
+        """Select the XT stream while preserving the baseline default."""
+
+        del require_image_query_stream, text_ar_mode, image_spans_present
+        return self.training_objective == "selfless_dual_stream" and bool(
+            self.training or calculate_likelihood
+        )
+
+    def _prepare_stream_attention_masks(
+        self,
+        attention_mask,
+        content_attention_mask,
+        *,
+        text_ar_mode: bool,
+        input_ids: torch.LongTensor | None,
+        token_types: torch.Tensor | None,
+        text_segment_ids: torch.Tensor | None,
+        past_key_values: Cache | None,
+        cache_position: torch.LongTensor | None,
+    ):
+        """Allow an isolated model class to supply a text-only content mask."""
+
+        del (
+            text_ar_mode,
+            input_ids,
+            token_types,
+            text_segment_ids,
+            past_key_values,
+            cache_position,
+        )
+        return attention_mask, content_attention_mask
+
+    def _finalize_stream_hidden(
+        self,
+        X0_hidden_states: torch.Tensor,
+        XT_hidden_states: torch.Tensor | None,
+        *,
+        use_query_stream: bool,
+        text_ar_mode: bool,
+        token_types: torch.Tensor | None,
+        past_key_values: Cache | None,
+        cache_position: torch.LongTensor | None,
+    ) -> torch.Tensor:
+        """Choose and normalize the stream returned by the baseline model."""
+
+        del text_ar_mode, token_types, past_key_values, cache_position
+        hidden_states = XT_hidden_states if use_query_stream else X0_hidden_states
+        if hidden_states is None:
+            raise RuntimeError("The selected Selfless stream was not constructed.")
+        return self.norm(hidden_states)
+
     # @check_model_inputs
     @auto_docstring
     def forward(
         self,
         X0_input_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        content_attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Cache] = None,
         X0_inputs_embeds: Optional[torch.FloatTensor] = None,
@@ -1378,6 +1346,31 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 "attention_mask must be provided for selfless sigma-causal attention."
             )
 
+        require_image_query_stream = kwargs.pop(
+            "_require_image_query_stream", None
+        )
+        requested_text_ar_mode = kwargs.pop("_text_ar_mode", None)
+        text_segment_ids = kwargs.pop("_text_segment_ids", None)
+        text_ar_mode = self._resolve_text_ar_mode(
+            requested=requested_text_ar_mode,
+            calculate_likelihood=calculate_likelihood,
+            require_image_query_stream=require_image_query_stream,
+            token_types=kwargs.get("token_types", None),
+            image_latent_mask=kwargs.get("image_latent_mask", None),
+        )
+        attention_mask, content_attention_mask = (
+            self._prepare_stream_attention_masks(
+                attention_mask,
+                content_attention_mask,
+                text_ar_mode=text_ar_mode,
+                input_ids=X0_input_ids,
+                token_types=kwargs.get("token_types", None),
+                text_segment_ids=text_segment_ids,
+                past_key_values=past_key_values,
+                cache_position=cache_position,
+            )
+        )
+
         # Every decoder layer consumes the same dense attention mask, and the
         # X0/XT streams share it as well.  Preparing it inside each attention
         # call repeated all/clone/index operations 56 times per microbatch on
@@ -1385,6 +1378,10 @@ class Qwen3Model(Qwen3PreTrainedModel):
         # indicator device-resident and reuse them across all layers/streams.
         if isinstance(attention_mask, torch.Tensor):
             attention_mask = _to_bool_atten_mask(attention_mask)
+        if isinstance(content_attention_mask, torch.Tensor):
+            content_attention_mask = _to_bool_atten_mask(
+                content_attention_mask
+            )
 
         debug_finite_backbone = bool(kwargs.get("debug_finite_backbone", False))
         debug_backbone_label = str(kwargs.get("debug_backbone_label", ""))
@@ -1417,7 +1414,13 @@ class Qwen3Model(Qwen3PreTrainedModel):
             X0_inputs_embeds,
         )
 
-        if self.training or calculate_likelihood:
+        use_query_stream = self._needs_query_stream(
+            calculate_likelihood=calculate_likelihood,
+            require_image_query_stream=require_image_query_stream,
+            text_ar_mode=text_ar_mode,
+            image_spans_present=image_spans_present,
+        )
+        if use_query_stream:
             XT_inputs_embeds = self._build_xt_inputs_embeds(
                 input_ids=X0_input_ids,
                 token_types=token_types,
@@ -1467,6 +1470,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 X0_hidden_states,
                 XT_hidden_states,
                 attention_mask,
+                content_attention_mask=content_attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 use_cache=use_cache,
@@ -1481,32 +1485,41 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 X0_hidden_states,
             )
 
-        if self.training or calculate_likelihood:
-            XT_hidden_states = self.norm(XT_hidden_states)
-            return BaseModelOutputWithPast(
-                last_hidden_state=XT_hidden_states,
-                past_key_values=past_key_values if use_cache else None,
-            )
-        else:
-            X0_hidden_states = self.norm(X0_hidden_states)
-            return BaseModelOutputWithPast(
-                last_hidden_state=X0_hidden_states,
-                past_key_values=past_key_values if use_cache else None,
-            )
+        hidden_states = self._finalize_stream_hidden(
+            X0_hidden_states,
+            XT_hidden_states,
+            use_query_stream=use_query_stream,
+            text_ar_mode=text_ar_mode,
+            token_types=token_types,
+            past_key_values=past_key_values,
+            cache_position=cache_position,
+        )
+        return BaseModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=past_key_values if use_cache else None,
+        )
 
 
 @auto_docstring
-class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
+class Qwen3ForCausalLM(
+    SelflessGenerationMixin,
+    Qwen3PreTrainedModel,
+    GenerationMixin,
+):
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
+    backbone_model_class = Qwen3Model
 
     def __init__(self, config):
         super().__init__(config)
-        self.model = Qwen3Model(config)
+        self.model = self.backbone_model_class(config)
         self.vocab_size = config.vocab_size
         self.image_latent_dim = getattr(config, "image_latent_dim", 4)
         self.image_flow_batch_mul = int(getattr(config, "image_flow_batch_mul", 1))
+        self.training_objective = str(
+            getattr(config, "training_objective", "selfless_dual_stream")
+        ).strip().lower()
         self.lambda_text = float(getattr(config, "lambda_text", 0.0))
         self.lambda_image = float(getattr(config, "lambda_image", 1.0))
         if self.lambda_text < 0.0 or self.lambda_image < 0.0:
@@ -1578,6 +1591,20 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         )
         return self.image_flow_condition_proj(z)
 
+    def _zero_image_module_loss(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return zero while keeping skipped image modules in the train graph."""
+
+        zero = hidden_states.float().sum() * 0.0
+        for module in (self.image_flow_condition_proj, self.image_flow_head):
+            for parameter in module.parameters():
+                if parameter.requires_grad and parameter.numel() > 0:
+                    zero = zero + parameter.reshape(-1)[0].float() * 0.0
+        self.image_flow_head.last_forward_stats = {}
+        return zero
+
     def _shared_noisy_image_latents(
         self,
         image_latents: torch.Tensor | None,
@@ -1605,42 +1632,26 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         context_conditions: torch.Tensor | None = None,
         latent_mixer_cache: dict | None = None,
         latent_mixer_cache_is_paired: bool = False,
+        context_prepared: bool = False,
         initial_noise: torch.Tensor | None = None,
+        initial_noise_prevalidated: bool = False,
         condition_evaluator=None,
         debug_finite: bool = False,
         debug_label: str = "",
     ) -> torch.Tensor:
-        if cfg == 1.0:
-            return self.image_flow_head.sample(
-                z,
-                temperature=temperature,
-                cfg=1.0,
-                cfg_schedule=cfg_schedule,
-                solver=solver,
-                num_steps=num_steps,
-                context_latents=context_latents,
-                context_mask=context_mask,
-                query_positions=query_positions,
-                context_positions=context_positions,
-                context_conditions=context_conditions,
-                latent_mixer_cache=latent_mixer_cache,
-                latent_mixer_cache_is_paired=latent_mixer_cache_is_paired,
-                initial_noise=initial_noise,
-                condition_evaluator=condition_evaluator,
-                debug_finite=debug_finite,
-                debug_label=debug_label,
-            )
-        if z_uncond is None:
-            raise ValueError(
-                "cfg != 1.0 requires z_uncond; pass paired conditional/unconditional conditions."
-            )
-        if z.shape != z_uncond.shape:
-            raise ValueError(
-                f"z and z_uncond must have the same shape, got {tuple(z.shape)} vs {tuple(z_uncond.shape)}"
-            )
-        paired = torch.cat([z, z_uncond], dim=0)
+        if cfg != 1.0:
+            if z_uncond is None:
+                raise ValueError(
+                    "cfg != 1.0 requires paired conditional/unconditional conditions"
+                )
+            if z.shape != z_uncond.shape:
+                raise ValueError(
+                    "z and z_uncond must have the same shape, got "
+                    f"{tuple(z.shape)} and {tuple(z_uncond.shape)}"
+                )
+            z = torch.cat([z, z_uncond], dim=0)
         return self.image_flow_head.sample(
-            paired,
+            z,
             temperature=temperature,
             cfg=cfg,
             cfg_schedule=cfg_schedule,
@@ -1653,7 +1664,9 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             context_conditions=context_conditions,
             latent_mixer_cache=latent_mixer_cache,
             latent_mixer_cache_is_paired=latent_mixer_cache_is_paired,
+            context_prepared=context_prepared,
             initial_noise=initial_noise,
+            initial_noise_prevalidated=initial_noise_prevalidated,
             condition_evaluator=condition_evaluator,
             debug_finite=debug_finite,
             debug_label=debug_label,
@@ -1671,6 +1684,18 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         super().tie_weights(
             missing_keys=missing_keys, recompute_mapping=recompute_mapping
         )
+
+    def _prepare_backbone_forward_kwargs(
+        self,
+        model_kwargs: dict,
+        *,
+        compute_text_loss: bool,
+        compute_image_loss: bool,
+    ) -> dict:
+        """Extension hook used by isolated objective model classes."""
+
+        del compute_text_loss, compute_image_loss
+        return model_kwargs
 
     @can_return_tuple
     @auto_docstring
@@ -1714,12 +1739,27 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         return_per_modality_loss_graph = bool(
             model_kwargs.pop("return_per_modality_loss_graph", False)
         )
+        compute_text_loss = bool(
+            model_kwargs.pop("compute_text_loss", True)
+        )
+        compute_image_loss_arg = model_kwargs.pop(
+            "compute_image_loss", None
+        )
         image_loss_mask_arg = model_kwargs.pop("image_loss_mask", None)
+        image_latent_mask_arg = model_kwargs.get("image_latent_mask", None)
         image_span_table_arg = model_kwargs.get("image_span_table", None)
         image_local_positions_arg = model_kwargs.get(
             "image_local_positions", None
         )
         record_flow_stats = bool(model_kwargs.pop("record_flow_stats", True))
+        compute_image_loss = (
+            bool(compute_image_loss_arg)
+            if compute_image_loss_arg is not None
+            else bool(
+                image_span_table_arg is not None
+                and image_span_table_arg.shape[0] > 0
+            )
+        )
         clean_image_latents = image_latents
         if inputs_embeds is None:
             context_image_latents = self._shared_noisy_image_latents(
@@ -1738,6 +1778,11 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             and context_image_latents is not clean_image_latents
         ):
             model_kwargs["image_latents_are_noisy"] = True
+        model_kwargs = self._prepare_backbone_forward_kwargs(
+            model_kwargs,
+            compute_text_loss=compute_text_loss,
+            compute_image_loss=compute_image_loss,
+        )
         outputs: BaseModelOutputWithPast = self.model(
             X0_input_ids=X0_input_ids,
             attention_mask=attention_mask,
@@ -1769,140 +1814,179 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 token_types = token_types.to(hidden_states.device)
                 labels = labels.to(hidden_states.device)
                 text_loss = hidden_states.sum() * 0.0
+                if self.training_objective == "showo_mae_flow":
+                    text_hidden_source = hidden_states[:, :-1]
+                    text_targets_source = labels[:, 1:]
+                    text_types_source = token_types[:, 1:]
+                else:
+                    text_hidden_source = hidden_states
+                    text_targets_source = labels
+                    text_types_source = token_types
                 valid_text_mask = (
-                    ((token_types == 0) | (token_types == 2))
-                    & (labels != -100)
+                    ((text_types_source == 0) | (text_types_source == 2))
+                    & (text_targets_source != -100)
+                    & compute_text_loss
                 )
                 text_token_count = valid_text_mask.sum()
-                if self.lambda_text > 0.0:
-                    text_hidden = hidden_states[valid_text_mask]
-                    text_targets = labels[valid_text_mask]
+                if compute_text_loss and self.lambda_text > 0.0:
+                    text_hidden = text_hidden_source[valid_text_mask]
+                    text_targets = text_targets_source[valid_text_mask]
                     text_logits = self.lm_head(text_hidden)
                     text_loss = F.cross_entropy(
                         text_logits,
                         text_targets,
                         reduction="sum",
                     ) / text_token_count.clamp_min(1).to(text_logits.dtype)
-                if image_span_table_arg is None:
+                if not compute_image_loss:
+                    image_loss = self._zero_image_module_loss(hidden_states)
+                    image_token_count = torch.zeros(
+                        (), device=hidden_states.device, dtype=torch.long
+                    )
+                elif image_span_table_arg is None:
                     raise ValueError(
                         "Caption image-flow training requires image_span_table from "
                         "the collator; GPU span discovery is intentionally unsupported."
                     )
-                if image_latents is None:
+                elif image_latents is None:
                     raise ValueError(
                         "image_latents must be provided for continuous image flow loss."
                     )
-                if image_latents.shape[-1] != self.image_latent_dim:
+                elif image_latents.shape[-1] != self.image_latent_dim:
                     raise ValueError(
                         f"image_latents last dimension ({image_latents.shape[-1]}) must match "
                         f"config.image_latent_dim ({self.image_latent_dim})."
                     )
-                span_table = image_span_table_arg.to(
-                    device=hidden_states.device,
-                    dtype=torch.long,
-                )
-                if span_table.ndim != 2 or span_table.shape[1] < 4:
-                    raise ValueError(
-                        "image_span_table must have shape [num_images, >=4], got "
-                        f"{tuple(span_table.shape)}"
-                    )
-                if span_table.shape[0] == 0:
-                    raise ValueError("caption batch contains no image spans")
-
-                image_tokens_per_img = int(self.config.image_tokens_per_img)
-                rows = span_table[:, 0]
-                starts = span_table[:, 2]
-                offsets = torch.arange(
-                    image_tokens_per_img,
-                    device=hidden_states.device,
-                    dtype=torch.long,
-                ).unsqueeze(0)
-                token_indices = starts.unsqueeze(1) + offsets
-
-                clean_image_latents = clean_image_latents.to(hidden_states.device)
-                context_for_loss = (
-                    clean_image_latents
-                    if context_image_latents is None
-                    else context_image_latents.to(hidden_states.device)
-                )
-                image_targets = clean_image_latents[rows.unsqueeze(1), token_indices]
-                image_context_latents = context_for_loss[
-                    rows.unsqueeze(1), token_indices
-                ]
-                selected_hidden_states = torch.index_select(hidden_states, 0, rows)
-                hidden_gather_indices = token_indices.unsqueeze(-1).expand(
-                    -1, -1, hidden_states.shape[-1]
-                )
-                image_hidden_states = torch.gather(
-                    selected_hidden_states,
-                    dim=1,
-                    index=hidden_gather_indices,
-                )
-                image_conditions = self._prepare_image_flow_condition(
-                    image_hidden_states
-                )
-                flow_sigma = model_kwargs.get("flow_sigma", None)
-                if flow_sigma is None:
-                    image_sigmas = offsets.expand(span_table.shape[0], -1).float()
                 else:
-                    flow_sigma = flow_sigma.to(
-                        device=hidden_states.device,
-                        dtype=torch.float32,
-                    )
-                    image_sigmas = flow_sigma[rows.unsqueeze(1), token_indices]
-                if image_local_positions_arg is None:
-                    image_positions_for_flow = offsets.expand(
-                        span_table.shape[0], -1
-                    )
-                else:
-                    local_positions = image_local_positions_arg.to(
+                    span_table = image_span_table_arg.to(
                         device=hidden_states.device,
                         dtype=torch.long,
                     )
-                    image_positions_for_flow = local_positions[
-                        rows.unsqueeze(1), token_indices
-                    ]
-                image_loss_mask = None
-                if image_loss_mask_arg is not None:
-                    full_loss_mask = image_loss_mask_arg.to(
-                        device=hidden_states.device,
-                        dtype=torch.bool,
-                    )
-                    image_loss_mask = full_loss_mask[
-                        rows.unsqueeze(1), token_indices
-                    ]
+                    if span_table.ndim != 2 or span_table.shape[1] < 4:
+                        raise ValueError(
+                            "image_span_table must have shape [num_images, >=4], got "
+                            f"{tuple(span_table.shape)}"
+                        )
+                    if span_table.shape[0] == 0:
+                        raise ValueError("caption batch contains no image spans")
 
-                if self.image_flow_batch_mul > 1:
-                    repeats = self.image_flow_batch_mul
-                    image_targets = image_targets.repeat(repeats, 1, 1)
-                    image_context_latents = image_context_latents.repeat(
-                        repeats, 1, 1
-                    )
-                    image_conditions = image_conditions.repeat(repeats, 1, 1)
-                    image_sigmas = image_sigmas.repeat(repeats, 1)
-                    image_positions_for_flow = image_positions_for_flow.repeat(
-                        repeats, 1
-                    )
-                    if image_loss_mask is not None:
-                        image_loss_mask = image_loss_mask.repeat(repeats, 1)
-                image_loss = self.image_flow_head(
-                    target=image_targets,
-                    z=image_conditions,
-                    mask=image_loss_mask,
-                    sigma=image_sigmas,
-                    image_positions=image_positions_for_flow,
-                    context_latents=image_context_latents,
-                    record_stats=record_flow_stats,
-                )
-                image_token_count = (
-                    image_loss_mask.sum()
-                    if image_loss_mask is not None
-                    else torch.tensor(
-                        image_targets.shape[0] * image_targets.shape[1],
+                    image_tokens_per_img = int(self.config.image_tokens_per_img)
+                    rows = span_table[:, 0]
+                    starts = span_table[:, 2]
+                    offsets = torch.arange(
+                        image_tokens_per_img,
                         device=hidden_states.device,
                         dtype=torch.long,
+                    ).unsqueeze(0)
+                    token_indices = starts.unsqueeze(1) + offsets
+
+                    clean_image_latents = clean_image_latents.to(hidden_states.device)
+                    context_for_loss = (
+                        clean_image_latents
+                        if context_image_latents is None
+                        else context_image_latents.to(hidden_states.device)
                     )
-                )
+                    image_targets = clean_image_latents[rows.unsqueeze(1), token_indices]
+                    image_context_latents = context_for_loss[
+                        rows.unsqueeze(1), token_indices
+                    ]
+                    selected_hidden_states = torch.index_select(hidden_states, 0, rows)
+                    hidden_gather_indices = token_indices.unsqueeze(-1).expand(
+                        -1, -1, hidden_states.shape[-1]
+                    )
+                    image_hidden_states = torch.gather(
+                        selected_hidden_states,
+                        dim=1,
+                        index=hidden_gather_indices,
+                    )
+                    image_conditions = self._prepare_image_flow_condition(
+                        image_hidden_states
+                    )
+                    flow_sigma = model_kwargs.get("flow_sigma", None)
+                    if flow_sigma is None:
+                        image_sigmas = offsets.expand(span_table.shape[0], -1).float()
+                    else:
+                        flow_sigma = flow_sigma.to(
+                            device=hidden_states.device,
+                            dtype=torch.float32,
+                        )
+                        image_sigmas = flow_sigma[rows.unsqueeze(1), token_indices]
+                    if image_local_positions_arg is None:
+                        image_positions_for_flow = offsets.expand(
+                            span_table.shape[0], -1
+                        )
+                    else:
+                        local_positions = image_local_positions_arg.to(
+                            device=hidden_states.device,
+                            dtype=torch.long,
+                        )
+                        image_positions_for_flow = local_positions[
+                            rows.unsqueeze(1), token_indices
+                        ]
+                    image_loss_mask = None
+                    if image_loss_mask_arg is not None:
+                        full_loss_mask = image_loss_mask_arg.to(
+                            device=hidden_states.device,
+                            dtype=torch.bool,
+                        )
+                        image_loss_mask = full_loss_mask[
+                            rows.unsqueeze(1), token_indices
+                        ]
+
+                    image_flow_context_mask = None
+                    if self.training_objective == "showo_mae_flow":
+                        if image_latent_mask_arg is None:
+                            raise ValueError(
+                                "showo_mae_flow requires image_latent_mask"
+                            )
+                        full_visible_mask = image_latent_mask_arg.to(
+                            device=hidden_states.device,
+                            dtype=torch.bool,
+                        )
+                        visible_image_tokens = full_visible_mask[
+                            rows.unsqueeze(1), token_indices
+                        ]
+                        image_flow_context_mask = visible_image_tokens.unsqueeze(
+                            1
+                        ).expand(-1, image_tokens_per_img, -1)
+                        image_sigmas = None
+
+                    if self.image_flow_batch_mul > 1:
+                        repeats = self.image_flow_batch_mul
+                        image_targets = image_targets.repeat(repeats, 1, 1)
+                        image_context_latents = image_context_latents.repeat(
+                            repeats, 1, 1
+                        )
+                        image_conditions = image_conditions.repeat(repeats, 1, 1)
+                        if image_sigmas is not None:
+                            image_sigmas = image_sigmas.repeat(repeats, 1)
+                        image_positions_for_flow = image_positions_for_flow.repeat(
+                            repeats, 1
+                        )
+                        if image_loss_mask is not None:
+                            image_loss_mask = image_loss_mask.repeat(repeats, 1)
+                        if image_flow_context_mask is not None:
+                            image_flow_context_mask = image_flow_context_mask.repeat(
+                                repeats, 1, 1
+                            )
+                    image_loss = self.image_flow_head(
+                        target=image_targets,
+                        z=image_conditions,
+                        mask=image_loss_mask,
+                        sigma=image_sigmas,
+                        image_positions=image_positions_for_flow,
+                        context_latents=image_context_latents,
+                        context_mask=image_flow_context_mask,
+                        record_stats=record_flow_stats,
+                    )
+                    image_token_count = (
+                        image_loss_mask.sum()
+                        if image_loss_mask is not None
+                        else torch.tensor(
+                            image_targets.shape[0] * image_targets.shape[1],
+                            device=hidden_states.device,
+                            dtype=torch.long,
+                        )
+                    )
                 loss = (
                     self.lambda_text * text_loss
                     + self.lambda_image * image_loss
@@ -1961,1767 +2045,6 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             reduction=reduction,
         )
 
-    @torch.no_grad()
-    def sample_image_latents_single_stream(
-        self,
-        input_ids: torch.Tensor,
-        token_types: torch.Tensor,
-        sigma: torch.Tensor,
-        spans: list[tuple[int, int, int]],
-        image_latent_dim: int | None = None,
-        initial_image_latents: torch.Tensor | None = None,
-        initial_image_latent_mask: torch.Tensor | None = None,
-        initial_noise_bank: torch.Tensor | None = None,
-        flow_temperature: float = 1.0,
-        flow_cfg: float = 1.0,
-        flow_cfg_schedule: str = "constant",
-        flow_solver: str | None = None,
-        flow_num_steps: int | None = None,
-        parallel_rate: int = 1,
-        order_strategy: str = "spatial_halton",
-        use_backbone_cache: bool = True,
-        return_trace: bool = False,
-        debug_finite: bool = False,
-        _debug_max_generation_steps: int | None = None,
-    ) -> (
-        torch.Tensor | tuple[torch.Tensor | None, dict[str, torch.Tensor | str]] | None
-    ):
-        from utils.utils import get_selfless_mask
-
-        if not spans:
-            return (None, {}) if return_trace else None
-
-        def _debug_check(
-            name: str, tensor: torch.Tensor, step: int | None = None
-        ) -> None:
-            if not debug_finite:
-                return
-            finite = torch.isfinite(tensor)
-            if bool(finite.all()):
-                return
-            finite_values = tensor[finite].float()
-            nonfinite_rows = None
-            if tensor.ndim >= 1:
-                row_finite = finite.reshape(tensor.shape[0], -1).all(dim=1)
-                nonfinite_rows = (
-                    (~row_finite).nonzero(as_tuple=True)[0].detach().cpu().tolist()
-                )
-            finite_range = (
-                [float(finite_values.min().item()), float(finite_values.max().item())]
-                if finite_values.numel()
-                else None
-            )
-            raise FloatingPointError(
-                "non-finite tensor during single-stream image generation: "
-                f"component={name!r}, generation_step={step}, "
-                f"shape={tuple(tensor.shape)}, nonfinite_rows={nonfinite_rows}, "
-                f"nonfinite={int((~finite).sum().item())}/{tensor.numel()}, "
-                f"finite_range={finite_range}"
-            )
-
-        device = input_ids.device
-        image_latent_dim = image_latent_dim or self.image_latent_dim
-        image_tokens_per_img = int(getattr(self.config, "image_tokens_per_img", 256))
-        side = int(image_tokens_per_img**0.5)
-        if side * side != image_tokens_per_img:
-            raise ValueError(
-                f"image_tokens_per_img={image_tokens_per_img} is not square"
-            )
-        selected_input_ids = torch.stack([input_ids[b] for b, _, _ in spans]).to(
-            device=device
-        )
-        selected_token_types = torch.stack([token_types[b] for b, _, _ in spans]).to(
-            device=device
-        )
-        selected_sigma = torch.stack([sigma[b] for b, _, _ in spans]).to(
-            device=device, dtype=torch.float32
-        )
-        work_latents = torch.zeros(
-            selected_input_ids.shape[0],
-            selected_input_ids.shape[1],
-            image_latent_dim,
-            device=device,
-            dtype=self.image_flow_head.net.final_layer.linear.weight.dtype,
-        )
-        selected_initial_noise = None
-        if initial_noise_bank is not None:
-            expected_noise_shape = (
-                len(spans),
-                image_tokens_per_img,
-                image_latent_dim,
-            )
-            if not isinstance(initial_noise_bank, torch.Tensor):
-                raise TypeError(
-                    "initial_noise_bank must be a torch.Tensor when provided, "
-                    f"got {type(initial_noise_bank).__name__}"
-                )
-            if tuple(initial_noise_bank.shape) != expected_noise_shape:
-                raise ValueError(
-                    "initial_noise_bank must align with selected sample/local-token positions "
-                    f"and have shape {expected_noise_shape}, got {tuple(initial_noise_bank.shape)}"
-                )
-            if not initial_noise_bank.is_floating_point():
-                raise TypeError(
-                    "initial_noise_bank must have a floating dtype, "
-                    f"got {initial_noise_bank.dtype}"
-                )
-            if not bool(torch.isfinite(initial_noise_bank).all().item()):
-                raise FloatingPointError(
-                    "initial_noise_bank contains non-finite values"
-                )
-            selected_initial_noise = initial_noise_bank.to(
-                device=device,
-                dtype=torch.float32,
-            )
-        base_image_latent_mask = torch.zeros_like(
-            selected_token_types, dtype=torch.bool
-        )
-        if initial_image_latents is not None:
-            if initial_image_latents.shape[:2] != input_ids.shape:
-                raise ValueError(
-                    "initial_image_latents must have shape [batch, seq_len, latent_dim], "
-                    f"got {tuple(initial_image_latents.shape)} for input_ids={tuple(input_ids.shape)}"
-                )
-            if initial_image_latents.shape[-1] != image_latent_dim:
-                raise ValueError(
-                    f"initial_image_latents last dimension ({initial_image_latents.shape[-1]}) "
-                    f"must match image_latent_dim ({image_latent_dim})."
-                )
-            selected_initial_latents = torch.stack(
-                [initial_image_latents[b] for b, _, _ in spans]
-            ).to(device=device, dtype=work_latents.dtype)
-            work_latents.copy_(selected_initial_latents)
-        if initial_image_latent_mask is not None:
-            if initial_image_latent_mask.shape != input_ids.shape:
-                raise ValueError(
-                    "initial_image_latent_mask must have shape [batch, seq_len], "
-                    f"got {tuple(initial_image_latent_mask.shape)} for input_ids={tuple(input_ids.shape)}"
-                )
-            if initial_image_latents is None and initial_image_latent_mask.any():
-                raise ValueError(
-                    "initial_image_latents must be provided when initial_image_latent_mask has true entries."
-                )
-            base_image_latent_mask = torch.stack(
-                [initial_image_latent_mask[b] for b, _, _ in spans]
-            ).to(device=device, dtype=torch.bool)
-
-        original_orders = []
-        local_spans = []
-        for out_idx, (batch_idx, start, end) in enumerate(spans):
-            local_spans.append((out_idx, start, end))
-            original_orders.append(
-                torch.argsort(
-                    sigma[batch_idx, start:end].to(device=device, dtype=torch.float32)
-                )
-            )
-
-        def _halton(index: int, base: int) -> float:
-            value = 0.0
-            scale = 1.0 / float(base)
-            while index > 0:
-                value += (index % base) * scale
-                index //= base
-                scale /= float(base)
-            return value
-
-        def _halton_order() -> torch.Tensor:
-            seen = set()
-            order = []
-            idx = 1
-            while len(order) < image_tokens_per_img and idx < image_tokens_per_img * 32:
-                row = min(side - 1, int(_halton(idx, 2) * side))
-                col = min(side - 1, int(_halton(idx, 3) * side))
-                flat = row * side + col
-                if flat not in seen:
-                    seen.add(flat)
-                    order.append(flat)
-                idx += 1
-            if len(order) < image_tokens_per_img:
-                order.extend(
-                    [flat for flat in range(image_tokens_per_img) if flat not in seen]
-                )
-            return torch.tensor(order, device=device, dtype=torch.long)
-
-        def _spatial_uniform_order() -> torch.Tensor:
-            yy, xx = torch.meshgrid(
-                torch.arange(side, device=device),
-                torch.arange(side, device=device),
-                indexing="ij",
-            )
-            center = (side - 1) / 2.0
-            ring = torch.maximum(
-                (yy.float() - center).abs(), (xx.float() - center).abs()
-            )
-            checker = (yy % 2) * 2 + (xx % 2)
-            return torch.argsort((ring * 4.0 + checker.float()).flatten())
-
-        filled = torch.zeros(
-            len(spans),
-            image_tokens_per_img,
-            device=device,
-            dtype=torch.bool,
-        )
-        generated = torch.zeros(
-            len(spans),
-            image_tokens_per_img,
-            image_latent_dim,
-            device=device,
-            dtype=work_latents.dtype,
-        )
-        generation_order = torch.zeros(
-            len(spans),
-            image_tokens_per_img,
-            device=device,
-            dtype=torch.long,
-        )
-        generation_step = torch.zeros_like(generation_order)
-        generation_score = torch.zeros(
-            len(spans),
-            image_tokens_per_img,
-            device=device,
-            dtype=torch.float32,
-        )
-        reveal_fraction = torch.zeros_like(generation_score)
-        for sample_idx, start, _ in local_spans:
-            initial_filled = base_image_latent_mask[
-                sample_idx, start : start + image_tokens_per_img
-            ]
-            if initial_filled.any():
-                filled[sample_idx] = initial_filled
-                generated[sample_idx, initial_filled] = work_latents[
-                    sample_idx,
-                    start : start + image_tokens_per_img,
-                ][initial_filled]
-
-        current_sigma = selected_sigma.clone()
-        next_image_order = torch.zeros(len(spans), device=device, dtype=torch.float32)
-        k = max(1, int(parallel_rate))
-        order_strategy = str(order_strategy or "spatial_halton").lower()
-        replay_original_sigma = order_strategy in {
-            "sigma",
-            "sigma_replay",
-            "causal_sigma",
-        }
-
-        def _condition(
-            hidden_values: torch.Tensor, local_positions: torch.Tensor
-        ) -> torch.Tensor:
-            return self._prepare_image_flow_condition(hidden_values)
-
-        def _flow_context(
-            sample_indices: torch.Tensor, local_positions: torch.Tensor
-        ) -> dict[str, torch.Tensor]:
-            if int(sample_indices.numel()) != len(spans):
-                raise RuntimeError(
-                    "batched flow cache requires one active token per sample; "
-                    f"got {sample_indices.numel()} tokens for {len(spans)} samples"
-                )
-            return {
-                "query_positions": local_positions.to(
-                    device=device, dtype=torch.long
-                ),
-                "latent_mixer_cache": flow_content_cache,
-                "latent_mixer_cache_is_paired": bool(use_flow_cfg),
-            }
-
-        if not replay_original_sigma:
-            for sample_idx, start, end in local_spans:
-                original_image_sigma = selected_sigma[sample_idx, start:end]
-                start_order = float(original_image_sigma.min().item())
-                visible_context = (
-                    (selected_token_types[sample_idx] != 1)
-                    & (selected_token_types[sample_idx] != 3)
-                    & (selected_sigma[sample_idx] < start_order)
-                )
-                if visible_context.any():
-                    start_order = max(
-                        start_order,
-                        float(
-                            selected_sigma[sample_idx, visible_context].max().item()
-                            + 1.0
-                        ),
-                    )
-                current_sigma[sample_idx, start:end] = (
-                    start_order + image_tokens_per_img
-                )
-                initial_positions = filled[sample_idx].nonzero(as_tuple=True)[0]
-                if initial_positions.numel() > 0:
-                    current_sigma[sample_idx, start + initial_positions] = (
-                        start_order
-                        + torch.arange(
-                            initial_positions.numel(),
-                            device=device,
-                            dtype=current_sigma.dtype,
-                        )
-                    )
-                next_image_order[sample_idx] = start_order + float(
-                    initial_positions.numel()
-                )
-        fill_counter = torch.ones(len(spans), device=device, dtype=torch.long)
-        step_idx = 1
-        fixed_orders = {
-            "sequential": torch.arange(
-                image_tokens_per_img, device=device, dtype=torch.long
-            ),
-            "raster": torch.arange(
-                image_tokens_per_img, device=device, dtype=torch.long
-            ),
-            "row_major": torch.arange(
-                image_tokens_per_img, device=device, dtype=torch.long
-            ),
-            "prefix": torch.arange(
-                image_tokens_per_img, device=device, dtype=torch.long
-            ),
-            "spatial_halton": _halton_order(),
-            "halton": _halton_order(),
-            "spatial_uniform": _spatial_uniform_order(),
-            "uniform": _spatial_uniform_order(),
-        }
-        latent_level_strategies = {"latent_proj_cosine"}
-        use_flow_cfg = flow_cfg != 1.0
-        if k != 1:
-            raise ValueError(
-                "Incremental content-cache generation requires "
-                "parallel_rate=1."
-            )
-        if order_strategy in latent_level_strategies:
-            raise ValueError(
-                "Dynamic flow generation does not support speculative "
-                "latent-level candidate scoring."
-            )
-        if bool(filled.any().item()):
-            raise ValueError(
-                "Incremental generation requires an empty "
-                "initial image-latent prefix."
-            )
-        flow_cache_branches = 2 if use_flow_cfg else 1
-        flow_content_cache = self.image_flow_head.empty_latent_mixer_cache(
-            batch_size=len(spans) * flow_cache_branches,
-            capacity=image_tokens_per_img,
-        )
-        flow_cache_peak_bytes = 0
-        flow_cache_divergence_sum = None
-        flow_cache_divergence_count = 0
-        boi_token_id = getattr(self.config, "boi_token_id", None)
-        if use_flow_cfg and boi_token_id is None:
-            raise ValueError(
-                "flow_cfg != 1.0 requires config.boi_token_id for image-uncond attention masks."
-            )
-        image_uncond_rows = (
-            torch.ones(
-                selected_input_ids.shape[0],
-                device=device,
-                dtype=torch.bool,
-            )
-            if use_flow_cfg
-            else None
-        )
-
-        # A mask embedding is a read-only query and must never enter the cache.
-        # After flow produces a real latent, the next two-token forward commits
-        # that latent while querying the next mask position.  Only the first
-        # token is written, so every layer's next query immediately sees the
-        # committed K/V without paying for a separate backbone forward.
-        caption_single_image_rows = bool(
-            (selected_token_types == 1)
-            .sum(dim=1)
-            .eq(image_tokens_per_img)
-            .all()
-            .item()
-        )
-        backbone_cache_enabled = bool(
-            use_backbone_cache
-            and caption_single_image_rows
-            and (order_strategy in fixed_orders or replay_original_sigma)
-        )
-        backbone_cache_fallback_reason = None
-        if use_backbone_cache and not backbone_cache_enabled:
-            if not caption_single_image_rows:
-                backbone_cache_fallback_reason = (
-                    "incremental backbone caching currently requires caption "
-                    "rows with exactly one image span"
-                )
-            else:
-                backbone_cache_fallback_reason = (
-                    f"order_strategy={order_strategy!r} requires full-sequence "
-                    "candidate scoring"
-                )
-        backbone_cache_tokens_committed = 0
-        backbone_pending_local_positions = None
-        backbone_pending_latents = None
-        backbone_cache_peak_bytes = 0
-        backbone_cond_cache = None
-        backbone_uncond_cache = None
-        backbone_key_sigma = None
-        backbone_key_valid = None
-        backbone_key_is_image = None
-        backbone_context_len = 0
-        backbone_max_cache_len = 0
-        full_position_ids = None
-        debug_conditional_hidden = []
-        debug_unconditional_hidden = []
-        span_starts = torch.tensor(
-            [start for _, start, _ in local_spans],
-            device=device,
-            dtype=torch.long,
-        )
-        batch_indices = torch.arange(len(spans), device=device, dtype=torch.long)
-
-        def _gather_position_ids(indices: torch.Tensor) -> torch.Tensor:
-            return torch.gather(
-                full_position_ids,
-                dim=2,
-                index=indices.unsqueeze(0).expand(2, -1, -1),
-            )
-
-        def _backbone_cache_mask(
-            query_sigma: torch.Tensor,
-            query_valid: torch.Tensor,
-            *,
-            image_uncond: bool,
-        ) -> torch.Tensor | BlockMask:
-            query_sigma = query_sigma.to(device=device, dtype=torch.float32)
-            query_valid = query_valid.to(device=device, dtype=torch.bool)
-
-            allowed = (
-                query_valid.unsqueeze(-1)
-                & backbone_key_valid.unsqueeze(1)
-                & (backbone_key_sigma.unsqueeze(1) < query_sigma.unsqueeze(-1))
-            )
-            if image_uncond:
-                allowed = allowed & backbone_key_is_image.unsqueeze(1)
-            if device.type == "npu":
-                return (~allowed).unsqueeze(1)  # True = disallow
-
-            def mask_mod(b, h, q_idx, kv_idx):
-                del h
-                return allowed[b, q_idx, kv_idx]
-
-            return create_block_mask(
-                mask_mod,
-                B=len(spans),
-                H=None,
-                Q_LEN=query_sigma.shape[1],
-                KV_LEN=backbone_max_cache_len,
-                device=device,
-            )
-
-        def _next_backbone_query_positions() -> torch.Tensor:
-            positions = []
-            for sample_idx in range(len(spans)):
-                if replay_original_sigma:
-                    order = original_orders[sample_idx]
-                else:
-                    order = fixed_orders[order_strategy]
-                positions.append(order[~filled[sample_idx, order]][:1])
-            return torch.cat(positions, dim=0)
-
-        def _cached_backbone_query(
-            local_positions: torch.Tensor,
-            *,
-            cache: SelflessStaticCache,
-            image_uncond: bool,
-            label: str,
-        ) -> torch.Tensor:
-            seq_positions = span_starts + local_positions
-            current_indices = seq_positions.unsqueeze(1)
-            current_query_sigma = current_sigma[
-                batch_indices, seq_positions
-            ].unsqueeze(1)
-            current_query_latents = work_latents[
-                batch_indices, seq_positions
-            ].unsqueeze(1)
-            current_query_mask = torch.zeros(
-                len(spans), 1, device=device, dtype=torch.bool
-            )
-            if backbone_pending_local_positions is None:
-                gather_indices = current_indices
-                query_sigma = current_query_sigma
-                query_latents = current_query_latents
-                query_mask = current_query_mask
-                cache_read_only = True
-                cache_write_mask = None
-            else:
-                pending_seq_positions = (
-                    span_starts + backbone_pending_local_positions
-                )
-                pending_indices = pending_seq_positions.unsqueeze(1)
-                gather_indices = torch.cat(
-                    [pending_indices, current_indices], dim=1
-                )
-                query_sigma = torch.cat(
-                    [
-                        current_sigma[
-                            batch_indices, pending_seq_positions
-                        ].unsqueeze(1),
-                        current_query_sigma,
-                    ],
-                    dim=1,
-                )
-                query_latents = torch.cat(
-                    [
-                        backbone_pending_latents.unsqueeze(1),
-                        current_query_latents,
-                    ],
-                    dim=1,
-                )
-                query_mask = torch.cat(
-                    [
-                        torch.ones(
-                            len(spans),
-                            1,
-                            device=device,
-                            dtype=torch.bool,
-                        ),
-                        current_query_mask,
-                    ],
-                    dim=1,
-                )
-                cache_read_only = False
-                cache_write_mask = query_mask
-            attention_mask = _backbone_cache_mask(
-                query_sigma,
-                torch.ones_like(query_mask),
-                image_uncond=image_uncond,
-            )
-            output = self.model(
-                X0_input_ids=torch.gather(
-                    selected_input_ids, 1, gather_indices
-                ),
-                attention_mask=attention_mask,
-                position_ids=_gather_position_ids(gather_indices),
-                past_key_values=cache,
-                use_cache=not cache_read_only,
-                cache_position=gather_indices,
-                cache_read_only=cache_read_only,
-                cache_write_mask=cache_write_mask,
-                token_types=torch.gather(
-                    selected_token_types, 1, gather_indices
-                ),
-                image_latents=query_latents,
-                image_latent_mask=query_mask,
-                image_reveal_sigma=query_sigma,
-                calculate_likelihood=False,
-                debug_finite_backbone=debug_finite,
-                debug_backbone_label=label,
-            ).last_hidden_state
-            return output[:, -1:]
-
-        def _stage_pending_backbone_token() -> None:
-            if backbone_pending_local_positions is None:
-                return
-            seq_positions = span_starts + backbone_pending_local_positions
-            pending_indices = seq_positions.unsqueeze(1)
-            commit_sigma = current_sigma[
-                batch_indices, seq_positions
-            ].unsqueeze(1)
-            backbone_key_sigma.scatter_(
-                1, pending_indices, commit_sigma
-            )
-            backbone_key_valid.scatter_(
-                1,
-                pending_indices,
-                torch.ones_like(pending_indices, dtype=torch.bool),
-            )
-            backbone_key_is_image.scatter_(
-                1,
-                pending_indices,
-                torch.ones_like(pending_indices, dtype=torch.bool),
-            )
-
-        if backbone_cache_enabled:
-            full_position_ids = build_row_col_position_ids(
-                selected_token_types,
-                image_tokens_per_img,
-            )
-            if replay_original_sigma:
-                context_cutoff = torch.stack(
-                    [
-                        selected_sigma[sample_idx, start:end].min()
-                        for sample_idx, start, end in local_spans
-                    ]
-                )
-            else:
-                context_cutoff = next_image_order
-            context_member = (
-                (selected_sigma < context_cutoff.unsqueeze(1))
-                & (selected_token_types != 3)
-            )
-            if bool((context_member & (selected_token_types == 1)).any().item()):
-                raise RuntimeError(
-                    "Backbone KV prefill unexpectedly contains image tokens."
-                )
-            context_counts = context_member.sum(dim=1)
-            backbone_context_len = int(context_counts.max().item())
-            if backbone_context_len <= 0:
-                raise RuntimeError(
-                    "Backbone KV cache requires at least one invariant context token."
-                )
-            context_indices = torch.zeros(
-                len(spans),
-                backbone_context_len,
-                device=device,
-                dtype=torch.long,
-            ).fill_(selected_input_ids.shape[1] - 1)
-            context_valid = torch.zeros(
-                len(spans),
-                backbone_context_len,
-                device=device,
-                dtype=torch.bool,
-            )
-            for sample_idx in range(len(spans)):
-                indices = context_member[sample_idx].nonzero(as_tuple=True)[0]
-                count = indices.numel()
-                context_indices[sample_idx, :count] = indices
-                context_valid[sample_idx, :count] = True
-
-            backbone_max_cache_len = selected_input_ids.shape[1]
-            backbone_key_sigma = torch.full(
-                (len(spans), backbone_max_cache_len),
-                torch.inf,
-                device=device,
-                dtype=torch.float32,
-            )
-            backbone_key_valid = torch.zeros(
-                len(spans),
-                backbone_max_cache_len,
-                device=device,
-                dtype=torch.bool,
-            )
-            backbone_key_is_image = torch.zeros_like(backbone_key_valid)
-            context_sigma = torch.gather(
-                selected_sigma, 1, context_indices
-            )
-            backbone_key_sigma.scatter_(
-                1,
-                context_indices,
-                context_sigma.masked_fill(~context_valid, torch.inf),
-            )
-            backbone_key_valid.scatter_(
-                1, context_indices, context_valid
-            )
-            context_input_ids = torch.gather(
-                selected_input_ids, 1, context_indices
-            )
-            context_token_types = _fill_invalid_token_types(
-                torch.gather(selected_token_types, 1, context_indices),
-                context_valid,
-            )
-            context_query_sigma = context_sigma.masked_fill(
-                ~context_valid, torch.inf
-            )
-            context_attention_mask = _backbone_cache_mask(
-                context_query_sigma,
-                context_valid,
-                image_uncond=False,
-            )
-            prefill_kwargs = {
-                "X0_input_ids": context_input_ids,
-                "attention_mask": context_attention_mask,
-                "position_ids": _gather_position_ids(context_indices),
-                "use_cache": True,
-                "cache_position": context_indices,
-                "token_types": context_token_types,
-                "image_reveal_sigma": context_query_sigma,
-                "calculate_likelihood": False,
-                "debug_finite_backbone": debug_finite,
-            }
-            backbone_cond_cache = SelflessStaticCache(
-                config=self.model.config,
-                max_cache_len=backbone_max_cache_len,
-            )
-            self.model(
-                past_key_values=backbone_cond_cache,
-                debug_backbone_label="conditional_cache_prefill",
-                **prefill_kwargs,
-            )
-            if use_flow_cfg:
-                backbone_uncond_cache = SelflessStaticCache(
-                    config=self.model.config,
-                    max_cache_len=backbone_max_cache_len,
-                )
-                self.model(
-                    past_key_values=backbone_uncond_cache,
-                    debug_backbone_label="unconditional_cache_prefill",
-                    **prefill_kwargs,
-                )
-            cache_dtype = next(self.model.parameters()).dtype
-            backbone_cache_peak_bytes = (
-                len(spans)
-                * int(self.config.num_hidden_layers)
-                * int(self.config.num_key_value_heads)
-                * backbone_max_cache_len
-                * int(getattr(self.config, "head_dim", self.config.hidden_size // self.config.num_attention_heads))
-                * cache_dtype.itemsize
-                * 2
-                * (2 if use_flow_cfg else 1)
-            )
-
-        for _ in range(image_tokens_per_img):
-            _debug_check("current_sigma", current_sigma, step_idx)
-            _debug_check("work_latents_before_backbone", work_latents, step_idx)
-            attention_mask = None
-            uncond_attention_mask = None
-            if backbone_cache_enabled:
-                pending_will_commit = (
-                    backbone_pending_local_positions is not None
-                )
-                _stage_pending_backbone_token()
-                backbone_query_local_positions = (
-                    _next_backbone_query_positions()
-                )
-                cached_hidden = _cached_backbone_query(
-                    backbone_query_local_positions,
-                    cache=backbone_cond_cache,
-                    image_uncond=False,
-                    label=f"conditional_cache_query_step={step_idx}",
-                )
-                hidden = cached_hidden
-                uncond_hidden = None
-                if use_flow_cfg:
-                    cached_uncond_hidden = _cached_backbone_query(
-                        backbone_query_local_positions,
-                        cache=backbone_uncond_cache,
-                        image_uncond=True,
-                        label=f"unconditional_cache_query_step={step_idx}",
-                    )
-                    uncond_hidden = cached_uncond_hidden
-                if pending_will_commit:
-                    backbone_cache_tokens_committed += 1
-            else:
-                attention_mask = get_selfless_mask(
-                    sigma=current_sigma,
-                    seq_len=selected_input_ids.shape[1],
-                    device=device,
-                )
-                uncond_attention_mask = None
-                if use_flow_cfg:
-                    uncond_attention_mask = get_selfless_mask(
-                        sigma=current_sigma,
-                        seq_len=selected_input_ids.shape[1],
-                        device=device,
-                        input_ids=selected_input_ids,
-                        token_types=selected_token_types,
-                        boi_token_id=int(boi_token_id),
-                        image_uncond_rows=image_uncond_rows,
-                    )
-                image_latent_mask = base_image_latent_mask.clone()
-                for sample_idx, start, _ in local_spans:
-                    image_latent_mask[
-                        sample_idx,
-                        start : start + image_tokens_per_img,
-                    ] = filled[sample_idx]
-                hidden = self.model(
-                    X0_input_ids=selected_input_ids,
-                    attention_mask=attention_mask,
-                    token_types=selected_token_types,
-                    image_latents=work_latents,
-                    image_latent_mask=image_latent_mask,
-                    image_reveal_sigma=current_sigma,
-                    calculate_likelihood=False,
-                    debug_finite_backbone=debug_finite,
-                    debug_backbone_label=f"conditional_generation_step={step_idx}",
-                ).last_hidden_state
-                uncond_hidden = None
-                if use_flow_cfg:
-                    uncond_hidden = self.model(
-                        X0_input_ids=selected_input_ids,
-                        attention_mask=uncond_attention_mask,
-                        token_types=selected_token_types,
-                        image_latents=work_latents,
-                        image_latent_mask=image_latent_mask,
-                        image_reveal_sigma=current_sigma,
-                        calculate_likelihood=False,
-                        debug_finite_backbone=debug_finite,
-                        debug_backbone_label=f"unconditional_generation_step={step_idx}",
-                    ).last_hidden_state
-            _debug_check("conditional_backbone_hidden", hidden, step_idx)
-            if use_flow_cfg:
-                _debug_check(
-                    "unconditional_backbone_hidden", uncond_hidden, step_idx
-                )
-
-            fill_local_positions = []
-            if order_strategy in latent_level_strategies:
-                all_sample_indices = []
-                all_seq_positions = []
-                all_local_positions = []
-                candidate_counts = []
-                for sample_idx, start, _ in local_spans:
-                    remaining = (~filled[sample_idx]).nonzero(as_tuple=True)[0]
-                    candidate_counts.append(int(remaining.numel()))
-                    if remaining.numel() == 0:
-                        continue
-                    all_sample_indices.append(torch.full_like(remaining, sample_idx))
-                    all_seq_positions.append(start + remaining)
-                    all_local_positions.append(remaining)
-
-                if not all_sample_indices:
-                    break
-
-                all_sample_indices = torch.cat(all_sample_indices)
-                all_seq_positions = torch.cat(all_seq_positions)
-                all_local_positions = torch.cat(all_local_positions)
-                z = _condition(
-                    hidden[all_sample_indices, all_seq_positions],
-                    all_local_positions,
-                )
-                z_uncond = None
-                if use_flow_cfg:
-                    z_uncond = _condition(
-                        uncond_hidden[all_sample_indices, all_seq_positions],
-                        all_local_positions,
-                    )
-
-                candidate_pred = Qwen3ForCausalLM.sample_image_flow_with_cfg(
-                    self,
-                    z,
-                    z_uncond=z_uncond,
-                    temperature=flow_temperature,
-                    cfg=flow_cfg,
-                    cfg_schedule=flow_cfg_schedule,
-                    solver=flow_solver,
-                    num_steps=flow_num_steps,
-                    initial_noise=(
-                        selected_initial_noise[
-                            all_sample_indices,
-                            all_local_positions,
-                        ]
-                        if selected_initial_noise is not None
-                        else None
-                    ),
-                    **_flow_context(all_sample_indices, all_local_positions),
-                ).to(work_latents.dtype)
-                projected = self.image_token_embedder(
-                    candidate_pred.to(dtype=self.image_token_embedder.weight_dtype),
-                    all_local_positions,
-                )
-                all_scores = F.cosine_similarity(projected.float(), z.float(), dim=-1)
-
-                cursor = 0
-                for sample_idx, count in enumerate(candidate_counts):
-                    if count == 0:
-                        continue
-                    local_positions = all_local_positions[cursor : cursor + count]
-                    local_scores = all_scores[cursor : cursor + count]
-                    local_pred = candidate_pred[cursor : cursor + count]
-                    fill_count = min(k, count)
-                    scores, chosen = torch.topk(local_scores, k=fill_count, dim=-1)
-                    positions = local_positions[chosen]
-                    chunks = local_pred[chosen]
-                    fill_local_positions.append((sample_idx, positions, scores, chunks))
-                    cursor += count
-            else:
-                for sample_idx, start, _ in local_spans:
-                    remaining_mask = ~filled[sample_idx]
-                    remaining_count = image_tokens_per_img - (step_idx - 1)
-                    if remaining_count == 0:
-                        continue
-                    fill_count = min(k, remaining_count)
-
-                    if order_strategy in {"sigma", "sigma_replay", "causal_sigma"}:
-                        order = original_orders[sample_idx]
-                        positions = order[~filled[sample_idx, order]][:fill_count]
-                        scores = -sigma[
-                            spans[sample_idx][0],
-                            spans[sample_idx][1] : spans[sample_idx][2],
-                        ].to(device=device, dtype=torch.float32)[positions]
-                    elif order_strategy == "random":
-                        remaining = remaining_mask.nonzero(as_tuple=True)[0]
-                        positions = remaining[
-                            torch.randperm(remaining.numel(), device=device)[
-                                :fill_count
-                            ]
-                        ]
-                        scores = torch.ones(
-                            fill_count, device=device, dtype=torch.float32
-                        )
-                    elif order_strategy in fixed_orders:
-                        order = fixed_orders[order_strategy]
-                        positions = order[~filled[sample_idx, order]][:fill_count]
-                        scores = torch.arange(
-                            fill_count, 0, -1, device=device, dtype=torch.float32
-                        )
-                    elif order_strategy in {
-                        "condition_norm",
-                        "hidden_norm",
-                        "confidence",
-                    }:
-                        span_hidden = hidden[
-                            sample_idx, start : start + image_tokens_per_img
-                        ]
-                        all_scores = (
-                            span_hidden.detach().float().pow(2).mean(dim=-1).sqrt()
-                        )
-                        all_scores = all_scores.masked_fill(~remaining_mask, -torch.inf)
-                        scores, positions = torch.topk(all_scores, k=fill_count, dim=-1)
-                    else:
-                        raise ValueError(
-                            f"Unknown single-stream order_strategy={order_strategy!r}; "
-                            "expected one of: sequential, hidden_norm, latent_proj_cosine, "
-                            "spatial_halton, spatial_uniform, sigma, causal_sigma, random."
-                        )
-
-                    fill_local_positions.append((sample_idx, positions, scores, None))
-
-            if not fill_local_positions:
-                break
-
-            if order_strategy not in latent_level_strategies:
-                sample_indices = []
-                seq_positions = []
-                local_positions_for_condition = []
-                for sample_idx, positions, _, _ in fill_local_positions:
-                    sample_indices.append(torch.full_like(positions, sample_idx))
-                    seq_positions.append(local_spans[sample_idx][1] + positions)
-                    local_positions_for_condition.append(positions)
-                sample_indices = torch.cat(sample_indices)
-                seq_positions = torch.cat(seq_positions)
-                local_positions_for_condition = torch.cat(local_positions_for_condition)
-
-                if backbone_cache_enabled:
-                    condition_hidden = hidden[:, 0]
-                else:
-                    condition_hidden = hidden[sample_indices, seq_positions]
-                if _debug_max_generation_steps is not None:
-                    debug_conditional_hidden.append(
-                        condition_hidden.detach().float().cpu()
-                    )
-                z = _condition(
-                    condition_hidden,
-                    local_positions_for_condition,
-                )
-                _debug_check("conditional_flow_condition", z, step_idx)
-                z_uncond = None
-                if use_flow_cfg:
-                    if backbone_cache_enabled:
-                        uncond_condition_hidden = uncond_hidden[:, 0]
-                    else:
-                        uncond_condition_hidden = uncond_hidden[
-                            sample_indices, seq_positions
-                        ]
-                    if _debug_max_generation_steps is not None:
-                        debug_unconditional_hidden.append(
-                            uncond_condition_hidden.detach().float().cpu()
-                        )
-                    z_uncond = _condition(
-                        uncond_condition_hidden,
-                        local_positions_for_condition,
-                    )
-                    _debug_check("unconditional_flow_condition", z_uncond, step_idx)
-                flow_context = _flow_context(
-                    sample_indices,
-                    local_positions_for_condition,
-                )
-                for context_name, context_value in flow_context.items():
-                    if isinstance(context_value, torch.Tensor):
-                        _debug_check(
-                            f"flow_context.{context_name}", context_value, step_idx
-                        )
-                condition_evaluator = self._make_backbone_flow_condition_evaluator(
-                    selected_input_ids=selected_input_ids,
-                    selected_token_types=selected_token_types,
-                    current_sigma=current_sigma,
-                    work_latents=work_latents,
-                    base_image_latent_mask=base_image_latent_mask,
-                    filled=filled,
-                    span_starts=span_starts,
-                    sample_indices=sample_indices,
-                    seq_positions=seq_positions,
-                    local_positions=local_positions_for_condition,
-                    attention_mask=attention_mask,
-                    uncond_attention_mask=uncond_attention_mask,
-                    use_flow_cfg=use_flow_cfg,
-                    backbone_cache_enabled=backbone_cache_enabled,
-                    backbone_cond_cache=backbone_cond_cache,
-                    backbone_uncond_cache=backbone_uncond_cache,
-                    backbone_key_sigma=backbone_key_sigma,
-                    backbone_key_valid=backbone_key_valid,
-                    backbone_key_is_image=backbone_key_is_image,
-                    backbone_max_cache_len=backbone_max_cache_len,
-                    full_position_ids=full_position_ids,
-                    image_tokens_per_img=image_tokens_per_img,
-                    debug_finite=debug_finite,
-                    generation_step=step_idx,
-                )
-                pred = Qwen3ForCausalLM.sample_image_flow_with_cfg(
-                    self,
-                    z,
-                    z_uncond=z_uncond,
-                    temperature=flow_temperature,
-                    cfg=flow_cfg,
-                    cfg_schedule=flow_cfg_schedule,
-                    solver=flow_solver,
-                    num_steps=flow_num_steps,
-                    initial_noise=(
-                        selected_initial_noise[
-                            sample_indices,
-                            local_positions_for_condition,
-                        ]
-                        if selected_initial_noise is not None
-                        else None
-                    ),
-                    condition_evaluator=condition_evaluator,
-                    **flow_context,
-                    debug_finite=debug_finite,
-                    debug_label=(
-                        (
-                            f"single_stream_generation_step={step_idx},"
-                            f"sample_indices={sample_indices.detach().cpu().tolist()},"
-                            f"local_positions={local_positions_for_condition.detach().cpu().tolist()}"
-                        )
-                        if debug_finite
-                        else ""
-                    ),
-                ).to(work_latents.dtype)
-                _debug_check("flow_prediction", pred, step_idx)
-
-            cursor = 0
-            for (
-                sample_idx,
-                local_positions,
-                local_scores,
-                local_chunks,
-            ) in fill_local_positions:
-                count = local_positions.numel()
-                if local_chunks is None:
-                    chunk = pred[cursor : cursor + count]
-                    cursor += count
-                else:
-                    chunk = local_chunks
-                start = local_spans[sample_idx][1]
-                work_latents[sample_idx, start + local_positions] = chunk
-                generated[sample_idx, local_positions] = chunk
-                _debug_check("generated_chunk", chunk, step_idx)
-                reveal_fraction[sample_idx, local_positions] = float(
-                    step_idx - 1
-                ) / float(max(image_tokens_per_img - 1, 1))
-                filled[sample_idx, local_positions] = True
-                if not replay_original_sigma:
-                    new_sigma = next_image_order[sample_idx] + torch.arange(
-                        count,
-                        device=device,
-                        dtype=current_sigma.dtype,
-                    )
-                    current_sigma[sample_idx, start + local_positions] = new_sigma
-                    next_image_order[sample_idx] += float(count)
-                generation_order[sample_idx, local_positions] = fill_counter[
-                    sample_idx
-                ]
-                generation_step[sample_idx, local_positions] = step_idx
-                generation_score[sample_idx, local_positions] = local_scores.to(
-                    generation_score.dtype
-                )
-                fill_counter[sample_idx] += count
-                if count != 1:
-                    raise AssertionError(
-                        "Dynamic flow cache commit must append one token at a "
-                        "time."
-                    )
-            cache_latents = pred
-            cache_conditions = z
-            cache_positions = local_positions_for_condition
-            if use_flow_cfg:
-                cache_latents = torch.cat([cache_latents, cache_latents], dim=0)
-                cache_conditions = torch.cat(
-                    [cache_conditions, z_uncond], dim=0
-                )
-                cache_positions = torch.cat(
-                    [cache_positions, cache_positions], dim=0
-                )
-            flow_content_cache = self.image_flow_head.append_latent_mixer_cache(
-                flow_content_cache,
-                context_latents=cache_latents,
-                context_conditions=cache_conditions,
-                context_positions=cache_positions,
-            )
-            if backbone_cache_enabled:
-                committed_seq_positions = (
-                    span_starts + backbone_query_local_positions
-                )
-                backbone_pending_local_positions = (
-                    backbone_query_local_positions
-                )
-                backbone_pending_latents = work_latents[
-                    batch_indices,
-                    committed_seq_positions,
-                ]
-            step_idx += 1
-            if (
-                _debug_max_generation_steps is not None
-                and (step_idx - 1) >= int(_debug_max_generation_steps)
-            ):
-                break
-
-        if flow_content_cache is not None:
-            flow_cache_peak_bytes = sum(
-                layer_cache[cache_name].numel()
-                * layer_cache[cache_name].element_size()
-                for layer_cache in flow_content_cache["layers"]
-                for cache_name in ("k", "v")
-            ) // len(spans)
-            if use_flow_cfg:
-                flow_cache_divergence_sum = torch.zeros(
-                    len(flow_content_cache["layers"]),
-                    device=device,
-                    dtype=torch.float32,
-                )
-                diagnostic_batch = 32
-                for layer_idx, layer_cache in enumerate(
-                    flow_content_cache["layers"]
-                ):
-                    conditional = layer_cache["k"][: len(spans)]
-                    unconditional = layer_cache["k"][len(spans) :]
-                    for start in range(0, len(spans), diagnostic_batch):
-                        delta = (
-                            conditional[start : start + diagnostic_batch]
-                            .detach()
-                            .float()
-                            .sub(
-                                unconditional[
-                                    start : start + diagnostic_batch
-                                ]
-                                .detach()
-                                .float()
-                            )
-                        )
-                        flow_cache_divergence_sum[layer_idx] += (
-                            delta.pow(2)
-                            .mean(dim=(1, 3))
-                            .sqrt()
-                            .sum()
-                        )
-                flow_cache_divergence_count = (
-                    len(spans)
-                    * int(flow_content_cache["layers"][0]["k"].shape[2])
-                )
-
-        if order_strategy == "sequential" and _debug_max_generation_steps is None:
-            expected_generation_order = torch.arange(
-                1,
-                image_tokens_per_img + 1,
-                device=device,
-                dtype=generation_order.dtype,
-            ).unsqueeze(0).expand(len(spans), -1)
-            if not torch.equal(generation_order, expected_generation_order):
-                raise AssertionError(
-                    "sequential image generation did not follow serialized "
-                    "latent-token order"
-                )
-
-        generated = generated.view(len(spans), side, side, image_latent_dim).permute(
-            0, 3, 1, 2
-        )
-        _debug_check("final_generated_latents", generated, step_idx)
-        if return_trace:
-            trace = {
-                "order_strategy": order_strategy,
-                "flow_cfg_schedule": str(flow_cfg_schedule),
-                "generation_order": generation_order.view(len(spans), side, side),
-                "generation_step": generation_step.view(len(spans), side, side),
-                "generation_score": generation_score.view(len(spans), side, side),
-                "reveal_fraction": reveal_fraction.view(len(spans), side, side),
-                "flow_head_architecture": "dynamic_dual_stream_pure_2d",
-                "backbone_kv_cache_enabled": backbone_cache_enabled,
-                "backbone_kv_cache_fallback_reason": (
-                    backbone_cache_fallback_reason
-                ),
-                "backbone_kv_cache_context_tokens": int(
-                    backbone_context_len
-                ),
-                "backbone_kv_cache_tokens_committed": int(
-                    backbone_cache_tokens_committed
-                ),
-                "backbone_kv_cache_peak_bytes": int(
-                    backbone_cache_peak_bytes
-                ),
-                "debug_conditional_backbone_hidden": (
-                    torch.stack(debug_conditional_hidden)
-                    if debug_conditional_hidden
-                    else None
-                ),
-                "debug_unconditional_backbone_hidden": (
-                    torch.stack(debug_unconditional_hidden)
-                    if debug_unconditional_hidden
-                    else None
-                ),
-                "flow_content_cache_peak_bytes_per_sample": int(
-                    flow_cache_peak_bytes
-                ),
-                "flow_cfg_content_cache_divergence_by_layer": (
-                    (
-                        flow_cache_divergence_sum
-                        / max(flow_cache_divergence_count, 1)
-                    )
-                    .detach()
-                    .cpu()
-                    .tolist()
-                    if flow_cache_divergence_sum is not None
-                    else None
-                ),
-            }
-            return generated, trace
-        return generated
-
-    def _sample_from_logits(
-        self, logits: torch.Tensor, temperature: float
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if temperature < 1e-6:
-            probs = torch.softmax(logits, dim=-1)
-            next_token = logits.argmax(dim=-1)
-        else:
-            probs = torch.softmax(logits / temperature, dim=-1)
-            next_token = torch.multinomial(probs, 1).squeeze(-1)
-        conf = probs.gather(-1, next_token.unsqueeze(-1)).squeeze(-1)
-        return next_token, conf
-
-    @torch.no_grad()
-    def _generate_one(
-        self,
-        prompt_ids: torch.Tensor,
-        gen_length: int,
-        prompt_task: str,
-        block_size: int,
-        temperature: float,
-        ratio,
-        parallel_rate,
-        decode_strategy: str,
-        flow_temperature: float = 1.0,
-        flow_cfg: float = 1.0,
-        flow_cfg_schedule: str = "constant",
-        flow_solver: str | None = None,
-        flow_num_steps: int | None = None,
-        image_parallel_rate: int | None = None,
-        image_order_strategy: str | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        from utils.utils import get_selfless_mask
-
-        device = self.device
-        eos_token_id = getattr(self.config, "eos_token_id", None)
-        boi_token_id = getattr(self.config, "boi_token_id", None)
-        eoi_token_id = getattr(self.config, "eoi_token_id", None)
-        image_mask_token_id = getattr(self.config, "image_mask_token_id", None)
-        image_tokens_per_img = int(getattr(self.config, "image_tokens_per_img", 256))
-        image_latent_dim = int(
-            getattr(
-                self, "image_latent_dim", getattr(self.config, "image_latent_dim", 4)
-            )
-        )
-        side = int(image_tokens_per_img**0.5)
-        if side * side != image_tokens_per_img:
-            raise ValueError(
-                f"image_tokens_per_img={image_tokens_per_img} is not square"
-            )
-
-        latent_dtype = torch.float32
-        flow_head = getattr(self, "image_flow_head", None)
-        if flow_head is not None:
-            try:
-                latent_dtype = flow_head.net.final_layer.linear.weight.dtype
-            except AttributeError:
-                latent_dtype = torch.float32
-
-        seq = prompt_ids.to(device=device, dtype=torch.long).flatten().clone()
-        token_types = torch.zeros_like(seq, dtype=torch.uint8)
-        image_latents = torch.zeros(
-            seq.shape[0],
-            image_latent_dim,
-            device=device,
-            dtype=latent_dtype,
-        )
-        image_latent_mask = torch.zeros(seq.shape[0], device=device, dtype=torch.bool)
-        generated_images = []
-        generated_spans = []
-        sigma = torch.empty(seq.shape[0], dtype=torch.float32, device=device)
-        if prompt_task == "ar":
-            sigma[:] = torch.arange(seq.shape[0], device=device, dtype=sigma.dtype)
-        elif prompt_task in {"random_sigma", "random"}:
-            sigma[:] = torch.rand(seq.shape[0], device=device, dtype=sigma.dtype)
-        else:
-            raise ValueError(f"Invalid prompt task: {prompt_task}")
-
-        generated_text_tokens = 0
-
-        def next_sigma_values(n: int) -> torch.Tensor:
-            start = float(sigma.max().item() + 1.0) if sigma.numel() > 0 else 0.0
-            return torch.arange(start, start + n, device=device, dtype=sigma.dtype)
-
-        def append_tokens(token_ids: torch.Tensor, types: torch.Tensor):
-            nonlocal seq, token_types, sigma, image_latents, image_latent_mask
-            token_ids = token_ids.to(device=device, dtype=torch.long).flatten()
-            types = types.to(device=device, dtype=torch.uint8).flatten()
-            if token_ids.shape != types.shape:
-                raise ValueError("token_ids and token types must have the same shape.")
-            n = int(token_ids.numel())
-            if n == 0:
-                return
-            seq = torch.cat([seq, token_ids])
-            token_types = torch.cat([token_types, types])
-            sigma = torch.cat([sigma, next_sigma_values(n)])
-            image_latents = torch.cat(
-                [
-                    image_latents,
-                    torch.zeros(
-                        n, image_latent_dim, device=device, dtype=image_latents.dtype
-                    ),
-                ],
-                dim=0,
-            )
-            image_latent_mask = torch.cat(
-                [
-                    image_latent_mask,
-                    torch.zeros(n, device=device, dtype=torch.bool),
-                ]
-            )
-
-        def model_kwargs_for_current_seq():
-            kwargs = {
-                "X0_input_ids": seq.unsqueeze(0),
-                "attention_mask": get_selfless_mask(
-                    sigma=sigma.unsqueeze(0),
-                    seq_len=seq.shape[0],
-                    device=device,
-                ),
-                "token_types": token_types.unsqueeze(0),
-                "calculate_likelihood": False,
-            }
-            if (token_types == 1).any():
-                kwargs["image_latents"] = image_latents.unsqueeze(0)
-                kwargs["image_latent_mask"] = image_latent_mask.unsqueeze(0)
-            return kwargs
-
-        def sample_current_image_span(image_start: int, image_end: int):
-            if eoi_token_id is None or image_mask_token_id is None:
-                raise ValueError(
-                    "Image generation requires config.eoi_token_id and config.image_mask_token_id."
-                )
-            generated = self.sample_image_latents_single_stream(
-                input_ids=seq.unsqueeze(0),
-                token_types=token_types.unsqueeze(0),
-                sigma=sigma.unsqueeze(0),
-                spans=[(0, image_start, image_end)],
-                image_latent_dim=image_latent_dim,
-                initial_image_latents=image_latents.unsqueeze(0),
-                initial_image_latent_mask=image_latent_mask.unsqueeze(0),
-                flow_temperature=flow_temperature,
-                flow_cfg=flow_cfg,
-                flow_cfg_schedule=flow_cfg_schedule,
-                flow_solver=flow_solver,
-                flow_num_steps=flow_num_steps,
-                parallel_rate=image_parallel_rate
-                if image_parallel_rate is not None
-                else 1,
-                order_strategy=image_order_strategy or "spatial_halton",
-            )
-            if generated is None:
-                return
-            image_chw = generated[0].to(device=device, dtype=image_latents.dtype)
-            flat_image = image_chw.permute(1, 2, 0).reshape(
-                image_tokens_per_img, image_latent_dim
-            )
-            image_latents[image_start:image_end] = flat_image
-            image_latent_mask[image_start:image_end] = True
-            generated_images.append(image_chw)
-            generated_spans.append((image_start, image_end))
-
-        while generated_text_tokens < gen_length:
-            append_tokens(
-                torch.tensor([self.config.mask_token_id], device=device),
-                torch.tensor([0], device=device, dtype=torch.uint8),
-            )
-            hidden = self.model(**model_kwargs_for_current_seq()).last_hidden_state[
-                0, -1
-            ]
-            text_logits = self.lm_head(hidden.unsqueeze(0))
-            next_token, _ = self._sample_from_logits(text_logits, temperature)
-            next_token = next_token.item()
-            seq[-1] = next_token
-            generated_text_tokens += 1
-
-            if boi_token_id is not None and next_token == int(boi_token_id):
-                if eoi_token_id is None or image_mask_token_id is None:
-                    raise ValueError(
-                        "Generated BOI but config.eoi_token_id or config.image_mask_token_id is missing."
-                    )
-                token_types[-1] = 2
-                image_start = int(seq.shape[0])
-                append_tokens(
-                    torch.full(
-                        (image_tokens_per_img,),
-                        int(image_mask_token_id),
-                        device=device,
-                        dtype=torch.long,
-                    ),
-                    torch.ones(image_tokens_per_img, device=device, dtype=torch.uint8),
-                )
-                image_end = int(seq.shape[0])
-                append_tokens(
-                    torch.tensor([int(eoi_token_id)], device=device, dtype=torch.long),
-                    torch.tensor([2], device=device, dtype=torch.uint8),
-                )
-                sample_current_image_span(image_start, image_end)
-                continue
-
-            if eos_token_id is not None and next_token == eos_token_id:
-                break
-
-        if generated_images:
-            generated_image_latents = torch.stack(generated_images, dim=0)
-            image_spans = torch.tensor(generated_spans, device=device, dtype=torch.long)
-        else:
-            generated_image_latents = torch.zeros(
-                0,
-                image_latent_dim,
-                side,
-                side,
-                device=device,
-                dtype=image_latents.dtype,
-            )
-            image_spans = torch.empty(0, 2, device=device, dtype=torch.long)
-        return seq, token_types, image_latents, generated_image_latents, image_spans
-
-    @torch.no_grad()
-    def generate(
-        self,
-        prompt_ids,
-        gen_length,
-        num_response=1,
-        prompt_task="ar",
-        block_size=4,
-        temperature=1.0,
-        ratio=None,
-        parallel_rate=None,
-        decode_strategy="confidence",
-        **kwargs,
-    ):
-        if prompt_ids.dim() == 1:
-            prompt_ids = prompt_ids.unsqueeze(0)
-        base_prompts = prompt_ids.to(self.device)
-        if base_prompts.shape[0] == 1:
-            base_prompts = base_prompts.repeat(num_response, 1)
-        elif base_prompts.shape[0] != num_response:
-            raise ValueError("prompt_ids batch size must be 1 or equal to num_response")
-
-        seqs = []
-        type_seqs = []
-        aligned_image_latents = []
-        generated_image_latents = []
-        image_spans = []
-        flow_temperature = float(kwargs.pop("flow_temperature", 1.0))
-        flow_cfg = float(kwargs.pop("flow_cfg", 1.0))
-        flow_cfg_schedule = str(kwargs.pop("flow_cfg_schedule", "constant"))
-        flow_solver = kwargs.pop("flow_solver", None)
-        flow_num_steps = kwargs.pop("flow_num_steps", None)
-        image_parallel_rate = kwargs.pop(
-            "image_parallel_rate",
-            parallel_rate if parallel_rate is not None else 1,
-        )
-        image_order_strategy = kwargs.pop(
-            "image_order_strategy",
-            "spatial_halton",
-        )
-        for i in range(num_response):
-            seq, token_types, image_latents, image_chw, spans = self._generate_one(
-                prompt_ids=base_prompts[i],
-                gen_length=gen_length,
-                prompt_task=prompt_task,
-                block_size=block_size,
-                temperature=temperature,
-                ratio=ratio,
-                parallel_rate=parallel_rate,
-                decode_strategy=decode_strategy,
-                flow_temperature=flow_temperature,
-                flow_cfg=flow_cfg,
-                flow_cfg_schedule=flow_cfg_schedule,
-                flow_solver=flow_solver,
-                flow_num_steps=flow_num_steps,
-                image_parallel_rate=image_parallel_rate,
-                image_order_strategy=image_order_strategy,
-            )
-            seqs.append(seq)
-            type_seqs.append(token_types)
-            aligned_image_latents.append(image_latents)
-            generated_image_latents.append(image_chw)
-            image_spans.append(spans)
-
-        max_len = max(seq.shape[0] for seq in seqs)
-        pad_id = getattr(self.config, "eos_token_id", None)
-        if pad_id is None:
-            pad_id = 0
-        output = torch.full(
-            (num_response, max_len), pad_id, device=self.device, dtype=torch.long
-        )
-        raw_output = torch.full(
-            (num_response, max_len), pad_id, device=self.device, dtype=torch.long
-        )
-        output_token_types = torch.full(
-            (num_response, max_len), 3, device=self.device, dtype=torch.uint8
-        )
-        image_latent_dim = int(
-            getattr(
-                self, "image_latent_dim", getattr(self.config, "image_latent_dim", 4)
-            )
-        )
-        latent_dtype = (
-            aligned_image_latents[0].dtype if aligned_image_latents else torch.float32
-        )
-        output_image_latents = torch.zeros(
-            num_response,
-            max_len,
-            image_latent_dim,
-            device=self.device,
-            dtype=latent_dtype,
-        )
-        for i, seq in enumerate(seqs):
-            token_types = type_seqs[i]
-            raw_output[i, : seq.shape[0]] = seq
-            output_token_types[i, : token_types.shape[0]] = token_types
-            output[i, : seq.shape[0]] = seq
-            output_image_latents[i, : aligned_image_latents[i].shape[0]] = (
-                aligned_image_latents[i]
-            )
-
-        max_images = max(
-            (images.shape[0] for images in generated_image_latents), default=0
-        )
-        image_tokens_per_img = int(getattr(self.config, "image_tokens_per_img", 256))
-        side = int(image_tokens_per_img**0.5)
-        generated_image_output = torch.zeros(
-            num_response,
-            max_images,
-            image_latent_dim,
-            side,
-            side,
-            device=self.device,
-            dtype=latent_dtype,
-        )
-        output_image_spans = torch.full(
-            (num_response, max_images, 2),
-            -1,
-            device=self.device,
-            dtype=torch.long,
-        )
-        image_counts = torch.zeros(num_response, device=self.device, dtype=torch.long)
-        for i, images in enumerate(generated_image_latents):
-            count = int(images.shape[0])
-            image_counts[i] = count
-            if count:
-                generated_image_output[i, :count] = images
-                output_image_spans[i, :count] = image_spans[i]
-
-        return {
-            "seq": output,
-            "raw_seq": raw_output,
-            "token_types": output_token_types,
-            "image_latents": output_image_latents,
-            "generated_image_latents": generated_image_output,
-            "image_spans": output_image_spans,
-            "image_counts": image_counts,
-            "parallel_rate": 0.0,
-        }
-
-    @torch.no_grad()
-    def speculative_generate(
-        self,
-        prompt_ids,
-        gen_length,
-        num_response=1,
-        prompt_task="ar",
-        block_size=4,
-        temperature=1.0,
-        ratio=None,
-        parallel_rate=None,
-    ):
-        from utils.utils import get_selfless_mask
-
-        # 1. 初始化
-        if prompt_ids.dim() == 1:
-            prompt_ids = prompt_ids.unsqueeze(0)
-        prompt_ids = prompt_ids.repeat(num_response, 1)
-
-        prompt_len = prompt_ids.shape[-1]
-        prefix = prompt_ids.to(self.device)
-
-        # 初始化全局 Sigma
-        max_seq_len = prompt_len + gen_length + block_size
-        sigma = torch.zeros(
-            (num_response, max_seq_len), dtype=torch.float32, device=self.device
-        )
-
-        # Context 的 Sigma 设置
-        if prompt_task == "ar":
-            sigma[:, :prompt_len] = torch.arange(0, prompt_len, device=self.device)
-        elif prompt_task in {"random_sigma", "random"}:
-            sigma[:, :prompt_len] = torch.rand(
-                num_response, prompt_len, device=self.device
-            )
-        else:
-            raise ValueError(f"Invalid prompt task: {prompt_task}")
-
-        global_step = 0
-        generated_tokens = 0
-        end_token_id = getattr(self.config, "eos_token_id", None)
-
-        while prefix.shape[-1] < prompt_len + gen_length:
-            curr_len = prefix.shape[-1]
-            curr_block_size = min(block_size, prompt_len + gen_length - curr_len)
-            if curr_block_size <= 0:
-                break
-            seq_len = curr_len + curr_block_size
-            block_order = torch.arange(
-                curr_len, seq_len, device=self.device, dtype=sigma.dtype
-            )
-            sigma[:, curr_len:seq_len] = block_order.unsqueeze(0)
-
-            # ==============================================================
-            # Phase 1: Draft
-            # ==============================================================
-            draft_seq = torch.full(
-                (num_response, seq_len), self.config.mask_token_id, device=self.device
-            )
-            draft_seq[:, :curr_len] = prefix
-
-            draft_sigma = sigma.clone()
-            # 保持 float32 以确保精度
-            draft_token_probs = torch.zeros(
-                (num_response, curr_block_size), dtype=torch.float32, device=self.device
-            )
-            draft_inner_order = float(curr_len)
-
-            while draft_seq[:, curr_len:].eq(self.config.mask_token_id).any():
-                attention_mask = get_selfless_mask(
-                    sigma=draft_sigma[:, :seq_len], seq_len=seq_len, device=self.device
-                )
-
-                logits = self(
-                    draft_seq, attention_mask=attention_mask, calculate_likelihood=True
-                ).logits
-
-                if temperature < 1e-6:
-                    probs = torch.softmax(logits, dim=-1)
-                    next_token = logits.argmax(dim=-1)
-                else:
-                    probs = torch.softmax(logits / temperature, dim=-1)
-                    next_token = torch.multinomial(
-                        probs.reshape(-1, probs.size(-1)), 1
-                    ).view(num_response, -1)
-
-                conf = probs.gather(-1, next_token.unsqueeze(-1)).squeeze(-1)
-                valid_mask = draft_seq.eq(self.config.mask_token_id)
-                masked_conf = conf.masked_fill(~valid_mask, -1.0)
-
-                if parallel_rate is not None:
-                    k_p = max(1, int(parallel_rate))
-                    topk_values, topk_indices = torch.topk(masked_conf, k=k_p, dim=-1)
-                    fill_mask = torch.zeros_like(masked_conf, dtype=torch.bool)
-                    fill_mask.scatter_(1, topk_indices, topk_values > -0.5)
-                elif ratio is not None:
-                    fill_mask = masked_conf >= ratio
-                    rows_with_no_fill = ~(fill_mask.any(dim=-1))
-                    rows_still_have_mask = valid_mask.any(dim=-1)
-                    rows_need_fallback = rows_with_no_fill & rows_still_have_mask
-                    if rows_need_fallback.any():
-                        fallback_cols = masked_conf[rows_need_fallback].argmax(dim=-1)
-                        fill_mask[rows_need_fallback, fallback_cols] = True
-                else:
-                    fill_mask = torch.zeros_like(masked_conf, dtype=torch.bool)
-                    fill_mask.scatter_(
-                        1, masked_conf.argmax(dim=-1, keepdim=True), True
-                    )
-
-                rows, cols = fill_mask.nonzero(as_tuple=True)
-                draft_seq[rows, cols] = next_token[rows, cols]
-
-                block_cols = cols - curr_len
-                valid_updates = (block_cols >= 0) & (block_cols < curr_block_size)
-                if valid_updates.any():
-                    r_ = rows[valid_updates]
-                    c_ = cols[valid_updates]
-                    bc_ = block_cols[valid_updates]
-                    # 【修复点】：显式转换 dtype，解决 BFloat16 -> Float32 赋值报错
-                    draft_token_probs[r_, bc_] = conf[r_, c_].to(
-                        dtype=draft_token_probs.dtype
-                    )
-
-                draft_sigma[rows, cols] = draft_inner_order
-                draft_inner_order += 1.0
-
-            draft_tokens = draft_seq[:, curr_len:]
-
-            # ==============================================================
-            # Phase 2: Verify
-            # ==============================================================
-            verify_sigma = sigma.clone()
-
-            block_ar_sigmas = torch.arange(
-                curr_len, seq_len, device=self.device, dtype=sigma.dtype
-            )
-
-            verify_sigma[:, curr_len:seq_len] = block_ar_sigmas.unsqueeze(0)
-
-            verify_attention_mask = get_selfless_mask(
-                sigma=verify_sigma[:, :seq_len], seq_len=seq_len, device=self.device
-            )
-
-            verify_outputs = self(
-                draft_seq,
-                attention_mask=verify_attention_mask,
-                calculate_likelihood=True,
-            )
-            verify_logits = verify_outputs.logits[:, curr_len:, :]
-
-            if temperature < 1e-6:
-                target_probs = torch.softmax(verify_logits, dim=-1)
-            else:
-                target_probs = torch.softmax(verify_logits / temperature, dim=-1)
-
-            # ==============================================================
-            # Phase 3: Accept / Reject
-            # ==============================================================
-            target_token_probs = target_probs.gather(
-                -1, draft_tokens.unsqueeze(-1)
-            ).squeeze(-1)
-
-            # 【优化点】：统一转换为 float32 进行除法运算，保证稳定性
-            acc_ratios = target_token_probs.to(torch.float32) / (
-                draft_token_probs + 1e-10
-            )
-            accept_mask = torch.rand_like(acc_ratios) < acc_ratios
-
-            num_accepted = accept_mask.cumprod(dim=1).sum(dim=1).long()
-            safe_n = num_accepted.min().item()
-
-            prefix = torch.cat([prefix, draft_tokens[:, :safe_n]], dim=1)
-
-            accepted_sigmas = torch.arange(
-                curr_len, curr_len + safe_n, device=self.device, dtype=sigma.dtype
-            )
-            sigma[:, curr_len : curr_len + safe_n] = accepted_sigmas.unsqueeze(0)
-
-            global_step += safe_n
-            generated_tokens += safe_n
-
-            if safe_n < curr_block_size:
-                resampled_token = torch.multinomial(target_probs[:, safe_n, :], 1)
-                prefix = torch.cat([prefix, resampled_token], dim=1)
-
-                sigma[:, curr_len + safe_n] = float(curr_len + safe_n)
-
-                global_step += 1
-                generated_tokens += 1
-
-            if end_token_id is not None:
-                new_part = prefix[:, curr_len:]
-                if (new_part == end_token_id).any(dim=-1).all():
-                    break
-
-        parallel_rate_metric = (
-            (generated_tokens / num_response) / (global_step + 1e-6)
-            if global_step > 0
-            else 0.0
-        )
-
-        return {"seq": prefix, "parallel_rate": parallel_rate_metric}
 
 
 class Qwen3ForSequenceClassification(

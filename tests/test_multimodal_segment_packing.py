@@ -31,7 +31,13 @@ class CharacterTokenizer:
         return [10 + ord(character) for character in text]
 
 
-def _write_dataset_files(tmp_path: Path, captions: list[str]):
+def _write_dataset_files(
+    tmp_path: Path,
+    captions: list[str],
+    *,
+    split: str = "train",
+):
+    tmp_path.mkdir(parents=True, exist_ok=True)
     cache = tmp_path / "latents.pt"
     means = torch.arange(
         len(captions) * 4 * 2, dtype=torch.float32
@@ -54,13 +60,18 @@ def _write_dataset_files(tmp_path: Path, captions: list[str]):
     manifest_rows = []
     caption_rows = []
     for index, caption in enumerate(captions, start=1):
-        image_name = f"n00000001_{index}.JPEG"
+        image_name = (
+            f"n00000001_{index}.JPEG"
+            if split == "train"
+            else f"n00000001_{split}_{index}.JPEG"
+        )
         relative_path = f"n00000001/{image_name}"
         manifest_rows.append(
             {
                 "img_id": index,
-                "source_path": f"/dataset/train/{relative_path}",
+                "source_path": f"/dataset/{split}/{relative_path}",
                 "synset": "n00000001",
+                "split": split,
             }
         )
         caption_rows.append(
@@ -143,7 +154,7 @@ def test_packing_rejects_non_power_of_two_row_length():
         )
 
 
-def test_prompt_payload_is_not_truncated_and_overflow_keeps_hash(tmp_path):
+def test_prompt_payload_is_not_truncated_and_overflow_keeps_manifest(tmp_path):
     caption = "x" * 2100
     dataset = _dataset(tmp_path, [caption])
     item = dataset[0]
@@ -159,7 +170,7 @@ def test_prompt_payload_is_not_truncated_and_overflow_keeps_hash(tmp_path):
     )
     assert packed["image_count"] == 1
     assert packed["pack_details"][-1] == 1
-    assert packed["sample_token_sha256"] == [item["token_ids_sha256"]]
+    assert packed["pack_manifest"]["rows"][0]["overflow"] is True
     valid = packed["segment_ids"][0] >= 0
     assert packed["input_ids"][0, valid].tolist() == item["input_ids"].tolist()
 
@@ -357,9 +368,8 @@ def test_repeated_packing_reuses_identical_pack_manifest(tmp_path):
     items = [dataset[index] for index in range(3)]
     first = collate_segment_packed(items, nominal_capacity=64)
     second = collate_segment_packed(items, nominal_capacity=64)
-    assert first["pack_manifest_sha256"] == second["pack_manifest_sha256"]
+    assert first["pack_manifest"] == second["pack_manifest"]
     assert torch.equal(first["sigma"], second["sigma"])
-    assert first["augmentation_sha256"] == second["augmentation_sha256"]
 
 
 def test_packed_and_unpacked_batches_preserve_future_ce_labels(tmp_path):
@@ -397,8 +407,13 @@ def test_packed_and_unpacked_batches_preserve_future_ce_labels(tmp_path):
 
 def test_packing_is_train_only_and_validation_rows_stay_independent(tmp_path):
     cache, manifest, caption_path, mapping = _write_dataset_files(
-        tmp_path,
+        tmp_path / "train",
         [f"caption {index}" for index in range(8)],
+    )
+    val_cache, val_manifest, val_caption_path, _ = _write_dataset_files(
+        tmp_path / "val",
+        ["validation one", "validation two"],
+        split="val",
     )
     config = OmegaConf.create(
         {
@@ -414,15 +429,21 @@ def test_packing_is_train_only_and_validation_rows_stay_independent(tmp_path):
                 "params": {
                     "cache_path": str(cache),
                     "manifest_jsonl": str(manifest),
+                    "expected_split": "train",
+                    "expected_records": 8,
                     "synset_mapping_path": str(mapping),
                     "conditioning_mode": "caption",
                     "caption_jsonl": str(caption_path),
                     "model_context_length": 4096,
                     "image_tokens_per_img": 4,
                     "image_latent_dim": 2,
-                    "val_ratio": 0.25,
-                    "split_strategy": "random",
-                    "split_seed": 43,
+                    "validation": {
+                        "cache_path": str(val_cache),
+                        "manifest_jsonl": str(val_manifest),
+                        "caption_jsonl": str(val_caption_path),
+                        "expected_split": "val",
+                        "expected_records": 2,
+                    },
                     "packing": {
                         "enabled": True,
                         "algorithm": "deterministic_best_fit_decreasing",
@@ -457,6 +478,29 @@ def test_packing_is_train_only_and_validation_rows_stay_independent(tmp_path):
     assert val_batch["input_ids"].shape[0] == 2
     assert (val_batch["token_types"] == 1).sum(dim=1).tolist() == [4, 4]
 
+    config.dataset.params.packing.enabled = False
+    config.dataset.params.pad_to_length_schedule = [128, 256]
+    scheduled_train, scheduled_val = (
+        build_imagenet_flow_cache_dataloaders(
+            config,
+            CharacterTokenizer(),
+        )
+    )
+    scheduled_iterator = iter(scheduled_train)
+    first_scheduled = next(scheduled_iterator)
+    second_scheduled = next(scheduled_iterator)
+    assert first_scheduled["input_ids"].shape == (4, 128)
+    assert second_scheduled["input_ids"].shape == (4, 256)
+    assert first_scheduled["pad_schedule_position"] == 0
+    assert second_scheduled["pad_schedule_position"] == 1
+    assert "pad_schedule_position" not in next(iter(scheduled_val))
+
+    config.training.dataloader_workers = 1
+    with pytest.raises(ValueError, match="stateful collator"):
+        build_imagenet_flow_cache_dataloaders(
+            config,
+            CharacterTokenizer(),
+        )
 
 def test_packed_and_unpacked_backbone_hidden_states_are_equivalent(tmp_path):
     if not torch.cuda.is_available():

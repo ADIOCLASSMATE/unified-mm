@@ -137,10 +137,10 @@ bash script/selfless/smoke_imagenet1k_train_val_eval_ascend16.sh
 
 It executes one real optimizer step, checkpoint and FP32 sharded-EMA save,
 validation loss and image decoding, raw/EMA HF export, and an independent
-fixed-Inception FID/IS evaluation. Its 16-sample FID uses the evaluator's
-explicit `--allow_nonofficial_fid` diagnostic opt-in and is only a pipeline
-check; comparable formal results still require 50,000 fake samples and
-`--require_official_protocol`. The latest successful smoke conclusion is kept
+fixed-Inception IS pipeline check. Smoke runs do not publish FID: comparable
+FID results require exactly 50,000 fake samples, the frozen original
+ImageNet-val moments, and `--require_official_protocol`. The latest successful
+smoke conclusion is kept
 in
 `public/datasets/imagenet_full/preparation/train_val_eval_smoke_report.json`;
 large smoke checkpoints are discarded after verification.
@@ -182,7 +182,7 @@ torchrun --standalone --nproc_per_node=16 \
   --parallel_rate 1 --strategies spatial_halton \
   --inception_weights_path public/models/torch-fidelity/weights-inception-2015-12-05-6726825d.pth \
   --real_stats_path public/datasets/imagenet_full/fid_stats/inception_v3_2048_imagenet_val50000_256.pt \
-  --skip_target_decode --require_official_protocol --canonical_pairing \
+  --require_official_protocol --canonical_pairing \
   --resume_progress --resume_checkpoint_interval_batches 1
 ```
 

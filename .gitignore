@@ -29,6 +29,7 @@ logs/
 wandb/
 core.*
 public
+poster_delivery/
 
 # Ascend/CANN runtime and JIT artifacts
 /kernel_meta/

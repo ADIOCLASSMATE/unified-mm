@@ -10,7 +10,7 @@ export UNIFIED_MM_VENV="${UNIFIED_MM_VENV:-.venv}"
 source "${REPO_ROOT}/script/offline_env.sh"
 cd "${REPO_ROOT}"
 
-VAL_ROOT="${VAL_ROOT:-/inspire/sj-ssd3/project/high-dimensionaldata/public/dataset/imagenet/v1/ILSVRC/Data/CLS-LOC/val}"
+VAL_ROOT="${VAL_ROOT:-/inspire/sj-ssd3/global_user/wanjiaxin-253108030048/dataset/imagenet/v1/ILSVRC/Data/CLS-LOC/val}"
 INCEPTION_WEIGHTS="${INCEPTION_WEIGHTS:-public/models/torch-fidelity/weights-inception-2015-12-05-6726825d.pth}"
 OUTPUT_PATH="${OUTPUT_PATH:-public/datasets/imagenet_full/fid_stats/inception_v3_2048_imagenet_val50000_256.pt}"
 STATUS_PATH="${STATUS_PATH:-public/datasets/imagenet_full/fid_stats/preparation.status}"
@@ -52,11 +52,10 @@ fi
 
 torchrun --standalone --nproc_per_node="${NPU_COUNT}" \
   scripts/precompute_imagenet_fid_stats.py \
-  --class_image_root "${VAL_ROOT}" \
+  --imagenet_val_dir "${VAL_ROOT}" \
   --inception_weights_path "${INCEPTION_WEIGHTS}" \
   --output "${OUTPUT_PATH}" \
   --device npu \
-  --split validation \
   --expected_samples 50000 \
   --expected_classes 1000 \
   --expected_samples_per_class 50 \

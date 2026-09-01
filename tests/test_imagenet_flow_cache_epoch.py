@@ -15,7 +15,6 @@ from utils.dataset_imagenet_flow_cache import (
     collate_imagenet_flow_cache,
 )
 from utils.imagenet_flow_dataloaders import (
-    _build_dataset_subsets,
     training_samples_per_epoch,
 )
 from utils.imagenet_synthetic_text_index import INDEX_SCHEMA
@@ -209,7 +208,11 @@ def test_validation_posterior_sample_is_fixed_across_epochs(tmp_path):
     epoch_nine = dataset[0]
 
     assert torch.equal(epoch_zero["image_latents"], epoch_nine["image_latents"])
-    assert epoch_zero["augmentation_sha256"] == epoch_nine["augmentation_sha256"]
+    assert epoch_zero["reveal_seed"].item() == epoch_nine["reveal_seed"].item()
+    assert (
+        epoch_zero["cfg_dropout_seed"].item()
+        == epoch_nine["cfg_dropout_seed"].item()
+    )
 
 
 def test_validation_reveal_order_is_fixed_across_rng_and_epochs(tmp_path):
@@ -368,29 +371,6 @@ def test_validation_joint_task_is_fixed_across_epochs(tmp_path):
     assert first["task_mode"] == second["task_mode"]
     assert torch.equal(first["labels"], second["labels"])
     assert torch.equal(first["image_loss_mask"], second["image_loss_mask"])
-
-
-def test_overlapping_validation_view_remains_deterministic(tmp_path):
-    dataset = _make_dataset(tmp_path)
-    train_dataset, val_dataset = _build_dataset_subsets(
-        dataset,
-        train_indices=[],
-        val_indices=[0],
-        validation_overlap_train=True,
-    )
-
-    first_train = train_dataset[0]
-    first_val = val_dataset[0]
-    train_dataset.dataset.set_epoch(9)
-    second_train = train_dataset[0]
-    second_val = val_dataset[0]
-
-    assert train_dataset.dataset._is_training_index(0) is True
-    assert val_dataset.dataset._is_training_index(0) is False
-    assert not torch.equal(
-        first_train["image_latents"], second_train["image_latents"]
-    )
-    assert torch.equal(first_val["image_latents"], second_val["image_latents"])
 
 
 def test_training_reveal_order_changes_with_epoch(tmp_path):

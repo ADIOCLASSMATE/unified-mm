@@ -20,17 +20,10 @@ def test_evaluator_default_is_4096_global(monkeypatch):
     args = evaluator.parse_args()
     assert args.device == "npu"
     assert args.batch_size == 4096
-    assert args.allow_nonofficial_fid is False
+    assert not hasattr(args, "allow_nonofficial_fid")
+    assert not hasattr(args, "split")
+    assert not hasattr(args, "is_split_assignment")
     assert evaluator.per_rank_batch_size(args.batch_size, 16) == 256
-
-
-def test_nonofficial_fid_requires_explicit_opt_in(monkeypatch):
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        ["evaluate_single_stream_fid_is.py", "--allow_nonofficial_fid"],
-    )
-    assert evaluator.parse_args().allow_nonofficial_fid is True
 
 
 def test_global_batch_must_be_positive_and_evenly_sharded():
@@ -107,9 +100,6 @@ def test_real_stats_loader_is_not_bound_to_an_ablation_split(tmp_path):
     )
     payload = evaluator.load_shared_original_real_stats(
         str(path),
-        config=OmegaConf.create({"dataset": {"params": {}}}),
         fid_feature=2,
-        real_image_size=256,
-        inception_weights_path="",
     )
     assert payload["stats"]["count"] == 10

@@ -117,6 +117,15 @@ def main() -> None:
     )
     if not bool(torch.isfinite(output.loss).item()):
         raise AssertionError("Dynamic-XT formal-shape loss is non-finite")
+    if set(output.per_modality_loss) != {"text_loss", "image_loss"}:
+        raise AssertionError("Dynamic-XT did not return per-modality losses")
+    if set(output.per_modality_count) != {"text_tokens", "image_tokens"}:
+        raise AssertionError("Dynamic-XT did not return per-modality counts")
+    if int(output.per_modality_count["image_tokens"].item()) != (
+        batch_size * image_tokens
+    ):
+        raise AssertionError("Dynamic-XT returned the wrong image-token count")
+    torch.testing.assert_close(output.per_modality_loss["image_loss"], output.loss)
     output.loss.backward()
     hook.remove()
     if backbone_calls != 1:

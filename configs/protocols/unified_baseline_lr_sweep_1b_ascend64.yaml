@@ -1,0 +1,79 @@
+# Frozen 1B learning-rate sweep for ablation-a. This manifest contains only
+# readable fields; training, resume validation, and selection compute no hashes.
+schema: unified_lr_sweep_v1
+base_config: configs/selfless/unified_baseline_100b_ascend_64npu.yaml
+platform_project: "随机序语言建模-统一自回归与掩码扩散的随机顺序生成框架"
+sweep_project: unified-a-lr-sweep-1b-s42
+output_root: output/unified-a-lr-sweep-1b-s42
+world_size: 64
+nodes: 4
+npu_per_node: 16
+seed: 42
+stop_after_steps: 955
+nominal_text_targets_per_step: 1048064
+nominal_text_targets_at_stop: 1000901120
+validation_step: 955
+validation_seed: 424242
+selection:
+    required_arms: 9
+    primary: mean_modality_rank
+    tie_breakers:
+        - worst_modality_rank
+        - relative_loss_sum
+        - arm_id
+    metrics:
+        - val/loss_text
+        - val/loss_image_flow
+    lower_is_better: true
+    require_all_arms: true
+    runtime_hashing_enabled: false
+formal_continuation:
+    max_train_steps: 95415
+    resume_selected_checkpoint: true
+    restart_from_step_zero: false
+arms:
+    - id: b20e5-f3e5
+      backbone_lr: 2.0e-4
+      flow_lr: 3.0e-5
+      job_name: umm-a-b20-f3-1b-s42
+      wave: 3
+    - id: b20e5-f4e5
+      backbone_lr: 2.0e-4
+      flow_lr: 4.0e-5
+      job_name: umm-a-b20-f4-1b-s42
+      wave: 2
+    - id: b20e5-f5e5
+      backbone_lr: 2.0e-4
+      flow_lr: 5.0e-5
+      job_name: umm-a-b20-f5-1b-s42
+      wave: 3
+    - id: b24e5-f3e5
+      backbone_lr: 2.4e-4
+      flow_lr: 3.0e-5
+      job_name: umm-a-b24-f3-1b-s42
+      wave: 2
+    - id: b24e5-f4e5
+      backbone_lr: 2.4e-4
+      flow_lr: 4.0e-5
+      job_name: umm-a-b24-f4-1b-s42-r1
+      wave: 1
+    - id: b24e5-f5e5
+      backbone_lr: 2.4e-4
+      flow_lr: 5.0e-5
+      job_name: umm-a-b24-f5-1b-s42
+      wave: 2
+    - id: b30e5-f3e5
+      backbone_lr: 3.0e-4
+      flow_lr: 3.0e-5
+      job_name: umm-a-b30-f3-1b-s42
+      wave: 3
+    - id: b30e5-f4e5
+      backbone_lr: 3.0e-4
+      flow_lr: 4.0e-5
+      job_name: umm-a-b30-f4-1b-s42
+      wave: 1
+    - id: b30e5-f5e5
+      backbone_lr: 3.0e-4
+      flow_lr: 5.0e-5
+      job_name: umm-a-b30-f5-1b-s42
+      wave: 1

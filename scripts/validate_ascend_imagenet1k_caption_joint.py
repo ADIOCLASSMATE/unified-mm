@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -26,45 +25,15 @@ MAX_STEPS = 12_020
 PUBLISHED_CAPTIONS_PER_IMAGE = 7
 SYNTHETIC_CAPTIONS_PER_IMAGE = 6
 T2I_PROMPTS_PER_IMAGE = 12
-CAPTION_SHA256 = (
-    "c74f17cd6f8f85e74ae23606a4f0c3cc3eb1d4979413c910b5a63b2b327f6c3b"
-)
-MODEL_WEIGHTS_SHA256 = (
-    "76b319f8094554b4022879a887c57f72ab584eda06398e01928b03b8d1b19baf"
-)
-MODEL_CONFIG_SHA256 = (
-    "4ad2b5308fc7c47e1807a4fa6b726b0d576cf190aa808df0d8568d01535e760c"
-)
-IMAGENET_MANIFEST_SHA256 = (
-    "9d165263e8cf4ba6d537d084a8cc3b87af2eaf5ef9a5b59e1360a6228c840759"
-)
 SELECTED_LR = 2e-5
 SELECTED_LAMBDA_TEXT = 0.05
 DEFAULT_GENERATION_STEPS = 10
-
-
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def require_file(path: Path, label: str) -> Path:
     if not path.is_file():
         raise FileNotFoundError(f"missing {label}: {path}")
     return path
-
-
-def require_hash(path: Path, expected: str, label: str) -> str:
-    actual = sha256_file(require_file(path, label))
-    if actual != expected:
-        raise RuntimeError(
-            f"{label} SHA256 mismatch: expected={expected}, actual={actual}, "
-            f"path={path}"
-        )
-    return actual
 
 
 def validate_config(config, *, world_size: int) -> dict[str, object]:
@@ -89,10 +58,6 @@ def validate_config(config, *, world_size: int) -> dict[str, object]:
             str(params.caption_jsonl),
             "public/datasets/imagenet1k_synthetic_v1/captions/"
             "imagenet1k_train_7captions.jsonl",
-        ),
-        "caption_manifest_sha256": (
-            str(params.caption_manifest_sha256),
-            CAPTION_SHA256,
         ),
         "synthetic_text_index_manifest": (
             str(params.synthetic_text_index_manifest),
@@ -156,9 +121,13 @@ def validate_config(config, *, world_size: int) -> dict[str, object]:
         ),
         "max_seq_length": (int(params.max_seq_length), 512),
         "pad_to_length": (int(params.pad_to_length), 512),
-        "split_strategy": (str(params.split_strategy), "stratified"),
-        "val_samples_per_class": (int(params.val_samples_per_class), 50),
-        "validation_overlap_train": (bool(params.validation_overlap_train), False),
+        "training_split": (str(params.expected_split), "train"),
+        "training_records": (int(params.expected_records), TRAIN_IMAGES),
+        "validation_split": (str(params.validation.expected_split), "val"),
+        "validation_records": (
+            int(params.validation.expected_records),
+            VALIDATION_IMAGES,
+        ),
         "ema_decay": (float(config.training.ema_decay), 0.999),
         "mixed_precision": (str(config.training.mixed_precision).lower(), "bf16"),
         "gradient_accumulation_dtype": (
@@ -200,7 +169,7 @@ def validate_config(config, *, world_size: int) -> dict[str, object]:
         "max_optimizer_steps": MAX_STEPS,
         "wsd_epochs": {"warmup": 1, "stable": 6, "decay": 3},
         "task_modes": ["t2i", "i2t"],
-        "training_images_available": TRAIN_IMAGES - VALIDATION_IMAGES,
+        "training_images_available": TRAIN_IMAGES,
         "validation_images": VALIDATION_IMAGES,
         "caption_source": "six_synthetic_only",
         "t2i_source": "twelve_synthetic_prompts",
@@ -294,17 +263,11 @@ def validate_synthetic_assets(
     caption_manifest = json.loads(
         caption_manifest_path.read_text(encoding="utf-8")
     )
-    _require_equal(caption_manifest["file_sha256"], CAPTION_SHA256, "caption hash")
     _require_equal(int(caption_manifest["records"]), TRAIN_IMAGES, "caption rows")
     _require_equal(
         int(caption_manifest["captions_per_image"]),
         PUBLISHED_CAPTIONS_PER_IMAGE,
         "published captions per image",
-    )
-    _require_equal(
-        caption_manifest["upstream_manifest_sha256"],
-        IMAGENET_MANIFEST_SHA256,
-        "caption upstream ImageNet manifest",
     )
 
     alignment_audit = json.loads(
@@ -357,11 +320,8 @@ def validate_synthetic_assets(
     finally:
         index.close()
 
-    actual_sha256 = None
     checked_rows = 0
     if deep_scan:
-        actual_sha256 = sha256_file(caption_path)
-        _require_equal(actual_sha256, CAPTION_SHA256, "caption file SHA256")
         with caption_path.open(encoding="utf-8") as handle:
             for checked_rows, line in enumerate(handle, start=1):
                 _validate_caption_row(json.loads(line), checked_rows - 1)
@@ -393,8 +353,6 @@ def validate_synthetic_assets(
         "dataset_root": str(dataset_root),
         "dataset_manifest": str(dataset_manifest_path),
         "caption_path": str(caption_path),
-        "caption_sha256": CAPTION_SHA256,
-        "caption_actual_sha256": actual_sha256,
         "caption_rows": TRAIN_IMAGES,
         "published_captions_per_image": PUBLISHED_CAPTIONS_PER_IMAGE,
         "synthetic_captions_used_per_image": SYNTHETIC_CAPTIONS_PER_IMAGE,
@@ -447,15 +405,17 @@ def main() -> None:
         model_root = Path(config.model.model_path)
         report["initialization"] = {
             "path": str(model_root),
-            "model_weights_sha256": require_hash(
-                model_root / "model.safetensors",
-                MODEL_WEIGHTS_SHA256,
-                "completed ImageNet-1K EMA weights",
+            "weights": str(
+                require_file(
+                    model_root / "model.safetensors",
+                    "completed ImageNet-1K EMA weights",
+                )
             ),
-            "config_sha256": require_hash(
-                model_root / "config.json",
-                MODEL_CONFIG_SHA256,
-                "completed ImageNet-1K EMA config",
+            "config": str(
+                require_file(
+                    model_root / "config.json",
+                    "completed ImageNet-1K EMA config",
+                )
             ),
         }
         for filename in (

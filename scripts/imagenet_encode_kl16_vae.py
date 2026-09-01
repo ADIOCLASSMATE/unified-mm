@@ -115,8 +115,8 @@ def validate_reusable_shard(
     num_shards: int,
     shard_index: int,
     scaling_factor: float,
-    vae_checkpoint_sha256: str,
-    vae_module_sha256: str,
+    vae_checkpoint_sha256: str | None,
+    vae_module_sha256: str | None,
     source_manifest_sha256: str | None,
     source_image_root: str | None,
 ) -> None:
@@ -338,6 +338,11 @@ def main() -> None:
     parser.add_argument("--start_img_id", type=int, default=1)
     parser.add_argument("--manifest_jsonl", default=None)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--no_hash",
+        action="store_true",
+        help="Do not calculate file digests while preparing the cache.",
+    )
     args = parser.parse_args()
 
     if args.num_shards < 1:
@@ -350,8 +355,14 @@ def main() -> None:
         raise FileNotFoundError(f"Missing KL16 checkpoint: {vae_path}")
     vae_module_root = Path(args.vae_module_root)
     AutoencoderKL = load_vae_class(vae_module_root)
-    vae_checkpoint_sha256 = sha256_file(vae_path)
-    vae_module_sha256 = sha256_file(vae_module_root / "models" / "vae.py")
+    vae_checkpoint_sha256 = (
+        None if args.no_hash else sha256_file(vae_path)
+    )
+    vae_module_sha256 = (
+        None
+        if args.no_hash
+        else sha256_file(vae_module_root / "models" / "vae.py")
+    )
 
     if args.source_mode == "docs_jsonl":
         samples = load_samples_from_docs(
@@ -394,7 +405,7 @@ def main() -> None:
     if shard_path.exists() and not args.overwrite:
         source_manifest_sha256 = (
             sha256_file(Path(args.source_manifest_jsonl))
-            if args.source_mode == "manifest_jsonl"
+            if args.source_mode == "manifest_jsonl" and not args.no_hash
             else None
         )
         validate_reusable_shard(
@@ -491,7 +502,7 @@ def main() -> None:
         ),
         "source_manifest_sha256": (
             sha256_file(Path(args.source_manifest_jsonl))
-            if args.source_mode == "manifest_jsonl"
+            if args.source_mode == "manifest_jsonl" and not args.no_hash
             else None
         ),
         "source_image_root": args.source_image_root,
@@ -510,6 +521,7 @@ def main() -> None:
         "posterior_shape": [16, 16, 32],
         "token_shape": [256, 32],
         "storage_dtype": "float16",
+        "runtime_hashing_enabled": not args.no_hash,
     }
     temporary_path = shard_path.with_suffix(shard_path.suffix + ".tmp")
     torch.save(

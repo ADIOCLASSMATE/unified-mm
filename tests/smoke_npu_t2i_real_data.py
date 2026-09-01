@@ -47,10 +47,8 @@ def build_dataset(config, tokenizer) -> ImageNetFlowCacheDataset:
         cache_caption_tokens=False,
         max_seq_length=params.max_seq_length,
         model_context_length=params.model_context_length,
-        caption_manifest_sha256=params.caption_manifest_sha256,
         max_samples=32,
         seed=config.training.seed,
-        emit_audit_metadata=False,
     )
 
 

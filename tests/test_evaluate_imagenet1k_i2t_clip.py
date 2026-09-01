@@ -39,15 +39,6 @@ def test_i2t_prefix_orders_eoi_before_image_and_caption_queries():
     assert float(sigma[image_start : image_start + 4].min()) > float(sigma[-1])
 
 
-class _Backbone:
-    def __call__(self, X0_input_ids, **kwargs):
-        del kwargs
-        batch, length = X0_input_ids.shape
-        return SimpleNamespace(
-            last_hidden_state=torch.zeros(batch, length, 1)
-        )
-
-
 class _Model:
     def __init__(self):
         self.config = SimpleNamespace(
@@ -57,14 +48,19 @@ class _Model:
             mask_token_id=23,
             im_end_token_id=None,
         )
-        self.model = _Backbone()
-        self.calls = 0
+        self.calls = []
 
-    def lm_head(self, hidden):
-        logits = torch.full((hidden.shape[0], 32), -100.0)
-        logits[:, 7 if self.calls == 0 else 9] = 100.0
-        self.calls += 1
-        return logits
+    def generate(self, task, **kwargs):
+        self.calls.append((task, kwargs))
+        input_ids = kwargs["input_ids"]
+        suffix = torch.tensor(
+            [[7, 9]] * input_ids.shape[0],
+            device=input_ids.device,
+            dtype=torch.long,
+        )
+        return torch.cat([input_ids, suffix], dim=1), {
+            "backbone_kv_cache_enabled": kwargs["use_cache"],
+        }
 
 
 def test_i2t_generation_stops_on_eos_and_decodes_only_caption_tokens():
@@ -81,6 +77,24 @@ def test_i2t_generation_stops_on_eos_and_decodes_only_caption_tokens():
     assert token_ids == [[7], [7]]
     assert texts == ["tok-7", "tok-7"]
     assert reasons == ["eos", "eos"]
+
+
+def test_i2t_generation_uses_unified_cached_model_api():
+    model = _Model()
+    generate_batch(
+        model,
+        _Tokenizer(),
+        text_prefix="describe",
+        image_batch=torch.zeros(1, 4, 3),
+        max_new_tokens=4,
+        temperature=0.0,
+        device=torch.device("cpu"),
+    )
+    task, kwargs = model.calls[0]
+    assert task == "i2t"
+    assert kwargs["use_cache"] is True
+    assert kwargs["return_trace"] is True
+    assert "attention_mask" not in kwargs
 
 
 def test_balanced_holdout_selection_round_robins_synsets():

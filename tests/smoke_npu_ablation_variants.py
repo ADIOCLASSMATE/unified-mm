@@ -163,7 +163,8 @@ def run_variant(
             raise AssertionError("Dynamic-XT time embedder backward failed")
 
     model.eval()
-    generated, trace = model.sample_image_latents_single_stream(
+    generated, trace = model.generate(
+        "t2i",
         input_ids=payload["input_ids"],
         token_types=payload["token_types"],
         sigma=payload["sigma"],
@@ -179,7 +180,7 @@ def run_variant(
         flow_num_steps=1,
         parallel_rate=1,
         order_strategy="sigma",
-        use_backbone_cache=model_label == "dynamic_xt",
+        use_cache=model_label == "dynamic_xt",
         return_trace=True,
         _debug_max_generation_steps=(1 if model_label == "dynamic_xt" else None),
     )

@@ -31,7 +31,6 @@ def main() -> None:
     scores.update(
         torch.tensor([[1.0, 0.0, -1.0]], device=device),
         [rank],
-        world_size,
     )
     features.all_reduce_()
     scores.all_reduce_()

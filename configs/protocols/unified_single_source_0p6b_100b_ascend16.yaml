@@ -1,0 +1,182 @@
+# Token-matched single-source controls for the 0.6B unified baseline.
+#
+# "Batch tokens" means physical input tensor positions, including any remaining
+# padding.  Each control matches only its source's contribution to one optimizer
+# update of the 64-NPU combined schedule, not the full combined update.
+schema: unified_single_source_0p6b_100b_v1
+base_config: configs/selfless/unified_baseline_100b_ascend_64npu.yaml
+platform_project: "随机序语言建模-统一自回归与掩码扩散的随机顺序生成框架"
+world_size: 16
+nodes: 1
+npu_per_node: 16
+seed: 42
+initialization: qwen3_0p6b_base_step_zero
+architecture_variant: selfless_contextual
+training_objective: selfless_dual_stream
+dual_stream_attention_contract: selfless_strict
+# Smallest common optimizer-boundary total at or above 100B.  Text updates
+# contain exactly twice as many physical positions as either image-source
+# update, so image runs use exactly twice the number of optimizer steps.
+target_physical_tokens_per_run: 100000595968
+runtime_hashing_enabled: false
+wandb_mode: disabled
+
+# Measured on one 16x910B2C node with the formal ZeRO-2/BF16/full-model/EMA
+# settings.  A candidate counts as feasible only after forward, backward,
+# optimizer.step, and EMA; five-step wall times include first-step compilation.
+batch_shape_selection:
+    climbmix:
+        rejected: ["GA1/B32 forward OOM", "GA2/B16 forward OOM", "GA4/B8 backward OOM"]
+        selected: "GA8/B4/L2048"
+        five_step_training_wall_seconds: 27.612201690673828
+    i2t:
+        rejected: ["GA1/B64/L512 forward OOM"]
+        selected: "GA2/B32/L512"
+        five_step_training_wall_seconds: 11.544341087341309
+        lower_padding_comparator: "GA9/B8/[448x8,512]: 15.443490028381348 seconds"
+    t2i:
+        rejected: ["GA1/B64/L512 forward OOM", "GA2/B32/L512 forward OOM"]
+        selected: "GA4/B16/L512"
+        five_step_training_wall_seconds: 16.23293113708496
+        lower_padding_comparator: "GA5/B16/[384x4,512]: 18.20005226135254 seconds"
+
+# This experiment matches physical positions, not the combined run's gradient
+# dilution.  Each single-source window retains the original per-task loss
+# coefficient (text/I2T lambda_text=0.05; T2I lambda_image=1.0) and averages
+# only that task's microbatches.  This is intentional single-task training,
+# not a reconstruction of that source's fractional gradient inside a
+# four-source combined update.
+loss_scaling_contract:
+    mode: full_single_task_objective
+    lambda_text: 0.05
+    lambda_image: 1.0
+    matches_combined_source_gradient_fraction: false
+
+# The formal combined run's "100B" label refers to nominal ClimbMix targets.
+# At 95,415 steps it sees 200,099,758,080 total physical positions, split as
+# 100,049,879,040 text and 50,024,939,520 for each image source.  These
+# controls instead give every single task the same ~100B physical budget.
+comparison_scope:
+    mode: equal_physical_tokens_across_single_tasks
+    combined_label_is_nominal_climbmix_targets: true
+    combined_total_physical_tokens: 200099758080
+    combined_cumulative_source_physical_tokens:
+        climbmix: 100049879040
+        i2t: 50024939520
+        t2i: 50024939520
+    matches_combined_source_exposure: false
+
+combined_reference:
+    world_size: 64
+    source_schedule: [climbmix, t2i, climbmix, i2t]
+    physical_tokens_per_optimizer_step: 2097152
+    source_contributions:
+        climbmix:
+            occurrences: 2
+            per_rank_micro_batch: 4
+            sequence_length: 2048
+            physical_tokens_per_optimizer_step: 1048576
+        i2t:
+            occurrences: 1
+            per_rank_micro_batch: 16
+            padded_sequence_length: 512
+            physical_tokens_per_optimizer_step: 524288
+        t2i:
+            occurrences: 1
+            per_rank_micro_batch: 16
+            padded_sequence_length: 512
+            physical_tokens_per_optimizer_step: 524288
+
+single_source_runs:
+    climbmix:
+        config: configs/selfless/unified_single_text_0p6b_100b_ascend16.yaml
+        job_name: umm-0p6b-text-only-100b-16-s42-r1
+        output_root: output/unified-a-0p6b-text-only-100bphys-s42-r1
+        per_rank_micro_batch: 4
+        pad_to_length_schedule: [2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048]
+        gradient_accumulation_steps: 8
+        physical_tokens_per_rank_per_optimizer_step: 65536
+        physical_tokens_per_optimizer_step: 1048576
+        max_train_steps: 95368
+        actual_physical_tokens: 100000595968
+        overshoot_physical_tokens: 595968
+        warmup_steps: 596
+        decay_steps: 23842
+    i2t:
+        config: configs/selfless/unified_single_caption_0p6b_100b_ascend16.yaml
+        job_name: umm-0p6b-caption-only-100b-16-s42-r1
+        output_root: output/unified-a-0p6b-caption-only-100bphys-s42-r1
+        per_rank_micro_batch: 32
+        pad_to_length_schedule: [512, 512]
+        gradient_accumulation_steps: 2
+        logical_samples_per_optimizer_step: 1024
+        combined_source_logical_samples_per_optimizer_step: 1024
+        physical_tokens_per_rank_per_optimizer_step: 32768
+        physical_tokens_per_optimizer_step: 524288
+        max_train_steps: 190736
+        actual_physical_tokens: 100000595968
+        overshoot_physical_tokens: 595968
+        warmup_steps: 1192
+        decay_steps: 47684
+    t2i:
+        config: configs/selfless/unified_single_t2i_0p6b_100b_ascend16.yaml
+        job_name: umm-0p6b-t2i-only-100b-16-s42-r1
+        output_root: output/unified-a-0p6b-t2i-only-100bphys-s42-r1
+        per_rank_micro_batch: 16
+        pad_to_length_schedule: [512, 512, 512, 512]
+        gradient_accumulation_steps: 4
+        logical_samples_per_optimizer_step: 1024
+        combined_source_logical_samples_per_optimizer_step: 1024
+        physical_tokens_per_rank_per_optimizer_step: 32768
+        physical_tokens_per_optimizer_step: 524288
+        max_train_steps: 190736
+        actual_physical_tokens: 100000595968
+        overshoot_physical_tokens: 595968
+        warmup_steps: 1192
+        decay_steps: 47684
+
+# Full, sequential scan of every selected training string with the frozen
+# Qwen3-0.6B tokenizer. Serialized lengths include prefix, 256 image tokens,
+# BOI/EOI/EOS, and the I2T suffix. No text is truncated at runtime: a sample
+# exceeding its scheduled width raises before the forward pass.
+full_training_length_audit:
+    tokenizer: public/models/Qwen--Qwen3-0.6B-Base
+    i2t:
+        selected_variants_per_image: 6
+        records: 7687002
+        min: 282
+        mean: 326.9370739073569
+        p50: 327
+        p90: 338
+        p95: 342
+        p99: 351
+        p999: 367
+        max: 446
+        greater_than_384: 1356
+        greater_than_448: 0
+    t2i:
+        selected_variants_per_image: 12
+        records: 15374004
+        min: 275
+        mean: 298.9392282582989
+        p50: 299
+        p90: 305
+        p95: 307
+        p99: 313
+        p999: 322
+        max: 372
+        greater_than_384: 0
+
+shared_optimizer:
+    backbone_and_special_learning_rate: 3.0e-4
+    flow_and_projector_learning_rate: 5.0e-5
+    beta1: 0.9
+    beta2: 0.95
+    weight_decay: 0.01
+    flow_weight_decay: 0.01
+    max_grad_norm: 1.0
+shared_checkpointing:
+    save_every: 2000
+    validation_every: 2000
+    checkpoints_total_limit: 3
+    save_final_resumable_checkpoint: true

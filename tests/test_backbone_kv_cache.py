@@ -1,3 +1,6 @@
+import inspect
+
+import pytest
 import torch
 from torch.nn.attention.flex_attention import flex_attention
 from transformers import Qwen3Config
@@ -24,7 +27,9 @@ def _eager_flex_attention(
     )
 
 
-def _tiny_model() -> Qwen3ForCausalLM:
+def _tiny_model(
+    attention_contract: str = "selfless_strict",
+) -> Qwen3ForCausalLM:
     config = Qwen3Config(
         vocab_size=32,
         hidden_size=32,
@@ -55,18 +60,84 @@ def _tiny_model() -> Qwen3ForCausalLM:
     config.image_flow_solver = "euler"
     config.image_uncond_prob = 0.0
     config.use_flex_attention = False
+    config.training_objective = "selfless_dual_stream"
+    config.dual_stream_attention_contract = attention_contract
     return Qwen3ForCausalLM(config).eval()
 
 
+def test_production_generation_defaults_to_cache_and_current_cfg():
+    image_signature = inspect.signature(Qwen3ForCausalLM.generate_image)
+    text_signature = inspect.signature(Qwen3ForCausalLM.generate_text)
+
+    assert image_signature.parameters["use_cache"].default is True
+    assert image_signature.parameters["flow_cfg"].default == 3.5
+    assert image_signature.parameters["flow_cfg_schedule"].default == "constant"
+    assert text_signature.parameters["use_cache"].default is True
+
+
 @torch.no_grad()
-def test_backbone_static_kv_cache_matches_full_recompute_with_cfg(monkeypatch):
+@pytest.mark.parametrize(
+    "attention_contract",
+    ["selfless_strict", "xlnet_content_diagonal"],
+)
+def test_ab_text_cache_matches_single_stream_full_reference(
+    monkeypatch,
+    attention_contract,
+):
     monkeypatch.setattr(
         selfless_flow,
-        "dynamic_flex_attention",
+        "compiled_flex_attention",
+        _eager_flex_attention,
+    )
+    torch.manual_seed(41)
+    model = _tiny_model(attention_contract)
+    input_ids = torch.tensor([[3, 4, 0], [5, 6, 7]])
+    token_types = torch.tensor(
+        [[0, 0, 3], [0, 0, 0]],
+        dtype=torch.uint8,
+    )
+
+    cached, cached_trace = model.generate_text(
+        input_ids,
+        token_types=token_types,
+        max_new_tokens=4,
+        temperature=0.0,
+        eos_token_id=-1,
+        use_cache=True,
+        return_trace=True,
+    )
+    full, full_trace = model.generate_text(
+        input_ids,
+        token_types=token_types,
+        max_new_tokens=4,
+        temperature=0.0,
+        eos_token_id=-1,
+        use_cache=False,
+        return_trace=True,
+    )
+
+    torch.testing.assert_close(cached, full, rtol=0, atol=0)
+    assert cached_trace["attention_contract"] == attention_contract
+    assert cached_trace["backbone_kv_cache_enabled"] is True
+    assert full_trace["backbone_kv_cache_enabled"] is False
+
+
+@torch.no_grad()
+@pytest.mark.parametrize(
+    "attention_contract",
+    ["selfless_strict", "xlnet_content_diagonal"],
+)
+def test_backbone_static_kv_cache_matches_full_recompute_with_cfg(
+    monkeypatch,
+    attention_contract,
+):
+    monkeypatch.setattr(
+        selfless_flow,
+        "compiled_flex_attention",
         _eager_flex_attention,
     )
     torch.manual_seed(11)
-    model = _tiny_model()
+    model = _tiny_model(attention_contract)
     input_ids = torch.tensor(
         [
             [3, 11, 8, 8, 8, 8, 12, 9],
@@ -101,20 +172,55 @@ def test_backbone_static_kv_cache_matches_full_recompute_with_cfg(monkeypatch):
         "parallel_rate": 1,
         "order_strategy": "spatial_halton",
         "return_trace": True,
+        "_debug_max_generation_steps": 4,
     }
 
-    full, full_trace = model.sample_image_latents_single_stream(
+    full, full_trace = model.generate(
+        "t2i",
         **kwargs,
-        use_backbone_cache=False,
+        use_cache=False,
     )
-    cached, cached_trace = model.sample_image_latents_single_stream(
+    backbone_calls = 0
+    original_forward = model.model.forward
+
+    def counted_forward(*args, **forward_kwargs):
+        nonlocal backbone_calls
+        backbone_calls += 1
+        return original_forward(*args, **forward_kwargs)
+
+    monkeypatch.setattr(model.model, "forward", counted_forward)
+    cached, cached_trace = model.generate(
+        "t2i",
         **kwargs,
-        use_backbone_cache=True,
+        use_cache=True,
     )
 
     torch.testing.assert_close(cached, full, rtol=0.0, atol=0.0)
+    # Full recompute and cached decoding use different GEMM query shapes, so
+    # their hidden states are numerically equivalent rather than bitwise. The
+    # same-shape single/dual-stream contract is tested bitwise separately.
+    torch.testing.assert_close(
+        cached_trace["debug_conditional_backbone_hidden"],
+        full_trace["debug_conditional_backbone_hidden"],
+        rtol=0.0,
+        atol=5.0e-7,
+    )
+    torch.testing.assert_close(
+        cached_trace["debug_unconditional_backbone_hidden"],
+        full_trace["debug_unconditional_backbone_hidden"],
+        rtol=0.0,
+        atol=5.0e-7,
+    )
+    assert full_trace["single_stream_attention_contract"] == attention_contract
+    assert cached_trace["single_stream_attention_contract"] == attention_contract
+    assert full_trace["single_stream_content_self_diagonal"] is (
+        attention_contract == "xlnet_content_diagonal"
+    )
     assert full_trace["backbone_kv_cache_enabled"] is False
     assert cached_trace["backbone_kv_cache_enabled"] is True
+    assert cached_trace["backbone_cfg_batched"] is True
+    # One context prefill plus one paired CFG call per generated image token.
+    assert backbone_calls == 1 + model.config.image_tokens_per_img
     assert cached_trace["backbone_kv_cache_context_tokens"] == 4
     # The final generated token has no future query and is intentionally left
     # pending instead of paying for a useless terminal cache write.
@@ -133,32 +239,88 @@ def test_backbone_static_kv_cache_matches_full_recompute_with_cfg(monkeypatch):
 
 
 @torch.no_grad()
-def test_backbone_cache_falls_back_for_hidden_candidate_scoring(monkeypatch):
+def test_cache_first_generation_rejects_dynamic_candidate_scoring(monkeypatch):
     monkeypatch.setattr(
         selfless_flow,
-        "dynamic_flex_attention",
+        "compiled_flex_attention",
         _eager_flex_attention,
     )
     torch.manual_seed(23)
     model = _tiny_model()
-    _, trace = model.sample_image_latents_single_stream(
-        input_ids=torch.tensor([[3, 11, 8, 8, 8, 8, 12, 9]]),
-        token_types=torch.tensor(
-            [[0, 2, 1, 1, 1, 1, 2, 0]], dtype=torch.uint8
-        ),
-        sigma=torch.tensor([[0.0, 1.0, 4.0, 5.0, 6.0, 7.0, 2.0, 3.0]]),
-        spans=[(0, 2, 6)],
-        initial_noise_bank=torch.zeros(1, 4, 4),
-        flow_cfg=1.0,
-        flow_solver="euler",
-        flow_num_steps=1,
-        parallel_rate=1,
-        order_strategy="hidden_norm",
-        use_backbone_cache=True,
-        return_trace=True,
-    )
+    with pytest.raises(ValueError, match="order_strategy must be one of"):
+        model.generate(
+            "t2i",
+            input_ids=torch.tensor([[3, 11, 8, 8, 8, 8, 12, 9]]),
+            token_types=torch.tensor(
+                [[0, 2, 1, 1, 1, 1, 2, 0]], dtype=torch.uint8
+            ),
+            sigma=torch.tensor(
+                [[0.0, 1.0, 4.0, 5.0, 6.0, 7.0, 2.0, 3.0]]
+            ),
+            spans=[(0, 2, 6)],
+            initial_noise_bank=torch.zeros(1, 4, 4),
+            flow_cfg=1.0,
+            flow_solver="euler",
+            flow_num_steps=1,
+            parallel_rate=1,
+            order_strategy="hidden_norm",
+            use_cache=True,
+            return_trace=True,
+        )
 
-    assert trace["backbone_kv_cache_enabled"] is False
-    assert "full-sequence candidate scoring" in trace[
-        "backbone_kv_cache_fallback_reason"
-    ]
+
+@torch.no_grad()
+def test_backbone_cache_and_full_path_isolate_packed_segments(monkeypatch):
+    monkeypatch.setattr(
+        selfless_flow,
+        "compiled_flex_attention",
+        _eager_flex_attention,
+    )
+    torch.manual_seed(31)
+    model = _tiny_model("xlnet_content_diagonal")
+    common = {
+        "token_types": torch.tensor(
+            [[0, 2, 1, 1, 1, 1, 2, 0, 0, 0, 0]],
+            dtype=torch.uint8,
+        ),
+        "sigma": torch.tensor(
+            [[0.0, 1.0, 4.0, 5.0, 6.0, 7.0, 2.0, 3.0, 0.0, 1.0, 2.0]]
+        ),
+        "segment_ids": torch.tensor(
+            [[0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1]],
+            dtype=torch.long,
+        ),
+        "spans": [(0, 2, 6)],
+        "initial_noise_bank": torch.arange(16, dtype=torch.float32).view(1, 4, 4)
+        / 13.0,
+        "flow_cfg": 1.0,
+        "flow_solver": "euler",
+        "flow_num_steps": 1,
+        "parallel_rate": 1,
+        "order_strategy": "spatial_halton",
+        "return_trace": True,
+    }
+
+    outputs = []
+    for distractor in ([20, 21, 22], [29, 30, 31]):
+        input_ids = torch.tensor(
+            [[3, 11, 8, 8, 8, 8, 12, 9, *distractor]]
+        )
+        full, full_trace = model.generate(
+            "t2i",
+            input_ids=input_ids,
+            **common,
+            use_cache=False,
+        )
+        cached, cached_trace = model.generate(
+            "t2i",
+            input_ids=input_ids,
+            **common,
+            use_cache=True,
+        )
+        torch.testing.assert_close(cached, full, rtol=0.0, atol=0.0)
+        assert full_trace["segment_isolation_enabled"] is True
+        assert cached_trace["segment_isolation_enabled"] is True
+        outputs.append(cached)
+
+    torch.testing.assert_close(outputs[0], outputs[1], rtol=0.0, atol=0.0)

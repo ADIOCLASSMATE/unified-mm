@@ -1,13 +1,11 @@
-"""Dataset splitting and DataLoader assembly for ImageNet flow training."""
+"""Independent ImageNet-train/ImageNet-val DataLoader assembly."""
 
 from __future__ import annotations
 
 import copy
-import json
-import random
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import torch
 from torch.utils.data import DataLoader, RandomSampler, Subset
@@ -18,8 +16,73 @@ from utils.multimodal_segment_packing import (
     is_power_of_two,
 )
 
-if TYPE_CHECKING:
-    from utils.dataset_imagenet_flow_cache import ImageNetFlowCacheDataset
+
+class ScheduledPadCollator:
+    """Cycle through fixed dense-attention widths in the main process.
+
+    The cursor advances only after a batch was collated successfully.  Callers
+    checkpoint only at a complete schedule boundary, where ``position == 0``.
+    """
+
+    def __init__(
+        self,
+        pad_to_length_schedule,
+        *,
+        pad_to_multiple_of: int | None = None,
+    ) -> None:
+        schedule = tuple(int(width) for width in pad_to_length_schedule)
+        if not schedule or any(width <= 0 for width in schedule):
+            raise ValueError(
+                "pad_to_length_schedule must contain positive widths, got "
+                f"{list(schedule)}"
+            )
+        multiple = (
+            None
+            if pad_to_multiple_of is None
+            else int(pad_to_multiple_of)
+        )
+        if multiple is not None:
+            if multiple <= 0:
+                raise ValueError(
+                    "pad_to_multiple_of must be positive when configured"
+                )
+            invalid = [
+                width for width in schedule if width % multiple != 0
+            ]
+            if invalid:
+                raise ValueError(
+                    "every scheduled pad width must already be divisible by "
+                    f"pad_to_multiple_of={multiple}; invalid={invalid}"
+                )
+        self.schedule = schedule
+        self.pad_to_multiple_of = multiple
+        self._position = 0
+
+    @property
+    def position(self) -> int:
+        return int(self._position)
+
+    def reset(self, position: int = 0) -> None:
+        position = int(position)
+        if not 0 <= position < len(self.schedule):
+            raise ValueError(
+                f"invalid scheduled-pad position={position} for "
+                f"length={len(self.schedule)}"
+            )
+        self._position = position
+
+    def __call__(self, batch):
+        position = self.position
+        width = self.schedule[position]
+        result = collate_imagenet_flow_cache(
+            batch,
+            pad_to_length=width,
+            pad_to_multiple_of=self.pad_to_multiple_of,
+        )
+        result["pad_schedule_position"] = position
+        result["scheduled_pad_to_length"] = width
+        self._position = (position + 1) % len(self.schedule)
+        return result
 
 
 def training_samples_per_epoch(config, dataset_size: int) -> int | None:
@@ -47,222 +110,10 @@ def training_samples_per_epoch(config, dataset_size: int) -> int | None:
     return sample_budget
 
 
-def _split_key_for_index(
-    dataset: ImageNetFlowCacheDataset, idx: int
-) -> str:
-    img_id = int(dataset.img_ids[int(idx)].item())
-    return dataset.synsets.get(img_id, "")
-
-
-def _build_split_indices(
-    dataset: ImageNetFlowCacheDataset,
-    val_ratio: float,
-    seed: int,
-    strategy: str,
-    val_samples_per_class: int | None = None,
-) -> tuple[list[int], list[int]]:
-    n_items = len(dataset)
-    if n_items <= 0:
-        return [], []
-    val_size = max(1, int(n_items * float(val_ratio)))
-    val_size = min(val_size, max(1, n_items - 1))
-    strategy = str(strategy or "stratified").lower()
-    fixed_val_size = (
-        int(val_samples_per_class)
-        if val_samples_per_class is not None
-        else None
-    )
-    if fixed_val_size is not None and fixed_val_size <= 0:
-        raise ValueError(
-            "val_samples_per_class must be positive, "
-            f"got {val_samples_per_class}"
-        )
-    if fixed_val_size is not None and strategy not in {
-        "stratified",
-        "synset",
-        "stratified_synset",
-    }:
-        raise ValueError(
-            "val_samples_per_class requires a stratified split strategy, "
-            f"got {strategy!r}."
-        )
-
-    if strategy in {"contiguous", "tail"}:
-        train_size = max(0, n_items - val_size)
-        return list(range(train_size)), list(range(train_size, n_items))
-
-    rng = random.Random(int(seed))
-    if strategy in {"shuffle", "shuffled", "random"}:
-        indices = list(range(n_items))
-        rng.shuffle(indices)
-        return indices[val_size:], indices[:val_size]
-
-    if strategy not in {"stratified", "synset", "stratified_synset"}:
-        raise ValueError(
-            f"Unknown ImageNet flow split_strategy={strategy!r}; "
-            "expected stratified, shuffled, or contiguous."
-        )
-
-    groups: dict[str, list[int]] = {}
-    for idx in range(n_items):
-        key = _split_key_for_index(dataset, idx)
-        groups.setdefault(key, []).append(idx)
-    if len(groups) <= 1:
-        indices = list(range(n_items))
-        rng.shuffle(indices)
-        single_group_val_size = (
-            fixed_val_size if fixed_val_size is not None else val_size
-        )
-        single_group_val_size = min(
-            single_group_val_size, max(1, n_items - 1)
-        )
-        return (
-            indices[single_group_val_size:],
-            indices[:single_group_val_size],
-        )
-
-    train_indices: list[int] = []
-    val_indices: list[int] = []
-    for key in sorted(groups):
-        group_indices = list(groups[key])
-        rng.shuffle(group_indices)
-        if fixed_val_size is not None:
-            group_val_size = fixed_val_size
-        else:
-            group_val_size = max(
-                1, int(len(group_indices) * float(val_ratio))
-            )
-        if len(group_indices) > 1:
-            group_val_size = min(
-                group_val_size, len(group_indices) - 1
-            )
-        else:
-            group_val_size = 0
-        val_indices.extend(group_indices[:group_val_size])
-        train_indices.extend(group_indices[group_val_size:])
-
-    rng.shuffle(train_indices)
-    rng.shuffle(val_indices)
-    return train_indices, val_indices
-
-
-def _load_explicit_split_indices(
-    dataset: ImageNetFlowCacheDataset,
-    split_manifest_jsonl: str,
-) -> tuple[list[int], list[int]]:
-    """Resolve a shared split manifest by image id."""
-
-    path = Path(split_manifest_jsonl)
-    if not path.exists():
-        raise FileNotFoundError(path)
-    index_by_image_id = {
-        int(image_id.item()): index
-        for index, image_id in enumerate(dataset.img_ids)
-    }
-    split_rows: dict[str, list[tuple[int, int]]] = {
-        "train": [],
-        "validation": [],
-    }
-    seen: set[int] = set()
-    with path.open() as handle:
-        for line_number, line in enumerate(handle, start=1):
-            if not line.strip():
-                continue
-            row = json.loads(line)
-            image_id = int(row["img_id"])
-            split = str(row["split"]).lower()
-            if split == "val":
-                split = "validation"
-            if split not in split_rows:
-                raise ValueError(
-                    f"{path}:{line_number} has unsupported split={split!r}"
-                )
-            if image_id in seen:
-                raise ValueError(f"duplicate img_id={image_id} in {path}")
-            if image_id not in index_by_image_id:
-                raise ValueError(
-                    f"{path}:{line_number} img_id={image_id} is absent "
-                    "from cache"
-                )
-            expected_synset = dataset.synsets.get(image_id, "")
-            row_synset = str(row.get("synset", expected_synset))
-            if row_synset != expected_synset:
-                raise ValueError(
-                    f"{path}:{line_number} synset mismatch for "
-                    f"img_id={image_id}: {row_synset!r} != "
-                    f"{expected_synset!r}"
-                )
-            split_index = int(
-                row.get("split_index", len(split_rows[split]))
-            )
-            split_rows[split].append(
-                (split_index, index_by_image_id[image_id])
-            )
-            seen.add(image_id)
-    if seen != set(index_by_image_id):
-        missing = sorted(set(index_by_image_id).difference(seen))
-        raise ValueError(
-            f"{path} does not cover the complete cache; missing "
-            f"{len(missing)} image ids, first={missing[:8]}"
-        )
-    train_indices = [
-        index
-        for _, index in sorted(
-            split_rows["train"], key=lambda item: item[0]
-        )
-    ]
-    val_indices = [
-        index
-        for _, index in sorted(
-            split_rows["validation"], key=lambda item: item[0]
-        )
-    ]
-    if not train_indices or not val_indices:
-        raise ValueError(
-            f"{path} must contain non-empty train and validation assignments"
-        )
-    return train_indices, val_indices
-
-
-def _build_dataset_subsets(
-    dataset: ImageNetFlowCacheDataset,
-    train_indices: list[int],
-    val_indices: list[int],
-    *,
-    validation_overlap_train: bool,
-) -> tuple[Subset, Subset]:
-    """Build train/validation views without changing validation RNG semantics."""
-
-    validation_dataset = dataset
-    if validation_overlap_train:
-        train_indices = list(range(len(dataset)))
-        # Both views share mmap-backed posterior tensors and immutable metadata,
-        # while keeping separate training masks. Validation therefore remains
-        # deterministic even though its rows are also available to training.
-        validation_dataset = copy.copy(dataset)
-        if dataset.synthetic_text_index is not None:
-            validation_dataset.synthetic_text_index = (
-                dataset.synthetic_text_index.clone()
-            )
-        validation_dataset.set_training_indices([])
-    dataset.set_training_indices(train_indices)
-    return (
-        Subset(dataset, train_indices),
-        Subset(validation_dataset, val_indices),
-    )
-
-
-def build_imagenet_flow_cache_dataloaders(config, tokenizer):
-    # Imported lazily to keep the dataset module's compatibility re-exports
-    # free of a module-import cycle.
+def _build_cache_dataset(config, params, tokenizer):
     from utils.dataset_imagenet_flow_cache import ImageNetFlowCacheDataset
 
-    params = config.dataset.params
-    packing = params.get("packing", None)
-    emit_pack_audit = bool(
-        packing is not None and packing.get("audit_manifests", False)
-    )
-    dataset = ImageNetFlowCacheDataset(
+    return ImageNetFlowCacheDataset(
         cache_path=params.cache_path,
         tokenizer=tokenizer,
         boi_token_id=config.model.boi_token_id,
@@ -276,21 +127,17 @@ def build_imagenet_flow_cache_dataloaders(config, tokenizer):
             "image_latent_dim", config.model.image_latent_dim
         ),
         manifest_jsonl=params.get("manifest_jsonl", None),
+        expected_split=params.get("expected_split", None),
+        expected_records=params.get("expected_records", None),
         synset_mapping_path=params.get("synset_mapping_path", None),
         conditioning_mode=params.get("conditioning_mode", None),
         caption_jsonl=params.get("caption_jsonl", None),
-        caption_text_key=params.get(
-            "caption_text_key", "recaption_short"
-        ),
+        caption_text_key=params.get("caption_text_key", "recaption_short"),
         caption_list_key=params.get("caption_list_key", "captions"),
-        caption_list_text_key=params.get(
-            "caption_list_text_key", "text"
-        ),
+        caption_list_text_key=params.get("caption_list_text_key", "text"),
         caption_path_key=params.get("caption_path_key", "path"),
         caption_id_key=params.get("caption_id_key", "id"),
-        caption_validation_index=params.get(
-            "caption_validation_index", 0
-        ),
+        caption_validation_index=params.get("caption_validation_index", 0),
         t2i_prompt_validation_index=params.get(
             "t2i_prompt_validation_index", 0
         ),
@@ -306,51 +153,76 @@ def build_imagenet_flow_cache_dataloaders(config, tokenizer):
             "caption_i2t_prefix",
             "Describe this image in one detailed caption:",
         ),
-        caption_include_original=params.get(
-            "caption_include_original", True
-        ),
+        caption_include_original=params.get("caption_include_original", True),
         cache_caption_tokens=params.get("cache_caption_tokens", False),
         max_seq_length=params.get(
             "max_seq_length", config.dataset.preprocessing.max_seq_length
         ),
         model_context_length=params.get("model_context_length", None),
-        caption_manifest_sha256=params.get(
-            "caption_manifest_sha256", None
-        ),
         max_samples=params.get("max_samples", -1),
         seed=config.training.seed,
-        emit_audit_metadata=emit_pack_audit,
+        image_sigma_order=params.get("image_sigma_order", "random"),
     )
 
-    val_ratio = params.get("val_ratio", 0.001)
-    val_samples_per_class = params.get("val_samples_per_class", None)
-    split_seed = params.get("split_seed", config.training.seed)
-    split_strategy = params.get("split_strategy", "stratified")
-    split_manifest_jsonl = params.get("split_manifest_jsonl", None)
-    if split_manifest_jsonl:
-        train_indices, val_indices = _load_explicit_split_indices(
-            dataset, str(split_manifest_jsonl)
+
+def _independent_validation_params(params):
+    validation = params.get("validation", None)
+    if validation is None:
+        return None
+    merged = copy.deepcopy(params)
+    merged.pop("validation", None)
+    for key, value in validation.items():
+        merged[key] = copy.deepcopy(value)
+    return merged
+
+
+def _assert_independent_imagenet_splits(train_dataset, val_dataset) -> None:
+    if train_dataset.dataset_split != "train":
+        raise ValueError(
+            "independent ImageNet training dataset must declare split='train'"
         )
-    else:
-        train_indices, val_indices = _build_split_indices(
-            dataset=dataset,
-            val_ratio=float(val_ratio),
-            seed=int(split_seed),
-            strategy=str(split_strategy),
-            val_samples_per_class=(
-                int(val_samples_per_class)
-                if val_samples_per_class is not None
-                else None
-            ),
+    if val_dataset.dataset_split != "val":
+        raise ValueError(
+            "independent ImageNet validation dataset must declare split='val'"
         )
-    train_dataset, val_dataset = _build_dataset_subsets(
-        dataset,
-        train_indices,
-        val_indices,
-        validation_overlap_train=bool(
-            params.get("validation_overlap_train", False)
-        ),
+    train_identities = {
+        (train_dataset.synsets[img_id], Path(path).name)
+        for img_id, path in train_dataset.source_paths_full.items()
+    }
+    val_identities = {
+        (val_dataset.synsets[img_id], Path(path).name)
+        for img_id, path in val_dataset.source_paths_full.items()
+    }
+    overlap = train_identities.intersection(val_identities)
+    if overlap:
+        raise ValueError(
+            "ImageNet train/val image identity overlap detected; first="
+            f"{sorted(overlap)[:8]}"
+        )
+
+
+def build_imagenet_flow_cache_dataloaders(config, tokenizer):
+    params = config.dataset.params
+    packing = params.get("packing", None)
+    emit_pack_audit = bool(
+        packing is not None and packing.get("audit_manifests", False)
     )
+    dataset = _build_cache_dataset(config, params, tokenizer)
+    validation_params = _independent_validation_params(params)
+    if validation_params is None:
+        raise ValueError(
+            "dataset.params.validation is required: training must use the "
+            "complete ImageNet train cache and validation must use the "
+            "independent ImageNet val cache"
+        )
+    validation_dataset = _build_cache_dataset(config, validation_params, tokenizer)
+    _assert_independent_imagenet_splits(dataset, validation_dataset)
+    train_indices = list(range(len(dataset)))
+    val_indices = list(range(len(validation_dataset)))
+    dataset.set_training_indices(train_indices)
+    validation_dataset.set_training_indices([])
+    train_dataset = Subset(dataset, train_indices)
+    val_dataset = Subset(validation_dataset, val_indices)
 
     pad_to_length = params.get("pad_to_length", None)
     if params.get("pad_to_max_length", False):
@@ -364,10 +236,23 @@ def build_imagenet_flow_cache_dataloaders(config, tokenizer):
         pad_to_multiple_of=params.get("pad_to_multiple_of", None),
     )
 
+    pad_to_length_schedule = params.get(
+        "pad_to_length_schedule", None
+    )
     packing_enabled = bool(
         packing is not None and packing.get("enabled", False)
     )
-    if packing_enabled:
+    if pad_to_length_schedule is not None and packing_enabled:
+        raise ValueError(
+            "pad_to_length_schedule and segment packing cannot be enabled "
+            "together"
+        )
+    if pad_to_length_schedule is not None:
+        train_collate_fn = ScheduledPadCollator(
+            pad_to_length_schedule,
+            pad_to_multiple_of=params.get("pad_to_multiple_of", None),
+        )
+    elif packing_enabled:
         algorithm = str(
             packing.get(
                 "algorithm", "deterministic_best_fit_decreasing"
@@ -421,6 +306,11 @@ def build_imagenet_flow_cache_dataloaders(config, tokenizer):
         else None
     )
     worker_count = int(config.training.dataloader_workers)
+    if pad_to_length_schedule is not None and worker_count != 0:
+        raise ValueError(
+            "pad_to_length_schedule uses a stateful collator and requires "
+            "training.dataloader_workers=0"
+        )
     worker_kwargs: dict[str, Any] = {}
     if worker_count > 0:
         worker_kwargs["prefetch_factor"] = int(

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import random
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
@@ -14,16 +12,6 @@ from models.modeling_model.image_position_utils import (
     build_row_col_position_ids,
 )
 from utils.imagenet_flow_sequence import build_selfless_sigma, scalar_int
-
-
-def canonical_sha256(value: Any) -> str:
-    payload = json.dumps(
-        value,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-    ).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
 
 
 def is_power_of_two(value: int) -> bool:
@@ -222,8 +210,6 @@ def collate_segment_packed(
 
     span_rows: list[list[int]] = []
     pack_rows: list[dict[str, Any]] = []
-    sample_token_hashes: list[str] = []
-    augmentation_hashes: list[str] = []
     for row_index, row in enumerate(rows):
         cursor = 0
         segment_records = []
@@ -267,10 +253,6 @@ def collate_segment_packed(
                 [row_index, segment_id, image_start, image_end, img_id]
             )
             if emit_audit_manifest:
-                token_hash = str(item["token_ids_sha256"])
-                augmentation_hash = str(item["augmentation_sha256"])
-                sample_token_hashes.append(token_hash)
-                augmentation_hashes.append(augmentation_hash)
                 segment_records.append(
                     {
                         "segment_id": segment_id,
@@ -279,8 +261,11 @@ def collate_segment_packed(
                         "start": cursor,
                         "end": end,
                         "serialized_length": length,
-                        "token_ids_sha256": token_hash,
-                        "augmentation_sha256": augmentation_hash,
+                        "caption_index": scalar_int(item, "caption_index"),
+                        "caption_count": scalar_int(item, "caption_count"),
+                        "task_mode": str(item["task_mode"]),
+                        "reveal_seed": scalar_int(item, "reveal_seed"),
+                        "cfg_dropout_seed": scalar_int(item, "cfg_dropout_seed"),
                     }
                 )
             cursor = end
@@ -339,10 +324,7 @@ def collate_segment_packed(
         }
         result.update(
             {
-                "pack_manifest_sha256": canonical_sha256(manifest_payload),
                 "pack_manifest": manifest_payload,
-                "sample_token_sha256": sample_token_hashes,
-                "augmentation_sha256": augmentation_hashes,
             }
         )
     return result

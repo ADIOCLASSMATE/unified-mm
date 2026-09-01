@@ -91,9 +91,9 @@ class PositionwiseFlowQwen3ForCausalLM(ContextualQwen3ForCausalLM):
         self.reset_backbone_attention_output_gates()
         self.reset_image_modules()
 
-    def sample_image_latents_single_stream(self, *args, **kwargs):
+    def generate_image(self, *args, **kwargs):
         return_trace = bool(kwargs.get("return_trace", False))
-        result = super().sample_image_latents_single_stream(*args, **kwargs)
+        result = super().generate_image(*args, **kwargs)
         if not return_trace or result is None:
             return result
         generated, trace = result

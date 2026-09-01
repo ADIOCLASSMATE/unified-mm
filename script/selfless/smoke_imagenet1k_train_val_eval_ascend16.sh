@@ -92,17 +92,12 @@ env \
   experiment.validation_image_samples=1 \
   experiment.validation_flow_cfg=1.0 \
   experiment.validation_flow_solver=euler \
-  experiment.validation_flow_probe_times='[0.5]' \
-  experiment.validation_save_debug_images=true \
   experiment.validation_single_stream_parallel_rate=1 \
   "experiment.validation_single_stream_order_strategies=[${GENERATION_STRATEGY}]" \
   model.image_flow_num_sampling_steps=10 \
   model.image_flow_batch_mul=1 \
   model.image_flow_solver=euler \
   dataset.params.max_samples=32 \
-  dataset.params.split_strategy=shuffle \
-  dataset.params.val_ratio=0.5 \
-  dataset.params.val_samples_per_class=null \
   training.batch_size=1 \
   training.total_batch_size=16 \
   training.samples_per_epoch=16 \
@@ -141,15 +136,20 @@ strategy_image = (
 )
 if not strategy_image.is_file():
     raise SystemExit(f"validation strategy image was not generated: {strategy_image}")
-generation_order_image = (
-    run_root
-    / "validation_flow_images"
-    / f"step-00000001-single_stream_order_{generation_strategy}.png"
+generation = json.loads(
+    (run_root / "validation_generation_step_1.json").read_text()
 )
-if not generation_order_image.is_file():
+strategy_generation = generation.get("strategies", {}).get(
+    generation_strategy,
+    {},
+)
+if (
+    generation.get("generation_entry") != "model.generate"
+    or generation.get("use_cache") is not True
+    or strategy_generation.get("backbone_kv_cache_enabled") is not True
+):
     raise SystemExit(
-        "validation generation-order trace was not generated: "
-        f"{generation_order_image}"
+        f"validation did not use unified cached generation: {generation}"
     )
 if not (ema_model / "model.safetensors").is_file():
     raise SystemExit("final EMA HF model was not exported")
@@ -190,8 +190,6 @@ torchrun --standalone --nproc_per_node="${NPU_COUNT}" \
   --vae_decode_batch_size 1 \
   --inception_weights_path public/models/torch-fidelity/weights-inception-2015-12-05-6726825d.pth \
   --real_stats_path public/datasets/imagenet_full/fid_stats/inception_v3_2048_imagenet_val50000_256.pt \
-  --skip_target_decode \
-  --allow_nonofficial_fid \
   --canonical_pairing
 
 python - "${RUN_ROOT}" "${EVAL_ROOT}" "${REPORT_PATH}" "${GENERATION_STRATEGY}" <<'PY'
@@ -207,12 +205,15 @@ validation = json.loads((run_root / "validation_metrics_step_1.json").read_text(
 evaluation = json.loads((eval_root / "metrics.json").read_text())
 strategy = evaluation["strategies"][generation_strategy]
 required = {
-    "fid": strategy["fid"],
     "inception_score_mean": strategy["inception_score_mean"],
     "inception_score_std": strategy["inception_score_std"],
 }
 if evaluation.get("samples_evaluated") != 16:
     raise SystemExit("evaluation did not process all 16 smoke samples")
+if strategy.get("fid") is not None:
+    raise SystemExit("smoke evaluation must not publish a non-official FID")
+if evaluation.get("metric_protocol", {}).get("fid_computed") is not False:
+    raise SystemExit("smoke evaluation unexpectedly computed FID")
 if any(not math.isfinite(float(value)) for value in required.values()):
     raise SystemExit(f"non-finite smoke evaluation metric: {required}")
 report = {
@@ -222,7 +223,6 @@ report = {
     "evaluation": {
         "samples_evaluated": evaluation["samples_evaluated"],
         "real_source": evaluation["real_source"],
-        "target_decode_skipped": evaluation["target_decode_skipped"],
         "strategy": generation_strategy,
         **required,
         "generation_step_max": strategy["generation_step_max"],

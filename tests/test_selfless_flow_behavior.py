@@ -32,7 +32,13 @@ class WordTokenizer:
         return ids
 
 
-def _write_data(tmp_path, captions=("first caption", "second caption")):
+def _write_data(
+    tmp_path,
+    captions=("first caption", "second caption"),
+    *,
+    split="train",
+):
+    tmp_path.mkdir(parents=True, exist_ok=True)
     cache = tmp_path / "latents.pt"
     manifest = tmp_path / "manifest.jsonl"
     mapping = tmp_path / "mapping.txt"
@@ -57,13 +63,18 @@ def _write_data(tmp_path, captions=("first caption", "second caption")):
     manifest_rows = []
     caption_rows = []
     for index, caption in enumerate(captions, start=1):
-        image_id = f"n00000001_{index}"
+        image_id = (
+            f"n00000001_{index}"
+            if split == "train"
+            else f"n00000001_{split}_{index}"
+        )
         relative_path = f"n00000001/{image_id}.JPEG"
         manifest_rows.append(
             {
                 "img_id": index,
-                "source_path": f"/imagenet/train/{relative_path}",
+                "source_path": f"/imagenet/{split}/{relative_path}",
                 "synset": "n00000001",
+                "split": split,
             }
         )
         caption_rows.append(
@@ -233,15 +244,15 @@ def test_multicaption_rows_cycle_by_epoch_and_fix_validation_caption(tmp_path):
 
     dataset.set_training_indices([0])
     selected = []
-    token_hashes = []
+    token_sequences = []
     for epoch in range(3):
         dataset.set_epoch(epoch)
         item = dataset[0]
         selected.append(item["caption_index"].item())
-        token_hashes.append(item["token_ids_sha256"])
+        token_sequences.append(tuple(item["input_ids"].tolist()))
         assert item["caption_count"].item() == 3
     assert set(selected) == {0, 1, 2}
-    assert len(set(token_hashes)) == 3
+    assert len(set(token_sequences)) == 3
 
     dataset.set_training_indices([])
     dataset.set_epoch(0)
@@ -250,9 +261,8 @@ def test_multicaption_rows_cycle_by_epoch_and_fix_validation_caption(tmp_path):
     validation_later = dataset[0]
     assert validation_zero["caption_index"].item() == 0
     assert validation_later["caption_index"].item() == 0
-    assert (
-        validation_zero["token_ids_sha256"]
-        == validation_later["token_ids_sha256"]
+    assert torch.equal(
+        validation_zero["input_ids"], validation_later["input_ids"]
     )
 
 
@@ -378,8 +388,13 @@ def test_loader_api_accepts_only_imagenet_flow_cache_dataset():
 
 def test_train_packing_is_enabled_without_packing_validation(tmp_path):
     cache, manifest, mapping, captions = _write_data(
-        tmp_path,
+        tmp_path / "train",
         captions=tuple(f"caption {index}" for index in range(8)),
+    )
+    val_cache, val_manifest, _, val_captions = _write_data(
+        tmp_path / "val",
+        captions=("validation one", "validation two"),
+        split="val",
     )
     config = OmegaConf.create(
         {
@@ -395,14 +410,20 @@ def test_train_packing_is_enabled_without_packing_validation(tmp_path):
                 "params": {
                     "cache_path": str(cache),
                     "manifest_jsonl": str(manifest),
+                    "expected_split": "train",
+                    "expected_records": 8,
                     "synset_mapping_path": str(mapping),
                     "conditioning_mode": "caption",
                     "caption_jsonl": str(captions),
                     "image_tokens_per_img": 4,
                     "image_latent_dim": 2,
-                    "val_ratio": 0.25,
-                    "split_strategy": "random",
-                    "split_seed": 43,
+                    "validation": {
+                        "cache_path": str(val_cache),
+                        "manifest_jsonl": str(val_manifest),
+                        "caption_jsonl": str(val_captions),
+                        "expected_split": "val",
+                        "expected_records": 2,
+                    },
                     "packing": {
                         "enabled": True,
                         "nominal_capacity": 64,

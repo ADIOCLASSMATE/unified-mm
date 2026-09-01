@@ -198,10 +198,6 @@ def _check_single_stream_uint8_cache(device: torch.device) -> None:
     config.image_flow_solver = "euler"
     config.image_uncond_prob = 0.0
     config.use_flex_attention = True
-    model = Qwen3ForCausalLM(config).eval().to(
-        device=device,
-        dtype=torch.bfloat16,
-    )
     input_ids = torch.tensor(
         [[3, 11, 8, 8, 8, 8, 12, 9], [4, 5, 11, 8, 8, 8, 8, 12]],
         device=device,
@@ -220,30 +216,50 @@ def _check_single_stream_uint8_cache(device: torch.device) -> None:
         torch.arange(32, device=device, dtype=torch.float32).reshape(2, 4, 4)
         / 17.0
     )
-    latents, trace = model.sample_image_latents_single_stream(
-        input_ids=input_ids,
-        token_types=token_types,
-        sigma=sigma,
-        spans=[(0, 2, 6), (1, 3, 7)],
-        initial_noise_bank=initial_noise,
-        flow_temperature=0.7,
-        flow_cfg=2.5,
-        flow_cfg_schedule="constant",
-        flow_solver="euler",
-        flow_num_steps=1,
-        parallel_rate=1,
-        order_strategy="spatial_halton",
-        use_backbone_cache=True,
-        return_trace=True,
-    )
-    torch.npu.synchronize()
-    if latents.shape != (2, 4, 2, 2) or not bool(torch.isfinite(latents).all()):
-        raise AssertionError(
-            "NPU single-stream cache returned invalid latents: "
-            f"shape={tuple(latents.shape)}"
+    for attention_contract in (
+        "selfless_strict",
+        "xlnet_content_diagonal",
+    ):
+        config.training_objective = "selfless_dual_stream"
+        config.dual_stream_attention_contract = attention_contract
+        model = Qwen3ForCausalLM(config).eval().to(
+            device=device,
+            dtype=torch.bfloat16,
         )
-    if trace["backbone_kv_cache_enabled"] is not True:
-        raise AssertionError(f"NPU single-stream cache was disabled: {trace}")
+        latents, trace = model.generate(
+            "t2i",
+            input_ids=input_ids,
+            token_types=token_types,
+            sigma=sigma,
+            spans=[(0, 2, 6), (1, 3, 7)],
+            initial_noise_bank=initial_noise,
+            flow_temperature=0.7,
+            flow_cfg=2.5,
+            flow_cfg_schedule="constant",
+            flow_solver="euler",
+            flow_num_steps=1,
+            parallel_rate=1,
+            order_strategy="spatial_halton",
+            use_cache=True,
+            return_trace=True,
+        )
+        torch.npu.synchronize()
+        if latents.shape != (2, 4, 2, 2) or not bool(
+            torch.isfinite(latents).all()
+        ):
+            raise AssertionError(
+                "NPU single-stream cache returned invalid latents: "
+                f"contract={attention_contract}, shape={tuple(latents.shape)}"
+            )
+        if trace["backbone_kv_cache_enabled"] is not True:
+            raise AssertionError(
+                f"NPU single-stream cache was disabled: {trace}"
+            )
+        if trace["single_stream_attention_contract"] != attention_contract:
+            raise AssertionError(
+                "NPU single-stream cache used the wrong attention contract: "
+                f"{trace}"
+            )
 
 
 def _check_flow_attention_layout(device: torch.device) -> None:

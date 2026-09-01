@@ -128,8 +128,12 @@ class ImageNetSyntheticTextIndex:
                 f"unsupported synthetic text index schema in {self.manifest_path}: "
                 f"{self.manifest.get('schema')!r}"
             )
-        if self.manifest.get("split") != "train":
-            raise ValueError("joint training currently requires the train text index")
+        self.split = str(self.manifest.get("split", "")).strip().lower()
+        if self.split not in {"train", "val"}:
+            raise ValueError(
+                "synthetic text index split must be 'train' or 'val', "
+                f"got {self.split!r}"
+            )
         self.row_count = int(self.manifest["records"])
         base = self.manifest_path.parent
 

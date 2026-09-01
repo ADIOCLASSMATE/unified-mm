@@ -8,7 +8,6 @@ the whole tied token embedding on a single rank.
 
 from __future__ import annotations
 
-import hashlib
 import heapq
 import json
 import os
@@ -58,17 +57,12 @@ def _tensor_view_identity(tensor: torch.Tensor) -> tuple[Any, ...]:
     )
 
 
-def _stable_json(payload: Any) -> str:
-    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
-
-
-def _layout_fingerprint(layout: dict[str, Any]) -> str:
-    fingerprint_payload = {
+def _layout_contract(layout: dict[str, Any]) -> dict[str, Any]:
+    return {
         key: value
         for key, value in layout.items()
         if key not in {"layout_fingerprint", "runtime"}
     }
-    return hashlib.sha256(_stable_json(fingerprint_payload).encode("utf-8")).hexdigest()
 
 
 def build_sharded_ema_layout(
@@ -165,13 +159,46 @@ def build_sharded_ema_layout(
         "rank_bytes": rank_bytes,
         "rank_chunk_count": rank_chunk_count,
     }
-    layout["layout_fingerprint"] = _layout_fingerprint(layout)
+    layout["layout_validation"] = "readable_field_equality"
     return layout
 
 
 def _manifest_path(path: str | Path) -> Path:
     path = Path(path)
     return path if path.name == "ema_manifest.json" else path / "ema_manifest.json"
+
+
+def _validate_readable_manifest_structure(manifest: dict[str, Any]) -> None:
+    world_size = int(manifest.get("world_size", 0))
+    chunks = manifest.get("chunks")
+    tensors = manifest.get("tensors")
+    if world_size <= 0 or not isinstance(chunks, dict) or not isinstance(tensors, dict):
+        raise ValueError("EMA manifest has an invalid readable layout structure")
+    rank_bytes = [0] * world_size
+    rank_chunk_count = [0] * world_size
+    for chunk_id, chunk in chunks.items():
+        if chunk.get("id") != chunk_id:
+            raise ValueError(f"EMA chunk id mismatch: {chunk_id!r}")
+        owner = int(chunk.get("owner", -1))
+        tensor_name = chunk.get("tensor")
+        if owner < 0 or owner >= world_size or tensor_name not in tensors:
+            raise ValueError(f"EMA chunk has invalid owner/tensor: {chunk_id!r}")
+        numel = int(chunk.get("numel", -1))
+        offset = int(chunk.get("offset", -1))
+        tensor_numel = int(tensors[tensor_name].get("numel", -1))
+        expected_bytes = numel * torch.empty(
+            (), dtype=_dtype_from_name(tensors[tensor_name]["ema_dtype"])
+        ).element_size()
+        if numel <= 0 or offset < 0 or offset + numel > tensor_numel:
+            raise ValueError(f"EMA chunk range is invalid: {chunk_id!r}")
+        if int(chunk.get("bytes", -1)) != expected_bytes:
+            raise ValueError(f"EMA chunk byte count is invalid: {chunk_id!r}")
+        rank_bytes[owner] += expected_bytes
+        rank_chunk_count[owner] += 1
+    if manifest.get("rank_bytes") != rank_bytes:
+        raise ValueError("EMA manifest rank_bytes does not match its chunks")
+    if manifest.get("rank_chunk_count") != rank_chunk_count:
+        raise ValueError("EMA manifest rank_chunk_count does not match its chunks")
 
 
 def load_ema_manifest(path: str | Path) -> dict[str, Any]:
@@ -187,9 +214,11 @@ def load_ema_manifest(path: str | Path) -> dict[str, Any]:
             f"Unsupported EMA manifest schema {manifest.get('schema')!r}; "
             f"expected {EMA_SCHEMA!r}."
         )
-    expected_fingerprint = _layout_fingerprint(manifest)
-    if manifest.get("layout_fingerprint") != expected_fingerprint:
-        raise ValueError(f"EMA manifest layout fingerprint mismatch: {manifest_path}")
+    if manifest.get("layout_validation") != "readable_field_equality":
+        raise ValueError(
+            f"EMA manifest must use readable field validation: {manifest_path}"
+        )
+    _validate_readable_manifest_structure(manifest)
     return manifest
 
 
@@ -368,7 +397,7 @@ class RankShardedEMA:
                 "schema": EMA_SCHEMA,
                 "rank": str(self.rank),
                 "world_size": str(self.world_size),
-                "layout_fingerprint": self.layout["layout_fingerprint"],
+                "layout_validation": "readable_field_equality",
             },
         )
         os.replace(temp_path, shard_path)
@@ -407,11 +436,10 @@ class RankShardedEMA:
                 "Sharded EMA requires the same world size when resuming: "
                 f"checkpoint={manifest['world_size']}, current={self.world_size}"
             )
-        if manifest["layout_fingerprint"] != self.layout["layout_fingerprint"]:
+        if _layout_contract(manifest) != _layout_contract(self.layout):
             raise RuntimeError(
-                "Sharded EMA layout does not match the current model/config: "
-                f"checkpoint={manifest['layout_fingerprint']}, "
-                f"current={self.layout['layout_fingerprint']}"
+                "Readable sharded EMA layout does not match the current "
+                "model/config."
             )
         runtime = manifest.get("runtime") or {}
         if float(runtime.get("decay", -1.0)) != self.decay:
@@ -537,6 +565,29 @@ def merge_sharded_ema_state_dict(
         canonical_name = manifest["canonical_for_name"][name]
         merged[name] = canonical_state[canonical_name]
     return merged
+
+
+def load_sharded_ema_checkpoint(
+    model: torch.nn.Module,
+    directory: str | Path,
+) -> dict[str, Any]:
+    """Strictly load a complete rank-sharded EMA into ``model`` on CPU."""
+
+    if not str(directory):
+        return {"ema_checkpoint": None}
+    path = Path(directory)
+    manifest = load_ema_manifest(path)
+    state_dict = merge_sharded_ema_state_dict(path)
+    model.load_state_dict(state_dict, strict=True)
+    runtime = manifest.get("runtime") or {}
+    return {
+        "ema_checkpoint": str(path),
+        "global_step": runtime.get("global_step"),
+        "decay": runtime.get("decay"),
+        "keys": len(state_dict),
+        "missing": [],
+        "unexpected": [],
+    }
 
 
 def read_sharded_ema_rows(

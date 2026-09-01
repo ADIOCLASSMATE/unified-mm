@@ -26,7 +26,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from scripts.generate_flow_validation_images import decode_latents, load_vae
+from utils.image_generation_io import decode_latents, load_vae
 from utils.imagenet_flow_batching import collate_imagenet_flow_cache
 from utils.utils import load_model_tokenizer
 
@@ -588,7 +588,8 @@ def generate_variant(
 
             synchronize(device)
             batch_started = time.perf_counter()
-            latents, trace = model.sample_image_latents_single_stream(
+            latents, trace = model.generate(
+                "t2i",
                 input_ids=input_ids,
                 token_types=token_types,
                 sigma=sigma,
@@ -602,7 +603,7 @@ def generate_variant(
                 flow_num_steps=int(args.sampling_steps),
                 parallel_rate=1,
                 order_strategy=spec["generation_strategy"],
-                use_backbone_cache=True,
+                use_cache=True,
                 return_trace=True,
                 debug_finite=bool(args.debug_finite),
             )

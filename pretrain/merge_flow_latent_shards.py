@@ -53,6 +53,11 @@ def main() -> None:
     parser.add_argument("--output_path", required=True)
     parser.add_argument("--manifest_jsonl", default=None)
     parser.add_argument("--mmap", action="store_true")
+    parser.add_argument(
+        "--no_hash",
+        action="store_true",
+        help="Do not calculate VAE, manifest, or output file digests.",
+    )
     args = parser.parse_args()
 
     shard_dir = Path(args.shard_dir)
@@ -129,6 +134,7 @@ def main() -> None:
         "image_size",
         "storage_dtype",
         "vae_dtype",
+        "runtime_hashing_enabled",
     )
     reference_metadata = source_metadata[0]
     for metadata in source_metadata[1:]:
@@ -158,7 +164,11 @@ def main() -> None:
 
     vae_checkpoint = Path(source_metadata[0]["vae_checkpoint"])
     if not vae_checkpoint.exists():
-        raise FileNotFoundError(f"Cannot fingerprint VAE checkpoint: {vae_checkpoint}")
+        raise FileNotFoundError(f"Missing VAE checkpoint: {vae_checkpoint}")
+    if args.no_hash and reference_metadata.get("runtime_hashing_enabled") is not False:
+        raise ValueError(
+            "--no_hash requires shards prepared with --no_hash"
+        )
     metadata = {
         "format": POSTERIOR_CACHE_FORMAT,
         "stats_layout": POSTERIOR_STATS_LAYOUT,
@@ -170,7 +180,9 @@ def main() -> None:
         "storage_dtype": str(posterior_stats.dtype).removeprefix("torch."),
         "vae": "mar-kl16",
         "vae_checkpoint": str(vae_checkpoint),
-        "vae_checkpoint_sha256": sha256_file(vae_checkpoint),
+        "vae_checkpoint_sha256": (
+            None if args.no_hash else sha256_file(vae_checkpoint)
+        ),
         "vae_module_root": source_metadata[0].get("vae_module_root"),
         "vae_module_sha256": source_metadata[0].get("vae_module_sha256"),
         "encoder_device_types": sorted(
@@ -182,10 +194,13 @@ def main() -> None:
         "source_image_root": source_metadata[0].get("source_image_root"),
         "source_shard_dir": str(shard_dir),
         "source_shards": [str(path) for path in shard_paths],
+        "runtime_hashing_enabled": not args.no_hash,
     }
     if manifest_path is not None:
         metadata["manifest_jsonl"] = str(manifest_path)
-        metadata["manifest_sha256"] = sha256_file(manifest_path)
+        metadata["manifest_sha256"] = (
+            None if args.no_hash else sha256_file(manifest_path)
+        )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = output_path.with_suffix(output_path.suffix + ".tmp")
     torch.save(
@@ -198,15 +213,12 @@ def main() -> None:
     )
     temporary_path.replace(output_path)
 
-    output_sha256 = sha256_file(output_path)
-
     metadata_path = output_path.with_suffix(output_path.suffix + ".metadata.json")
     with metadata_path.open("w") as handle:
         json.dump(
             {
                 **metadata,
                 "output_path": str(output_path),
-                "output_sha256": output_sha256,
                 "first_img_id": int(img_ids[0]) if img_ids.numel() else None,
                 "last_img_id": int(img_ids[-1]) if img_ids.numel() else None,
             },
@@ -215,7 +227,7 @@ def main() -> None:
         )
     print(
         f"Merged {len(shard_paths)} shards into {output_path} "
-        f"({posterior_stats.shape[0]} images, sha256={output_sha256})"
+        f"({posterior_stats.shape[0]} images, hashing={not args.no_hash})"
     )
 
 

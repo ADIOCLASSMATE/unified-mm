@@ -1,0 +1,149 @@
+# Frozen no-finetune understanding protocol selected after the 56K/58K/60K audit.
+# New final runs load the exported final EMA directly; the audited sharded
+# checkpoints remain readable only for historical checkpoint-trend continuity.
+schema: pretraining_native_understanding_evaluation_v4
+weights: hf_final_ema
+runtime_hashing_enabled: false
+hardware:
+  accelerator: ascend_910b
+  world_size: 16
+  world_size_semantics: per_job
+model_source:
+  directory_name: hf_model-final-ema
+  load_policy: direct_from_pretrained
+  step_provenance: ema_export_metadata.json.source_global_step
+legacy_weights_compatibility: rank_sharded_ema
+adaptation:
+  downstream_finetuning: false
+  instruction_tuning: false
+  linear_probe: false
+dataset_contract:
+  image_training_split: imagenet_train
+  custom_in_domain_evaluation_split: imagenet_val
+  standard_retrieval_evaluation_splits:
+    - mscoco_karpathy_test_5k
+    - flickr30k_karpathy_test_1k
+  training_split_overlap_allowed: false
+scoring:
+  model_contract: selfless_same_position_query_stream
+  causal_lm_one_token_shift: false
+  primary_candidate_score: mean_token_loglikelihood
+  score_variant: normalized_loglikelihood
+  efficient_backend: shared_prompt_and_image_prefix_kv_cache
+  reference_backend: repeated_full_sequence_likelihood
+  required_equivalence_check: cached_and_reference_scores_match
+
+imagenet_retrieval:
+  status: retained_custom_in_domain_protocol
+  runner: scripts/evaluate_imagenet_pretraining_native.py
+  split: official_imagenet_val
+  subsets:
+    - name: retrieval_1k
+      images: 1000
+      captions: 1000
+      selection: one_deterministically_selected_image_per_class
+    - name: retrieval_5k
+      images: 5000
+      captions: 5000
+      selection: five_deterministically_selected_images_per_class
+  primary_metrics:
+    - image_to_text_instance_recall_at_1
+    - image_to_text_instance_recall_at_5
+    - image_to_text_instance_recall_at_10
+    - text_to_image_instance_recall_at_1
+    - text_to_image_instance_recall_at_5
+    - text_to_image_instance_recall_at_10
+  secondary_metrics:
+    - same_class_relevance_recall_at_1_5_10
+    - median_rank
+  ambiguity_note: exact_instance_and_same_class_relevance_are_reported_separately
+
+standard_cross_dataset_retrieval:
+  status: paper_main_standard_protocol
+  runner: scripts/evaluate_cross_dataset_retrieval.py
+  merge_runner: scripts/merge_cross_dataset_retrieval_partitions.py
+  scoring: image_conditioned_caption_normalized_loglikelihood
+  metrics:
+    - image_to_text_recall_at_1
+    - image_to_text_recall_at_5
+    - image_to_text_recall_at_10
+    - text_to_image_recall_at_1
+    - text_to_image_recall_at_5
+    - text_to_image_recall_at_10
+  datasets:
+    - name: mscoco_karpathy_test_5k
+      split: karpathy_test
+      images: 5000
+      captions: 25010
+      caption_count_distribution: {5: 4990, 6: 10}
+      coco_1k_five_fold_average: false
+      execution:
+        independent_query_partitions: 1
+        world_size_per_partition: 16
+        effective_world_size: 16
+        partition_method: image_index_modulo
+        each_partition_uses_all_candidate_captions: true
+        merge_requires_exact_duplicate_free_query_coverage: true
+    - name: flickr30k_karpathy_test_1k
+      split: karpathy_test
+      images: 1000
+      captions_per_image: 5
+      captions: 5000
+      execution:
+        independent_query_partitions: 1
+        world_size: 16
+
+official_hard_negative_and_compositional_benchmarks:
+  runner: scripts/evaluate_multimodal_likelihood_benchmarks.py
+  tasks:
+    - name: sugarcrepe
+      records: 7511
+      chance_accuracy: 0.5
+      metrics: [overall_accuracy, seven_category_accuracy]
+    - name: aro_vg_relation
+      records: 23937
+      chance_accuracy: 0.5
+      metrics: [pairwise_accuracy]
+    - name: aro_vg_attribution
+      records: 28748
+      chance_accuracy: 0.5
+      metrics: [pairwise_accuracy]
+
+internal_ablation_trend_only:
+  paper_main_table: false
+  leaderboard_comparable: false
+  tasks:
+    - name: mmbench_dev_en
+      original_questions: 1164
+      circular_rows: 4329
+      scoring: semantic_candidate_same_position_likelihood
+      primary_metric: circular_accuracy_normalized_loglikelihood
+      reason_retained: clearly_above_conservative_random_baseline_in_three_checkpoint_audit
+    - name: seed_bench_image
+      records: 14233
+      subset: official_SEED_Bench_1_single_image_dimensions_1_to_9
+      scoring: semantic_candidate_normalized_loglikelihood
+      primary_metric: accuracy_normalized_loglikelihood
+      reason_retained: clearly_above_four_choice_random_baseline_in_three_checkpoint_audit
+
+removed_from_protocol:
+  custom_imagenet_caption_negatives:
+    - imagenet_caption_random_negative
+    - imagenet_caption_same_class_negative
+    - imagenet_caption_near_class_negative
+  score_variants:
+    - visual_calibration
+  benchmarks:
+    imagenet_classification_top1_top5: training_objective_mismatch
+    imagenet_real_top1_top5: training_objective_mismatch
+    pope_coco: chance_level_and_degenerate_no_prediction_bias
+    coco_caption_ppl: no_chance_baseline_or_matched_reference_for_interpretation
+    winoground: official_gated_assets_unavailable
+    svo_probes: official_image_assets_unavailable
+    whatsup_controlled: official_controlled_assets_unavailable
+
+outputs:
+  per_sample_scores: true
+  per_category_scores: true
+  score_variant: normalized_loglikelihood_only
+  no_hashes: true

@@ -21,6 +21,20 @@ CONFIGS = {
     ),
 }
 CONFIG_PATH = CONFIGS["baseline"]
+CONFIGS_400 = {
+    "baseline": (
+        "configs/selfless/"
+        "imagenet1k_t2i_baseline_400ep_ascend_64npu_bs1024.yaml"
+    ),
+    "positionwise_head": (
+        "configs/selfless/"
+        "imagenet1k_t2i_positionwise_head_400ep_ascend_64npu_bs1024.yaml"
+    ),
+    "seq_sigma": (
+        "configs/selfless/"
+        "imagenet1k_t2i_seq_sigma_400ep_ascend_64npu_bs1024.yaml"
+    ),
+}
 
 
 def test_t2i_baseline_config_preserves_formal_training_contract():
@@ -93,6 +107,23 @@ def test_t2i_variant_validator_rejects_cross_wired_config():
 
     with pytest.raises(RuntimeError, match="experiment_project"):
         validate_config(config, world_size=64, variant="seq_sigma")
+
+
+@pytest.mark.parametrize("variant", tuple(CONFIGS_400))
+def test_t2i_400ep_configs_preserve_extended_training_contract(variant):
+    config = OmegaConf.load(CONFIGS_400[variant])
+    report = validate_config(config, world_size=64, variant=variant)
+
+    assert report["epochs"] == 400
+    assert report["max_optimizer_steps"] == 480_800
+    assert report["wsd_epochs"] == {
+        "warmup": 40,
+        "stable": 240,
+        "decay": 120,
+    }
+    assert config.training.total_batch_size == 1024
+    assert config.optimizer.params.learning_rate == pytest.approx(2e-5)
+    assert config.dataset.params.caption_sequence_modes == ["t2i"]
 
 
 def _without_variant_identity(config):

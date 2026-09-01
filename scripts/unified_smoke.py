@@ -221,7 +221,8 @@ def run_validation(model, batch):
     if tuple(sampled.shape) != (4, 4):
         raise RuntimeError(f"unexpected flow sample shape: {tuple(sampled.shape)}")
 
-    single_stream, trace = model.sample_image_latents_single_stream(
+    single_stream, trace = model.generate(
+        "t2i",
         input_ids=batch["input_ids"],
         token_types=batch["token_types"],
         sigma=batch["sigma"],

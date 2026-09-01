@@ -1,9 +1,10 @@
 import json
+from types import SimpleNamespace
 
 import pytest
 import torch
 
-from scripts import evaluate_single_stream_fid_is as evaluator
+import scripts.evaluate_single_stream_fid_is as evaluator
 from scripts.image_evaluation_metrics import (
     FeatureMoments,
     InceptionScoreMoments,
@@ -12,6 +13,9 @@ from scripts.evaluate_single_stream_fid_is import (
     EVALUATION_PROGRESS_SCHEMA,
     decode_latents_in_microbatches,
     emit_evaluation_progress,
+    build_canonical_initial_noise_bank,
+    build_evaluation_resume_contract,
+    evaluation_pairing_manifests,
     evaluation_metrics_from_state,
     evaluation_metrics_state,
     evaluation_progress_payload,
@@ -20,6 +24,76 @@ from scripts.evaluate_single_stream_fid_is import (
     save_evaluation_resume_checkpoint,
     shard_unpacked_batch_rows,
 )
+
+
+def test_evaluation_contract_uses_only_readable_identity(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("training: {}\n", encoding="utf-8")
+
+    noise, noise_records = build_canonical_initial_noise_bank(
+        [0, 1],
+        evaluation_seed=42,
+    )
+    assert tuple(noise.shape) == (2, 256, 16)
+    assert noise_records == [
+        {"global_sample_index": 0, "canonical_noise_seed": 42},
+        {"global_sample_index": 1, "canonical_noise_seed": 43},
+    ]
+    pairing = evaluation_pairing_manifests(
+        local_noise_records=noise_records,
+        local_sample_records=[
+            {"global_sample_index": 0, "image_id": 10},
+            {"global_sample_index": 1, "image_id": 11},
+        ],
+        evaluation_seed=42,
+        expected_samples=2,
+    )
+    assert pairing["runtime_hashing_enabled"] is False
+    assert not any("sha256" in key for key in pairing)
+
+    args = SimpleNamespace(
+        adapter="none",
+        model_state="",
+        ema_checkpoint="",
+        caption_sequence_mode="t2i",
+        batch_size=32,
+        vae_decode_batch_size=2,
+        samples=32,
+        seed=42,
+        cfg=3.5,
+        cfg_schedule="constant",
+        sampling_steps="10",
+        temperature=1.0,
+        flow_solver="heun",
+        parallel_rate=1,
+        disable_backbone_kv_cache=False,
+        model_dtype="bf16",
+        vae_dtype="fp32",
+        fid_feature=2048,
+        is_splits=8,
+        save_images=False,
+    )
+    contract = build_evaluation_resume_contract(
+        args=args,
+        config_path=config_path,
+        model_path=tmp_path,
+        strategies=["spatial_halton"],
+        world_size=16,
+        canonical_pairing_enabled=True,
+        target_latents_are_placeholders=False,
+        real_stats_path="",
+        inception_weights_path=None,
+        image_tokens=256,
+        attention_contract="xlnet_content_diagonal",
+    )
+    assert contract["runtime_hashing_enabled"] is False
+    assert "sha256" not in contract
+    assert (
+        contract["generation"]["dual_stream_attention_contract"]
+        == "xlnet_content_diagonal"
+    )
+    assert contract["generation"]["single_stream_visible_content_diagonal"]
+    assert not contract["generation"]["single_stream_current_query_diagonal"]
 
 
 def test_evaluation_progress_payload_reports_rate_and_eta():
@@ -202,7 +276,6 @@ def _metric_state_for_resume_test():
             dtype=torch.float64,
         ),
         [0, 1],
-        2,
     )
     return {
         "spatial_halton": {
@@ -259,7 +332,7 @@ def test_evaluation_resume_checkpoint_commits_atomically_and_rejects_stale_contr
     tmp_path,
 ):
     device = torch.device("cpu")
-    contract = {"sha256": "contract-a"}
+    contract = {"name": "contract-a"}
     state = {
         "next_batch_idx": 3,
         "generated": 2,
@@ -298,7 +371,7 @@ def test_evaluation_resume_checkpoint_commits_atomically_and_rejects_stale_contr
     with pytest.raises(ValueError, match="stale evaluator resume"):
         load_evaluation_resume_checkpoint(
             tmp_path,
-            contract={"sha256": "contract-b"},
+            contract={"name": "contract-b"},
             rank=0,
             world_size=1,
         )

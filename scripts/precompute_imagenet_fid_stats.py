@@ -1,28 +1,22 @@
 #!/usr/bin/env python3
-"""Precompute deterministic ImageNet-subset Inception moments."""
+"""Precompute Inception moments for the original 50K ImageNet-val images."""
 
 from __future__ import annotations
 
 import argparse
-import hashlib
-import json
 import sys
 import tempfile
-from collections import Counter
 from pathlib import Path
 
 import torch
 import torch.distributed as dist
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset, Sampler
+from torchvision import transforms
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from scripts.evaluate_single_stream_fid_is import (
-    build_real_image_transform,
-    file_sha256,
-    init_distributed,
-)
+from scripts.evaluate_single_stream_fid_is import init_distributed
 from scripts.image_evaluation_metrics import (
     FeatureMoments,
     build_inception_extractor,
@@ -48,7 +42,16 @@ class RankStrideSampler(Sampler[int]):
 class ImageDataset(Dataset):
     def __init__(self, paths: list[Path], image_size: int):
         self.paths = paths
-        self.transform = build_real_image_transform(image_size)
+        self.transform = transforms.Compose(
+            [
+                transforms.Resize(
+                    int(image_size),
+                    interpolation=transforms.InterpolationMode.BICUBIC,
+                ),
+                transforms.CenterCrop(int(image_size)),
+                transforms.ToTensor(),
+            ]
+        )
 
     def __len__(self) -> int:
         return len(self.paths)
@@ -60,21 +63,14 @@ class ImageDataset(Dataset):
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--manifest", default=None)
-    parser.add_argument("--split_manifest", default=None)
-    parser.add_argument("--imagenet_train_dir", default=None)
     parser.add_argument(
-        "--class_image_root",
-        default=None,
-        help=(
-            "Class-folder image root used directly as the real distribution. "
-            "This is mutually exclusive with --manifest/--split_manifest."
-        ),
+        "--imagenet_val_dir",
+        required=True,
+        help="Official ImageNet-val class-folder root (1,000 classes, 50 images each).",
     )
     parser.add_argument("--inception_weights_path", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--device", default="npu")
-    parser.add_argument("--split", default="validation")
     parser.add_argument("--expected_samples", type=int, default=10000)
     parser.add_argument("--expected_classes", type=int, default=100)
     parser.add_argument("--expected_samples_per_class", type=int, default=100)
@@ -86,121 +82,39 @@ def parse_args():
 
 
 def load_selected_paths(args) -> tuple[list[Path], list[dict[str, object]]]:
-    if args.class_image_root:
-        if args.manifest or args.split_manifest or args.imagenet_train_dir:
+    root = Path(args.imagenet_val_dir)
+    if not root.is_dir():
+        raise FileNotFoundError(root)
+    paths: list[Path] = []
+    selected: list[dict[str, object]] = []
+    for class_dir in sorted(path for path in root.iterdir() if path.is_dir()):
+        class_paths = sorted(path for path in class_dir.iterdir() if path.is_file())
+        if len(class_paths) != int(args.expected_samples_per_class):
             raise ValueError(
-                "--class_image_root is mutually exclusive with "
-                "--manifest/--split_manifest/--imagenet_train_dir"
+                f"{class_dir} has {len(class_paths)} images; expected "
+                f"{args.expected_samples_per_class}"
             )
-        root = Path(args.class_image_root)
-        if not root.is_dir():
-            raise FileNotFoundError(root)
-        paths: list[Path] = []
-        selected: list[dict[str, object]] = []
-        for class_dir in sorted(path for path in root.iterdir() if path.is_dir()):
-            class_paths = sorted(path for path in class_dir.iterdir() if path.is_file())
-            if len(class_paths) != int(args.expected_samples_per_class):
-                raise ValueError(
-                    f"{class_dir} has {len(class_paths)} images; expected "
-                    f"{args.expected_samples_per_class}"
-                )
-            for path in class_paths:
-                selected.append(
-                    {
-                        "synset": class_dir.name,
-                        # Keep the selected-set identity independent of the
-                        # platform mount point while retaining the absolute
-                        # root separately in metadata.
-                        "source_path": path.relative_to(root).as_posix(),
-                        "split": str(args.split),
-                        "split_index": len(selected),
-                    }
-                )
-                paths.append(path)
-        if len(paths) != int(args.expected_samples):
-            raise ValueError(
-                f"{root} has {len(paths)} class-folder images; expected "
-                f"{args.expected_samples}"
+        for path in class_paths:
+            selected.append(
+                {
+                    "synset": class_dir.name,
+                    "source_path": path.relative_to(root).as_posix(),
+                    "split": "val",
+                    "split_index": len(selected),
+                }
             )
-        class_count = len({str(row["synset"]) for row in selected})
-        if class_count != int(args.expected_classes):
-            raise ValueError(
-                f"{root} has {class_count} classes; expected {args.expected_classes}"
-            )
-        return paths, selected
-
-    if not args.manifest or not args.split_manifest or not args.imagenet_train_dir:
+            paths.append(path)
+    if len(paths) != int(args.expected_samples):
         raise ValueError(
-            "provide either --class_image_root or all of --manifest, "
-            "--split_manifest and --imagenet_train_dir"
+            f"{root} has {len(paths)} class-folder images; expected "
+            f"{args.expected_samples}"
         )
-    manifest_path = Path(args.manifest)
-    split_path = Path(args.split_manifest)
-    image_root = Path(args.imagenet_train_dir)
-    sources: dict[int, tuple[str, Path]] = {}
-    with manifest_path.open(encoding="utf-8") as handle:
-        for line in handle:
-            record = json.loads(line)
-            sources[int(record["img_id"])] = (
-                str(record["synset"]),
-                Path(record["source_path"]),
-            )
-
-    selected = []
-    with split_path.open(encoding="utf-8") as handle:
-        for line in handle:
-            record = json.loads(line)
-            if str(record["split"]) == str(args.split):
-                selected.append(record)
-    selected.sort(key=lambda record: int(record["split_index"]))
-    if len(selected) != int(args.expected_samples):
+    class_count = len({str(row["synset"]) for row in selected})
+    if class_count != int(args.expected_classes):
         raise ValueError(
-            f"split={args.split!r} has {len(selected)} rows; "
-            f"expected {args.expected_samples}"
+            f"{root} has {class_count} classes; expected {args.expected_classes}"
         )
-    per_class = Counter(str(record["synset"]) for record in selected)
-    if len(per_class) != int(args.expected_classes):
-        raise ValueError(
-            f"selected split has {len(per_class)} classes; "
-            f"expected {args.expected_classes}"
-        )
-    unexpected_counts = {
-        synset: count
-        for synset, count in per_class.items()
-        if count != int(args.expected_samples_per_class)
-    }
-    if unexpected_counts:
-        raise ValueError(
-            "selected split is not class balanced: "
-            f"{unexpected_counts}"
-        )
-
-    paths = []
-    for record in selected:
-        img_id = int(record["img_id"])
-        if img_id not in sources:
-            raise KeyError(f"img_id={img_id} is absent from {manifest_path}")
-        source_synset, source_path = sources[img_id]
-        if source_synset != str(record["synset"]):
-            raise ValueError(
-                f"img_id={img_id} synset mismatch: "
-                f"manifest={source_synset}, split={record['synset']}"
-            )
-        path = source_path
-        if not path.is_file():
-            path = image_root / source_synset / source_path.name
-        if not path.is_file():
-            raise FileNotFoundError(path)
-        paths.append(path)
     return paths, selected
-
-
-def selected_records_sha256(records: list[dict[str, object]]) -> str:
-    payload = "".join(
-        json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
-        for record in records
-    )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def save_atomic(payload: dict[str, object], output: Path) -> None:
@@ -265,7 +179,7 @@ def main() -> None:
 
     if rank == 0:
         payload = {
-            "schema": "imagenet_inception_feature_moments_v1",
+            "schema": "imagenet_val_inception_feature_moments_v2",
             "stats": {
                 "count": int(moments.count.item()),
                 "sum": moments.sum.detach().cpu(),
@@ -273,38 +187,17 @@ def main() -> None:
             },
             "metadata": {
                 "source": {
-                    "manifest": (
-                        str(Path(args.manifest).resolve())
-                        if args.manifest
-                        else None
-                    ),
-                    "manifest_sha256": (
-                        file_sha256(args.manifest) if args.manifest else None
-                    ),
-                    "split_manifest": (
-                        str(Path(args.split_manifest).resolve())
-                        if args.split_manifest
-                        else None
-                    ),
-                    "split_manifest_sha256": (
-                        file_sha256(args.split_manifest)
-                        if args.split_manifest
-                        else None
-                    ),
-                    "class_image_root": (
-                        str(Path(args.class_image_root).resolve())
-                        if args.class_image_root
-                        else None
-                    ),
-                    "selected_records_sha256": selected_records_sha256(selected),
-                    "split": str(args.split),
+                    "dataset": "ImageNet-1K",
+                    "imagenet_val_dir": str(Path(args.imagenet_val_dir).resolve()),
+                    "split": "val",
+                    "records": len(selected),
                     "classes": int(args.expected_classes),
                     "samples_per_class": int(args.expected_samples_per_class),
                 },
                 "feature": {
                     "extractor": "torch-fidelity-inception-v3-compat",
                     "feature": int(args.feature),
-                    "weights_sha256": file_sha256(args.inception_weights_path),
+                    "weights_path": str(Path(args.inception_weights_path).resolve()),
                     "accumulation_dtype": str(moments.sum.dtype),
                 },
                 "image_transform": {

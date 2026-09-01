@@ -89,7 +89,7 @@ def main() -> None:
         "source_ema_dir": str(args.ema_dir),
         "source_global_step": runtime.get("global_step"),
         "source_world_size": manifest["world_size"],
-        "layout_fingerprint": manifest["layout_fingerprint"],
+        "layout_validation": "readable_field_equality",
         "state_key_count": len(merged_state),
         "floating_dtype": "float32",
         "merge_device": "cpu",

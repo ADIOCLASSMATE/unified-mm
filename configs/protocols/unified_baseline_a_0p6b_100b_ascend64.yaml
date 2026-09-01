@@ -1,0 +1,37 @@
+schema: unified_baseline_a_0p6b_100b_v1
+base_config: configs/selfless/unified_baseline_100b_ascend_64npu.yaml
+platform_project: "随机序语言建模-统一自回归与掩码扩散的随机顺序生成框架"
+run_project: unified-a-0p6b-100b-imagenet-split-s42-r1
+world_size: 64
+nodes: 4
+npu_per_node: 16
+seed: 42
+initialization: qwen3_0p6b_base_step_zero
+resume_from_checkpoint: none
+historical_lr_sweep:
+    rerun: false
+    winner_id: b30e5-f5e5
+    backbone_and_special_lr: 3.0e-4
+    flow_and_projector_lr: 5.0e-5
+target_text_tokens: 100000000000
+nominal_text_targets_per_step: 1048064
+max_train_steps: 95415
+source_schedule: [climbmix, t2i, climbmix, i2t]
+gradient_accumulation_steps: 4
+imagenet:
+    train:
+        split: train
+        records: 1281167
+        use_all_records: true
+    validation:
+        split: val
+        records: 50000
+        cached_kl16_posterior: true
+        tasks_per_image: [t2i, i2t]
+    train_validation_overlap_allowed: false
+save_every: 2000
+checkpoints_total_limit: 3
+validation_every: 2000
+qualitative_every: 2000
+runtime_hashing_enabled: false
+wandb_mode: disabled

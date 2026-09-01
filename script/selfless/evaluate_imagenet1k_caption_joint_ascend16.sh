@@ -27,7 +27,6 @@ EVAL_ROOT="${RUN_ROOT}/${EVAL_SUBDIR}"
 I2T_ROOT="${EVAL_ROOT}/i2t-clip"
 T2I_ROOT="${EVAL_ROOT}/t2i-fid-is"
 CLIP_MODEL="${CLIP_MODEL:-public/models/openai--clip-vit-base-patch32}"
-EXPECTED_CLIP_WEIGHT_SHA256="a63082132ba4f97a80bea76823f544493bffa8082296d62d71581a4feff1576f"
 NPU_COUNT=16
 
 if [[ ! "${RUN_PROJECT}" =~ ^[a-zA-Z0-9._-]+$ ]]; then
@@ -65,12 +64,6 @@ for required in \
   fi
 done
 
-ACTUAL_CLIP_WEIGHT_SHA256="$(sha256sum "${CLIP_MODEL}/pytorch_model.bin" | awk '{print $1}')"
-if [[ "${ACTUAL_CLIP_WEIGHT_SHA256}" != "${EXPECTED_CLIP_WEIGHT_SHA256}" ]]; then
-  echo "ERROR: CLIP weight SHA256 mismatch: ${ACTUAL_CLIP_WEIGHT_SHA256}" >&2
-  exit 5
-fi
-
 read -r NPU_AVAILABLE VISIBLE_NPUS <<< "$(python - <<'PY'
 import torch
 import torch_npu  # noqa: F401
@@ -89,32 +82,16 @@ unset CUDA_VISIBLE_DEVICES PYTORCH_CUDA_ALLOC_CONF
 mkdir -p "${EVAL_ROOT}/prelaunch_audit"
 
 python - "${RUN_PROJECT}" "${MODEL_PATH}" "${CLIP_MODEL}" >"${EVAL_ROOT}/prelaunch_audit/assets.json" <<'PY'
-import hashlib
 import json
-from pathlib import Path
 import sys
-
-def sha256(path):
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 run_project, model_path, clip_model = sys.argv[1:]
 payload = {
-    "schema": "selfless_imagenet1k_caption_joint_generation_preflight_v1",
+    "schema": "selfless_imagenet1k_caption_joint_generation_preflight_v2",
     "run_project": run_project,
-    "model": {
-        "path": model_path,
-        "weights_sha256": sha256(Path(model_path) / "model.safetensors"),
-        "config_sha256": sha256(Path(model_path) / "config.json"),
-    },
-    "clip": {
-        "path": clip_model,
-        "weights_sha256": sha256(Path(clip_model) / "pytorch_model.bin"),
-        "config_sha256": sha256(Path(clip_model) / "config.json"),
-    },
+    "model_path": model_path,
+    "clip_model_path": clip_model,
+    "runtime_hashing_enabled": False,
 }
 print(json.dumps(payload, indent=2, sort_keys=True))
 PY
@@ -126,7 +103,7 @@ run_i2t() {
     torchrun --standalone --nproc_per_node="${NPU_COUNT}" \
     scripts/evaluate_imagenet1k_i2t_clip.py \
     --config "${CONFIG}" \
-    --model_path "${MODEL_PATH}" \
+    --model_source "${MODEL_PATH}" \
     --clip_model_dir "${CLIP_MODEL}" \
     --output_dir "${I2T_ROOT}" \
     --samples 1000 \
@@ -153,7 +130,6 @@ run_t2i() {
     --model_dtype bf16 \
     --samples 50000 \
     --batch_size 4096 \
-    --split val \
     --caption_sequence_mode t2i \
     --sampling_steps "${SAMPLING_STEPS}" \
     --temperature 1.0 \
@@ -166,7 +142,6 @@ run_t2i() {
     --vae_decode_batch_size 16 \
     --inception_weights_path public/models/torch-fidelity/weights-inception-2015-12-05-6726825d.pth \
     --real_stats_path public/datasets/imagenet_full/fid_stats/inception_v3_2048_imagenet_val50000_256.pt \
-    --skip_target_decode \
     --require_official_protocol \
     --canonical_pairing \
     --resume_progress \

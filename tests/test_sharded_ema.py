@@ -221,7 +221,7 @@ def test_manifest_tampering_is_detected(tmp_path):
     manifest = json.loads(path.read_text())
     manifest["rank_bytes"][0] += 1
     path.write_text(json.dumps(manifest))
-    with pytest.raises(ValueError, match="fingerprint mismatch"):
+    with pytest.raises(ValueError, match="rank_bytes"):
         load_ema_manifest(tmp_path)
 
 

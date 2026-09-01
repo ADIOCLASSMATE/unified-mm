@@ -74,7 +74,6 @@ env \
   --vae_decode_batch_size 16 \
   --inception_weights_path public/models/torch-fidelity/weights-inception-2015-12-05-6726825d.pth \
   --real_stats_path public/datasets/imagenet_full/fid_stats/inception_v3_2048_imagenet_val50000_256.pt \
-  --skip_target_decode \
   --require_official_protocol \
   --canonical_pairing \
   --resume_progress \

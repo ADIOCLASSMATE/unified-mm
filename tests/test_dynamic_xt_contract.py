@@ -149,6 +149,8 @@ def test_dynamic_training_contract_requires_one_flow_state_without_rematerializa
     source = inspect.getsource(DynamicXtQwen3ForCausalLM.forward)
     assert "for repeat_idx in range(repeats)" not in source
     assert "checkpoint(" not in source
+    assert 'output["per_modality_loss"]' in source
+    assert 'output["per_modality_count"]' in source
 
     invalid = tiny_config()
     invalid.image_flow_batch_mul = 4
@@ -273,7 +275,7 @@ def test_dynamic_pretrained_init_preserves_common_missing_parameters(tmp_path):
 
 
 def test_dynamic_evaluation_adapter_restores_backbone_time_embedder(tmp_path):
-    from scripts.generate_flow_validation_images import load_adapter
+    from utils.image_generation_io import load_adapter
 
     source = DynamicXtQwen3ForCausalLM(tiny_config())
     expected = {

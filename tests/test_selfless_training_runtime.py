@@ -1,21 +1,17 @@
-from pathlib import Path
-
 import pytest
 import torch
 from omegaconf import OmegaConf
 
 from utils.selfless_training_runtime import (
-    LEGACY_RESUME_SCHEMA,
+    RESUME_CONTRACT_VERSION,
     RESUME_SCHEMA,
-    RESUME_SIGNATURE_VERSION,
     TrainingWindow,
+    build_resume_contract,
     build_sampler_resume_state,
-    build_legacy_resume_signature,
-    build_resume_signature,
     gradient_norm_log_payload,
     training_stop_step,
     validate_sampler_resume_state,
-    validate_resume_metadata,
+    validate_resume_contract,
     validate_wsd_contract,
 )
 
@@ -52,39 +48,40 @@ def _config(*, max_train_steps: int = 100):
     )
 
 
-def _signature(config):
-    return build_resume_signature(
+def _contract(config):
+    return build_resume_contract(
         config,
         world_size=4,
         gradient_accumulation_steps=2,
     )
 
 
-def test_resume_signature_covers_future_training_controls():
+def test_resume_contract_covers_future_training_controls():
     baseline = _config()
     changed_steps = _config(max_train_steps=101)
     changed_grad_clip = _config()
     changed_grad_clip.training.max_grad_norm = 0.5
 
-    assert _signature(baseline) != _signature(changed_steps)
-    assert _signature(baseline) != _signature(changed_grad_clip)
+    assert _contract(baseline) != _contract(changed_steps)
+    assert _contract(baseline) != _contract(changed_grad_clip)
 
     changed_output = _config()
     changed_output.experiment.output_dir = "/another/output"
-    assert _signature(baseline) == _signature(changed_output)
+    assert _contract(baseline) == _contract(changed_output)
 
     changed_output_policy = _config()
     changed_output_policy.experiment.save_ema_eval_every = 10
+    changed_output_policy.experiment.save_model_with_ema_eval = True
     changed_output_policy.experiment.save_image_flow_adapter = False
     changed_output_policy.experiment.save_final_image_flow_adapter = True
-    assert _signature(baseline) == _signature(changed_output_policy)
+    assert _contract(baseline) == _contract(changed_output_policy)
 
 
-def test_stage_stop_boundary_does_not_change_resume_signature():
+def test_stage_stop_boundary_does_not_change_resume_contract():
     baseline = _config()
     staged = _config()
     staged.training.stop_after_steps = 20
-    assert _signature(staged) == _signature(baseline)
+    assert _contract(staged) == _contract(baseline)
     assert training_stop_step(staged) == 20
 
     staged.training.stop_after_steps = 101
@@ -138,68 +135,23 @@ def test_sampler_resume_state_round_trip_is_strict():
         )
 
 
-def test_v3_resume_metadata_requires_exact_signature(tmp_path: Path):
+def test_v3_resume_metadata_requires_exact_readable_contract():
     config = _config()
     metadata = {
         "schema": RESUME_SCHEMA,
-        "config_signature_version": RESUME_SIGNATURE_VERSION,
-        "config_signature": _signature(config),
+        "config_contract_version": RESUME_CONTRACT_VERSION,
+        "config_contract": _contract(config),
     }
-    validate_resume_metadata(
+    validate_resume_contract(
         metadata,
-        checkpoint_dir=tmp_path / "checkpoint-5",
-        config=config,
-        world_size=4,
-        gradient_accumulation_steps=2,
-        current_signature=_signature(config),
+        current_contract=_contract(config),
     )
 
-    metadata["config_signature"] = "wrong"
+    metadata["config_contract"] = _contract(_config(max_train_steps=101))
     with pytest.raises(RuntimeError, match="inexact continuation"):
-        validate_resume_metadata(
+        validate_resume_contract(
             metadata,
-            checkpoint_dir=tmp_path / "checkpoint-5",
-            config=config,
-            world_size=4,
-            gradient_accumulation_steps=2,
-            current_signature=_signature(config),
-        )
-
-
-def test_v2_resume_uses_immutable_config_to_cover_omitted_fields(tmp_path: Path):
-    saved_config = _config(max_train_steps=100)
-    OmegaConf.save(saved_config, tmp_path / "config.yaml")
-    checkpoint_dir = tmp_path / "checkpoint-5"
-    checkpoint_dir.mkdir()
-    metadata = {
-        "schema": LEGACY_RESUME_SCHEMA,
-        "config_signature": build_legacy_resume_signature(
-            saved_config,
-            world_size=4,
-            gradient_accumulation_steps=2,
-        ),
-    }
-
-    validate_resume_metadata(
-        metadata,
-        checkpoint_dir=checkpoint_dir,
-        config=saved_config,
-        world_size=4,
-        gradient_accumulation_steps=2,
-        current_signature=_signature(saved_config),
-    )
-
-    changed = _config(max_train_steps=101)
-    # max_train_steps was omitted from the legacy signature, so only the new
-    # immutable-config comparison catches this inexact continuation.
-    with pytest.raises(RuntimeError, match="immutable config differs"):
-        validate_resume_metadata(
-            metadata,
-            checkpoint_dir=checkpoint_dir,
-            config=changed,
-            world_size=4,
-            gradient_accumulation_steps=2,
-            current_signature=_signature(changed),
+            current_contract=_contract(config),
         )
 
 

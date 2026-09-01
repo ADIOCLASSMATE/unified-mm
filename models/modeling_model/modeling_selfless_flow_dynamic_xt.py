@@ -304,6 +304,7 @@ class DynamicXtQwen3ForCausalLM(Qwen3ForCausalLM):
 
     config_class = SelflessFlowDynamicXtConfig
     model_type = "selfless_flow_dynamic_xt"
+    _supports_paired_backbone_cfg = False
 
     def __init__(self, config: Qwen3Config):
         Qwen3PreTrainedModel.__init__(self, config)
@@ -446,6 +447,9 @@ class DynamicXtQwen3ForCausalLM(Qwen3ForCausalLM):
             )
 
         model_kwargs = dict(kwargs)
+        return_per_modality_loss_graph = bool(
+            model_kwargs.pop("return_per_modality_loss_graph", False)
+        )
         image_loss_mask = model_kwargs.pop("image_loss_mask", None)
         record_flow_stats = bool(model_kwargs.pop("record_flow_stats", True))
         image_local_positions = model_kwargs.get("image_local_positions", None)
@@ -538,7 +542,7 @@ class DynamicXtQwen3ForCausalLM(Qwen3ForCausalLM):
         sigmas = layout["sigmas"]
         positions = layout["positions"]
         loss_mask = layout["loss_mask"]
-        loss = self.image_flow_head(
+        image_loss = self.image_flow_head(
             target=targets,
             z=image_conditions,
             mask=loss_mask,
@@ -548,12 +552,46 @@ class DynamicXtQwen3ForCausalLM(Qwen3ForCausalLM):
             record_stats=record_flow_stats,
             training_state=training_state,
         )
+        # Keep the training output contract identical to the static model.
+        # Dynamic-XT is image-only, but the trainer aggregates both modalities
+        # on every rank and therefore still requires an explicit zero text loss
+        # and the corresponding token counts.
+        labels_on_device = labels.to(hidden_states.device)
+        token_types_on_device = token_types.to(hidden_states.device)
+        valid_text_mask = (
+            ((token_types_on_device == 0) | (token_types_on_device == 2))
+            & (labels_on_device != -100)
+        )
+        text_loss = hidden_states.sum() * 0.0
+        text_token_count = valid_text_mask.sum()
+        image_token_count = (
+            loss_mask.sum()
+            if loss_mask is not None
+            else torch.tensor(
+                targets.shape[0] * targets.shape[1],
+                device=hidden_states.device,
+                dtype=torch.long,
+            )
+        )
         output = CausalLMOutputWithPast(
-            loss=loss,
+            loss=image_loss,
             logits=None,
             past_key_values=None,
         )
         output["last_hidden_state"] = hidden_states
+        output["per_modality_loss"] = {
+            "text_loss": text_loss.detach(),
+            "image_loss": image_loss.detach(),
+        }
+        if return_per_modality_loss_graph:
+            output["per_modality_loss_graph"] = {
+                "text_loss": text_loss,
+                "image_loss": image_loss,
+            }
+        output["per_modality_count"] = {
+            "text_tokens": text_token_count.detach(),
+            "image_tokens": image_token_count.detach(),
+        }
         output["flow_debug_stats"] = {
             key: value.detach()
             for key, value in self.image_flow_head.last_forward_stats.items()
@@ -713,9 +751,9 @@ class DynamicXtQwen3ForCausalLM(Qwen3ForCausalLM):
         return evaluator
 
     @torch.no_grad()
-    def sample_image_latents_single_stream(self, *args, **kwargs):
+    def generate_image(self, *args, **kwargs):
         self._dynamic_xt_eval_counts = {"conditional": 0, "unconditional": 0}
-        result = super().sample_image_latents_single_stream(*args, **kwargs)
+        result = super().generate_image(*args, **kwargs)
         if not bool(kwargs.get("return_trace", False)) or result is None:
             return result
         generated, trace = result

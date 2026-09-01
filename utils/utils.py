@@ -1,4 +1,5 @@
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -95,10 +96,31 @@ def load_model_tokenizer(
     model_config_class=None,
 ):
     from models.modeling_model.image_backbone import validate_image_data_layout
+    from models.modeling_model.modeling_single_stream_text_ar import (
+        SingleStreamTextARConfig,
+        SingleStreamTextARQwen3ForCausalLM,
+    )
 
-    architecture_variant = str(
+    validate_image_data_layout(config)
+    if model_dtype not in {torch.bfloat16, torch.float32}:
+        raise ValueError(
+            "model_dtype must be torch.bfloat16 or torch.float32, "
+            f"got {model_dtype}"
+        )
+
+    source_config = AutoConfig.from_pretrained(
+        config.model.model_path,
+        trust_remote_code=True,
+    )
+    configured_variant = str(
         config.model.get("architecture_variant", "selfless_contextual")
     ).strip().lower()
+    checkpoint_variant = getattr(source_config, "architecture_variant", None)
+    architecture_variant = (
+        str(checkpoint_variant).strip().lower()
+        if checkpoint_variant is not None
+        else configured_variant
+    )
     if model_class is not None:
         Qwen3ForCausalLM = model_class
         implementation_label = model_class.__name__
@@ -112,17 +134,16 @@ def load_model_tokenizer(
         )
 
         implementation_label = "positionwise_selfless"
+    elif architecture_variant == "single_stream_text_ar":
+        Qwen3ForCausalLM = SingleStreamTextARQwen3ForCausalLM
+        if model_config_class is None:
+            model_config_class = SingleStreamTextARConfig
+        implementation_label = "single_stream_text_ar"
     else:
         raise ValueError(
             f"Unknown model.architecture_variant={architecture_variant!r}; "
-            "expected selfless_contextual or positionwise_selfless."
-        )
-
-    validate_image_data_layout(config)
-    if model_dtype not in {torch.bfloat16, torch.float32}:
-        raise ValueError(
-            "model_dtype must be torch.bfloat16 or torch.float32, "
-            f"got {model_dtype}"
+            "expected selfless_contextual, positionwise_selfless, or "
+            "single_stream_text_ar."
         )
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -165,6 +186,10 @@ def load_model_tokenizer(
 
     multimodal_config_keys = (
         "architecture_variant",
+        "training_objective",
+        "dual_stream_attention_contract",
+        "showo_mask_schedule",
+        "showo_min_masking_rate",
         "dynamic_xt_contract",
         "boi_token_id",
         "eoi_token_id",
@@ -190,10 +215,6 @@ def load_model_tokenizer(
         "lambda_image",
     )
 
-    source_config = AutoConfig.from_pretrained(
-        config.model.model_path,
-        trust_remote_code=True,
-    )
     if model_config_class is None or isinstance(source_config, model_config_class):
         model_config = source_config
     else:
@@ -211,7 +232,11 @@ def load_model_tokenizer(
     model_config.use_flex_attention = config.model.use_flex_attention
     model_config.eos_token_id = tokenizer.eos_token_id
     for key in multimodal_config_keys:
-        value = config.model.get(key)
+        value = (
+            architecture_variant
+            if key == "architecture_variant" and model_class is None
+            else config.model.get(key)
+        )
         if value is not None:
             setattr(model_config, key, value)
 
@@ -449,13 +474,18 @@ def get_selfless_mask(
     image_uncond_rows: torch.Tensor | None = None,
     segment_ids: torch.Tensor | None = None,
     image_uncond_mask: torch.Tensor | None = None,
+    include_diagonal: bool = False,
+    diagonal_query_mask: torch.Tensor | None = None,
 ) -> torch.Tensor | BlockMask:
     """
-    Selfless Attention mask — removes the diagonal (self-attention) from both streams.
+    Sigma-ordered attention mask for a Selfless or XLNet content stream.
 
-    Both content and query streams use strict S_kv < S_q, meaning no position can
-    attend to itself. This is the key difference from XLNet's selfish mask (S_kv <= S_q
-    for content stream), which allows the diagonal shortcut.
+    The default is strict ``S_kv < S_q``. With ``include_diagonal=True`` the
+    content stream uses XLNet-style ``S_kv <= S_q`` while the separately built
+    query mask remains strict. ``diagonal_query_mask`` is the generation-time
+    hybrid form: only selected content-query rows gain their physical self
+    edge, while mask/query rows remain strict.  Unlike ``S_kv <= S_q``, this
+    does not connect distinct positions whose generation sigmas are tied.
 
     Args:
         sigma: Permutation sorting values, shape: (batch_size, seq_len)
@@ -470,6 +500,19 @@ def get_selfless_mask(
         raise ValueError(
             f"sigma must have shape {(int(B), int(seq_len))}, "
             f"got {tuple(sigma.shape)}"
+        )
+    if include_diagonal and diagonal_query_mask is not None:
+        raise ValueError(
+            "include_diagonal and diagonal_query_mask are mutually exclusive"
+        )
+    if diagonal_query_mask is not None:
+        if tuple(diagonal_query_mask.shape) != tuple(sigma.shape):
+            raise ValueError(
+                "diagonal_query_mask must align with sigma: "
+                f"{tuple(diagonal_query_mask.shape)} != {tuple(sigma.shape)}"
+            )
+        diagonal_query_mask = diagonal_query_mask.to(
+            device=device, dtype=torch.bool
         )
     use_segments = segment_ids is not None
     if use_segments:
@@ -526,7 +569,15 @@ def get_selfless_mask(
     # expected by torch flex_attention and the architecture tests.
     S_q = sigma.unsqueeze(-1)    # [B, S, 1]
     S_kv = sigma.unsqueeze(1)    # [B, 1, S]
-    allowed = S_kv < S_q         # strict — no diagonal, no self-view
+    allowed = S_kv <= S_q if include_diagonal else S_kv < S_q
+    if diagonal_query_mask is not None:
+        positions = torch.arange(seq_len, device=device, dtype=torch.long)
+        physical_diagonal = positions.view(1, seq_len, 1).eq(
+            positions.view(1, 1, seq_len)
+        )
+        allowed = allowed | (
+            diagonal_query_mask.unsqueeze(-1) & physical_diagonal
+        )
     if use_segments:
         q_seg = segment_ids.unsqueeze(-1)
         kv_seg = segment_ids.unsqueeze(1)
@@ -559,3 +610,167 @@ def get_selfless_mask(
         KV_LEN=seq_len,
         device=device,
     )
+
+
+def get_showo_mae_mask(
+    *,
+    input_ids: torch.Tensor,
+    token_types: torch.Tensor,
+    device,
+    boi_token_id: int,
+    segment_ids: torch.Tensor | None = None,
+    image_uncond_rows: torch.Tensor | None = None,
+    image_uncond_mask: torch.Tensor | None = None,
+) -> torch.Tensor | BlockMask:
+    """Build Show-O omni attention: causal text and full image blocks.
+
+    Image queries see all image tokens in their own image span and all
+    preceding tokens. Text/special queries remain causal. Padding and tokens
+    from another packed segment are never visible.
+    """
+
+    input_ids = input_ids.to(device=device)
+    token_types = token_types.to(device=device)
+    if input_ids.shape != token_types.shape or input_ids.ndim != 2:
+        raise ValueError(
+            "input_ids and token_types must be aligned rank-2 tensors, got "
+            f"{tuple(input_ids.shape)} and {tuple(token_types.shape)}"
+        )
+    batch_size, seq_len = input_ids.shape
+    positions = torch.arange(seq_len, device=device, dtype=torch.long)
+    causal = positions.view(1, 1, seq_len) <= positions.view(1, seq_len, 1)
+    valid = token_types != 3
+    allowed = (
+        causal
+        & valid.unsqueeze(-1)
+        & valid.unsqueeze(1)
+    )
+
+    image_span_ids = torch.cumsum(
+        input_ids.eq(int(boi_token_id)).to(torch.long), dim=1
+    )
+    q_image = token_types.eq(1).unsqueeze(-1)
+    kv_image = token_types.eq(1).unsqueeze(1)
+    same_image_span = image_span_ids.unsqueeze(-1).eq(
+        image_span_ids.unsqueeze(1)
+    )
+    allowed = allowed | (
+        q_image
+        & kv_image
+        & same_image_span
+        & valid.unsqueeze(-1)
+        & valid.unsqueeze(1)
+    )
+
+    if segment_ids is not None:
+        if tuple(segment_ids.shape) != tuple(input_ids.shape):
+            raise ValueError("segment_ids must align with input_ids")
+        segment_ids = segment_ids.to(device=device, dtype=torch.long)
+        same_segment = segment_ids.unsqueeze(-1).eq(segment_ids.unsqueeze(1))
+        allowed = (
+            allowed
+            & same_segment
+            & segment_ids.unsqueeze(-1).ge(0)
+            & segment_ids.unsqueeze(1).ge(0)
+        )
+
+    if image_uncond_rows is not None or image_uncond_mask is not None:
+        if image_uncond_mask is not None:
+            if segment_ids is None:
+                raise ValueError("image_uncond_mask requires segment_ids")
+            if tuple(image_uncond_mask.shape) != tuple(input_ids.shape):
+                raise ValueError("image_uncond_mask must align with input_ids")
+            q_is_uncond_image = image_uncond_mask.to(
+                device=device, dtype=torch.bool
+            ).unsqueeze(-1)
+        else:
+            if tuple(image_uncond_rows.shape) != (batch_size,):
+                raise ValueError(
+                    "image_uncond_rows must have shape "
+                    f"{(batch_size,)}, got {tuple(image_uncond_rows.shape)}"
+                )
+            q_is_uncond_image = (
+                image_uncond_rows.to(device=device, dtype=torch.bool).view(
+                    batch_size, 1
+                )
+                & token_types.eq(1)
+            ).unsqueeze(-1)
+        allowed = allowed & (
+            ~q_is_uncond_image
+            | (kv_image & same_image_span)
+        )
+
+    if input_ids.device.type == "npu":
+        return (~allowed).unsqueeze(1)
+
+    def showo_fn(b, h, q_idx, kv_idx):
+        del h
+        return allowed[b, q_idx, kv_idx]
+
+    return create_block_mask(
+        showo_fn,
+        B=batch_size,
+        H=None,
+        Q_LEN=seq_len,
+        KV_LEN=seq_len,
+        device=device,
+    )
+
+
+def sample_showo_mae_image_mask(
+    *,
+    image_span_table: torch.Tensor,
+    full_image_loss_mask: torch.Tensor,
+    image_tokens_per_img: int,
+    min_masking_rate: float = 0.0,
+    generator: torch.Generator | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sample the official Show-O cosine-ratio random image mask."""
+
+    if not 0.0 <= float(min_masking_rate) <= 1.0:
+        raise ValueError("min_masking_rate must lie in [0, 1]")
+    if image_span_table.ndim != 2 or image_span_table.shape[1] < 4:
+        raise ValueError("image_span_table must have shape [num_images, >=4]")
+    if full_image_loss_mask.ndim != 2:
+        raise ValueError("full_image_loss_mask must be rank 2")
+    num_images = int(image_span_table.shape[0])
+    if num_images <= 0:
+        raise ValueError("Show-O masking requires at least one image span")
+    image_tokens_per_img = int(image_tokens_per_img)
+    device = full_image_loss_mask.device
+    spans = image_span_table.to(device=device, dtype=torch.long)
+    rows = spans[:, 0]
+    starts = spans[:, 2]
+    offsets = torch.arange(
+        image_tokens_per_img, device=device, dtype=torch.long
+    ).unsqueeze(0)
+    token_indices = starts.unsqueeze(1) + offsets
+    eligible = full_image_loss_mask.to(device=device, dtype=torch.bool)[
+        rows.unsqueeze(1), token_indices
+    ]
+
+    timesteps = torch.rand(
+        num_images, device=device, generator=generator, dtype=torch.float32
+    )
+    mask_prob = torch.cos(timesteps * (math.pi * 0.5)).clamp(
+        min=float(min_masking_rate), max=1.0
+    )
+    num_masked = (image_tokens_per_img * mask_prob).round().clamp(
+        min=1, max=image_tokens_per_img
+    )
+    random_order = torch.rand(
+        num_images,
+        image_tokens_per_img,
+        device=device,
+        generator=generator,
+        dtype=torch.float32,
+    ).argsort(dim=-1)
+    # Joint validation also contains I2T spans whose image-loss eligibility is
+    # all false. They remain fully visible while T2I spans receive the sampled
+    # Show-O mask. The operation stays device-side and adds no host sync.
+    local_mask = (random_order < num_masked.unsqueeze(-1)) & eligible
+    sampled_mask = torch.zeros_like(
+        full_image_loss_mask, device=device, dtype=torch.bool
+    )
+    sampled_mask[rows.unsqueeze(1), token_indices] = local_mask
+    return sampled_mask, mask_prob

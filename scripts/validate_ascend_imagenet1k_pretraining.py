@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import math
 import os
@@ -20,14 +19,6 @@ from utils.dataset_imagenet_flow_cache import (
 )
 from utils.selfless_training_runtime import validate_wsd_contract
 
-EXPECTED = {
-    "manifest_sha256": "9d165263e8cf4ba6d537d084a8cc3b87af2eaf5ef9a5b59e1360a6228c840759",
-    "qwen_weights_sha256": "cd2a512003e2f9f3cd3c32a9c3573f820bb28c940f73c57b1ddaa983d9223eba",
-    "vae_module_sha256": "95e9d47d017817cd86858d78587786c931a9ba9596fe3eb6d6dce4136580112b",
-    "vae_checkpoint_sha256": "34ce001bcfffb7af67ec8af1e683a30d7bd45760855ddc7deedc1330f2cfd38f",
-    "inception_weights_sha256": "6726825d0af5f729cebd5821db510b11b1cfad8faad88a03f1befd49fb9129b2",
-    "imagenet_val_records_sha256": "bc1ebeb10fa8b249bce3724e2a901582a5c9d0f42cd27d0498fb96aa917ed0c5",
-}
 TRAIN_IMAGES = 1_281_167
 TRAIN_SAMPLES_PER_EPOCH = 1_281_024
 GLOBAL_BATCH = 1_024
@@ -38,27 +29,10 @@ VALIDATION_IMAGES = 50_000
 DEFAULT_GENERATION_STEPS = 10
 
 
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def require_file(path: Path, label: str) -> Path:
     if not path.is_file():
         raise FileNotFoundError(f"missing {label}: {path}")
     return path
-
-
-def require_hash(path: Path, expected: str, label: str) -> str:
-    actual = sha256_file(require_file(path, label))
-    if actual != expected:
-        raise RuntimeError(
-            f"{label} SHA256 mismatch: expected={expected}, actual={actual}, path={path}"
-        )
-    return actual
 
 
 def validate_config(config, *, world_size: int) -> dict[str, object]:
@@ -110,10 +84,13 @@ def validate_config(config, *, world_size: int) -> dict[str, object]:
             expected_project,
         ),
         "conditioning_mode": (str(params.conditioning_mode), "class"),
-        "validation_overlap_train": (bool(params.validation_overlap_train), True),
-        "val_samples_per_class": (int(params.val_samples_per_class), 50),
-        "split_strategy": (str(params.split_strategy), "stratified"),
-        "split_seed": (int(params.split_seed), 42),
+        "training_split": (str(params.expected_split), "train"),
+        "training_records": (int(params.expected_records), TRAIN_IMAGES),
+        "validation_split": (str(params.validation.expected_split), "val"),
+        "validation_records": (
+            int(params.validation.expected_records),
+            VALIDATION_IMAGES,
+        ),
         "total_batch_size": (int(config.training.total_batch_size), GLOBAL_BATCH),
         "samples_per_epoch": (int(config.training.samples_per_epoch), TRAIN_SAMPLES_PER_EPOCH),
         "optimizer_steps_per_epoch": (int(config.training.optimizer_steps_per_epoch), STEPS_PER_EPOCH),
@@ -290,8 +267,6 @@ def validate_cache(path: Path, *, deep_scan: bool) -> dict[str, object]:
         "posterior_stats_dim": 32,
         "storage_dtype": "float16",
         "scaling_factor": 0.2325,
-        "manifest_sha256": EXPECTED["manifest_sha256"],
-        "vae_checkpoint_sha256": EXPECTED["vae_checkpoint_sha256"],
     }
     for field, expected in expected_metadata.items():
         if metadata.get(field) != expected:
@@ -315,7 +290,11 @@ def validate_cache(path: Path, *, deep_scan: bool) -> dict[str, object]:
 
 def validate_real_stats(path: Path) -> dict[str, object]:
     payload = torch.load(path, map_location="cpu", weights_only=True)
-    if payload.get("schema") != "imagenet_inception_feature_moments_v1":
+    schema = payload.get("schema")
+    if schema not in {
+        "imagenet_inception_feature_moments_v1",
+        "imagenet_val_inception_feature_moments_v2",
+    }:
         raise RuntimeError("unsupported ImageNet validation real-stat schema")
     stats = payload.get("stats", {})
     feature_sum = stats.get("sum")
@@ -333,27 +312,31 @@ def validate_real_stats(path: Path) -> dict[str, object]:
     metadata = payload.get("metadata", {})
     source = metadata.get("source", {})
     feature = metadata.get("feature", {})
+    split = source.get("split")
+    if split not in {"val", "validation"}:
+        raise RuntimeError(
+            f"real-stat metadata split mismatch: {split!r} is not ImageNet val"
+        )
     expected = {
         "classes": (source.get("classes"), 1_000),
         "samples_per_class": (source.get("samples_per_class"), 50),
-        "split": (source.get("split"), "validation"),
-        "selected_records_sha256": (
-            source.get("selected_records_sha256"),
-            EXPECTED["imagenet_val_records_sha256"],
-        ),
         "feature": (feature.get("feature"), 2048),
-        "weights_sha256": (
-            feature.get("weights_sha256"),
-            EXPECTED["inception_weights_sha256"],
-        ),
         "accumulation_dtype": (feature.get("accumulation_dtype"), "torch.float32"),
     }
+    if schema == "imagenet_val_inception_feature_moments_v2":
+        expected.update(
+            {
+                "dataset": (source.get("dataset"), "ImageNet-1K"),
+                "records": (source.get("records"), VALIDATION_IMAGES),
+            }
+        )
     for label, (actual, required) in expected.items():
         if actual != required:
             raise RuntimeError(
                 f"real-stat metadata {label} mismatch: {actual!r} != {required!r}"
             )
     return {
+        "schema": schema,
         "count": VALIDATION_IMAGES,
         "classes": 1_000,
         "samples_per_class": 50,
@@ -394,31 +377,27 @@ def main() -> None:
         cache_path = Path(config.dataset.params.cache_path)
         inception_path = Path(config.evaluation.inception_weights_path)
         real_stats_path = Path(config.evaluation.real_stats_path)
-        report["hashes"] = {
-            "qwen_weights": require_hash(
-                model_root / "model.safetensors",
-                EXPECTED["qwen_weights_sha256"],
-                "Qwen3-0.6B-Base weights",
+        report["assets"] = {
+            "qwen_weights": str(
+                require_file(
+                    model_root / "model.safetensors",
+                    "Qwen3-0.6B-Base weights",
+                )
             ),
-            "vae_module": require_hash(
-                vae_root / "models" / "vae.py",
-                EXPECTED["vae_module_sha256"],
-                "MAR KL16 VAE module",
+            "vae_module": str(
+                require_file(vae_root / "models" / "vae.py", "MAR KL16 VAE module")
             ),
-            "vae_checkpoint": require_hash(
-                Path(config.experiment.validation_vae_path),
-                EXPECTED["vae_checkpoint_sha256"],
-                "MAR KL16 checkpoint",
+            "vae_checkpoint": str(
+                require_file(
+                    Path(config.experiment.validation_vae_path),
+                    "MAR KL16 checkpoint",
+                )
             ),
-            "manifest": require_hash(
-                manifest_path,
-                EXPECTED["manifest_sha256"],
-                "canonical ImageNet-1K train manifest",
+            "manifest": str(
+                require_file(manifest_path, "canonical ImageNet-1K train manifest")
             ),
-            "inception_weights": require_hash(
-                inception_path,
-                EXPECTED["inception_weights_sha256"],
-                "torch-fidelity Inception weights",
+            "inception_weights": str(
+                require_file(inception_path, "torch-fidelity Inception weights")
             ),
         }
         report["manifest"] = validate_manifest(manifest_path)

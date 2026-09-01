@@ -54,14 +54,10 @@ def test_real_stats_class_root_ignores_root_level_duplicate_files(tmp_path):
         for image_index in range(2):
             (class_dir / f"{synset}_{image_index}.JPEG").touch()
     args = SimpleNamespace(
-        class_image_root=str(root),
-        manifest=None,
-        split_manifest=None,
-        imagenet_train_dir=None,
+        imagenet_val_dir=str(root),
         expected_samples=4,
         expected_classes=2,
         expected_samples_per_class=2,
-        split="validation",
     )
 
     paths, records = load_selected_paths(args)
@@ -73,5 +69,5 @@ def test_real_stats_class_root_ignores_root_level_duplicate_files(tmp_path):
         "n00000002",
         "n00000002",
     ]
-    assert {record["split"] for record in records} == {"validation"}
+    assert {record["split"] for record in records} == {"val"}
     assert records[0]["source_path"] == "n00000001/n00000001_0.JPEG"

@@ -2,7 +2,6 @@
 import argparse
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
-import hashlib
 import json
 import math
 import os
@@ -22,9 +21,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from omegaconf import OmegaConf
-from PIL import Image
 from safetensors import safe_open
-from torchvision import transforms
 from torchvision.utils import save_image
 from tqdm.auto import tqdm
 
@@ -40,10 +37,9 @@ from scripts.image_evaluation_metrics import (  # noqa: E402
     frechet_distance,
     metric_accumulation_dtype,
 )
-from scripts.generate_flow_validation_images import (  # noqa: E402
+from utils.image_generation_io import (  # noqa: E402
     decode_latents,
     load_adapter,
-    load_sharded_ema_checkpoint,
     load_model_state,
     load_vae,
 )
@@ -53,6 +49,15 @@ from models.modeling_model.image_backbone import (  # noqa: E402
     pure_2d_position_contract,
 )
 from utils.dataset_utils import get_dataloaders  # noqa: E402
+from utils.combined_dataloaders import (  # noqa: E402
+    build_unified_image_validation_dataloader,
+)
+from utils.evaluation_model_source import (  # noqa: E402
+    configure_model_source,
+    load_model_source_weights,
+    resolve_evaluation_model_source,
+)
+from utils.sharded_ema import load_sharded_ema_checkpoint  # noqa: E402
 from utils.utils import load_model_tokenizer  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -73,24 +78,7 @@ EVALUATION_RESUME_SCHEMA = "single_stream_fid_is_resume_v1"
 EVALUATION_RESUME_COMMIT_SCHEMA = "single_stream_fid_is_resume_commit_v1"
 DEFAULT_PROGRESS_LOG_INTERVAL_SAMPLES = 250
 DEFAULT_PROGRESS_LOG_INTERVAL_SECONDS = 60.0
-
-
-def canonical_json_sha256(payload: object) -> str:
-    encoded = json.dumps(
-        payload,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def file_sha256(path: str | Path) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+IS_SPLIT_ASSIGNMENT_STRATIFIED = "stratified_by_synset"
 
 
 EVALUATOR_RNG_CONTRACT = {
@@ -119,33 +107,10 @@ EVALUATOR_RNG_CONTRACT = {
         "distributed_rank",
         "strategy",
     ],
-    "per_sample_digest": (
-        "sha256(canonical tensor header JSON + newline + contiguous C-order bytes)"
-    ),
+    "per_sample_identity": "evaluation_seed_plus_global_sample_index",
     "noise_manifest_schema": CANONICAL_NOISE_MANIFEST_SCHEMA,
     "sample_manifest_schema": ORDERED_EVAL_SAMPLE_MANIFEST_SCHEMA,
 }
-EVALUATOR_RNG_CONTRACT_SHA256 = canonical_json_sha256(EVALUATOR_RNG_CONTRACT)
-
-
-def canonical_tensor_sha256(tensor: torch.Tensor) -> str:
-    tensor = tensor.detach().to(device="cpu").contiguous()
-    header = {
-        "dtype": str(tensor.dtype),
-        "shape": [int(value) for value in tensor.shape],
-    }
-    digest = hashlib.sha256()
-    digest.update(
-        json.dumps(
-            header,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=True,
-        ).encode("utf-8")
-    )
-    digest.update(b"\n")
-    digest.update(tensor.numpy().tobytes(order="C"))
-    return digest.hexdigest()
 
 
 def canonical_image_flow_initial_noise(
@@ -196,9 +161,12 @@ def build_canonical_initial_noise_bank(
     records = [
         {
             "global_sample_index": global_index,
-            "canonical_noise_sha256": canonical_tensor_sha256(noise),
+            "canonical_noise_seed": (
+                int(evaluation_seed) + global_index
+            )
+            % EVALUATOR_RNG_SEED_MODULUS,
         }
-        for global_index, noise in zip(normalized_indices, canonical)
+        for global_index in normalized_indices
     ]
     flattened = canonical.reshape(
         int(canonical.shape[0]),
@@ -215,6 +183,15 @@ def parse_args():
     parser.add_argument(
         "--config",
         default="configs/selfless/imagenet1k_class_pretrain_800ep_ascend_64npu_bs1024.yaml",
+    )
+    parser.add_argument(
+        "--model_source",
+        type=Path,
+        default=None,
+        help=(
+            "Canonical unified-evaluation source: final HF EMA export or "
+            "rank-sharded EMA checkpoint."
+        ),
     )
     parser.add_argument("--model_path_override", default="")
     parser.add_argument("--adapter", default="none")
@@ -240,7 +217,6 @@ def parse_args():
         ),
     )
     parser.add_argument("--samples", type=int, default=1024)
-    parser.add_argument("--split", choices=["val", "train"], default="val")
     parser.add_argument(
         "--caption_sequence_mode",
         choices=("config", "t2i", "i2t"),
@@ -286,43 +262,14 @@ def parse_args():
         help="Optional local torch-fidelity InceptionV3 weights path for FID/IS.",
     )
     parser.add_argument(
-        "--real_source",
-        choices=["vae_decoded_target_latents", "imagenet_original"],
-        default="vae_decoded_target_latents",
-        help=(
-            "Reference distribution for FID. The default compares against VAE-decoded target latents; "
-            "imagenet_original loads original ImageNet files from the manifest/source_path mapping."
-        ),
-    )
-    parser.add_argument(
         "--real_stats_path",
         default="",
         help=(
-            "Precomputed original-ImageNet Inception moments shared across architectures. "
-            "When set, this overrides --real_source and real images are not re-extracted. "
-            "Pass 'none' to explicitly disable a path inherited from the config."
+            "Required precomputed Inception moments for all 50,000 original "
+            "ImageNet val images."
         ),
-    )
-    parser.add_argument(
-        "--imagenet_train_dir",
-        default="/inspire/dataset/imagenet/v1/ILSVRC/Data/CLS-LOC/train",
-        help="Root used to resolve manifest source paths when --real_source=imagenet_original.",
-    )
-    parser.add_argument(
-        "--real_image_size",
-        type=int,
-        default=256,
-        help="Resize/center-crop size for original ImageNet real images.",
     )
     parser.add_argument("--save_images", action="store_true")
-    parser.add_argument(
-        "--skip_target_decode",
-        action="store_true",
-        help=(
-            "Skip decoding target latents when frozen real-image statistics "
-            "already provide the metric reference."
-        ),
-    )
     parser.add_argument(
         "--allow_sigma_strategies",
         action="store_true",
@@ -334,15 +281,6 @@ def parse_args():
         help=(
             "Fail unless shared real stats, the full matching fake sample count, "
             "and 10 deterministic IS splits are used."
-        ),
-    )
-    parser.add_argument(
-        "--allow_nonofficial_fid",
-        action="store_true",
-        help=(
-            "Compute a diagnostic FID against frozen real statistics even "
-            "when the generated sample count does not match the real-stat "
-            "count. The result is not an official comparable FID."
         ),
     )
     parser.add_argument(
@@ -755,6 +693,21 @@ def evaluation_artifact_identity(path: str | Path | None) -> dict[str, object] |
     return identity
 
 
+def without_digest_fields(value):
+    """Drop recorded digest fields from a no-hash evaluation report."""
+
+    if isinstance(value, Mapping):
+        return {
+            key: without_digest_fields(item)
+            for key, item in value.items()
+            if "sha256" not in str(key).lower()
+            and "digest" not in str(key).lower()
+        }
+    if isinstance(value, list):
+        return [without_digest_fields(item) for item in value]
+    return value
+
+
 def build_evaluation_resume_contract(
     *,
     args,
@@ -767,21 +720,21 @@ def build_evaluation_resume_contract(
     real_stats_path: str,
     inception_weights_path: str | None,
     image_tokens: int,
+    attention_contract: str,
 ) -> dict[str, object]:
     config_path = Path(config_path).expanduser().resolve()
     if not config_path.is_file():
         raise FileNotFoundError(config_path)
+    evaluator_path = Path(__file__).resolve()
     contract = {
         "schema": "single_stream_fid_is_resume_contract_v1",
-        "evaluator": {
-            "path": str(Path(__file__).resolve()),
-            "sha256": file_sha256(Path(__file__).resolve()),
-        },
-        "config": {
-            "path": str(config_path),
-            "sha256": file_sha256(config_path),
-        },
+        "runtime_hashing_enabled": False,
+        "evaluator": evaluation_artifact_identity(evaluator_path),
+        "config": evaluation_artifact_identity(config_path),
         "artifacts": {
+            "model_source": evaluation_artifact_identity(
+                getattr(args, "model_source", None)
+            ),
             "model_path": evaluation_artifact_identity(model_path),
             "adapter": evaluation_artifact_identity(args.adapter),
             "model_state": evaluation_artifact_identity(args.model_state),
@@ -795,7 +748,7 @@ def build_evaluation_resume_contract(
             "world_size": int(world_size),
         },
         "dataset": {
-            "split": str(args.split),
+            "split": "val",
             "caption_sequence_mode": str(args.caption_sequence_mode),
             "batch_size": int(args.batch_size),
             "vae_decode_batch_size": int(args.vae_decode_batch_size),
@@ -804,11 +757,7 @@ def build_evaluation_resume_contract(
             "target_latents_are_placeholders": bool(
                 target_latents_are_placeholders
             ),
-            "real_source": str(args.real_source),
-            "real_image_size": int(args.real_image_size),
-            "imagenet_train_dir": str(
-                Path(args.imagenet_train_dir).expanduser().resolve()
-            ),
+            "real_source": "cached_original_imagenet_val",
         },
         "generation": {
             "seed": int(args.seed),
@@ -820,6 +769,11 @@ def build_evaluation_resume_contract(
             "flow_solver": str(args.flow_solver),
             "parallel_rate": int(args.parallel_rate),
             "backbone_kv_cache": not bool(args.disable_backbone_kv_cache),
+            "dual_stream_attention_contract": str(attention_contract),
+            "single_stream_visible_content_diagonal": (
+                str(attention_contract) == "xlnet_content_diagonal"
+            ),
+            "single_stream_current_query_diagonal": False,
             "model_dtype": str(args.model_dtype),
             "vae_dtype": str(args.vae_dtype),
             "canonical_pairing_enabled": bool(canonical_pairing_enabled),
@@ -827,14 +781,21 @@ def build_evaluation_resume_contract(
         "metrics": {
             "fid_feature": int(args.fid_feature),
             "is_splits": int(args.is_splits),
+            "is_split_assignment": IS_SPLIT_ASSIGNMENT_STRATIFIED,
         },
         "output": {
             "save_images": bool(args.save_images),
-            "skip_target_decode": bool(args.skip_target_decode),
         },
     }
-    contract["sha256"] = canonical_json_sha256(contract)
     return contract
+
+
+def evaluation_resume_contract_identity(
+    contract: Mapping,
+) -> dict[str, object]:
+    """Return the readable evaluator-resume identity."""
+
+    return {"mode": "readable_fields", "value": dict(contract)}
 
 
 def feature_moments_state(moments: FeatureMoments | None):
@@ -1004,14 +965,14 @@ def save_evaluation_resume_checkpoint(
         raise ValueError(
             f"next_batch_idx must be nonnegative, got {next_batch_idx}"
         )
-    contract_sha256 = str(contract["sha256"])
+    contract_identity = evaluation_resume_contract_identity(contract)
     root = Path(output_dir) / "resume_state"
     batch_dir = root / f"batch-{next_batch_idx:08d}"
     batch_dir.mkdir(parents=True, exist_ok=True)
     rank_path = batch_dir / f"rank-{int(rank):05d}.pt"
     payload = {
         "schema": EVALUATION_RESUME_SCHEMA,
-        "contract_sha256": contract_sha256,
+        "contract_identity": contract_identity,
         "rank": int(rank),
         "world_size": int(world_size),
         **dict(state),
@@ -1036,11 +997,9 @@ def save_evaluation_resume_checkpoint(
                     "size": int(expected_path.stat().st_size),
                 }
             )
-        write_json_atomic(
-            root / "commit.json",
-            {
+        commit_payload = {
                 "schema": EVALUATION_RESUME_COMMIT_SCHEMA,
-                "contract_sha256": contract_sha256,
+                "contract_identity": contract_identity,
                 "world_size": int(world_size),
                 "next_batch_idx": next_batch_idx,
                 "batch_directory": batch_dir.name,
@@ -1048,8 +1007,8 @@ def save_evaluation_resume_checkpoint(
                 "updated_at": datetime.now(timezone.utc)
                 .isoformat()
                 .replace("+00:00", "Z"),
-            },
-        )
+            }
+        write_json_atomic(root / "commit.json", commit_payload)
     distributed_barrier(distributed, device)
     if is_main_process(rank):
         for stale_dir in root.glob("batch-*"):
@@ -1075,12 +1034,13 @@ def load_evaluation_resume_checkpoint(
         raise ValueError(
             f"unsupported evaluator resume commit schema: {commit.get('schema')!r}"
         )
-    expected_contract_sha256 = str(contract["sha256"])
-    if commit.get("contract_sha256") != expected_contract_sha256:
+    expected_contract_identity = evaluation_resume_contract_identity(contract)
+    checkpoint_contract_identity = commit.get("contract_identity")
+    if checkpoint_contract_identity != expected_contract_identity:
         raise ValueError(
             "stale evaluator resume checkpoint contract: "
-            f"checkpoint={commit.get('contract_sha256')!r}, "
-            f"current={expected_contract_sha256!r}"
+            f"checkpoint={checkpoint_contract_identity!r}, "
+            f"current={expected_contract_identity!r}"
         )
     if int(commit.get("world_size", -1)) != int(world_size):
         raise ValueError(
@@ -1106,8 +1066,8 @@ def load_evaluation_resume_checkpoint(
         raise ValueError(
             f"unsupported evaluator resume schema: {payload.get('schema')!r}"
         )
+    payload_contract_identity = payload.get("contract_identity")
     expected_fields = {
-        "contract_sha256": expected_contract_sha256,
         "rank": int(rank),
         "world_size": int(world_size),
         "next_batch_idx": int(commit["next_batch_idx"]),
@@ -1117,6 +1077,11 @@ def load_evaluation_resume_checkpoint(
         for key, value in expected_fields.items()
         if payload.get(key) != value
     }
+    if payload_contract_identity != expected_contract_identity:
+        mismatches["contract_identity"] = {
+            "checkpoint": payload_contract_identity,
+            "expected": expected_contract_identity,
+        }
     if mismatches:
         raise ValueError(
             "evaluator resume rank state does not match commit: "
@@ -1313,6 +1278,123 @@ def get_base_dataset_and_indices(loader_dataset):
     return loader_dataset, None
 
 
+def build_inception_score_split_plan(
+    loader_dataset,
+    *,
+    samples: int,
+    splits: int,
+) -> tuple[list[int], dict[str, object]]:
+    """Build deterministic IS split ids before generation starts.
+
+    ImageNet manifests are commonly class-contiguous. Splitting their row
+    numbers into contiguous blocks therefore changes the class support of each
+    IS partition. The stratified contract instead sorts stable image ids within
+    every synset and distributes them round-robin across the requested splits.
+    This makes the partition independent of dataset and generation order.
+    """
+
+    samples = int(samples)
+    splits = int(splits)
+    if samples <= 0:
+        raise ValueError(f"IS samples must be positive, got {samples}")
+    if splits <= 0:
+        raise ValueError(f"IS splits must be positive, got {splits}")
+    if samples < splits:
+        raise ValueError(
+            f"IS samples must be at least splits, got {samples} < {splits}"
+        )
+    if samples > len(loader_dataset):
+        raise ValueError(
+            "IS split plan cannot exceed the evaluation dataset: "
+            f"{samples} > {len(loader_dataset)}"
+        )
+
+    base_dataset, subset_indices = get_base_dataset_and_indices(loader_dataset)
+    if not hasattr(base_dataset, "img_ids") or not hasattr(
+        base_dataset, "synsets"
+    ):
+        raise ValueError(
+            "stratified IS requires an ImageNet dataset with img_ids and synsets"
+        )
+
+    grouped_rows: dict[str, list[tuple[int, int]]] = {}
+    seen_image_ids: set[int] = set()
+    for loader_row in range(samples):
+        base_row = (
+            int(subset_indices[loader_row])
+            if subset_indices is not None
+            else loader_row
+        )
+        if base_row < 0 or base_row >= len(base_dataset):
+            raise IndexError(
+                f"evaluation dataset row {base_row} is outside "
+                f"[0, {len(base_dataset)})"
+            )
+        image_id = int(base_dataset.img_ids[base_row].item())
+        if image_id in seen_image_ids:
+            raise ValueError(
+                "stratified IS requires unique image ids; duplicate "
+                f"image_id={image_id}"
+            )
+        seen_image_ids.add(image_id)
+        synset = str(base_dataset.synsets.get(image_id, "")).strip()
+        if not synset:
+            raise ValueError(
+                "stratified IS requires a non-empty synset for every image; "
+                f"image_id={image_id}"
+            )
+        grouped_rows.setdefault(synset, []).append((image_id, loader_row))
+
+    split_ids = [-1 for _ in range(samples)]
+    per_class_split_counts: list[list[int]] = []
+    for synset in sorted(grouped_rows):
+        split_counts = [0 for _ in range(splits)]
+        for within_class_index, (_, loader_row) in enumerate(
+            sorted(grouped_rows[synset])
+        ):
+            split_id = within_class_index % splits
+            split_ids[loader_row] = split_id
+            split_counts[split_id] += 1
+        per_class_split_counts.append(split_counts)
+
+    if any(split_id < 0 for split_id in split_ids):
+        raise RuntimeError("internal error: incomplete stratified IS split plan")
+    samples_per_split = [0 for _ in range(splits)]
+    for split_id in split_ids:
+        samples_per_split[split_id] += 1
+    classes_per_split = [
+        sum(class_counts[split] > 0 for class_counts in per_class_split_counts)
+        for split in range(splits)
+    ]
+    per_class_counts = [len(rows) for rows in grouped_rows.values()]
+    flattened_class_split_counts = [
+        count
+        for class_counts in per_class_split_counts
+        for count in class_counts
+    ]
+    return split_ids, {
+        "assignment": IS_SPLIT_ASSIGNMENT_STRATIFIED,
+        "samples": samples,
+        "splits": splits,
+        "class_stratified": True,
+        "source_dataset_split": getattr(
+            base_dataset, "dataset_split", None
+        ),
+        "within_class_order": "ascending_stable_image_id",
+        "class_count": len(grouped_rows),
+        "samples_per_class_min": min(per_class_counts),
+        "samples_per_class_max": max(per_class_counts),
+        "samples_per_split": samples_per_split,
+        "classes_per_split": classes_per_split,
+        "samples_per_class_per_split_min": min(
+            flattened_class_split_counts
+        ),
+        "samples_per_class_per_split_max": max(
+            flattened_class_split_counts
+        ),
+    }
+
+
 def ordered_eval_sample_records(
     loader_dataset,
     *,
@@ -1364,7 +1446,7 @@ def _gather_object_records(local_records: list[dict[str, object]]) -> list[dict[
     return [record for rank_records in gathered for record in (rank_records or [])]
 
 
-def evaluation_pairing_manifest_hashes(
+def evaluation_pairing_manifests(
     *,
     local_noise_records: list[dict[str, object]],
     local_sample_records: list[dict[str, object]],
@@ -1402,58 +1484,15 @@ def evaluation_pairing_manifest_hashes(
         "schema": ORDERED_EVAL_SAMPLE_MANIFEST_SCHEMA,
         "records": sample_records,
     }
-    return {
+    result = {
         "canonical_noise_manifest_schema": CANONICAL_NOISE_MANIFEST_SCHEMA,
-        "canonical_noise_manifest_sha256": canonical_json_sha256(noise_payload),
         "ordered_eval_sample_manifest_schema": ORDERED_EVAL_SAMPLE_MANIFEST_SCHEMA,
-        "ordered_eval_sample_manifest_sha256": canonical_json_sha256(sample_payload),
         "paired_sample_count": len(expected_indices),
+        "runtime_hashing_enabled": False,
+        "evaluation_seed": int(noise_payload["evaluation_seed"]),
+        "ordered_sample_count": len(sample_payload["records"]),
     }
-
-
-def source_paths_for_rows(
-    loader_dataset,
-    loader_rows: list[int],
-    imagenet_train_dir: Path,
-):
-    base_dataset, subset_indices = get_base_dataset_and_indices(loader_dataset)
-    if not hasattr(base_dataset, "img_ids") or not hasattr(base_dataset, "source_paths"):
-        raise ValueError("--real_source=imagenet_original requires an ImageNetFlowCacheDataset or Subset of it.")
-
-    paths = []
-    for loader_row in loader_rows:
-        dataset_row = int(loader_row)
-        if subset_indices is not None:
-            dataset_row = int(subset_indices[dataset_row])
-        img_id = int(base_dataset.img_ids[dataset_row].item())
-        source_path = base_dataset.source_paths.get(img_id)
-        if not source_path:
-            raise KeyError(f"No source_path in manifest for img_id={img_id}")
-        path = Path(source_path)
-        if not path.is_absolute():
-            path = imagenet_train_dir / path
-        if not path.exists():
-            raise FileNotFoundError(path)
-        paths.append(path)
-    return paths
-
-
-def build_real_image_transform(image_size: int):
-    return transforms.Compose(
-        [
-            transforms.Resize(int(image_size), interpolation=transforms.InterpolationMode.BICUBIC),
-            transforms.CenterCrop(int(image_size)),
-            transforms.ToTensor(),
-        ]
-    )
-
-
-def load_real_images(paths, transform, device):
-    images = []
-    for path in paths:
-        with Image.open(path) as image:
-            images.append(transform(image.convert("RGB")))
-    return torch.stack(images, dim=0).to(device=device, dtype=torch.float32)
+    return result
 
 
 def require_finite_metric_scalar(value: float, *, label: str) -> float:
@@ -1535,12 +1574,31 @@ def is_official_flow_protocol(
     samples: int,
     is_splits: int,
     parallel_rate: int,
+    is_split_plan: Mapping[str, object],
 ) -> bool:
     return bool(
         shared_real_count is not None
         and int(samples) == int(shared_real_count)
         and int(is_splits) == 10
         and int(parallel_rate) == 1
+        and is_split_plan.get("assignment")
+        == IS_SPLIT_ASSIGNMENT_STRATIFIED
+        and is_split_plan.get("source_dataset_split") == "val"
+        and int(is_split_plan.get("class_count", -1)) == 1000
+        and int(is_split_plan.get("samples_per_class_min", -1)) == 50
+        and int(is_split_plan.get("samples_per_class_max", -1)) == 50
+        and list(is_split_plan.get("samples_per_split", []))
+        == [5000] * 10
+        and list(is_split_plan.get("classes_per_split", []))
+        == [1000] * 10
+        and int(
+            is_split_plan.get("samples_per_class_per_split_min", -1)
+        )
+        == 5
+        and int(
+            is_split_plan.get("samples_per_class_per_split_max", -1)
+        )
+        == 5
     )
 
 
@@ -1595,16 +1653,12 @@ def shared_feature_moments(payload, *, feature: int, device) -> FeatureMoments:
 def load_shared_original_real_stats(
     path: str,
     *,
-    config,
     fid_feature: int,
-    real_image_size: int,
-    inception_weights_path: str,
 ):
     stats_path = Path(path)
     if not stats_path.is_file():
         raise FileNotFoundError(stats_path)
     payload = torch.load(stats_path, map_location="cpu")
-    del config, real_image_size
     if not isinstance(payload, Mapping) or "stats" not in payload:
         raise ValueError(
             f"{stats_path} must contain a mapping with a 'stats' entry."
@@ -1634,14 +1688,6 @@ def load_shared_original_real_stats(
             "shared real stats feature dimension mismatch: "
             f"cache={recorded_feature}, requested={fid_feature}."
         )
-    recorded_weights_sha256 = feature_metadata.get("weights_sha256")
-    if recorded_weights_sha256 and inception_weights_path:
-        actual_weights_sha256 = file_sha256(inception_weights_path)
-        if str(recorded_weights_sha256) != actual_weights_sha256:
-            raise ValueError(
-                "shared real stats were produced with different Inception "
-                "weights."
-            )
     return payload
 
 
@@ -1715,26 +1761,75 @@ def main(*, model_loader=None):
         raise ValueError("--strategies must contain at least one strategy")
     validate_strategies(strategies, args.allow_sigma_strategies)
     config = OmegaConf.load(args.config)
+    config.training.runtime_hashing_enabled = False
+    evaluation_model_source = None
+    if args.model_source is not None:
+        legacy_sources = {
+            "model_path_override": args.model_path_override,
+            "adapter": args.adapter if args.adapter != "none" else "",
+            "model_state": args.model_state,
+            "ema_checkpoint": args.ema_checkpoint,
+        }
+        conflicts = [name for name, value in legacy_sources.items() if value]
+        if conflicts:
+            raise ValueError(
+                "--model_source cannot be combined with legacy weight inputs: "
+                f"{conflicts}"
+            )
+        evaluation_model_source = resolve_evaluation_model_source(
+            args.model_source
+        )
+        configure_model_source(config, evaluation_model_source)
+    elif args.model_path_override:
+        override_path = Path(args.model_path_override)
+        if (override_path / "ema_export_metadata.json").is_file():
+            evaluation_model_source = resolve_evaluation_model_source(
+                override_path
+            )
+            if args.ema_checkpoint:
+                raise ValueError(
+                    "a final HF EMA model_path_override cannot be combined "
+                    "with a sharded EMA overlay"
+                )
+            configure_model_source(config, evaluation_model_source)
+        else:
+            config.model.model_path = args.model_path_override
+    attention_contract = str(
+        config.model.get(
+            "dual_stream_attention_contract",
+            "selfless_strict",
+        )
+    ).strip().lower()
+    if attention_contract not in {
+        "selfless_strict",
+        "xlnet_content_diagonal",
+    }:
+        raise ValueError(
+            "unsupported model.dual_stream_attention_contract="
+            f"{attention_contract!r}"
+        )
+    unified_dataset = str(config.dataset.class_name) == "UnifiedMixedDataset"
+    dataset_params = (
+        config.dataset.params.image
+        if unified_dataset
+        else config.dataset.params
+    )
     canonical_pairing_enabled = bool(args.canonical_pairing)
-    if args.model_path_override:
-        config.model.model_path = args.model_path_override
     if args.caption_sequence_mode != "config":
         conditioning_mode = str(
-            config.dataset.params.get("conditioning_mode", "")
+            dataset_params.get("conditioning_mode", "")
         ).strip().lower()
         if conditioning_mode != "caption":
             raise ValueError(
                 "--caption_sequence_mode requires a caption-conditioned dataset, "
                 f"got conditioning_mode={conditioning_mode!r}"
             )
-        config.dataset.params.caption_sequence_modes = [
-            str(args.caption_sequence_mode)
-        ]
+        dataset_params.caption_sequence_modes = [str(args.caption_sequence_mode)]
     config.training.batch_size = int(local_batch_size)
     config.training.dataloader_workers = 0
     config.model.image_flow_num_sampling_steps = str(args.sampling_steps)
     target_latents_are_placeholders = bool(
-        config.dataset.params.get(
+        dataset_params.get(
             "target_latents_are_placeholders",
             False,
         )
@@ -1759,17 +1854,46 @@ def main(*, model_loader=None):
         config,
         model_dtype=requested_model_dtype,
     )
-    if is_main_process(rank):
-        print(f"Loading adapter: {args.adapter}")
-    adapter_report = load_adapter(model, args.adapter)
-    if is_main_process(rank):
-        print(f"Loading model state: {args.model_state or 'none'}")
-    model_state_report = load_model_state(model, args.model_state)
-    if is_main_process(rank):
-        print(f"Loading sharded EMA checkpoint: {args.ema_checkpoint or 'none'}")
-    ema_checkpoint_report = load_sharded_ema_checkpoint(
-        model, args.ema_checkpoint
-    )
+    loaded_attention_contract = str(
+        getattr(
+            model.config,
+            "dual_stream_attention_contract",
+            "selfless_strict",
+        )
+    ).strip().lower()
+    if loaded_attention_contract != attention_contract:
+        raise ValueError(
+            "loaded model attention contract does not match evaluation config: "
+            f"model={loaded_attention_contract!r}, config={attention_contract!r}"
+        )
+    if evaluation_model_source is not None:
+        if is_main_process(rank):
+            print(
+                "Loading evaluation model source: "
+                f"{evaluation_model_source.path}"
+            )
+        model_source_load_report = load_model_source_weights(
+            model,
+            evaluation_model_source,
+        )
+        adapter_report = {"adapter": None}
+        model_state_report = {"model_state": None}
+    else:
+        if is_main_process(rank):
+            print(f"Loading adapter: {args.adapter}")
+        adapter_report = load_adapter(model, args.adapter)
+        if is_main_process(rank):
+            print(f"Loading model state: {args.model_state or 'none'}")
+        model_state_report = load_model_state(model, args.model_state)
+        if is_main_process(rank):
+            print(
+                "Loading sharded EMA checkpoint: "
+                f"{args.ema_checkpoint or 'none'}"
+            )
+        model_source_load_report = load_sharded_ema_checkpoint(
+            model,
+            args.ema_checkpoint,
+        )
     model = model.to(device).eval()
     if hasattr(model.image_flow_head, "reset_guidance_diagnostics"):
         model.image_flow_head.reset_guidance_diagnostics()
@@ -1803,12 +1927,27 @@ def main(*, model_loader=None):
     vae = load_vae(config, device, args.vae_dtype)
     scaling_factor = float(config.experiment.validation_vae_scaling_factor)
     if is_main_process(rank):
-        print(f"Loading {args.split} dataloader...")
-    train_loader, val_loader = get_dataloaders(config, tokenizer)
-    source_loader = val_loader if args.split == "val" else train_loader
+        print("Loading ImageNet val dataloader...")
+    if unified_dataset:
+        selected_mode = (
+            str(args.caption_sequence_mode)
+            if args.caption_sequence_mode != "config"
+            else "t2i"
+        )
+        val_loader = build_unified_image_validation_dataloader(
+            config,
+            tokenizer,
+            task_modes=(selected_mode,),
+            batch_size=local_batch_size,
+            num_workers=0,
+        )
+        source_loader = val_loader
+    else:
+        _, val_loader = get_dataloaders(config, tokenizer)
+        source_loader = val_loader
     if len(source_loader.dataset) < int(args.samples):
         raise ValueError(
-            f"{args.split} dataset has {len(source_loader.dataset)} rows, "
+            f"ImageNet val has {len(source_loader.dataset)} rows, "
             f"fewer than --samples={args.samples}"
         )
     loader = DataLoader(
@@ -1821,15 +1960,14 @@ def main(*, model_loader=None):
         ),
         num_workers=0,
         pin_memory=True,
-        # Evaluation is always one logical sample per physical row, even
-        # when reading the training split.
+        # Evaluation is always one logical sample per ImageNet val row.
         collate_fn=val_loader.collate_fn,
     )
-    if args.real_source == "imagenet_original" and args.split != "val":
-        raise ValueError("--real_source=imagenet_original currently expects --split val because train loader is shuffled.")
-    real_transform = build_real_image_transform(args.real_image_size)
-    imagenet_train_dir = Path(args.imagenet_train_dir)
-
+    is_split_ids, is_split_plan = build_inception_score_split_plan(
+        source_loader.dataset,
+        samples=int(args.samples),
+        splits=int(args.is_splits),
+    )
     image_tokens = int(config.model.image_tokens_per_img)
     side = int(image_tokens ** 0.5)
     if side * side != image_tokens:
@@ -1851,60 +1989,42 @@ def main(*, model_loader=None):
 
     inception_weights_path = resolve_inception_weights_path(args.inception_weights_path)
     requested_real_stats_path = str(args.real_stats_path).strip()
-    real_stats_path = (
-        ""
-        if requested_real_stats_path.lower() in {"none", "null"}
-        else str(
-            requested_real_stats_path
-            or config.get("evaluation", {}).get("real_stats_path", "")
-        )
+    real_stats_path = str(
+        requested_real_stats_path
+        or config.get("evaluation", {}).get("real_stats_path", "")
     )
-    shared_real_payload = None
-    if real_stats_path:
-        if inception_weights_path is None:
-            raise ValueError(
-                "shared original-image stats require an explicit local "
-                "--inception_weights_path so its content hash can be verified"
-            )
-        shared_real_payload = load_shared_original_real_stats(
-            real_stats_path,
-            config=config,
-            fid_feature=int(args.fid_feature),
-            real_image_size=int(args.real_image_size),
-            inception_weights_path=inception_weights_path,
+    if not real_stats_path:
+        raise ValueError(
+            "T2I FID/IS evaluation requires --real_stats_path for all 50,000 "
+            "original ImageNet val images"
         )
-    shared_real_count = (
-        int(shared_real_payload["stats"]["count"])
-        if shared_real_payload is not None
-        else None
+    if inception_weights_path is None:
+        raise ValueError(
+            "T2I FID/IS evaluation requires an explicit local "
+            "--inception_weights_path"
+        )
+    shared_real_payload = load_shared_original_real_stats(
+        real_stats_path,
+        fid_feature=int(args.fid_feature),
     )
-    if args.skip_target_decode and shared_real_payload is None:
-        raise ValueError(
-            "--skip_target_decode requires frozen --real_stats_path"
-        )
-    if (
-        target_latents_are_placeholders
-        and shared_real_payload is None
-        and args.real_source == "vae_decoded_target_latents"
-    ):
-        raise ValueError(
-            "dataset target latents are declared as placeholders and cannot "
-            "serve as real images; provide frozen --real_stats_path or use "
-            "--real_source=imagenet_original"
-        )
+    shared_real_count = int(shared_real_payload["stats"]["count"])
     official_protocol = is_official_flow_protocol(
         shared_real_count=shared_real_count,
         samples=int(args.samples),
         is_splits=int(args.is_splits),
         parallel_rate=int(args.parallel_rate),
+        is_split_plan=is_split_plan,
     )
     if args.require_official_protocol and not official_protocol:
         raise ValueError(
             "Official flow FID/IS protocol requires shared original-ImageNet "
-            f"stats, exactly its {shared_real_count} fake samples, and "
-            "--is_splits=10 with --parallel_rate=1; "
+            f"stats, exactly its {shared_real_count} fake samples, 10 "
+            "synset-stratified IS splits with all 1,000 classes represented "
+            "equally in every split, and --parallel_rate=1; "
             f"got samples={args.samples}, is_splits={args.is_splits}, "
-            f"parallel_rate={args.parallel_rate}, real_stats_path={real_stats_path!r}"
+            f"parallel_rate={args.parallel_rate}, "
+            f"is_split_plan={is_split_plan!r}, "
+            f"real_stats_path={real_stats_path!r}"
         )
     if is_main_process(rank):
         print(
@@ -1936,6 +2056,7 @@ def main(*, model_loader=None):
         real_stats_path=real_stats_path,
         inception_weights_path=inception_weights_path,
         image_tokens=image_tokens,
+        attention_contract=attention_contract,
     )
 
     metrics = {
@@ -1953,11 +2074,6 @@ def main(*, model_loader=None):
         }
         for strategy in strategies
     }
-    real_moments = (
-        None
-        if shared_real_payload is not None
-        else FeatureMoments.zeros(int(args.fid_feature), device)
-    )
     reset_peak_memory_stats(device)
 
     generated = 0
@@ -1988,10 +2104,6 @@ def main(*, model_loader=None):
         metrics = evaluation_metrics_from_state(
             resume_payload["metrics"],
             strategies=strategies,
-            device=device,
-        )
-        real_moments = feature_moments_from_state(
-            resume_payload["real_moments"],
             device=device,
         )
         resume_next_batch_idx = int(resume_payload["next_batch_idx"])
@@ -2142,7 +2254,6 @@ def main(*, model_loader=None):
                     current_reserved_mib,
                 ),
                 "metrics": evaluation_metrics_state(metrics),
-                "real_moments": feature_moments_state(real_moments),
             },
         )
 
@@ -2209,13 +2320,16 @@ def main(*, model_loader=None):
             }
 
         source_spans = list(all_spans)
+        batch_tensors = {
+            "input_ids": input_ids,
+            "token_types": token_types,
+            "sigma": sigma,
+            "image_latents": image_latents,
+        }
+        if batch.get("segment_ids") is not None:
+            batch_tensors["segment_ids"] = batch["segment_ids"]
         local_batch, spans = shard_unpacked_batch_rows(
-            {
-                "input_ids": input_ids,
-                "token_types": token_types,
-                "sigma": sigma,
-                "image_latents": image_latents,
-            },
+            batch_tensors,
             source_spans,
         )
         seen_complete_spans = min(
@@ -2226,6 +2340,11 @@ def main(*, model_loader=None):
         token_types = local_batch["token_types"].to(device)
         sigma = local_batch["sigma"].to(device)
         image_latents = local_batch["image_latents"].to(device)
+        segment_ids = (
+            local_batch["segment_ids"].to(device)
+            if "segment_ids" in local_batch
+            else None
+        )
         selected_span_batches += 1
 
         initial_noise_bank = None
@@ -2244,66 +2363,18 @@ def main(*, model_loader=None):
             )
 
         target_latents = span_latents_to_chw(image_latents, spans, side)
-        target_images = None
-        if (
-            not target_latents_are_placeholders
-            and not args.skip_target_decode
-        ):
-            decoded_target_images = decode_latents_in_microbatches(
-                vae,
-                target_latents.float(),
-                scaling_factor,
-                batch_size=int(args.vae_decode_batch_size),
-            )
-            require_finite_metric_tensor(
-                decoded_target_images,
-                label=f"decoded_target_images.rank{rank}.batch{batch_idx}",
-            )
-            target_images = metric_images(decoded_target_images)
-        if shared_real_payload is not None:
-            real_images = None
-        elif args.real_source == "imagenet_original":
-            real_paths = source_paths_for_rows(
-                loader.dataset,
-                selected_global_indices,
-                imagenet_train_dir,
-            )
-            real_images = load_real_images(real_paths, real_transform, device)
-        else:
-            real_images = target_images
-        if real_moments is not None:
-            require_finite_metric_tensor(
-                real_images,
-                label=f"real_images.rank{rank}.batch{batch_idx}",
-            )
-            real_features, _ = extract_inception_features_in_microbatches(
-                inception,
-                real_images,
-                batch_size=int(args.vae_decode_batch_size),
-            )
-            require_finite_metric_tensor(
-                real_features,
-                label=f"real_features.rank{rank}.batch{batch_idx}",
-            )
-            real_moments.update(real_features)
-        if args.save_images and target_images is not None:
-            save_indexed_images(target_images.cpu(), out_dir / "target_decoded", selected_global_indices)
-        if (
-            args.save_images
-            and shared_real_payload is None
-            and args.real_source == "imagenet_original"
-        ):
-            save_indexed_images(real_images.cpu(), out_dir / "imagenet_original_real", selected_global_indices)
 
         for strategy_idx, strategy in enumerate(strategies):
             torch.manual_seed(int(args.seed) + batch_idx * 1009 + strategy_idx * 131071 + rank * 1_000_003)
             synchronize_device(device)
             generation_started = time.perf_counter()
-            single_latents, trace = model.sample_image_latents_single_stream(
+            single_latents, trace = model.generate(
+                "t2i",
                 input_ids=input_ids,
                 token_types=token_types,
                 sigma=sigma,
                 spans=spans,
+                segment_ids=segment_ids,
                 image_latent_dim=image_latents.shape[-1],
                 initial_noise_bank=initial_noise_bank,
                 flow_temperature=float(args.temperature),
@@ -2312,7 +2383,7 @@ def main(*, model_loader=None):
                 flow_solver=args.flow_solver,
                 parallel_rate=int(args.parallel_rate),
                 order_strategy=str(strategy),
-                use_backbone_cache=not bool(
+                use_cache=not bool(
                     args.disable_backbone_kv_cache
                 ),
                 return_trace=True,
@@ -2363,8 +2434,7 @@ def main(*, model_loader=None):
                 )
             state["score_moments"].update(
                 fake_logits,
-                selected_global_indices,
-                int(args.samples),
+                [is_split_ids[index] for index in selected_global_indices],
             )
             count = int(generated_images.shape[0])
             if not target_latents_are_placeholders:
@@ -2435,7 +2505,7 @@ def main(*, model_loader=None):
             "device": str(device),
             "config": str(args.config),
             "model_path": str(config.model.model_path),
-            "split": str(args.split),
+            "split": "val",
             "samples_requested": int(args.samples),
             "batch_size": int(args.batch_size),
             "loader_batches": int(len(loader)) if hasattr(loader, "__len__") else None,
@@ -2468,7 +2538,7 @@ def main(*, model_loader=None):
 
     pairing_manifests = None
     if canonical_pairing_enabled:
-        pairing_manifests = evaluation_pairing_manifest_hashes(
+        pairing_manifests = evaluation_pairing_manifests(
             local_noise_records=local_noise_manifest_records,
             local_sample_records=local_eval_sample_manifest_records,
             evaluation_seed=int(args.seed),
@@ -2476,13 +2546,6 @@ def main(*, model_loader=None):
         )
     guidance_diagnostics = {}
 
-    if real_moments is not None:
-        real_moments.all_reduce_()
-        if int(real_moments.count.item()) != int(args.samples):
-            raise RuntimeError(
-                f"distributed real feature count={int(real_moments.count.item())}; "
-                f"expected={args.samples}"
-            )
     for strategy, state in metrics.items():
         if state["score_moments"] is None:
             raise RuntimeError(f"strategy={strategy!r} generated no Inception logits")
@@ -2500,20 +2563,12 @@ def main(*, model_loader=None):
                 f"expected={args.samples}"
             )
 
-    compute_fid = bool(
-        shared_real_payload is None
-        or int(args.samples) == int(shared_real_count)
-        or args.allow_nonofficial_fid
-    )
+    compute_fid = int(args.samples) == int(shared_real_count)
     if is_main_process(rank) and compute_fid:
-        real_reference_moments = (
-            shared_feature_moments(
-                shared_real_payload,
-                feature=int(args.fid_feature),
-                device=torch.device("cpu"),
-            )
-            if shared_real_payload is not None
-            else real_moments
+        real_reference_moments = shared_feature_moments(
+            shared_real_payload,
+            feature=int(args.fid_feature),
+            device=torch.device("cpu"),
         )
         real_mean, real_cov = real_reference_moments.mean_cov()
     peak_device_allocated_mib = reduce_max(
@@ -2540,11 +2595,18 @@ def main(*, model_loader=None):
     )
 
     results = {
+        "runtime_hashing_enabled": False,
         "official_protocol": official_protocol,
         "implementation_contracts": {
             "evaluator_rng_contract": EVALUATOR_RNG_CONTRACT,
-            "evaluator_rng_contract_sha256": EVALUATOR_RNG_CONTRACT_SHA256,
             "canonical_initial_noise_enabled": bool(canonical_pairing_enabled),
+            "backbone_attention": {
+                "dual_stream_attention_contract": attention_contract,
+                "single_stream_visible_content_diagonal": (
+                    attention_contract == "xlnet_content_diagonal"
+                ),
+                "single_stream_current_query_diagonal": False,
+            },
             "evaluation_resume": {
                 "schema": EVALUATION_RESUME_SCHEMA,
                 "commit_schema": EVALUATION_RESUME_COMMIT_SCHEMA,
@@ -2558,15 +2620,17 @@ def main(*, model_loader=None):
                 "checkpoint_interval_batches": int(
                     args.resume_checkpoint_interval_batches
                 ),
-                "contract_sha256": str(resume_contract["sha256"]),
+                "contract_identity": evaluation_resume_contract_identity(
+                    resume_contract
+                ),
             },
             **(pairing_manifests or {}),
         },
         "metric_protocol": {
             "fid_reducer": "symmetric_eigendecomposition",
             "fid_computed": bool(compute_fid),
-            "nonofficial_fid_enabled": bool(args.allow_nonofficial_fid),
-            "is_split_assignment": "contiguous_by_global_sample_index",
+            "is_split_assignment": IS_SPLIT_ASSIGNMENT_STRATIFIED,
+            "is_split_plan": is_split_plan,
             "is_std": "population",
             "is_splits": int(args.is_splits),
         },
@@ -2578,6 +2642,16 @@ def main(*, model_loader=None):
         },
         "config": args.config,
         "model_path": str(config.model.model_path),
+        "weight_source": (
+            evaluation_model_source.kind
+            if evaluation_model_source is not None
+            else ("rank_sharded_ema" if args.ema_checkpoint else "hf_model")
+        ),
+        "evaluation_model_source": (
+            evaluation_model_source.report()
+            if evaluation_model_source is not None
+            else None
+        ),
         "architecture": {
             "position_contract": pure_2d_position_contract(),
             "image_layout": (
@@ -2601,8 +2675,8 @@ def main(*, model_loader=None):
                 ),
             },
             "padded_sequence_length": (
-                int(config.dataset.params.pad_to_length)
-                if config.dataset.params.get("pad_to_length", None) is not None
+                int(dataset_params.pad_to_length)
+                if dataset_params.get("pad_to_length", None) is not None
                 else None
             ),
             "flow_head": {
@@ -2654,8 +2728,8 @@ def main(*, model_loader=None):
         },
         "adapter": adapter_report,
         "model_state": model_state_report,
-        "ema_checkpoint": ema_checkpoint_report,
-        "split": args.split,
+        "model_source_load": model_source_load_report,
+        "split": "val",
         "seed": int(args.seed),
         "batch_size": int(args.batch_size),
         "samples_requested": int(args.samples),
@@ -2687,34 +2761,13 @@ def main(*, model_loader=None):
                 else None
             ),
         },
-        "real_source": (
-            "cached_original_imagenet"
-            if shared_real_payload is not None
-            else str(args.real_source)
-        ),
-        "real_stats_path": (
-            str(Path(real_stats_path).resolve())
-            if shared_real_payload is not None
-            else None
-        ),
-        "real_stats_metadata": (
+        "real_source": "cached_original_imagenet_val",
+        "real_stats_path": str(Path(real_stats_path).resolve()),
+        "real_stats_metadata": without_digest_fields(
             shared_real_payload["metadata"]
-            if shared_real_payload is not None
-            else None
         ),
         "target_latents_are_placeholders": (
             target_latents_are_placeholders
-        ),
-        "target_decode_skipped": bool(args.skip_target_decode),
-        "imagenet_train_dir": (
-            str(imagenet_train_dir)
-            if shared_real_payload is None and args.real_source == "imagenet_original"
-            else None
-        ),
-        "real_image_size": (
-            int(args.real_image_size)
-            if shared_real_payload is not None or args.real_source == "imagenet_original"
-            else None
         ),
         "cfg": float(args.cfg),
         "cfg_schedule": str(args.cfg_schedule),
@@ -2726,7 +2779,6 @@ def main(*, model_loader=None):
         "inception_weights_path": inception_weights_path,
         "strategies": {},
     }
-
     for strategy, state in metrics.items():
         global_count = int(reduce_sum(float(state["count"]), device))
         global_latent_mse_sum = (

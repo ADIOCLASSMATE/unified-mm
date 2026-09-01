@@ -1,18 +1,10 @@
 #!/usr/bin/env python3
-"""Generate ImageNet-1K I2T captions and score them with a frozen CLIP model.
-
-The evaluator uses the same deterministic 50-images-per-class holdout as the
-joint-training validation loader.  It conditions on cached MAR posterior
-latents, generates captions autoregressively, and compares each caption with
-the corresponding original ImageNet training image.  Distributed ranks write
-auditable JSONL shards; rank zero merges them into one metrics artifact.
-"""
+"""Generate held-out ImageNet-val I2T captions and score them with CLIP."""
 
 from __future__ import annotations
 
 import argparse
 from collections import Counter
-import hashlib
 import json
 import math
 import os
@@ -37,15 +29,25 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from utils.dataset_imagenet_flow_cache import ImageNetFlowCacheDataset  # noqa: E402
-from utils.imagenet_flow_dataloaders import _build_split_indices  # noqa: E402
-from utils.utils import get_selfless_mask, load_model_tokenizer  # noqa: E402
+from utils.imagenet_flow_dataloaders import (  # noqa: E402
+    _build_cache_dataset,
+    _independent_validation_params,
+)
+from utils.imagenet_flow_sequence import build_selfless_sigma  # noqa: E402
+from utils.evaluation_model_source import (  # noqa: E402
+    add_model_source_argument,
+    configure_model_source,
+    load_model_source_weights,
+    model_source_from_args,
+)
+from utils.utils import load_model_tokenizer  # noqa: E402
 
 
 DEFAULT_CONFIG = Path(
     "configs/selfless/imagenet1k_caption_joint_10ep_ascend16_b1024.yaml"
 )
 DEFAULT_IMAGE_ROOT = Path(
-    "public/dataset/imagenet/v1/ILSVRC/Data/CLS-LOC/train"
+    "public/dataset/imagenet/v1/ILSVRC/Data/CLS-LOC/val"
 )
 DEFAULT_CLIP_MODEL = Path("public/models/openai--clip-vit-base-patch32")
 WORD_RE = re.compile(r"\b\w+\b", flags=re.UNICODE)
@@ -54,7 +56,7 @@ WORD_RE = re.compile(r"\b\w+\b", flags=re.UNICODE)
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
-    parser.add_argument("--model_path", type=Path, required=True)
+    add_model_source_argument(parser)
     parser.add_argument("--clip_model_dir", type=Path, default=DEFAULT_CLIP_MODEL)
     parser.add_argument("--image_root", type=Path, default=DEFAULT_IMAGE_ROOT)
     parser.add_argument("--output_dir", type=Path, required=True)
@@ -92,12 +94,27 @@ def atomic_write_text(path: Path, text: str) -> None:
             temporary.unlink(missing_ok=True)
 
 
-def file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+def source_image_path(
+    dataset: ImageNetFlowCacheDataset,
+    img_id: int,
+    image_root: Path,
+) -> Path:
+    recorded = dataset.source_paths_full.get(int(img_id), "")
+    if recorded:
+        direct = Path(recorded)
+        if direct.is_file():
+            return direct.resolve()
+    relative = dataset.source_paths[int(img_id)]
+    candidate = image_root / relative
+    if candidate.is_file():
+        return candidate.resolve()
+    # Validation roots commonly already end in ``val`` while relative paths
+    # include ILSVRC/Data/CLS-LOC/val.  The filename fallback is unambiguous
+    # inside each synset directory.
+    fallback = image_root / dataset.synsets[int(img_id)] / Path(relative).name
+    if fallback.is_file():
+        return fallback.resolve()
+    raise FileNotFoundError(candidate)
 
 
 def clip_weight_path(model_dir: Path) -> Path:
@@ -147,53 +164,28 @@ def barrier(device: torch.device) -> None:
         dist.barrier()
 
 
-def build_dataset(config, tokenizer) -> tuple[ImageNetFlowCacheDataset, list[int]]:
+def evaluation_image_params(config):
     params = config.dataset.params
-    dataset = ImageNetFlowCacheDataset(
-        cache_path=params.cache_path,
-        tokenizer=tokenizer,
-        boi_token_id=config.model.boi_token_id,
-        eoi_token_id=config.model.eoi_token_id,
-        mask_token_id=config.model.mask_token_id,
-        eos_token_id=tokenizer.eos_token_id,
-        image_tokens_per_img=params.get(
-            "image_tokens_per_img", config.model.image_tokens_per_img
-        ),
-        image_latent_dim=params.get(
-            "image_latent_dim", config.model.image_latent_dim
-        ),
-        manifest_jsonl=params.manifest_jsonl,
-        synset_mapping_path=params.get("synset_mapping_path", None),
-        conditioning_mode="caption",
-        caption_jsonl=params.caption_jsonl,
-        caption_list_key=params.get("caption_list_key", "captions"),
-        caption_list_text_key=params.get("caption_list_text_key", "text"),
-        caption_path_key=params.get("caption_path_key", "path"),
-        caption_id_key=params.get("caption_id_key", "id"),
-        caption_validation_index=0,
-        t2i_prompt_validation_index=0,
-        caption_sequence_modes=("i2t",),
-        synthetic_text_index_manifest=params.synthetic_text_index_manifest,
-        caption_t2i_prefix=params.caption_t2i_prefix,
-        caption_i2t_prefix=params.caption_i2t_prefix,
-        # The original caption is an evaluation reference only.  Joint training
-        # still uses the six synthetic captions because its config remains false.
-        caption_include_original=True,
-        cache_caption_tokens=False,
-        max_seq_length=params.max_seq_length,
-        model_context_length=params.get("model_context_length", None),
-        caption_manifest_sha256=params.caption_manifest_sha256,
-        seed=config.training.seed,
-    )
-    _, validation_indices = _build_split_indices(
-        dataset,
-        val_ratio=float(params.get("val_ratio", 0.001)),
-        seed=int(params.get("split_seed", config.training.seed)),
-        strategy=str(params.get("split_strategy", "stratified")),
-        val_samples_per_class=int(params.val_samples_per_class),
-    )
+    if str(config.dataset.class_name) == "UnifiedMixedDataset":
+        params = params.image
+    return params
+
+
+def build_dataset(config, tokenizer) -> tuple[ImageNetFlowCacheDataset, list[int]]:
+    params = evaluation_image_params(config)
+    validation_params = _independent_validation_params(params)
+    if validation_params is None:
+        raise ValueError(
+            "I2T evaluation requires an independent ImageNet val dataset"
+        )
+    if str(validation_params.get("expected_split", "")).lower() != "val":
+        raise ValueError(
+            "I2T evaluation dataset must declare expected_split='val'"
+        )
+    dataset = _build_cache_dataset(config, validation_params, tokenizer)
+    dataset.caption_sequence_modes = ("i2t",)
     dataset.set_training_indices([])
-    return dataset, validation_indices
+    return dataset, list(range(len(dataset)))
 
 
 def select_balanced_validation_indices(
@@ -285,6 +277,7 @@ def generate_batch(
     max_new_tokens: int,
     temperature: float,
     device: torch.device,
+    base_sigma_batch: torch.Tensor | None = None,
 ) -> tuple[list[str], list[list[int]], list[str]]:
     batch_size, image_tokens, latent_dim = image_batch.shape
     base_ids, base_types, base_sigma, image_start = build_i2t_prefix(
@@ -297,7 +290,17 @@ def generate_batch(
     )
     input_ids = base_ids.unsqueeze(0).expand(batch_size, -1).clone().to(device)
     token_types = base_types.unsqueeze(0).expand(batch_size, -1).clone().to(device)
-    sigma = base_sigma.unsqueeze(0).expand(batch_size, -1).clone().to(device)
+    if base_sigma_batch is None:
+        sigma = base_sigma.unsqueeze(0).expand(batch_size, -1).clone()
+    else:
+        if tuple(base_sigma_batch.shape) != (batch_size, int(base_ids.numel())):
+            raise ValueError(
+                "base_sigma_batch must align with the serialized I2T prefix: "
+                f"got {tuple(base_sigma_batch.shape)}, expected "
+                f"{(batch_size, int(base_ids.numel()))}"
+            )
+        sigma = base_sigma_batch.clone()
+    sigma = sigma.to(device=device, dtype=torch.float32)
     image_latents = torch.zeros(
         batch_size,
         input_ids.shape[1],
@@ -314,79 +317,36 @@ def generate_batch(
     im_end_id = getattr(model.config, "im_end_token_id", None)
     if im_end_id is not None:
         stop_ids.add(int(im_end_id))
-    finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
-    generated: list[list[int]] = [[] for _ in range(batch_size)]
-    stop_reasons = ["max_new_tokens"] * batch_size
-    for _ in range(int(max_new_tokens)):
-        input_ids = torch.cat(
-            [
-                input_ids,
-                torch.full(
-                    (batch_size, 1),
-                    int(model.config.mask_token_id),
-                    dtype=torch.long,
-                    device=device,
-                ),
-            ],
-            dim=1,
-        )
-        token_types = torch.cat(
-            [token_types, torch.zeros(batch_size, 1, dtype=torch.uint8, device=device)],
-            dim=1,
-        )
-        next_sigma = sigma.amax(dim=1, keepdim=True) + 1.0
-        sigma = torch.cat([sigma, next_sigma], dim=1)
-        image_latents = torch.cat(
-            [
-                image_latents,
-                torch.zeros(
-                    batch_size,
-                    1,
-                    latent_dim,
-                    dtype=image_latents.dtype,
-                    device=device,
-                ),
-            ],
-            dim=1,
-        )
-        image_latent_mask = torch.cat(
-            [
-                image_latent_mask,
-                torch.zeros(batch_size, 1, dtype=torch.bool, device=device),
-            ],
-            dim=1,
-        )
-        attention_mask = get_selfless_mask(
-            sigma=sigma,
-            seq_len=int(input_ids.shape[1]),
-            device=device,
-        )
-        hidden = model.model(
-            X0_input_ids=input_ids,
-            attention_mask=attention_mask,
-            token_types=token_types,
-            image_latents=image_latents,
-            image_latent_mask=image_latent_mask,
-            calculate_likelihood=False,
-        ).last_hidden_state[:, -1]
-        logits = model.lm_head(hidden)
-        if float(temperature) <= 1.0e-6:
-            next_tokens = logits.argmax(dim=-1)
-        else:
-            probabilities = torch.softmax(logits.float() / float(temperature), dim=-1)
-            next_tokens = torch.multinomial(probabilities, 1).squeeze(1)
-        next_tokens = torch.where(finished, torch.full_like(next_tokens, eos_id), next_tokens)
-        input_ids[:, -1] = next_tokens
-        for row, token in enumerate(next_tokens.detach().cpu().tolist()):
-            if bool(finished[row]):
-                continue
-            if int(token) in stop_ids:
-                finished[row] = True
-                stop_reasons[row] = "eos" if int(token) == eos_id else "im_end"
-            else:
-                generated[row].append(int(token))
-        if bool(finished.all()):
-            break
+    output_ids, trace = model.generate(
+        "i2t",
+        input_ids=input_ids,
+        token_types=token_types,
+        sigma=sigma,
+        image_latents=image_latents,
+        image_latent_mask=image_latent_mask,
+        max_new_tokens=int(max_new_tokens),
+        temperature=float(temperature),
+        eos_token_id=sorted(stop_ids),
+        use_cache=True,
+        return_trace=True,
+    )
+    if trace.get("backbone_kv_cache_enabled") is not True:
+        raise RuntimeError("I2T evaluation must use the model KV cache")
+
+    generated: list[list[int]] = []
+    stop_reasons: list[str] = []
+    prompt_length = int(input_ids.shape[1])
+    for suffix in output_ids[:, prompt_length:].detach().cpu().tolist():
+        tokens: list[int] = []
+        reason = "max_new_tokens"
+        for token in suffix:
+            token = int(token)
+            if token in stop_ids:
+                reason = "eos" if token == eos_id else "im_end"
+                break
+            tokens.append(token)
+        generated.append(tokens)
+        stop_reasons.append(reason)
     texts = [
         tokenizer.decode(tokens, skip_special_tokens=True).strip()
         for tokens in generated
@@ -476,7 +436,7 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--max_new_tokens must be positive")
     if not math.isfinite(float(args.temperature)) or args.temperature < 0:
         raise ValueError("--temperature must be finite and non-negative")
-    for path in (args.config, args.model_path, args.clip_model_dir, args.image_root):
+    for path in (args.config, args.clip_model_dir, args.image_root):
         if not path.exists():
             raise FileNotFoundError(path)
     clip_weight_path(args.clip_model_dir)
@@ -485,16 +445,44 @@ def validate_args(args: argparse.Namespace) -> None:
 def main() -> None:
     args = parse_args()
     validate_args(args)
+    source = model_source_from_args(args)
     rank, world_size, _, device = initialize_device(args.device)
     torch.manual_seed(int(args.seed) + rank)
     config = OmegaConf.load(args.config)
-    config.model.model_path = str(args.model_path)
-    config.training.from_scratch = False
-    config.training.use_gradient_checkpointing = False
+    config.training.runtime_hashing_enabled = False
+    configure_model_source(config, source)
+    attention_contract = str(
+        config.model.get(
+            "dual_stream_attention_contract",
+            "selfless_strict",
+        )
+    ).strip().lower()
+    if attention_contract not in {
+        "selfless_strict",
+        "xlnet_content_diagonal",
+    }:
+        raise ValueError(
+            "unsupported dual-stream attention contract: "
+            f"{attention_contract!r}"
+        )
     model_dtype = torch.bfloat16 if args.model_dtype == "bf16" else torch.float32
     model, tokenizer = load_model_tokenizer(config, model_dtype=model_dtype)
+    loaded_attention_contract = str(
+        getattr(
+            model.config,
+            "dual_stream_attention_contract",
+            "selfless_strict",
+        )
+    ).strip().lower()
+    if loaded_attention_contract != attention_contract:
+        raise ValueError(
+            "loaded model attention contract does not match evaluation config: "
+            f"model={loaded_attention_contract!r}, config={attention_contract!r}"
+        )
+    model_source_report = load_model_source_weights(model, source)
     model.eval().to(device)
     dataset, validation_indices = build_dataset(config, tokenizer)
+    params = evaluation_image_params(config)
     if args.samples > len(validation_indices):
         raise ValueError(
             f"requested {args.samples} samples from {len(validation_indices)} holdout rows"
@@ -513,20 +501,29 @@ def main() -> None:
     for start in range(0, len(local_pairs), int(args.batch_size_per_rank)):
         pairs = local_pairs[start : start + int(args.batch_size_per_rank)]
         latents = []
+        base_sigmas = []
         identities = []
         for global_index, dataset_index in pairs:
-            latent, posterior_seed = dataset._sample_posterior(dataset_index, 0)
+            sample = dataset[dataset_index]
+            latent = sample["image_latents"]
+            posterior_seed = int(sample["posterior_seed"].item())
+            sample_sigma = build_selfless_sigma(
+                sample,
+                image_tokens=int(dataset.image_tokens_per_img),
+            )
+            image_start = int(sample["image_start"].item())
+            prefix_end = image_start + int(dataset.image_tokens_per_img) + 1
+            base_sigma = sample_sigma[:prefix_end]
             img_id = int(dataset.img_ids[dataset_index].item())
             references = dataset._indexed_caption_texts(dataset_index, img_id)
-            if len(references) != 7:
+            if not references:
                 raise ValueError(
-                    f"expected original + six synthetic captions, got {len(references)}"
+                    f"expected at least one validation caption, got {len(references)}"
                 )
             relative_path = dataset.source_paths[img_id]
-            source_path = args.image_root / relative_path
-            if not source_path.is_file():
-                raise FileNotFoundError(source_path)
+            source_path = source_image_path(dataset, img_id, args.image_root)
             latents.append(latent)
+            base_sigmas.append(base_sigma)
             identities.append(
                 {
                     "global_sample_index": int(global_index),
@@ -537,6 +534,8 @@ def main() -> None:
                     "source_path": str(source_path.resolve()),
                     "synset": dataset.synsets[img_id],
                     "posterior_seed": int(posterior_seed),
+                    "image_reveal_seed": int(sample["reveal_seed"].item()),
+                    "image_sigma_order": str(sample["image_sigma_order"]),
                     "reference_caption": references[0],
                 }
             )
@@ -544,10 +543,11 @@ def main() -> None:
             model,
             tokenizer,
             torch.stack(latents),
-            text_prefix=str(config.dataset.params.caption_i2t_prefix),
+            text_prefix=str(params.caption_i2t_prefix),
             max_new_tokens=int(args.max_new_tokens),
             temperature=float(args.temperature),
             device=device,
+            base_sigma_batch=torch.stack(base_sigmas),
         )
         for identity, generated_text, token_ids, stop_reason in zip(
             identities,
@@ -604,39 +604,44 @@ def main() -> None:
             float(row["reference_clip_image_text_cosine"]) for row in rows
         ]
         class_counts = Counter(str(row["synset"]) for row in rows)
-        class_counts_payload = json.dumps(
-            dict(sorted(class_counts.items())),
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
+        model_identity = {
+            **source.report(),
+            "load_report": model_source_report,
+        }
+        clip_identity = {
+            "model": str(args.clip_model_dir.resolve()),
+        }
+        class_balance = {
+            "class_count": len(class_counts),
+            "min_samples_per_class": min(class_counts.values()),
+            "max_samples_per_class": max(class_counts.values()),
+            "counts": dict(sorted(class_counts.items())),
+        }
+        validation_params = _independent_validation_params(params)
+        split_payload = {
+            "name": str(getattr(dataset, "dataset_split", "val")),
+            "manifest": str(validation_params.manifest_jsonl),
+        }
         metrics = {
-            "schema": "selfless_imagenet1k_i2t_clip_metrics_v1",
+            "schema": "selfless_imagenet1k_i2t_clip_metrics_v2",
+            "runtime_hashing_enabled": False,
             "samples": len(rows),
-            "model": {
-                "path": str(args.model_path),
-                "config_sha256": file_sha256(args.model_path / "config.json"),
-                "weights_sha256": file_sha256(
-                    args.model_path / "model.safetensors"
-                ),
-            },
-            "split": {
-                "strategy": str(config.dataset.params.split_strategy),
-                "seed": int(config.dataset.params.split_seed),
-                "val_samples_per_class": int(
-                    config.dataset.params.val_samples_per_class
-                ),
-                "validation_overlap_train": False,
-            },
-            "class_balance": {
-                "class_count": len(class_counts),
-                "min_samples_per_class": min(class_counts.values()),
-                "max_samples_per_class": max(class_counts.values()),
-                "counts_sha256": hashlib.sha256(class_counts_payload).hexdigest(),
-            },
+            "model": model_identity,
+            "split": split_payload,
+            "class_balance": class_balance,
             "generation": {
                 "seed": int(args.seed),
                 "max_new_tokens": int(args.max_new_tokens),
                 "temperature": float(args.temperature),
+                "image_sigma_order": sorted(
+                    {str(row["image_sigma_order"]) for row in rows}
+                ),
+                "sigma_source": "validation_sample_training_contract",
+                "dual_stream_attention_contract": attention_contract,
+                "single_stream_visible_content_diagonal": (
+                    attention_contract == "xlnet_content_diagonal"
+                ),
+                "single_stream_current_query_diagonal": False,
                 "empty_caption_rate": sum(
                     not str(row["generated_caption"]).strip() for row in rows
                 )
@@ -651,11 +656,7 @@ def main() -> None:
                 / len(rows),
             },
             "clip": {
-                "model": str(args.clip_model_dir.resolve()),
-                "config_sha256": file_sha256(args.clip_model_dir / "config.json"),
-                "weights_sha256": file_sha256(
-                    clip_weight_path(args.clip_model_dir)
-                ),
+                **clip_identity,
                 "caption_clip_score": sum(generated_scores) / len(generated_scores),
                 "reference_clip_score": sum(reference_scores) / len(reference_scores),
                 "mean_delta_vs_reference": sum(

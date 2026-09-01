@@ -1,0 +1,120 @@
+schema: unified_full_evaluation_protocol_v5
+launcher: script/selfless/evaluate_unified_native_full_checkpoint_ascend16.sh
+weights: hf_final_ema
+runtime_hashing_enabled: false
+hardware:
+  accelerator: ascend_910b
+  world_size: 16
+model_source:
+  directory_name: hf_model-final-ema
+  load_policy: direct_from_pretrained
+  step_provenance: ema_export_metadata.json.source_global_step
+legacy_weights_compatibility: rank_sharded_ema
+dataset_contract:
+  image_training_split: imagenet_train
+  custom_in_domain_evaluation_split: imagenet_val
+  standard_retrieval_evaluation_splits:
+    - mscoco_karpathy_test_5k
+    - flickr30k_karpathy_test_1k
+components:
+  heldout_validation:
+    records: 50000
+    max_batches_per_rank: 0
+    tasks: [t2i, i2t]
+    metrics:
+      - loss
+      - loss_t2i
+      - loss_i2t
+      - ppl_text
+      - weighted_contribution_t2i
+      - weighted_contribution_i2t
+    qualitative_outputs: [generated_images, generated_captions]
+  qualitative_image_understanding:
+    status: diagnostic_not_paper_metric
+    task: imagenet_val_i2t_captioning
+    source: heldout_validation
+    outputs: [generated_captions]
+  pretraining_native_understanding:
+    protocol: configs/protocols/pretraining_native_understanding_evaluation_ascend16.yaml
+    launcher: script/selfless/evaluate_pretraining_native_understanding_ascend16.sh
+    downstream_finetuning: false
+    tasks:
+      - imagenet_val_retrieval_1k_i2t_t2i_recall_at_1_5_10
+      - imagenet_val_retrieval_5k_i2t_t2i_recall_at_1_5_10
+      - mscoco_karpathy_test_5k_i2t_t2i_recall_at_1_5_10
+      - flickr30k_karpathy_test_1k_i2t_t2i_recall_at_1_5_10
+      - sugarcrepe
+      - aro_vg_relation
+      - aro_vg_attribution
+    domains:
+      custom_in_domain: imagenet_val
+      standard_retrieval: [mscoco_karpathy_test_5k, flickr30k_karpathy_test_1k]
+      compositional: [sugarcrepe, aro_vg_relation, aro_vg_attribution]
+      internal_ablation_only: [mmbench_dev_en, seed_bench_image]
+    removed_from_protocol:
+      - imagenet_classification_top1_top5
+      - imagenet_real_top1_top5
+      - pope_coco
+      - coco_caption_ppl
+      - winoground
+      - svo_probes
+      - whatsup_controlled
+      - imagenet_caption_random_negative
+      - imagenet_caption_same_class_negative
+      - imagenet_caption_near_class_negative
+      - visual_calibration
+  image_generation:
+    task: imagenet_val_t2i
+    samples: 50000
+    real_reference: imagenet_val_50000
+    sampling_steps: 10
+    cfg: 3.5
+    cfg_schedule: constant
+    flow_solver: heun
+    strategy: spatial_halton
+    canonical_pairing: true
+    inception_score_splits: 10
+    inception_score_split_assignment: stratified_by_synset
+    metrics: [fid, inception_score]
+  pure_text:
+    protocol: selfless_text_benchmark_v1
+    # MMLU 5-shot reaches 3,097 tokenizer tokens.  Evaluation uses 4,096 so
+    # no benchmark prompt is truncated; this does not change the 2,048-token
+    # ClimbMix training contract.
+    max_sequence_length: 4096
+    loglikelihood_batch_size_per_rank: 8
+    tasks:
+      - name: arc_easy
+        split: validation
+        fewshot: 0
+        primary_metric: accuracy_normalized
+      - name: arc_challenge
+        split: validation
+        fewshot: 0
+        primary_metric: accuracy_normalized
+      - name: hellaswag
+        split: validation
+        fewshot: 0
+        primary_metric: accuracy_normalized
+      - name: piqa
+        split: validation
+        fewshot: 0
+        primary_metric: accuracy_normalized
+      - name: winogrande
+        split: validation
+        fewshot: 0
+        primary_metric: accuracy
+      - name: boolq
+        split: validation
+        fewshot: 0
+        primary_metric: accuracy
+      - name: openbookqa
+        split: validation
+        fewshot: 0
+        primary_metric: accuracy_normalized
+      - name: mmlu
+        split: test
+        fewshot: 5
+        primary_metric: accuracy
+    contamination_check: disabled
+    contamination_check_reason: runtime hashing is disabled by experiment contract

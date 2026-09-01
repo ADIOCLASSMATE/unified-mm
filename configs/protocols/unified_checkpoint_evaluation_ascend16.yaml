@@ -1,0 +1,46 @@
+schema: unified_checkpoint_evaluation_protocol_v3
+weights: hf_final_ema
+runtime_hashing_enabled: false
+hardware:
+  accelerator: ascend_910b
+  world_size: 16
+model_source:
+  directory_name: hf_model-final-ema
+  load_policy: direct_from_pretrained
+  step_provenance: ema_export_metadata.json.source_global_step
+legacy_weights_compatibility: rank_sharded_ema
+dataset:
+  training_split: imagenet_train
+  evaluation_split: imagenet_val
+  validation_records: 50000
+components:
+  heldout_validation:
+    tasks: [t2i, i2t]
+    metrics:
+      - loss
+      - loss_t2i
+      - loss_i2t
+      - ppl_text
+      - weighted_contribution_t2i
+      - weighted_contribution_i2t
+    qualitative_outputs: [generated_images, generated_captions]
+  t2i_fid_is:
+    formal_samples: 50000
+    real_reference: imagenet_val_50000
+    sampling_steps: 10
+    cfg: 3.5
+    cfg_schedule: constant
+    flow_solver: heun
+    strategy: spatial_halton
+    canonical_pairing: true
+profiles:
+  smoke:
+    heldout_validation_max_batches_per_rank: 2
+    i2t_max_new_tokens: 32
+    t2i_samples: 32
+    official_fid: false
+  formal:
+    heldout_validation_max_batches_per_rank: 0
+    i2t_max_new_tokens: 96
+    t2i_samples: 50000
+    official_fid: true

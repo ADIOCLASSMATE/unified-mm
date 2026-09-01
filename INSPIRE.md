@@ -2,8 +2,9 @@
 
 ## Shared paths
 
-- Repository: `/inspire/sj-ssd3/project/high-dimensionaldata/wanjiaxin-253108030048/code/unified-mm`
-- Shared user root: `/inspire/sj-ssd3/project/high-dimensionaldata/wanjiaxin-253108030048`
+- Repository: `/inspire/sj-ssd3/global_user/wanjiaxin-253108030048/code/unified-mm`
+- Shared user root: `/inspire/sj-ssd3/global_user/wanjiaxin-253108030048`
+- Repository `public` link target: `/inspire/sj-ssd3/global_user/wanjiaxin-253108030048`
 - Full ImageNet latent cache: `public/datasets/imagenet_full`
 - ImageNet-100 distilled captions: `public/datasets/imagenet_distilled_captions/imagenet100`
 - ImageNet-1K synthetic caption/T2I dataset:
@@ -61,10 +62,35 @@ not implicitly mount the official dataset.
   contract below.
 - Project: `多模态大模型新架构评测探索与scaling-law`
   (`high-dimensionaldata`).
+- Project override for the unified ClimbMix + ImageNet work: every 1B LR-sweep
+  Job and every formal 100B a/b/c ablation Job must use
+  `随机序语言建模-统一自回归与掩码扩散的随机顺序生成框架`. Never submit those
+  Jobs to `high-dimensionaldata`.
+- Unified training sets `training.runtime_hashing_enabled: false`. Its data
+  loading, checkpoint/resume checks, EMA layout checks, sweep selection, and
+  formal continuation must use readable fields and must not calculate hashes.
+  Unified launchers also set `WANDB_MODE=disabled`; metrics are retained in
+  local logs and readable JSON instead of initializing a third-party tracker.
+- The frozen 1B grid is
+  `configs/protocols/unified_baseline_lr_sweep_1b_ascend64.yaml`; launch one
+  arm with
+  `script/selfless/pretraining_unified_baseline_lr_sweep_arm_ascend64.sh` and
+  select only after all nine complete with
+  `scripts/select_unified_lr_sweep.py`.
+- The formal a/b/c contract is
+  `configs/protocols/unified_ablation_100b_ascend64.yaml`; launch each selected
+  condition with
+  `script/selfless/pretraining_unified_ablation_100b_ascend64.sh`. The 0.6B
+  historical winner is frozen at backbone/special-token LR `3.0e-4` and
+  flow/projector LR `5.0e-5`; every formal arm starts from Qwen3-0.6B-Base at
+  optimizer step zero and never resumes a sweep checkpoint. Ablation b must
+  differ from a only by the XLNet-style content-stream diagonal.
 - Dedicated Workspace: `昇腾卡公共空间`; use it only for Ascend workloads.
 - Compute Group: `910B资源` (`ASCEND 910B (64GB)`).
-- Ascend training allocation ceiling: 256 concurrent GPUs. This is a total
-  project limit, not the per-instance `gpu,cpu,mem` quota triple.
+- The `high-dimensionaldata` Ascend training allocation ceiling is 256
+  concurrent GPUs. This is a total project limit, not the per-instance
+  `gpu,cpu,mem` quota triple; do not assume the same ceiling for the unified
+  project override without a Live platform check.
 - Preferred full-node Job row: `16,128,1024`; use `16,64,1024` only after a
   Live quota check shows it is the better valid row. At 16 GPUs per instance,
   256 GPUs corresponds to at most 16 instances.
@@ -80,6 +106,69 @@ not implicitly mount the official dataset.
   (platform image name `dev-wjx-ascend:v-1.3`).
 - Before every submission, check Live Job quota, image status, active project
   Jobs, availability, and whole-node capacity; always dry-run first.
+
+### Unified 0.6B ImageNet-native full evaluation
+
+- The reusable 16-NPU protocol is
+  `configs/protocols/unified_full_evaluation_ascend16.yaml`. Text benchmark
+  assets live at `public/benchmarks/selfless_text_v1`; its readable manifest
+  records source URLs, file sizes, and row counts only. Runtime hashing and
+  contamination/decontamination hashing remain disabled.
+- The canonical complete-suite entry is
+  `script/selfless/evaluate_unified_native_full_checkpoint_ascend16.sh`. It
+  combines official ImageNet-val 50K T2I FID/IS, the eight-task text suite,
+  class-balanced ImageNet-val 1K/5K custom retrieval, MSCOCO Karpathy 5K test
+  retrieval, Flickr30K Karpathy test retrieval, SugarCrepe, and ARO. MMBench
+  and SEED are internal ablation-trend diagnostics only. ImageNet
+  classification/ReaL and the old I2T-CLIP score are not part of the paper
+  protocol. The text-only entry is
+  `script/selfless/evaluate_selfless_text_ascend16.sh`.
+- The canonical final-evaluation input for ablation a is
+  `output/unified-a-0p6b-100b-imagenet-split-s42-r1/hf_model-final-ema`.
+  It is loaded directly as the Hugging Face model, without a sharded EMA
+  overlay; `ema_export_metadata.json` records source step 95415. Rank-sharded
+  checkpoint directories remain legacy inputs only for historical trends.
+- The reusable T2I-only entry is
+  `script/selfless/evaluate_unified_t2i_fid_is_ascend16.sh`. Official IS uses
+  ten deterministic `stratified_by_synset` splits. Each split must contain
+  all 1,000 ImageNet classes with exactly five samples per class; the official
+  gate also requires the source dataset itself to declare `split=val`.
+- Text scoring follows this model's same-position Selfless query-stream
+  likelihood contract rather than a stock next-token lm-eval adapter. MMLU is
+  5-shot; the evaluation-only maximum context is 4096 and does not change the
+  2048-token training contract.
+- Historical checkpoint evaluation output is under
+  `output/evaluation/unified-a-0p6b/checkpoints/step-{56000,58000,60000}`;
+  the compact trend is `output/evaluation/unified-a-0p6b/trend/trend.md`.
+  Per-sample benchmark/text results and qualitative image/caption artifacts are
+  retained, while rank shards, resume state, duplicate logs, smoke output, and
+  results from removed protocols are excluded.
+- The historical checkpoint-protocol evaluation is complete for its latest
+  retained checkpoint, step 60000. Step 56000/58000 remain compact historical trend
+  rows and do not repeat standard cross-dataset retrieval. The canonical
+  archive manifest reports `paper_protocol_complete=true` with no pending
+  tasks.
+- Flickr30K Karpathy 1K test was evaluated by one 16-NPU Job. MSCOCO
+  Karpathy 5K test was evaluated by two independent 16-NPU query partitions;
+  every partition scored against all 25,010 captions, and
+  `script/selfless/finalize_unified_step60000_evaluation.sh` strictly merged
+  the duplicate-free 5,000-row result and produced the native/full summaries.
+- The complete no-hash multimodal-likelihood posterior cache for the current
+  readable asset manifest is
+  `public/benchmarks/selfless_multimodal_likelihood_v1/vae_posterior_mar_kl16`
+  (64,973 images in 16 shards). The superseded 6,164-image cache was moved to
+  the shared `.Trash` and is not a valid evaluation input.
+- `output/evaluation-checkpoints` remains outside the result archive because it
+  contains 77GB of legacy checkpoint-trend inputs, not evaluation output.
+  Moving it would invalidate recorded historical paths; it is not the
+  canonical input for a new final evaluation.
+- Evaluation launchers use the repository `.venv/bin/python` explicitly;
+  do not rely on a bare `python` being present in non-interactive Ascend Job
+  images. Completed core results can be reused through
+  `REUSE_CORE_EVAL_ROOT` without repeating 50K FID generation; retained
+  external predictions can be reused through `REUSE_BENCHMARK_EVAL_ROOT`.
+  Standard retrieval results can be reused through
+  `REUSE_COCO_RETRIEVAL_ROOT` and `REUSE_FLICKR30K_RETRIEVAL_ROOT`.
 
 ### Final ImageNet-100 training hyperparameters
 
@@ -156,31 +245,30 @@ not implicitly mount the official dataset.
   result is retained below its run root at
   `generation-evaluation/heun10/t2i-fid-is/metrics.json`. The former 100-step
   comparison result remains at `generation-evaluation/t2i-fid-is/metrics.json`.
-- A controlled 50,000-sample 10-step Heun evaluation completed on 2026-08-26
-  and established 10 steps as the repository-wide default.
-  It used the exact same model exports, prompts, canonical initial-noise
-  manifest, CFG, generation strategies, and real moments as the 100-step
-  evaluation; only `sampling_steps` changed. Results are retained at
-  `generation-evaluation/heun10/t2i-fid-is/metrics.json` under each run root.
-  The paired results are:
+- Formal T2I comparisons use only independent ImageNet-val prompts, 50,000
+  generated samples, frozen original ImageNet-val moments, and ten
+  synset-stratified IS partitions. Results made with training-image prompts or
+  row-contiguous IS partitions are not part of the repository protocol.
 
-  | Variant | FID (10 / 100) | IS (10 / 100) | 10-step speedup |
-  | --- | ---: | ---: | ---: |
-  | baseline | `7.08059539 / 7.16406866` | `291.19039612 / 290.10296936` | `3.745x` |
-  | position-wise | `6.32034850 / 6.35782419` | `277.25525208 / 277.88425598` | `1.351x` |
-  | sequential sigma | `6.53787385 / 6.89504184` | `200.10390015 / 190.78056335` | `3.788x` |
+### ImageNet-1K T2I-only 400-epoch training
 
-  Ten steps caused no material quality regression, preserved both the FID and
-  IS architecture rankings, improved FID for all three variants, and improved
-  IS for baseline and sequential sigma. Launchers default to 10 steps and
-  accept `SAMPLING_STEPS` only as an explicit experimental override; use a
-  distinct `EVAL_SUBDIR` for any override to preserve paired results. The
-  10-step metrics SHA256 values are baseline
-  `1c49039290f78b78dcb75800bd0afef987d2df9f58c188f3486f455b07bf7c10`,
-  position-wise
-  `0ff65645f096d743925239651cc482362b21d8737a96f43f36e68235bca7b1be`,
-  and sequential sigma
-  `7d5c7c143c2edd79b301401e37a487033c5263a5183004ec4cd1fd56521fb362`.
+- The 400-epoch experiments are independent full training runs initialized
+  from the same three matching 800-epoch class-conditioned EMA exports as the
+  80-epoch experiments. They do not resume the already-decayed 80-epoch
+  optimizer/scheduler state and never overwrite the retained 80-epoch runs.
+- Their configs are the matching
+  `configs/selfless/imagenet1k_t2i_{baseline,positionwise_head,seq_sigma}_400ep_ascend_64npu_bs1024.yaml`
+  files; their launchers are the matching
+  `script/selfless/pretraining_imagenet1k_t2i_{baseline,positionwise_head,seq_sigma}_ascend_64npu_bs1024_400ep.sh`
+  files.
+- The shared contract remains 64 Ascend NPUs (`4 x 16`), per-rank batch 16,
+  GA 1, global batch 1024, learning rate `2e-5`, T2I-only image flow, and the
+  deterministic twelve-prompt rotation. Each run uses 1,202 optimizer steps
+  per epoch and 480,800 total steps. WSD is extended proportionally to 40
+  warmup + 240 stable + 120 decay epochs.
+- Canonical output roots are the matching
+  `output/selfless-flow-imagenet1k-t2i-{baseline,positionwise-head,seq-sigma}-ascend64-b1024-400ep`
+  directories.
 
 ### Formal ImageNet-1K 800-epoch pretraining
 

@@ -177,8 +177,7 @@ class InceptionScoreMoments:
     def update(
         self,
         logits,
-        global_indices: Sequence[int],
-        total_samples: int,
+        split_ids: Sequence[int],
     ) -> None:
         import torch
 
@@ -186,16 +185,26 @@ class InceptionScoreMoments:
             device=self.probability_sum.device,
             dtype=self.probability_sum.dtype,
         ).softmax(dim=-1)
-        indices = torch.as_tensor(
-            global_indices,
-            device=logits.device,
+        split_ids = torch.as_tensor(
+            split_ids,
+            device=self.probability_sum.device,
             dtype=torch.long,
         )
-        split_ids = torch.div(
-            indices * int(self.count.numel()),
-            int(total_samples),
-            rounding_mode="floor",
-        ).clamp_max(self.count.numel() - 1)
+        if int(split_ids.numel()) != int(probabilities.shape[0]):
+            raise ValueError(
+                "Inception Score split ids must match the logits batch: "
+                f"{int(split_ids.numel())} != {int(probabilities.shape[0])}"
+            )
+        if split_ids.numel() and (
+            int(split_ids.min().item()) < 0
+            or int(split_ids.max().item()) >= int(self.count.numel())
+        ):
+            raise ValueError(
+                "Inception Score split ids must be in "
+                f"[0, {int(self.count.numel())}), got "
+                f"min={int(split_ids.min().item())}, "
+                f"max={int(split_ids.max().item())}"
+            )
         p_log_p = (
             probabilities
             * probabilities.clamp_min(

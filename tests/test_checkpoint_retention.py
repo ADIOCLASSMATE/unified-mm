@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 import torch
 from omegaconf import OmegaConf
+from safetensors.torch import save_file
 
 import pretrain.train_selfless_flow as training
 from pretrain.train_selfless_flow import _image_flow_adapter_save_enabled
@@ -13,6 +14,21 @@ from utils.utils import rotate_checkpoints_for_save
 def _mkdirs(root: Path, *names: str) -> None:
     for name in names:
         (root / name).mkdir()
+
+
+def _write_test_safetensors(path: Path, state_dict: dict[str, torch.Tensor]) -> int:
+    """Write one representative tensor for each tied-storage group."""
+
+    stored = {}
+    seen_ids = set()
+    for name, tensor in state_dict.items():
+        identity = id(tensor)
+        if identity in seen_ids:
+            continue
+        seen_ids.add(identity)
+        stored[name] = tensor
+    save_file(stored, str(path))
+    return len(stored)
 
 
 def test_rotation_excludes_destination_created_early_by_non_main_rank(tmp_path: Path):
@@ -53,6 +69,47 @@ def test_rotation_keeps_space_for_destination_not_created_yet(tmp_path: Path):
         "checkpoint-30",
         "checkpoint-40",
     ]
+
+
+def test_four_rolling_saves_leave_exactly_the_latest_three(tmp_path: Path):
+    for step in (10, 20, 30, 40):
+        name = f"checkpoint-{step}"
+        rotate_checkpoints_for_save(
+            tmp_path,
+            3,
+            current_checkpoint_name=name,
+            milestone_every_steps=0,
+        )
+        checkpoint = tmp_path / name
+        checkpoint.mkdir()
+        (checkpoint / "checkpoint_complete.json").write_text("{}")
+
+    assert sorted(path.name for path in tmp_path.glob("checkpoint-*")) == [
+        "checkpoint-20",
+        "checkpoint-30",
+        "checkpoint-40",
+    ]
+
+
+def test_begin_checkpoint_write_removes_stale_partial_destination(tmp_path: Path):
+    checkpoint = tmp_path / "checkpoint-20"
+    checkpoint.mkdir()
+    (checkpoint / "stale-rank-state.pt").write_bytes(b"partial")
+    (checkpoint / "checkpoint_complete.json").write_text("stale")
+
+    class Accelerator:
+        is_main_process = True
+
+        @staticmethod
+        def wait_for_everyone():
+            return None
+
+    training._begin_checkpoint_write(
+        checkpoint,
+        accelerator=Accelerator(),
+    )
+
+    assert not checkpoint.exists()
 
 
 def test_rotation_rejects_nonpositive_limit(tmp_path: Path):
@@ -159,9 +216,6 @@ def test_intermediate_adapter_can_be_disabled_while_final_remains_enabled():
                 "save_image_flow_adapter": False,
                 "save_final_image_flow_adapter": True,
             },
-            "training": {
-                "save_image_flow_adapter": True,
-            }
         }
     )
 
@@ -183,7 +237,7 @@ def test_periodic_ema_eval_export_is_complete_bf16_and_self_describing(
     manifest = {
         "runtime": {"global_step": 20},
         "world_size": 4,
-        "layout_fingerprint": "layout-sha256",
+        "layout_validation": "readable_field_equality",
     }
     ema_dir = tmp_path / "checkpoint-20"
     ema_dir.mkdir()
@@ -204,7 +258,7 @@ def test_periodic_ema_eval_export_is_complete_bf16_and_self_describing(
             assert state_dict["model.embed_tokens.weight"].dtype == torch.bfloat16
             assert state_dict["model.embed_tokens.weight"] is state_dict["lm_head.weight"]
             assert state_dict["position_ids"].dtype == torch.int64
-            (path / "model.safetensors").write_bytes(b"complete-model")
+            _write_test_safetensors(path / "model.safetensors", state_dict)
             (path / "config.json").write_text(
                 json.dumps({"dtype": "float32", "torch_dtype": "float32"})
             )
@@ -254,10 +308,434 @@ def test_periodic_ema_eval_export_is_complete_bf16_and_self_describing(
         "export_kind": "evaluation",
         "floating_dtype": "bfloat16",
         "source_ema_directory": str(ema_dir),
+        "source_ema_directory_retained": True,
         "source_global_step": 20,
         "source_world_size": 4,
-        "layout_fingerprint": "layout-sha256",
+        "layout_validation": "readable_field_equality",
         "state_key_count": len(full_state),
+        "stored_weight_key_count": 3,
     }
     assert hf_config["dtype"] == "bfloat16"
     assert hf_config["torch_dtype"] == "bfloat16"
+
+
+def test_periodic_current_model_export_is_complete_atomic_and_idempotent(
+    tmp_path: Path,
+):
+    global_step = 12_510
+    save_calls = []
+    full_state = {
+        "weight": torch.randn(2, 3, dtype=torch.float32),
+        "position_ids": torch.arange(3, dtype=torch.int64),
+    }
+
+    class FakeModel:
+        def save_pretrained(
+            self,
+            path,
+            *,
+            save_function,
+            state_dict,
+            safe_serialization,
+        ):
+            del save_function
+            save_calls.append(Path(path))
+            path.mkdir(parents=True)
+            assert safe_serialization
+            assert state_dict["weight"].dtype == torch.bfloat16
+            assert state_dict["position_ids"].dtype == torch.int64
+            _write_test_safetensors(path / "model.safetensors", state_dict)
+            (path / "config.json").write_text(
+                json.dumps({"dtype": "float32", "torch_dtype": "float32"})
+            )
+
+    class FakeTokenizer:
+        @staticmethod
+        def save_pretrained(path):
+            (path / "tokenizer.json").write_text("{}")
+
+    class FakeAccelerator:
+        is_main_process = True
+
+        @staticmethod
+        def get_state_dict(model):
+            del model
+            return dict(full_state)
+
+        @staticmethod
+        def unwrap_model(model):
+            return model
+
+        @staticmethod
+        def save(*args, **kwargs):
+            del args, kwargs
+
+        @staticmethod
+        def wait_for_everyone():
+            return None
+
+    config = OmegaConf.create(
+        {
+            "experiment": {
+                "output_dir": str(tmp_path),
+                "ema_eval_dtype": "bf16",
+            },
+            "training": {},
+        }
+    )
+    args = (
+        FakeModel(),
+        FakeTokenizer(),
+        config,
+        FakeAccelerator(),
+        global_step,
+    )
+    training._save_model_hf_for_evaluation(*args)
+
+    export = tmp_path / f"hf_model-{global_step}-eval"
+    assert save_calls == [tmp_path / f".{export.name}.partial"]
+    assert not (tmp_path / f".{export.name}.partial").exists()
+    assert (export / "model.safetensors").is_file()
+    assert (export / "config.json").is_file()
+    assert (export / "tokenizer.json").is_file()
+    metadata = json.loads(
+        (export / "model_export_metadata.json").read_text()
+    )
+    assert metadata == {
+        "schema": "selfless_model_hf_export_v1",
+        "export_kind": "evaluation",
+        "floating_dtype": "bfloat16",
+        "source_global_step": global_step,
+        "state_key_count": len(full_state),
+        "stored_weight_key_count": len(full_state),
+    }
+    hf_config = json.loads((export / "config.json").read_text())
+    assert hf_config["dtype"] == "bfloat16"
+    assert hf_config["torch_dtype"] == "bfloat16"
+
+    # Reaching the same step again after resuming an older rolling checkpoint
+    # keeps the already-complete artifact instead of overwriting it.
+    training._save_model_hf_for_evaluation(*args)
+    assert len(save_calls) == 1
+
+
+def test_periodic_ema_eval_export_uses_ephemeral_state_off_checkpoint_cadence(
+    tmp_path: Path,
+    monkeypatch,
+):
+    global_step = 12_510
+    source_checkpoint = tmp_path / f"checkpoint-{global_step}"
+    staged_directories = []
+
+    class FakeEMA:
+        started = True
+
+        def __init__(self):
+            self.global_step = global_step
+
+        def save_checkpoint(self, directory, accelerator, *, global_step):
+            directory = Path(directory)
+            staged_directories.append(directory)
+            directory.mkdir(parents=True)
+            (directory / "ema_manifest.json").write_text("{}")
+            accelerator.wait_for_everyone()
+            return directory / "ema_manifest.json"
+
+    monkeypatch.setattr(
+        training,
+        "merge_sharded_ema_state_dict",
+        lambda path: {"weight": torch.ones(2, dtype=torch.float32)},
+    )
+    monkeypatch.setattr(
+        training,
+        "load_ema_manifest",
+        lambda path: {
+            "runtime": {"global_step": global_step},
+            "world_size": 64,
+            "layout_validation": "readable_field_equality",
+        },
+    )
+    monkeypatch.setattr(training.logger, "info", lambda *args, **kwargs: None)
+
+    class FakeModel:
+        def save_pretrained(self, path, *, state_dict, safe_serialization):
+            path.mkdir(parents=True)
+            assert safe_serialization
+            assert state_dict["weight"].dtype == torch.bfloat16
+            _write_test_safetensors(path / "model.safetensors", state_dict)
+            (path / "config.json").write_text(
+                json.dumps({"dtype": "float32", "torch_dtype": "float32"})
+            )
+
+    class FakeTokenizer:
+        @staticmethod
+        def save_pretrained(path):
+            (path / "tokenizer.json").write_text("{}")
+
+    class FakeAccelerator:
+        is_main_process = True
+
+        @staticmethod
+        def unwrap_model(model):
+            return model
+
+        @staticmethod
+        def wait_for_everyone():
+            return None
+
+    config = OmegaConf.create(
+        {
+            "experiment": {"output_dir": str(tmp_path)},
+            "training": {"ema_save_hf_model": True},
+        }
+    )
+    training._save_ema_hf_model(
+        FakeEMA(),
+        FakeModel(),
+        FakeTokenizer(),
+        config,
+        FakeAccelerator(),
+        global_step,
+        source_checkpoint,
+        floating_dtype=torch.bfloat16,
+        save_name=f"hf_model-{global_step}-ema-eval",
+        export_kind="evaluation",
+    )
+
+    export = tmp_path / f"hf_model-{global_step}-ema-eval"
+    assert [path.name for path in staged_directories] == [
+        f".hf_model-{global_step}-ema-eval.ema-state.partial"
+    ]
+    assert not source_checkpoint.exists()
+    assert not staged_directories[0].exists()
+    assert not (tmp_path / f".{export.name}.partial").exists()
+    assert (export / "model.safetensors").is_file()
+    assert (export / "config.json").is_file()
+    assert (export / "tokenizer.json").is_file()
+    assert (export / "ema_export_metadata.json").is_file()
+    metadata = json.loads((export / "ema_export_metadata.json").read_text())
+    assert metadata["source_ema_directory_retained"] is False
+
+    training._save_ema_hf_model(
+        FakeEMA(),
+        FakeModel(),
+        FakeTokenizer(),
+        config,
+        FakeAccelerator(),
+        global_step,
+        source_checkpoint,
+        floating_dtype=torch.bfloat16,
+        save_name=f"hf_model-{global_step}-ema-eval",
+        export_kind="evaluation",
+    )
+    assert len(staged_directories) == 1
+
+    _mkdirs(tmp_path, "checkpoint-8000", "checkpoint-10000", "checkpoint-12000")
+    rotate_checkpoints_for_save(
+        tmp_path,
+        3,
+        current_checkpoint_name="checkpoint-14000",
+    )
+    (tmp_path / "checkpoint-14000").mkdir()
+    assert sorted(path.name for path in tmp_path.glob("checkpoint-*")) == [
+        "checkpoint-10000",
+        "checkpoint-12000",
+        "checkpoint-14000",
+    ]
+
+
+def test_current_model_export_broadcasts_rank0_failure_and_cleans_partial(
+    tmp_path: Path,
+    monkeypatch,
+):
+    broadcasts = []
+
+    def record_broadcast(objects, *, from_process):
+        assert from_process == 0
+        broadcasts.append(dict(objects[0]))
+        return objects
+
+    monkeypatch.setattr(training, "broadcast_object_list", record_broadcast)
+
+    class FakeModel:
+        @staticmethod
+        def save_pretrained(path, **kwargs):
+            del kwargs
+            path.mkdir(parents=True)
+            (path / "partial").write_text("partial")
+            raise OSError("injected write failure")
+
+    class FakeAccelerator:
+        is_main_process = True
+        num_processes = 64
+
+        @staticmethod
+        def get_state_dict(model):
+            del model
+            return {"weight": torch.ones(1)}
+
+        @staticmethod
+        def unwrap_model(model):
+            return model
+
+        @staticmethod
+        def save(*args, **kwargs):
+            del args, kwargs
+
+    config = OmegaConf.create(
+        {
+            "experiment": {
+                "output_dir": str(tmp_path),
+                "ema_eval_dtype": "bf16",
+            },
+            "training": {},
+        }
+    )
+    with pytest.raises(RuntimeError, match="injected write failure"):
+        training._save_model_hf_for_evaluation(
+            FakeModel(),
+            object(),
+            config,
+            FakeAccelerator(),
+            12_510,
+        )
+
+    assert broadcasts[-1]["ok"] is False
+    assert not (tmp_path / ".hf_model-12510-eval.partial").exists()
+    assert not (tmp_path / "hf_model-12510-eval").exists()
+
+
+def test_non_main_rank_never_materializes_the_complete_current_model(
+    tmp_path: Path,
+    monkeypatch,
+):
+    outcomes = iter(
+        [
+            {"ok": True, "result": "write"},
+            {"ok": True, "result": "saved"},
+        ]
+    )
+
+    def receive_rank0_outcome(objects, *, from_process):
+        assert from_process == 0
+        assert objects == [None]
+        objects[0] = next(outcomes)
+        return objects
+
+    monkeypatch.setattr(
+        training,
+        "broadcast_object_list",
+        receive_rank0_outcome,
+    )
+
+    class NonMainAccelerator:
+        is_main_process = False
+        num_processes = 64
+
+        @staticmethod
+        def get_state_dict(model):
+            del model
+            raise AssertionError("non-main rank must not gather the full model")
+
+    config = OmegaConf.create(
+        {
+            "experiment": {
+                "output_dir": str(tmp_path),
+                "ema_eval_dtype": "bf16",
+            },
+            "training": {},
+        }
+    )
+    training._save_model_hf_for_evaluation(
+        object(),
+        object(),
+        config,
+        NonMainAccelerator(),
+        12_510,
+    )
+
+
+def test_evaluation_pair_manifest_commits_only_two_valid_exports(tmp_path: Path):
+    global_step = 12_510
+    dtype_name = "bfloat16"
+    exports = (
+        (
+            tmp_path / f"hf_model-{global_step}-eval",
+            "model_export_metadata.json",
+            "selfless_model_hf_export_v1",
+        ),
+        (
+            tmp_path / f"hf_model-{global_step}-ema-eval",
+            "ema_export_metadata.json",
+            "selfless_ema_hf_export_v1",
+        ),
+    )
+    for directory, metadata_name, schema in exports:
+        directory.mkdir()
+        _write_test_safetensors(
+            directory / "model.safetensors",
+            {"weight": torch.ones(2, dtype=torch.bfloat16)},
+        )
+        (directory / "config.json").write_text(
+            json.dumps({"dtype": dtype_name, "torch_dtype": dtype_name})
+        )
+        (directory / "tokenizer.json").write_text("{}")
+        (directory / metadata_name).write_text(
+            json.dumps(
+                {
+                    "schema": schema,
+                    "export_kind": "evaluation",
+                    "floating_dtype": dtype_name,
+                    "source_global_step": global_step,
+                    "state_key_count": 1,
+                    "stored_weight_key_count": 1,
+                }
+            )
+        )
+
+    class FakeAccelerator:
+        is_main_process = True
+
+    config = OmegaConf.create(
+        {
+            "experiment": {
+                "output_dir": str(tmp_path),
+                "ema_eval_dtype": "bf16",
+            },
+            "training": {},
+        }
+    )
+    training._publish_evaluation_model_pair_manifest(
+        config,
+        FakeAccelerator(),
+        global_step,
+    )
+
+    manifest_path = tmp_path / f"hf_model-{global_step}-eval-pair.json"
+    assert json.loads(manifest_path.read_text()) == {
+        "schema": "selfless_evaluation_model_pair_v1",
+        "complete": True,
+        "global_step": global_step,
+        "floating_dtype": dtype_name,
+        "current_model_directory": f"hf_model-{global_step}-eval",
+        "ema_model_directory": f"hf_model-{global_step}-ema-eval",
+    }
+    assert not (tmp_path / f".{manifest_path.name}.partial").exists()
+
+    # A resume that reaches the same step keeps the exact committed pair.
+    original = manifest_path.read_bytes()
+    training._publish_evaluation_model_pair_manifest(
+        config,
+        FakeAccelerator(),
+        global_step,
+    )
+    assert manifest_path.read_bytes() == original
+
+    # A non-empty but corrupt weight file can never be accepted as complete.
+    (exports[0][0] / "model.safetensors").write_bytes(b"truncated")
+    with pytest.raises(RuntimeError, match="Invalid safetensors export"):
+        training._publish_evaluation_model_pair_manifest(
+            config,
+            FakeAccelerator(),
+            global_step,
+        )

@@ -2,61 +2,34 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import math
 import time
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 import torch
 from omegaconf import OmegaConf
 
-RESUME_SIGNATURE_VERSION = 3
-LEGACY_RESUME_SCHEMA = "selfless_caption_training_checkpoint_v2"
+RESUME_CONTRACT_VERSION = 1
 RESUME_SCHEMA = "selfless_caption_training_checkpoint_v3"
 SAMPLER_RESUME_SCHEMA = "selfless_caption_sampler_resume_v1"
 
-_LEGACY_TRAINING_KEYS = (
-    "batch_size",
-    "total_batch_size",
-    "mixed_precision",
-    "gradient_accumulation_dtype",
-    "seed",
-    "dataloader_shuffle_seed",
-    "use_ema",
-    "ema_decay",
-    "ema_update_after_step",
-    "ema_shard_chunk_numel",
-    "trainable_scope",
-)
 
-
-def _stable_hash(payload: dict[str, Any]) -> str:
-    encoded = json.dumps(
-        payload,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def build_resume_signature(
+def build_resume_contract(
     config,
     *,
     world_size: int,
     gradient_accumulation_steps: int,
-) -> str:
-    """Hash every configuration field that can affect training continuation."""
+) -> dict[str, Any]:
+    """Return every configuration field that affects exact continuation."""
 
     training = OmegaConf.to_container(config.training, resolve=True)
     # ``stop_after_steps`` is an operational stage boundary, not a numerical
     # training control.  Excluding it lets a checkpoint continue from Stage 1
     # to Stage 2 while every optimizer/scheduler/data/EMA control stays strict.
     training.pop("stop_after_steps", None)
-    payload = {
-        "signature_version": RESUME_SIGNATURE_VERSION,
+    return {
+        "contract_version": RESUME_CONTRACT_VERSION,
         "model": OmegaConf.to_container(config.model, resolve=True),
         "dataset": OmegaConf.to_container(config.dataset, resolve=True),
         "optimizer": OmegaConf.to_container(config.optimizer, resolve=True),
@@ -64,101 +37,37 @@ def build_resume_signature(
             config.lr_scheduler,
             resolve=True,
         ),
-        # Hash the complete training section so future numerical controls are
-        # strict by default instead of requiring an allow-list update.
+        # Preserve the complete training section so future numerical controls
+        # remain strict without requiring an allow-list update.
         "training": training,
         "world_size": int(world_size),
         "gradient_accumulation_steps": int(gradient_accumulation_steps),
     }
-    return _stable_hash(payload)
 
 
-def build_legacy_resume_signature(
-    config,
-    *,
-    world_size: int,
-    gradient_accumulation_steps: int,
-) -> str:
-    """Reproduce the v2 signature for strict migration of old checkpoints."""
-
-    training = OmegaConf.to_container(config.training, resolve=True)
-    payload = {
-        "model": OmegaConf.to_container(config.model, resolve=True),
-        "dataset": OmegaConf.to_container(config.dataset, resolve=True),
-        "optimizer": OmegaConf.to_container(config.optimizer, resolve=True),
-        "lr_scheduler": OmegaConf.to_container(
-            config.lr_scheduler,
-            resolve=True,
-        ),
-        "training": {
-            key: training.get(key) for key in _LEGACY_TRAINING_KEYS
-        },
-        "world_size": int(world_size),
-        "gradient_accumulation_steps": int(gradient_accumulation_steps),
-    }
-    return _stable_hash(payload)
-
-
-def validate_resume_metadata(
+def validate_resume_contract(
     metadata: dict[str, Any],
     *,
-    checkpoint_dir: Path,
-    config,
-    world_size: int,
-    gradient_accumulation_steps: int,
-    current_signature: str,
+    current_contract: dict[str, Any],
 ) -> None:
-    """Validate v3 checkpoints and safely migrate strict v2 checkpoints."""
+    """Validate an unhashed, human-readable continuation contract."""
 
-    schema = metadata.get("schema")
-    if schema == RESUME_SCHEMA:
-        if int(metadata.get("config_signature_version", -1)) != (
-            RESUME_SIGNATURE_VERSION
-        ):
-            raise RuntimeError(
-                "Unsupported resume config signature version: "
-                f"{metadata.get('config_signature_version')!r}"
-            )
-        if metadata.get("config_signature") != current_signature:
-            raise RuntimeError(
-                "Resume config signature differs from the checkpoint; "
-                "refusing an inexact continuation."
-            )
-        return
-
-    if schema != LEGACY_RESUME_SCHEMA:
+    if metadata.get("schema") != RESUME_SCHEMA:
         raise RuntimeError(
-            f"Unsupported training checkpoint metadata schema: {schema!r}"
+            "Readable resume contracts require checkpoint schema "
+            f"{RESUME_SCHEMA!r}, got {metadata.get('schema')!r}."
         )
-
-    legacy_signature = build_legacy_resume_signature(
-        config,
-        world_size=world_size,
-        gradient_accumulation_steps=gradient_accumulation_steps,
-    )
-    if metadata.get("config_signature") != legacy_signature:
+    if int(metadata.get("config_contract_version", -1)) != (
+        RESUME_CONTRACT_VERSION
+    ):
         raise RuntimeError(
-            "Legacy resume config signature differs from the checkpoint."
+            "Unsupported readable resume contract version: "
+            f"{metadata.get('config_contract_version')!r}"
         )
-
-    # v2 omitted max_train_steps and other numerical training controls.  The
-    # immutable run config is therefore required to prove a strict migration.
-    saved_config_path = checkpoint_dir.parent / "config.yaml"
-    if not saved_config_path.is_file():
+    if metadata.get("config_contract") != current_contract:
         raise RuntimeError(
-            "Cannot strictly resume a v2 checkpoint without its immutable "
-            f"run config: {saved_config_path}"
-        )
-    saved_config = OmegaConf.load(saved_config_path)
-    saved_signature = build_resume_signature(
-        saved_config,
-        world_size=world_size,
-        gradient_accumulation_steps=gradient_accumulation_steps,
-    )
-    if saved_signature != current_signature:
-        raise RuntimeError(
-            "Legacy checkpoint immutable config differs from the current "
-            "training contract; refusing an inexact continuation."
+            "Resume configuration differs from the checkpoint; refusing an "
+            "inexact continuation."
         )
 
 

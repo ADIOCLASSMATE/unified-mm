@@ -17,7 +17,6 @@ Caption joint training uses disjoint targets. T2I rows supervise only image
 flow, while I2T rows supervise only caption tokens (and their final EOS).
 """
 
-import hashlib
 import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -51,6 +50,8 @@ class ImageNetFlowCacheDataset(Dataset):
         image_tokens_per_img: int = 256,
         image_latent_dim: int = 16,
         manifest_jsonl: Optional[str] = None,
+        expected_split: Optional[str] = None,
+        expected_records: Optional[int] = None,
         synset_mapping_path: Optional[str] = None,
         conditioning_mode: Optional[str] = None,
         caption_jsonl: Optional[str | Sequence[str]] = None,
@@ -69,11 +70,9 @@ class ImageNetFlowCacheDataset(Dataset):
         cache_caption_tokens: bool = False,
         max_seq_length: Optional[int] = None,
         model_context_length: Optional[int] = None,
-        caption_manifest_sha256: Optional[str] = None,
         max_samples: int = -1,
         seed: int = 42,
         image_sigma_order: str = "random",
-        emit_audit_metadata: bool = True,
     ):
         self.cache_path = Path(cache_path)
         if not self.cache_path.exists():
@@ -170,7 +169,6 @@ class ImageNetFlowCacheDataset(Dataset):
                 f"Unknown image_sigma_order={image_sigma_order!r}; "
                 "expected 'random' or 'sequential'."
             )
-        self.emit_audit_metadata = bool(emit_audit_metadata)
         # DataLoader workers keep their own Dataset object, so a plain Python
         # integer would become stale when persistent_workers=True.  Tensor
         # storage remains shared after the Dataset is sent to workers, which
@@ -178,7 +176,52 @@ class ImageNetFlowCacheDataset(Dataset):
         self._epoch_state = torch.zeros((), dtype=torch.int64).share_memory_()
         self.training_index_mask: Optional[torch.Tensor] = None
 
-        self.synsets, self.source_paths = self._load_manifest(manifest_jsonl)
+        self.expected_split = (
+            str(expected_split).strip().lower() if expected_split else None
+        )
+        if self.expected_split not in {None, "train", "val"}:
+            raise ValueError(
+                "expected_split must be 'train' or 'val', "
+                f"got {expected_split!r}"
+            )
+        self.expected_records = (
+            int(expected_records) if expected_records is not None else None
+        )
+        if self.expected_records is not None and self.expected_records <= 0:
+            raise ValueError("expected_records must be positive")
+        (
+            self.synsets,
+            self.source_paths,
+            self.source_paths_full,
+            self.manifest_splits,
+        ) = self._load_manifest(manifest_jsonl)
+        if self.expected_records is not None:
+            if len(self) != self.expected_records:
+                raise ValueError(
+                    "posterior cache record count mismatch: "
+                    f"{len(self)} != {self.expected_records}"
+                )
+            if len(self.synsets) != self.expected_records:
+                raise ValueError(
+                    "ImageNet manifest record count mismatch: "
+                    f"{len(self.synsets)} != {self.expected_records}"
+                )
+        observed_splits = set(self.manifest_splits.values())
+        if self.expected_split is not None and observed_splits != {
+            self.expected_split
+        }:
+            raise ValueError(
+                "ImageNet manifest split mismatch: "
+                f"expected={self.expected_split!r}, "
+                f"observed={sorted(observed_splits)!r}"
+            )
+        self.dataset_split = (
+            self.expected_split
+            if self.expected_split is not None
+            else next(iter(observed_splits))
+            if len(observed_splits) == 1
+            else None
+        )
         self.synset_names = self._load_synset_names(synset_mapping_path)
         self.caption_jsonl = caption_jsonl
         self.caption_text_key = str(caption_text_key)
@@ -210,11 +253,6 @@ class ImageNetFlowCacheDataset(Dataset):
             "caption_i2t_prefix",
         )
         self.caption_include_original = bool(caption_include_original)
-        self.caption_manifest_sha256 = (
-            str(caption_manifest_sha256).strip().lower()
-            if caption_manifest_sha256
-            else None
-        )
         self.cache_caption_tokens = bool(cache_caption_tokens)
         self.text_cache: Dict[str, torch.Tensor] = {}
         self.sequence_cache: Dict[str, Dict[str, torch.Tensor]] = {}
@@ -236,11 +274,19 @@ class ImageNetFlowCacheDataset(Dataset):
         if self.conditioning_mode == "caption":
             if not caption_jsonl:
                 raise ValueError("conditioning_mode='caption' requires caption_jsonl")
-            self._validate_caption_manifest_digest(caption_jsonl)
             if self.synthetic_text_index_manifest:
                 self.synthetic_text_index = ImageNetSyntheticTextIndex(
                     self.synthetic_text_index_manifest
                 )
+                if (
+                    self.dataset_split is not None
+                    and self.synthetic_text_index.split != self.dataset_split
+                ):
+                    raise ValueError(
+                        "posterior/manifest and synthetic-text splits differ: "
+                        f"{self.dataset_split!r} != "
+                        f"{self.synthetic_text_index.split!r}"
+                    )
                 if self.synthetic_text_index.row_count < len(self):
                     raise ValueError(
                         "synthetic text index is shorter than the posterior cache: "
@@ -297,16 +343,23 @@ class ImageNetFlowCacheDataset(Dataset):
 
     def _load_manifest(
         self, manifest_jsonl: Optional[str]
-    ) -> Tuple[Dict[int, str], Dict[int, str]]:
+    ) -> Tuple[
+        Dict[int, str],
+        Dict[int, str],
+        Dict[int, str],
+        Dict[int, str],
+    ]:
         if not manifest_jsonl:
-            return {}, {}
+            return {}, {}, {}, {}
         path = Path(manifest_jsonl)
         if not path.exists():
             raise FileNotFoundError(path)
         synsets: Dict[int, str] = {}
         source_paths: Dict[int, str] = {}
+        source_paths_full: Dict[int, str] = {}
+        manifest_splits: Dict[int, str] = {}
         with path.open() as f:
-            for line in f:
+            for line_number, line in enumerate(f, start=1):
                 if not line.strip():
                     continue
                 row = json.loads(line)
@@ -316,8 +369,26 @@ class ImageNetFlowCacheDataset(Dataset):
                 synsets[img_id] = str(row.get("synset", ""))
                 source_path = row.get("source_path")
                 if source_path:
-                    source_paths[img_id] = self._relative_image_path(str(source_path))
-        return synsets, source_paths
+                    normalized_source_path = str(source_path)
+                    source_paths[img_id] = self._relative_image_path(
+                        normalized_source_path
+                    )
+                    source_paths_full[img_id] = normalized_source_path
+                split = str(row.get("split", "")).strip().lower()
+                if not split and source_path:
+                    path_parts = {
+                        part.lower() for part in Path(str(source_path)).parts
+                    }
+                    if "train" in path_parts:
+                        split = "train"
+                    elif "val" in path_parts:
+                        split = "val"
+                if split not in {"train", "val"}:
+                    raise ValueError(
+                        f"{path}:{line_number} has no unambiguous train/val split"
+                    )
+                manifest_splits[img_id] = split
+        return synsets, source_paths, source_paths_full, manifest_splits
 
     def _load_synset_names(
         self, synset_mapping_path: Optional[str]
@@ -345,55 +416,6 @@ class ImageNetFlowCacheDataset(Dataset):
         if isinstance(caption_jsonl, (str, Path)):
             return [Path(caption_jsonl)]
         return [Path(path) for path in caption_jsonl]
-
-    def _validate_caption_manifest_digest(
-        self,
-        caption_jsonl: str | Sequence[str],
-    ) -> None:
-        if not self.caption_manifest_sha256:
-            return
-        paths = self._caption_jsonl_paths(caption_jsonl)
-        if len(paths) != 1:
-            raise ValueError(
-                "caption_manifest_sha256 requires exactly one frozen caption "
-                f"manifest, got {paths}"
-            )
-        if self.synthetic_text_index_manifest:
-            index_manifest_path = Path(self.synthetic_text_index_manifest)
-            index_manifest = json.loads(
-                index_manifest_path.read_text(encoding="utf-8")
-            )
-            actual = str(index_manifest.get("caption", {}).get("sha256", ""))
-            if actual != self.caption_manifest_sha256:
-                raise ValueError(
-                    "caption manifest digest mismatch in synthetic text index: "
-                    f"expected={self.caption_manifest_sha256}, actual={actual}, "
-                    f"path={index_manifest_path}"
-                )
-            indexed_caption_path = Path(
-                index_manifest.get("caption", {}).get("path", "")
-            )
-            if not indexed_caption_path.is_absolute():
-                indexed_caption_path = (
-                    index_manifest_path.parent / indexed_caption_path
-                )
-            if indexed_caption_path.resolve() != paths[0].resolve():
-                raise ValueError(
-                    "caption JSONL differs from the synthetic text index source: "
-                    f"{paths[0]} != {indexed_caption_path}"
-                )
-            return
-        digest = hashlib.sha256()
-        with paths[0].open("rb") as handle:
-            for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
-                digest.update(chunk)
-        actual = digest.hexdigest()
-        if actual != self.caption_manifest_sha256:
-            raise ValueError(
-                "caption manifest digest mismatch: "
-                f"expected={self.caption_manifest_sha256}, actual={actual}, "
-                f"path={paths[0]}"
-            )
 
     def _relative_image_path(self, path: str) -> str:
         parts = Path(path).parts
@@ -614,12 +636,25 @@ class ImageNetFlowCacheDataset(Dataset):
         current_epoch: int,
         purpose: str,
     ) -> int:
-        payload = (
-            f"{self.seed}:{int(current_epoch)}:{int(idx)}:{str(purpose)}"
-        ).encode("utf-8")
-        return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") & (
-            (1 << 63) - 1
-        )
+        purpose_offsets = {
+            "vae_posterior": 11,
+            "caption_task_offset": 23,
+            "caption_validation_task": 37,
+            "t2i_text_cycle_offset": 41,
+            "i2t_text_cycle_offset": 43,
+            "image_reveal_order": 53,
+            "cfg_dropout": 67,
+        }
+        if purpose not in purpose_offsets:
+            raise ValueError(
+                f"missing arithmetic seed offset for purpose={purpose!r}"
+            )
+        return (
+            int(self.seed)
+            + 1_000_003 * int(current_epoch)
+            + 97_409 * int(idx)
+            + purpose_offsets[purpose]
+        ) & ((1 << 63) - 1)
 
     def _apply_latent_layout(self, latents: torch.Tensor) -> torch.Tensor:
         return latents.reshape(self.image_tokens_per_img, self.image_latent_dim)
@@ -761,7 +796,8 @@ class ImageNetFlowCacheDataset(Dataset):
             return self._indexed_caption_texts(idx, img_id)
         row = self.synthetic_text_index.read_t2i(int(idx))
         expected_stem = Path(self.source_paths[int(img_id)]).stem
-        expected_image_id = f"train/{expected_stem}"
+        expected_split = self.synthetic_text_index.split
+        expected_image_id = f"{expected_split}/{expected_stem}"
         if row.get("image_id") != expected_image_id:
             raise ValueError(
                 f"T2I image identity mismatch at cache row {idx}: "
@@ -933,29 +969,9 @@ class ImageNetFlowCacheDataset(Dataset):
             "caption_index": torch.tensor(caption_index, dtype=torch.long),
             "caption_count": torch.tensor(caption_count, dtype=torch.long),
             "task_mode": task_mode,
+            "posterior_seed": torch.tensor(posterior_seed, dtype=torch.long),
             "reveal_seed": torch.tensor(reveal_seed, dtype=torch.long),
             "image_sigma_order": self.image_sigma_order,
             "cfg_dropout_seed": torch.tensor(cfg_dropout_seed, dtype=torch.long),
         }
-        if self.emit_audit_metadata:
-            result["token_ids_sha256"] = hashlib.sha256(
-                sequence["input_ids"].contiguous().numpy().tobytes()
-            ).hexdigest()
-            result["augmentation_sha256"] = hashlib.sha256(
-                json.dumps(
-                    {
-                        "posterior_sample_epoch": int(sample_epoch),
-                        "posterior_seed": int(posterior_seed),
-                        "training_sample": bool(is_training),
-                        "img_id": img_id,
-                        "sample_index": int(idx),
-                        "caption_index": int(caption_index),
-                        "caption_count": int(caption_count),
-                        "task_mode": task_mode,
-                        "image_sigma_order": self.image_sigma_order,
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-            ).hexdigest()
         return result
