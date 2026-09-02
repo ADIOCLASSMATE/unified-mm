@@ -178,7 +178,7 @@ env \
   --limit "${LIMIT}" \
   --seed 424242 \
   --device npu \
-  --model_dtype bf16 \
+  --model_dtype fp32 \
   --image_sigma_order auto \
   --progress_every "${PROGRESS_EVERY}" \
   "${PROTOCOL_ARGS[@]}"
