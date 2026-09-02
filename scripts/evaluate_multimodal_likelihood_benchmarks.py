@@ -747,13 +747,21 @@ def score_candidate_requests(
             token_greedy.append(logits.argmax(dim=-1).eq(targets))
         logprobs = torch.cat(token_logprobs)
         greedy = torch.cat(token_greedy)
-        for row_index, (original_index, _) in enumerate(batch_pairs):
+        for row_index, (original_index, request) in enumerate(batch_pairs):
             selection = selected_rows.eq(row_index)
             row_logprobs = logprobs[selection]
             row_greedy = greedy[selection]
             count = int(row_logprobs.numel())
             if count <= 0:
                 raise RuntimeError("candidate request has no target tokens")
+            if not bool(torch.isfinite(row_logprobs).all().item()):
+                raise FloatingPointError(
+                    "candidate request produced non-finite token log-probabilities: "
+                    f"example_index={request.example_index}, "
+                    f"candidate_index={request.candidate_index}, "
+                    f"image_id={request.image_id}, "
+                    f"mc_sample_index={request.mc_sample_index}"
+                )
             total = float(row_logprobs.sum().item())
             scores[original_index] = CandidateScore(
                 loglikelihood=total,
