@@ -7,7 +7,6 @@ requests.  They deliberately do not require free-form answer generation:
 * MMBench-dev is converted to semantic candidate-text ranking.  All official
   circular option rows are retained and grouped by original question.
 * SugarCrepe is converted to positive-vs-hard-negative caption ranking.
-* COCO val2017 captions, when present, are converted to caption perplexity.
 * Optional SEED-Bench, POPE, ARO VG-Relation/VG-Attribution and normalized
   Winoground assets can be added through their corresponding command-line
   paths.
@@ -32,16 +31,25 @@ import io
 import json
 import os
 from pathlib import Path
+import random
 import tempfile
 from typing import Any, Iterable, Sequence
 
 from PIL import Image
 
 
-ASSET_SCHEMA = "selfless_multimodal_likelihood_assets_v1"
+ASSET_SCHEMA = "selfless_multimodal_likelihood_assets_v2"
 TASK_SCHEMA = "selfless_multimodal_likelihood_task_v1"
 DEFAULT_ROOT = Path("public/benchmarks/selfless_multimodal_likelihood_v1")
 DEFAULT_I2T_PREFIX = "Describe this image in one detailed caption:"
+LANGUAGE_PRIOR_NULL_IMAGE_COUNT = 3
+LANGUAGE_PRIOR_NULL_IMAGE_IDS = tuple(
+    9_000_000_000 + index for index in range(LANGUAGE_PRIOR_NULL_IMAGE_COUNT)
+)
+LANGUAGE_PRIOR_NULL_IMAGE_SEEDS = (17_071, 29_129, 43_231)
+LANGUAGE_PRIOR_NULL_IMAGE_SIZE = 256
+LANGUAGE_PRIOR_NULL_NORMALIZED_MEAN = 0.0
+LANGUAGE_PRIOR_NULL_NORMALIZED_STD = 0.25
 SUGARCREPE_SPLITS = (
     "add_att",
     "add_obj",
@@ -201,6 +209,67 @@ class ImageRegistry:
 
     def __len__(self) -> int:
         return len(self._by_id)
+
+
+def prepare_language_prior_null_images(
+    root: Path,
+    registry: ImageRegistry,
+) -> dict[str, Any]:
+    """Materialize fixed Gaussian content-free images in model input space.
+
+    The VAE preprocessing maps RGB [0, 1] to [-1, 1].  We therefore sample
+    N(0, 0.25) in that normalized space, clamp to [-1, 1], and quantize once
+    to lossless PNG.  Fixed arithmetic metadata makes every formal run use
+    exactly the same three null inputs without consulting benchmark labels.
+    """
+
+    image_root = root / "images" / "language-prior-null"
+    rows: list[dict[str, Any]] = []
+    for index, (image_id, seed) in enumerate(
+        zip(LANGUAGE_PRIOR_NULL_IMAGE_IDS, LANGUAGE_PRIOR_NULL_IMAGE_SEEDS)
+    ):
+        generator = random.Random(seed)
+        pixels = bytearray()
+        for _ in range(LANGUAGE_PRIOR_NULL_IMAGE_SIZE**2 * 3):
+            normalized = max(
+                -1.0,
+                min(
+                    1.0,
+                    generator.gauss(
+                        LANGUAGE_PRIOR_NULL_NORMALIZED_MEAN,
+                        LANGUAGE_PRIOR_NULL_NORMALIZED_STD,
+                    ),
+                ),
+            )
+            pixels.append(int(round((normalized + 1.0) * 127.5)))
+        image = Image.frombytes(
+            "RGB",
+            (LANGUAGE_PRIOR_NULL_IMAGE_SIZE, LANGUAGE_PRIOR_NULL_IMAGE_SIZE),
+            bytes(pixels),
+        )
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG", optimize=False)
+        path = image_root / f"gaussian-{index:02d}.png"
+        atomic_write_bytes(path, buffer.getvalue())
+        registry.add(image_id, path, "language_prior_null")
+        rows.append(
+            {
+                "image_id": image_id,
+                "path": str(path.resolve()),
+                "seed": seed,
+            }
+        )
+    return {
+        "estimator": "content_free_gaussian_image_logmeanexp",
+        "count": LANGUAGE_PRIOR_NULL_IMAGE_COUNT,
+        "images": rows,
+        "pixel_space": "vae_preprocess_normalized_minus1_to_plus1",
+        "normalized_gaussian_mean": LANGUAGE_PRIOR_NULL_NORMALIZED_MEAN,
+        "normalized_gaussian_std": LANGUAGE_PRIOR_NULL_NORMALIZED_STD,
+        "clamp": [-1.0, 1.0],
+        "storage": "lossless_rgb_png",
+        "uses_benchmark_labels": False,
+    }
 
 
 def task_record(
@@ -378,46 +447,6 @@ def prepare_sugarcrepe(
     return examples, {
         "sources": sources,
         "coco_image_root": str(coco_val2017_dir.resolve()),
-        "retained_rows": len(examples),
-    }
-
-
-def prepare_coco_caption_ppl(
-    annotations_path: Path,
-    coco_val2017_dir: Path,
-    registry: ImageRegistry,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    payload = json.loads(annotations_path.read_text(encoding="utf-8"))
-    images = {int(row["id"]): str(row["file_name"]) for row in payload["images"]}
-    examples: list[dict[str, Any]] = []
-    for row in sorted(payload["annotations"], key=lambda value: int(value["id"])):
-        image_id = int(row["image_id"])
-        filename = images[image_id]
-        img_id = registry.add(
-            2_000_000_000 + image_id,
-            coco_val2017_dir / filename,
-            "coco_caption_ppl",
-        )
-        examples.append(
-            task_record(
-                task="coco_caption_ppl",
-                kind="caption_perplexity",
-                item_id=str(row["id"]),
-                image_id=img_id,
-                prompt=DEFAULT_I2T_PREFIX,
-                candidates=[row["caption"]],
-                label=0,
-                category="caption",
-                metadata={
-                    "coco_image_id": image_id,
-                    "filename": filename,
-                },
-            )
-        )
-    return examples, {
-        "source": source_stat(annotations_path),
-        "coco_image_root": str(coco_val2017_dir.resolve()),
-        "images": len(images),
         "retained_rows": len(examples),
     }
 
@@ -887,7 +916,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mmbench_tsv", type=Path, default=None)
     parser.add_argument("--sugarcrepe_dir", type=Path, default=None)
     parser.add_argument("--coco_val2017_dir", type=Path, default=None)
-    parser.add_argument("--coco_captions_json", type=Path, default=None)
     parser.add_argument("--seed_questions_json", type=Path, default=None)
     parser.add_argument("--seed_image_root", type=Path, default=None)
     parser.add_argument("--pope_annotation_dir", type=Path, default=None)
@@ -919,11 +947,6 @@ def main() -> None:
     mmbench_tsv = args.mmbench_tsv or raw / "mmbench" / "MMBench_DEV_EN.tsv"
     sugarcrepe_dir = args.sugarcrepe_dir or raw / "sugarcrepe"
     coco_val2017_dir = args.coco_val2017_dir or raw / "coco" / "val2017"
-    coco_captions_json = (
-        args.coco_captions_json
-        or raw / "coco" / "annotations" / "captions_val2017.json"
-    )
-
     registry = ImageRegistry()
     tasks: dict[str, dict[str, Any]] = {}
     task_rows: dict[str, list[dict[str, Any]]] = {}
@@ -973,12 +996,9 @@ def main() -> None:
         [*sugar_paths, coco_val2017_dir],
         lambda: prepare_sugarcrepe(sugarcrepe_dir, coco_val2017_dir, registry),
     )
-    prepare(
-        "coco_caption_ppl",
-        [coco_captions_json, coco_val2017_dir],
-        lambda: prepare_coco_caption_ppl(
-            coco_captions_json, coco_val2017_dir, registry
-        ),
+    unavailable["coco_caption_ppl"] = (
+        "removed from the formal protocol: conditional caption perplexity is "
+        "not a language-prior-debiased image-text matching metric"
     )
 
     if args.seed_questions_json is not None or args.seed_image_root is not None:
@@ -1097,6 +1117,7 @@ def main() -> None:
             "official What’sUp Controlled-A/B annotations and image roots were not supplied"
         )
 
+    language_prior_null_images = prepare_language_prior_null_images(root, registry)
     image_manifest = root / "image_manifest.jsonl"
     atomic_write_text(image_manifest, jsonl_text(registry.rows()))
     required = {
@@ -1112,6 +1133,7 @@ def main() -> None:
         "runtime_hashing_enabled": False,
         "image_manifest_jsonl": str(image_manifest.resolve()),
         "images": len(registry),
+        "language_prior_null_images": language_prior_null_images,
         "tasks": tasks,
         "unavailable": unavailable,
         "required_tasks": sorted(required),
@@ -1119,7 +1141,13 @@ def main() -> None:
         "scoring_contract": {
             "model_family": "selfless_dual_stream",
             "prediction_position": "same_position_query_stream",
-            "primary_candidate_score": "mean_token_loglikelihood",
+            "primary_candidate_score": (
+                "language_prior_debiased_mean_token_loglikelihood"
+            ),
+            "language_prior_alpha": 1.0,
+            "language_prior_estimator": (
+                "content_free_gaussian_image_logmeanexp"
+            ),
             "free_form_generation_required": False,
             "runtime_hashing_enabled": False,
         },

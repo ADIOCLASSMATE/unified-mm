@@ -1,4 +1,4 @@
-schema: unified_multimodal_likelihood_evaluation_v3
+schema: unified_multimodal_likelihood_evaluation_v5
 weights: hf_final_ema
 runtime_hashing_enabled: false
 hardware:
@@ -9,46 +9,65 @@ model_source:
   load_policy: direct_from_pretrained
   step_provenance: ema_export_metadata.json.source_global_step
 legacy_weights_compatibility: rank_sharded_ema
+assets:
+  schema: selfless_multimodal_likelihood_assets_v2
+  records: 61036
+  cache_schema: selfless_image_posterior_cache_v2
+  cache_directory: vae_posterior_mar_kl16_v2
 scoring:
   model_contract: selfless_same_position_query_stream
   causal_lm_one_token_shift: false
   free_form_generation_required: false
   candidate_target: answer_or_caption_text_without_eos
-  primary_candidate_score: mean_token_loglikelihood
+  primary_candidate_score: language_prior_debiased_mean_token_loglikelihood
+  reported_score_variant: language_prior_debiased_only
+  language_prior:
+    alpha: 1.0
+    estimator: content_free_gaussian_image_logmeanexp
+    null_images: 3
+    normalized_pixel_distribution: {mean: 0.0, std: 0.25}
+    uses_benchmark_labels: false
   posterior_sample: deterministic_arithmetic_seed
   image_sigma_order: from_model_training_config
+  image_order_monte_carlo:
+    samples: 64
+    estimator: mean_loglikelihood
+    execution: expand_batch_dimension
+    common_random_numbers_across_candidates_and_models: true
+    posterior_resampled: false
 tasks:
   - name: mmbench_dev_en
     official_original_questions: 1164
     official_circular_rows: 4329
     protocol_variant: semantic_candidate_normalized_nll
     circular_group_rule: every_rotation_must_be_correct
-    primary_metric: circular_accuracy_normalized_loglikelihood
+    primary_metric: circular_accuracy_language_prior_debiased
     leaderboard_comparable: false
   - name: seed_bench_image
     records: 14233
     subset: official_SEED_Bench_1_single_image_dimensions_1_to_9
-    scoring: semantic_candidate_normalized_nll
-    primary_metric: accuracy_normalized_loglikelihood
+    scoring: semantic_candidate_language_prior_debiased_mean_token_loglikelihood
+    primary_metric: accuracy_language_prior_debiased
     leaderboard_comparable: false
   - name: sugarcrepe
     records: 7511
     groups: [add_att, add_obj, replace_att, replace_obj, replace_rel, swap_att, swap_obj]
-    primary_metric: accuracy_normalized_loglikelihood
+    primary_metric: language_prior_debiased_pairwise.win_rate
     chance_accuracy: 0.5
   - name: aro_vg_relation
     records: 23937
     scoring: positive_vs_negative_caption
-    primary_metric: accuracy_normalized_loglikelihood
+    primary_metric: language_prior_debiased_pairwise.win_rate
     chance_accuracy: 0.5
   - name: aro_vg_attribution
     records: 28748
     scoring: positive_vs_negative_caption
-    primary_metric: accuracy_normalized_loglikelihood
+    primary_metric: language_prior_debiased_pairwise.win_rate
     chance_accuracy: 0.5
 outputs:
-  per_sample_candidate_loglikelihoods: true
+  per_sample_debiased_candidate_scores: true
   per_task_summary: true
   per_category_summary: true
-  record_normalized_scores: true
+  record_language_prior_debiased_scores: true
+  record_uncalibrated_scores: false
   no_hashes: true

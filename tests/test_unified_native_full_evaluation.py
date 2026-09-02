@@ -8,43 +8,33 @@ from scripts import summarize_unified_native_checkpoint_trend as native_trend
 from scripts import summarize_unified_native_full_evaluation as native_full
 
 
-def _retrieval(records, i2t, t2i):
-    def direction(r1):
-        return {
-            "instance_recall_at_1": r1,
-            "instance_recall_at_5": min(1.0, r1 + 0.1),
-            "instance_recall_at_10": min(1.0, r1 + 0.2),
-        }
-
-    return {
-        "complete_formal_target": True,
-        "records": records,
-        "normalized_loglikelihood": {
-            "image_to_text": direction(i2t),
-            "text_to_image": direction(t2i),
-            "mean_bidirectional_instance_recall_at_1": (i2t + t2i) / 2,
-        },
-    }
-
-
 def _benchmark(task, records, value):
     metrics = {
         "records": records,
-        "primary_metric": "accuracy_normalized_loglikelihood",
-        "accuracy_normalized_loglikelihood": value,
+        "primary_metric": "accuracy_language_prior_debiased",
+        "accuracy_language_prior_debiased": value,
     }
     if task == "mmbench_dev_en":
         metrics.update(
             {
-                "primary_metric": "circular_accuracy_normalized_loglikelihood",
-                "circular_accuracy_normalized_loglikelihood": value,
-                "vanilla_accuracy_normalized_loglikelihood": value + 0.01,
+                "primary_metric": "circular_accuracy_language_prior_debiased",
+                "circular_accuracy_language_prior_debiased": value,
+                "vanilla_accuracy_language_prior_debiased": value + 0.01,
+            }
+        )
+    if task in {"sugarcrepe", "aro_vg_relation", "aro_vg_attribution"}:
+        metrics.update(
+            {
+                "primary_metric": "language_prior_debiased_pairwise.win_rate",
+                "language_prior_debiased_pairwise": {"win_rate": value},
             }
         )
     if task == "sugarcrepe":
         metrics["categories"] = {
             "add_att": {
-                "accuracy_normalized_loglikelihood": value + 0.02,
+                "language_prior_debiased_pairwise": {
+                    "win_rate": value + 0.02,
+                },
             }
         }
     return {"task": task, "metrics": metrics}
@@ -53,20 +43,48 @@ def _benchmark(task, records, value):
 def _standard_retrieval(images, i2t, t2i):
     def direction(r1):
         return {
+            "queries": images,
+            "candidates": captions,
             "recall_at_1": r1,
             "recall_at_5": min(1.0, r1 + 0.1),
             "recall_at_10": min(1.0, r1 + 0.2),
+            "mean_recall_at_1_5_10": min(1.0, r1 + 0.1),
+            "mean_rank": 2.0,
+            "median_rank": 1.0,
         }
 
+    captions = 25_010 if images == 5_000 else 5_000
+    image_to_text = direction(i2t)
+    text_to_image = direction(t2i)
+    text_to_image["queries"] = captions
+    text_to_image["candidates"] = images
     return {
         "complete_formal_target": True,
         "images": images,
-        "captions": images * 5,
-        "normalized_loglikelihood": {
-            "image_to_text": direction(i2t),
-            "text_to_image": direction(t2i),
-            "mean_bidirectional_recall_at_1": (i2t + t2i) / 2,
+        "captions": captions,
+        "caption_count_distribution": (
+            {"5": 4_990, "6": 10}
+            if images == 5_000
+            else {"5": 1_000}
+        ),
+        "primary_metric": "mean_recall_at_1_5_10",
+        "recall_unit": "unit_interval",
+        "rank_unit": "one_based_candidate_rank",
+        "coco_five_fold_1k_average": False,
+        "scoring": {
+            "primary_candidate_score": (
+                "language_prior_debiased_mean_token_loglikelihood"
+            ),
+            "language_prior_alpha": 1.0,
+            "language_prior_estimator": "candidate_image_logmeanexp",
         },
+        "image_to_text": image_to_text,
+        "text_to_image": text_to_image,
+        "mean_recall_at_1_5_10": (
+            image_to_text["mean_recall_at_1_5_10"]
+            + text_to_image["mean_recall_at_1_5_10"]
+        )
+        / 2,
     }
 
 
@@ -81,6 +99,7 @@ def _native_summary(checkpoint, step):
         ),
     }
     return {
+        "schema": "pretraining_native_understanding_summary_v5",
         "complete": True,
         "runtime_hashing_enabled": False,
         "checkpoint": str(checkpoint.resolve()),
@@ -92,16 +111,33 @@ def _native_summary(checkpoint, step):
             "train_validation_overlap_allowed": False,
         },
         "primary_metrics": {
-            "retrieval_1k": 0.6,
-            "retrieval_5k": 0.5,
-            "mscoco_karpathy_test_5k": 0.35,
-            "flickr30k_karpathy_test_1k": 0.55,
+            "imagenet1k_zeroshot_top_1_accuracy": 0.25,
+            "imagenet1k_zeroshot_top_5_accuracy": 0.5,
+            "mscoco_karpathy_test_5k": 0.45,
+            "flickr30k_karpathy_test_1k": 0.65,
             "sugarcrepe": 0.63,
             "aro_vg_relation": 0.71,
             "aro_vg_attribution": 0.88,
         },
-        "retrieval_1k": _retrieval(1_000, 0.3, 0.9),
-        "retrieval_5k": _retrieval(5_000, 0.2, 0.8),
+        "imagenet1k_zeroshot_classification": {
+            "complete_formal_target": True,
+            "records": 50_000,
+            "classes": 1_000,
+            "formal_target_records": 50_000,
+            "language_prior_image_count": 50_000,
+            "primary_metric": "top_1_accuracy",
+            "accuracy_unit": "unit_interval",
+            "class_text_template": "a photo of a {class_name}.",
+            "scoring": {
+                "primary_candidate_score": (
+                    "language_prior_debiased_mean_token_loglikelihood"
+                ),
+                "language_prior_alpha": 1.0,
+                "language_prior_estimator": "candidate_image_logmeanexp",
+            },
+            "top_1_accuracy": 0.25,
+            "top_5_accuracy": 0.5,
+        },
         "standard_cross_dataset_retrieval": {
             "mscoco_karpathy_test_5k": _standard_retrieval(5_000, 0.2, 0.5),
             "flickr30k_karpathy_test_1k": _standard_retrieval(1_000, 0.4, 0.7),
@@ -113,6 +149,20 @@ def _native_summary(checkpoint, step):
         "internal_ablation_diagnostics": {
             task: benchmarks[task]
             for task in ("mmbench_dev_en", "seed_bench_image")
+        },
+        "selection_contract": {
+            "imagenet_validation_images": 50_000,
+            "image_text_matching_score_variant": (
+                "language_prior_debiased_mean_token_loglikelihood_only"
+            ),
+            "language_prior_alpha": 1.0,
+            "dense_retrieval_language_prior_estimator": (
+                "candidate_image_logmeanexp"
+            ),
+            "hard_negative_language_prior_estimator": (
+                "content_free_gaussian_image_logmeanexp"
+            ),
+            "hard_negative_language_prior_null_images": 3,
         },
     }
 
@@ -152,6 +202,7 @@ def test_selected_native_full_summary_and_trend(tmp_path, monkeypatch):
     (core / "full_evaluation_summary.json").write_text(
         json.dumps(
             {
+                "schema": "unified_full_checkpoint_evaluation_summary_v3",
                 "complete": True,
                 "profile": "formal",
                 "runtime_hashing_enabled": False,
@@ -164,12 +215,24 @@ def test_selected_native_full_summary_and_trend(tmp_path, monkeypatch):
                 },
                 "generation": {
                     "imagenet_val_t2i": {
-                        "official_protocol": True,
+                        "project_formal_protocol": True,
+                        "leaderboard_comparable_to_adm_dit": False,
+                        "protocol_name": (
+                            "imagenet_val_fid50k_torch_fidelity_stratified_is"
+                        ),
+                        "reference_distribution": "imagenet_val_50000",
+                        "comparison_scope": "same_protocol_only",
+                        "not_adm_dit_reason": (
+                            "validation_reference_and_pytorch_torch_fidelity_extractor"
+                        ),
+                        "fid_reducer": "symmetric_eigendecomposition",
+                        "strategy": "spatial_halton",
                         "samples": 50_000,
                         "is_split_assignment": "stratified_by_synset",
                         "fid": 5.5,
                         "inception_score_mean": 240.0,
                         "inception_score_std": 3.0,
+                        "inception_score_splits": [237.0, 243.0] * 5,
                     }
                 },
                 "understanding": {
@@ -178,6 +241,7 @@ def test_selected_native_full_summary_and_trend(tmp_path, monkeypatch):
                 },
                 "pure_text": {
                     "macro_average_primary": 0.46,
+                    "macro_average_role": "internal_cross_task_summary_only",
                     "primary_metrics": {"arc_easy": 0.5},
                 },
             }
@@ -211,7 +275,9 @@ def test_selected_native_full_summary_and_trend(tmp_path, monkeypatch):
         )
     )
     assert summary["complete"] is True
-    assert summary["understanding"]["domains"]["custom_in_domain"] == "imagenet_val"
+    assert summary["understanding"]["domains"]["zero_shot_classification"] == (
+        "imagenet_val_50k"
+    )
     assert (
         summary["understanding"]
         ["out_of_domain_general_vlm_benchmarks_in_paper_summary"]
@@ -222,5 +288,5 @@ def test_selected_native_full_summary_and_trend(tmp_path, monkeypatch):
     row = native_trend.trend_row(output)
     assert row["global_step"] == step
     assert row["benchmarks"]["sugarcrepe"] == 0.63
-    assert row["retrieval_5k"]["t2i_r1"] == 0.8
+    assert row["imagenet1k_zeroshot"]["top_1_accuracy"] == 0.25
     assert row["standard_retrieval"]["mscoco_karpathy_test_5k"]["t2i_r1"] == 0.5

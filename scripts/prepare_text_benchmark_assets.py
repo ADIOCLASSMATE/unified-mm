@@ -18,22 +18,25 @@ import pyarrow.parquet as pq
 
 DEFAULT_ROOT = Path("public/benchmarks/selfless_text_v1")
 
+ASSET_SCHEMA = "selfless_text_benchmark_assets_v2"
+
+
 PARQUET_ASSETS = {
-    "arc_easy_validation": {
+    "arc_easy_test": {
         "url": (
             "https://huggingface.co/api/datasets/allenai/ai2_arc/parquet/"
-            "ARC-Easy/validation/0.parquet"
+            "ARC-Easy/test/0.parquet"
         ),
-        "path": "arc_easy/validation.parquet",
-        "records": 570,
+        "path": "arc_easy/test.parquet",
+        "records": 2_376,
     },
-    "arc_challenge_validation": {
+    "arc_challenge_test": {
         "url": (
             "https://huggingface.co/api/datasets/allenai/ai2_arc/parquet/"
-            "ARC-Challenge/validation/0.parquet"
+            "ARC-Challenge/test/0.parquet"
         ),
-        "path": "arc_challenge/validation.parquet",
-        "records": 299,
+        "path": "arc_challenge/test.parquet",
+        "records": 1_172,
     },
     "hellaswag_validation": {
         "url": (
@@ -59,12 +62,12 @@ PARQUET_ASSETS = {
         "path": "boolq/validation.parquet",
         "records": 3270,
     },
-    "openbookqa_validation": {
+    "openbookqa_test": {
         "url": (
             "https://huggingface.co/api/datasets/allenai/openbookqa/parquet/"
-            "main/validation/0.parquet"
+            "main/test/0.parquet"
         ),
-        "path": "openbookqa/validation.parquet",
+        "path": "openbookqa/test.parquet",
         "records": 500,
     },
     "mmlu_dev": {
@@ -193,7 +196,7 @@ def main() -> None:
     root = args.output_root.expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
     report: dict[str, object] = {
-        "schema": "selfless_text_benchmark_assets_v1",
+        "schema": ASSET_SCHEMA,
         "complete": False,
         "runtime_hashing_enabled": False,
         "root": str(root),

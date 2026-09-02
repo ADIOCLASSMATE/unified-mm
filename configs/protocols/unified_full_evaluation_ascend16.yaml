@@ -1,4 +1,4 @@
-schema: unified_full_evaluation_protocol_v5
+schema: unified_full_evaluation_protocol_v9
 launcher: script/selfless/evaluate_unified_native_full_checkpoint_ascend16.sh
 weights: hf_final_ema
 runtime_hashing_enabled: false
@@ -12,7 +12,7 @@ model_source:
 legacy_weights_compatibility: rank_sharded_ema
 dataset_contract:
   image_training_split: imagenet_train
-  custom_in_domain_evaluation_split: imagenet_val
+  zero_shot_classification_split: imagenet_val_50k
   standard_retrieval_evaluation_splits:
     - mscoco_karpathy_test_5k
     - flickr30k_karpathy_test_1k
@@ -39,20 +39,20 @@ components:
     launcher: script/selfless/evaluate_pretraining_native_understanding_ascend16.sh
     downstream_finetuning: false
     tasks:
-      - imagenet_val_retrieval_1k_i2t_t2i_recall_at_1_5_10
-      - imagenet_val_retrieval_5k_i2t_t2i_recall_at_1_5_10
+      - imagenet1k_val_50k_zeroshot_top1_top5
       - mscoco_karpathy_test_5k_i2t_t2i_recall_at_1_5_10
       - flickr30k_karpathy_test_1k_i2t_t2i_recall_at_1_5_10
       - sugarcrepe
       - aro_vg_relation
       - aro_vg_attribution
     domains:
-      custom_in_domain: imagenet_val
+      zero_shot_classification: imagenet_val_50k
       standard_retrieval: [mscoco_karpathy_test_5k, flickr30k_karpathy_test_1k]
       compositional: [sugarcrepe, aro_vg_relation, aro_vg_attribution]
       internal_ablation_only: [mmbench_dev_en, seed_bench_image]
     removed_from_protocol:
-      - imagenet_classification_top1_top5
+      - imagenet_val_retrieval_1k
+      - imagenet_val_retrieval_5k
       - imagenet_real_top1_top5
       - pope_coco
       - coco_caption_ppl
@@ -62,8 +62,27 @@ components:
       - imagenet_caption_random_negative
       - imagenet_caption_same_class_negative
       - imagenet_caption_near_class_negative
-      - visual_calibration
+      - uncalibrated_retrieval_loglikelihood
+    language_prior_calibration:
+      protocol_family: transductive_language_prior_calibrated_generative_scoring
+      directly_comparable_to_openai_clip_cosine_scoring: false
+      applies_to:
+        - imagenet1k_val_50k
+        - mscoco_karpathy_test_5k
+        - flickr30k_karpathy_test_1k
+        - sugarcrepe
+        - aro_vg_relation
+        - aro_vg_attribution
+      dense_candidate_estimator: candidate_image_logmeanexp
+      hard_negative_estimator: content_free_gaussian_image_logmeanexp
+      hard_negative_null_images: 3
+      alpha: 1.0
+      reported_variant: debiased_only
   image_generation:
+    status: project_formal_same_protocol_comparison
+    protocol_name: imagenet_val_fid50k_torch_fidelity_stratified_is
+    leaderboard_comparable_to_adm_dit: false
+    comparison_scope: same_protocol_only
     task: imagenet_val_t2i
     samples: 50000
     real_reference: imagenet_val_50000
@@ -76,8 +95,48 @@ components:
     inception_score_splits: 10
     inception_score_split_assignment: stratified_by_synset
     metrics: [fid, inception_score]
+  official_text_to_image_benchmarks:
+    status: required_final_checkpoint_release_metrics
+    generation_launcher: script/selfless/generate_official_t2i_benchmark_ascend16.sh
+    evaluator: scripts/evaluate_official_t2i_benchmarks.py
+    generation_hardware: ascend_910b_16npu
+    scoring_hardware: cuda_separate_official_environments
+    generation_parameters: runtime_adjustable_and_manifested
+    tasks:
+      - name: geneval
+        repository: djghosh13/geneval
+        commit: af4902f24d3ca90ebbb446dd9891a59e0f82725f
+        prompts: 553
+        images_per_prompt: 4
+        primary_metric: overall_unweighted_mean_over_six_tasks
+      - name: dpgbench
+        repository: TencentQQGYLab/ELLA
+        commit: 3c228f1dc6c4d3cad0a47493816151a419f14db3
+        prompts: 1065
+        images_per_prompt: 4
+        official_vqa_model: damo/mplug_visual-question-answering_coco_large_en
+        primary_metric: dpgbench
+      - name: mjhq
+        dataset_repository: playgroundai/MJHQ-30K
+        dataset_commit: 15b0a659e066e763d0e9a6cd8f00e25f8af5e084
+        prompts: 30000
+        evaluator_repository: GaParmar/clean-fid
+        evaluator_commit: e88c4d6269a4bbf04c04deeb578475b57719acee
+        evaluator_version: 0.1.35
+        primary_metric: clean_fid
+        leaderboard_resolution: 1024
+  fixed_vae_reconstruction:
+    status: one_time_preprocessing_quality_check
+    launcher: script/selfless/evaluate_mar_kl16_rfid_ascend16.sh
+    dataset: imagenet_val_50000
+    primary_metric: metrics.sample.rfid
+    posterior_sample_seed: 42
+    secondary_diagnostic: metrics.mean.rfid
+    checkpoint_dependent: false
   pure_text:
-    protocol: selfless_text_benchmark_v1
+    protocol: selfless_text_benchmark_v2
+    lm_eval_reference_commit: b954108c9baaaa934b4ad842033b31a97ee30816
+    adapter_note: same_position_selfless_scoring_required_not_generic_causal_lm
     # MMLU 5-shot reaches 3,097 tokenizer tokens.  Evaluation uses 4,096 so
     # no benchmark prompt is truncated; this does not change the 2,048-token
     # ClimbMix training contract.
@@ -85,11 +144,11 @@ components:
     loglikelihood_batch_size_per_rank: 8
     tasks:
       - name: arc_easy
-        split: validation
+        split: test
         fewshot: 0
         primary_metric: accuracy_normalized
       - name: arc_challenge
-        split: validation
+        split: test
         fewshot: 0
         primary_metric: accuracy_normalized
       - name: hellaswag
@@ -109,12 +168,14 @@ components:
         fewshot: 0
         primary_metric: accuracy
       - name: openbookqa
-        split: validation
+        split: test
         fewshot: 0
         primary_metric: accuracy_normalized
       - name: mmlu
         split: test
         fewshot: 5
-        primary_metric: accuracy
+        primary_metric: accuracy_macro
+        aggregation: unweighted_macro_over_57_subjects
+    cross_task_macro_role: internal_summary_only
     contamination_check: disabled
     contamination_check_reason: runtime hashing is disabled by experiment contract

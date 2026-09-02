@@ -12,7 +12,7 @@ cd "${REPO_ROOT}"
 export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
 ASSET_ROOT="${ASSET_ROOT:-public/benchmarks/selfless_multimodal_likelihood_v1}"
-CACHE_ROOT="${CACHE_ROOT:-${ASSET_ROOT}/vae_posterior_mar_kl16}"
+CACHE_ROOT="${CACHE_ROOT:-${ASSET_ROOT}/vae_posterior_mar_kl16_v2}"
 MANIFEST="${MANIFEST:-${ASSET_ROOT}/image_manifest.jsonl}"
 SHARD_DIR="${SHARD_DIR:-${CACHE_ROOT}/shards}"
 LOG_DIR="${LOG_DIR:-${CACHE_ROOT}/logs}"
@@ -35,10 +35,24 @@ import sys
 from pathlib import Path
 
 payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+schema = payload.get("schema")
+if schema not in {
+    "selfless_multimodal_likelihood_assets_v2",
+    "selfless_cross_dataset_retrieval_assets_v1",
+}:
+    raise RuntimeError(f"image benchmark assets use an unsupported schema: {schema!r}")
 if not payload.get("complete", False):
     raise RuntimeError("multimodal likelihood asset manifest is incomplete")
 if payload.get("runtime_hashing_enabled", True) is not False:
     raise RuntimeError("multimodal likelihood assets violate the no-hash contract")
+if schema == "selfless_multimodal_likelihood_assets_v2":
+    prior = payload.get("language_prior_null_images", {})
+    if (
+        prior.get("count") != 3
+        or [row.get("image_id") for row in prior.get("images", [])]
+        != [9000000000, 9000000001, 9000000002]
+    ):
+        raise RuntimeError("multimodal likelihood assets have the wrong null-image contract")
 PY
 
 read -r NPU_AVAILABLE VISIBLE_NPUS <<< "$(python - <<'PY'
@@ -93,6 +107,7 @@ if [[ "${CACHE_VALIDATE_ONLY:-0}" != "1" ]]; then
       --num_shards "${NPU_COUNT}" \
       --shard_index "${local_rank}" \
       --no_hash \
+      --overwrite \
       >"${log_path}" 2>&1 &
     pids+=("$!")
   done
@@ -110,7 +125,8 @@ if [[ "${CACHE_VALIDATE_ONLY:-0}" != "1" ]]; then
   fi
 fi
 
-python - "${MANIFEST}" "${SHARD_DIR}" "${COMPLETE_PATH}" <<'PY'
+python - "${ASSET_ROOT}/manifest.json" "${MANIFEST}" "${SHARD_DIR}" \
+  "${COMPLETE_PATH}" <<'PY'
 import json
 import os
 from pathlib import Path
@@ -119,9 +135,10 @@ import tempfile
 
 import torch
 
-manifest_path = Path(sys.argv[1])
-shard_dir = Path(sys.argv[2])
-complete_path = Path(sys.argv[3])
+asset = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+manifest_path = Path(sys.argv[2])
+shard_dir = Path(sys.argv[3])
+complete_path = Path(sys.argv[4])
 expected_ids = []
 with manifest_path.open(encoding="utf-8") as handle:
     for line in handle:
@@ -149,7 +166,9 @@ for path in shards:
 if sorted(actual_ids) != sorted(expected_ids):
     raise RuntimeError("cache image IDs do not exactly match the asset image manifest")
 payload = {
+    "schema": "selfless_image_posterior_cache_v2",
     "status": "ok",
+    "asset_schema": asset.get("schema"),
     "records": len(actual_ids),
     "shards": len(shards),
     "token_shape": [256, 32],
@@ -160,6 +179,10 @@ payload = {
         "mtime_ns": int(manifest_path.stat().st_mtime_ns),
     },
     "runtime_hashing_enabled": False,
+    "language_prior_null_image_ids": [
+        int(row["image_id"])
+        for row in asset.get("language_prior_null_images", {}).get("images", [])
+    ],
 }
 complete_path.parent.mkdir(parents=True, exist_ok=True)
 temporary = None

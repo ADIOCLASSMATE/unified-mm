@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Evaluate the custom ImageNet-val image-text retrieval protocol.
+"""Evaluate calibrated zero-shot ImageNet-1K classification on all 50K val images.
 
-This evaluator uses the Selfless same-position image-conditioned text
-likelihood directly.  It does not fine-tune a classifier, use a CLIP proxy, or
-apply a causal-LM one-token shift.  The reference backend streams candidate
-requests and is correctness-first: the 1K x 1K and 5K x 5K retrieval
-protocols are intentionally reported as high-cost evaluations.
+The 1,000 candidate texts use OpenAI CLIP's curated ImageNet class names and
+one frozen template.  The Selfless model itself supplies the length-normalized
+conditional token likelihoods; no external CLIP model scores the checkpoint.
+The formal score subtracts each class text's log-mean-exp marginal over all
+50,000 validation images with a fixed language-prior alpha of one.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from pathlib import Path
 import sys
 import tempfile
 import time
-from typing import Any, Iterable, Sequence
+from typing import Any, Sequence
 
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
@@ -41,9 +41,13 @@ from scripts.evaluate_multimodal_likelihood_benchmarks import (  # noqa: E402
     barrier,
     encode_candidate,
     initialize_device,
-    jsonl_text,
     score_candidate_requests,
     utc_now,
+)
+from scripts.language_prior_calibration import (  # noqa: E402
+    LANGUAGE_PRIOR_ALPHA,
+    LANGUAGE_PRIOR_ESTIMATOR,
+    language_prior_debiased_scores,
 )
 from models.modeling_model.image_position_utils import (  # noqa: E402
     build_row_col_position_ids,
@@ -62,16 +66,20 @@ from utils.utils import load_model_tokenizer  # noqa: E402
 
 DEFAULT_CONFIG = Path("configs/selfless/unified_baseline_100b_ascend_64npu.yaml")
 DEFAULT_MANIFEST = Path("public/datasets/imagenet_full/manifest_val.jsonl")
-DEFAULT_CAPTIONS = Path(
-    "public/datasets/imagenet1k_synthetic_v1/captions/"
-    "imagenet1k_val_visual_descriptions.jsonl"
-)
 DEFAULT_CLASSES = Path("public/datasets/imagenet1k_synthetic_v1/t2i/classes.json")
+DEFAULT_CLASSNAMES = Path("scripts/assets/imagenet1k_openai_clip_classnames.json")
 DEFAULT_CACHE = Path(
     "public/datasets/imagenet_full/vae_posterior_mar_kl16/val_shards"
 )
-DEFAULT_TASKS = ("retrieval_1k", "retrieval_5k")
 RETRIEVAL_PROMPT = "Describe this image in one detailed caption:"
+CLASS_TEXT_TEMPLATE = "a photo of a {class_name}."
+CLASSIFICATION_TASK = "imagenet1k_zeroshot_classification"
+OPENAI_CLIP_CLASSNAME_COMMIT = "d05afc436d78f1c48dc0dbf8e5980a9d471f35f6"
+OPENAI_CLIP_CLASSNAME_NOTEBOOK = "notebooks/Prompt_Engineering_for_ImageNet.ipynb"
+CLASS_IDENTITY_CORRECTIONS = (
+    (744, "n04008634", "missile", "projectile"),
+    (836, "n04355933", "sunglasses", "sunglass"),
+)
 
 
 @dataclass(frozen=True)
@@ -82,7 +90,6 @@ class ImageNetRecord:
     image_id: str
     synset: str
     class_index: int
-    caption: str
 
 
 class CachedTokenizer:
@@ -118,17 +125,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     add_model_source_argument(parser)
     parser.add_argument("--image_manifest", type=Path, default=DEFAULT_MANIFEST)
-    parser.add_argument("--captions", type=Path, default=DEFAULT_CAPTIONS)
     parser.add_argument("--classes", type=Path, default=DEFAULT_CLASSES)
+    parser.add_argument("--class_names", type=Path, default=DEFAULT_CLASSNAMES)
     parser.add_argument("--cache_shard_dir", type=Path, default=DEFAULT_CACHE)
     parser.add_argument("--output_dir", type=Path, required=True)
-    parser.add_argument("--tasks", default=",".join(DEFAULT_TASKS))
     parser.add_argument("--batch_size_per_rank", type=int, default=32)
     parser.add_argument("--request_chunk_size", type=int, default=128)
     parser.add_argument("--lm_head_chunk_tokens", type=int, default=256)
     parser.add_argument("--max_length", type=int, default=2048)
     parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument("--require_formal_protocol", action="store_true")
     parser.add_argument("--seed", type=int, default=424242)
+    parser.add_argument("--progress_every", type=int, default=10)
     parser.add_argument("--device", choices=("npu", "cuda", "cpu"), default="npu")
     parser.add_argument("--model_dtype", choices=("bf16", "fp32"), default="bf16")
     parser.add_argument(
@@ -151,14 +159,12 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
 
 def load_imagenet_records(
     manifest_path: Path,
-    captions_path: Path,
     classes_path: Path,
 ) -> list[ImageNetRecord]:
     images = read_jsonl(manifest_path)
-    captions = read_jsonl(captions_path)
     class_payload = json.loads(classes_path.read_text(encoding="utf-8"))
     class_rows = list(class_payload["classes"])
-    if len(images) != 50_000 or len(captions) != 50_000:
+    if len(images) != 50_000:
         raise ValueError("formal ImageNet-val evaluation requires exactly 50,000 rows")
     if len(class_rows) != 1_000:
         raise ValueError("ImageNet class metadata has unexpected cardinality")
@@ -167,20 +173,22 @@ def load_imagenet_records(
     }
     if len(synset_to_class) != 1_000:
         raise ValueError("invalid ImageNet class metadata")
+    class_to_synset = {
+        class_index: synset for synset, class_index in synset_to_class.items()
+    }
+    for class_index, expected_synset, _, _ in CLASS_IDENTITY_CORRECTIONS:
+        if class_to_synset.get(class_index) != expected_synset:
+            raise ValueError(
+                "ImageNet class metadata does not match the disambiguated "
+                f"class-name contract at index {class_index}"
+            )
 
     records: list[ImageNetRecord] = []
     class_counts: dict[int, int] = defaultdict(int)
-    for index, (image, caption) in enumerate(zip(images, captions)):
-        caption_values = caption.get("captions") or []
-        if len(caption_values) != 1:
-            raise ValueError(f"expected one ImageNet caption at row {index}")
+    for index, image in enumerate(images):
         if (
             int(image["manifest_index"]) != index
-            or int(caption["manifest_index"]) != index
-            or int(image["img_id"]) != int(caption["img_id"])
-            or str(image["synset"]) != str(caption["synset"])
             or str(image.get("split")) != "val"
-            or str(caption.get("split")) != "val"
         ):
             raise ValueError(f"ImageNet val alignment mismatch at row {index}")
         synset = str(image["synset"])
@@ -194,41 +202,73 @@ def load_imagenet_records(
                 image_id=str(image["image_id"]),
                 synset=synset,
                 class_index=class_index,
-                caption=str(caption_values[0]["text"]).strip(),
             )
         )
     if set(class_counts) != set(range(1_000)) or set(class_counts.values()) != {50}:
         raise ValueError("ImageNet val must contain 50 examples for every class")
+    if len({record.img_id for record in records}) != len(records):
+        raise ValueError("ImageNet val manifest contains duplicate internal image IDs")
+    if len({record.image_id for record in records}) != len(records):
+        raise ValueError("ImageNet val manifest contains duplicate official image IDs")
     return records
 
 
-def arithmetic_order_key(record: ImageNetRecord, seed: int) -> tuple[int, int]:
-    value = (
-        int(record.img_id) * 1_103_515_245
-        + int(seed) * 12_345
-        + int(record.class_index) * 97_409
-    ) & ((1 << 63) - 1)
-    return value, int(record.img_id)
-
-
-def stratified_records(
-    records: Sequence[ImageNetRecord],
-    per_class: int,
-    seed: int,
-) -> list[ImageNetRecord]:
-    if not 1 <= int(per_class) <= 50:
-        raise ValueError("per_class must be in [1, 50]")
-    grouped: dict[int, list[ImageNetRecord]] = defaultdict(list)
-    for record in records:
-        grouped[int(record.class_index)].append(record)
-    selected: list[ImageNetRecord] = []
-    for class_index in range(1_000):
-        ordered = sorted(
-            grouped[class_index],
-            key=lambda record: arithmetic_order_key(record, int(seed)),
+def load_openai_clip_class_names(path: Path) -> tuple[list[str], dict[str, Any]]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("schema") != "openai_clip_imagenet1k_classnames_v1":
+        raise ValueError("unexpected OpenAI CLIP ImageNet class-name schema")
+    expected_provenance = {
+        "source_repository": "https://github.com/openai/CLIP",
+        "source_commit": OPENAI_CLIP_CLASSNAME_COMMIT,
+        "source_notebook": OPENAI_CLIP_CLASSNAME_NOTEBOOK,
+        "class_order": "ILSVRC2012 class index 0..999",
+    }
+    for key, expected in expected_provenance.items():
+        if payload.get(key) != expected:
+            raise ValueError(
+                f"OpenAI CLIP class-name provenance mismatch for {key}: "
+                f"{payload.get(key)!r} != {expected!r}"
+            )
+    names = [str(value).strip() for value in payload.get("class_names", [])]
+    if len(names) != 1_000 or any(not value for value in names):
+        raise ValueError("OpenAI CLIP class-name asset must contain 1,000 names")
+    if len(set(names)) != 1_000:
+        raise ValueError("OpenAI CLIP class-name asset contains duplicate candidates")
+    expected_corrections = [
+        {
+            "class_index": class_index,
+            "synset": synset,
+            "official_notebook_value": original,
+            "value": replacement,
+            "reason": reason,
+        }
+        for (class_index, synset, original, replacement), reason in zip(
+            CLASS_IDENTITY_CORRECTIONS,
+            (
+                "avoid duplicate with class 657 and preserve WordNet synset identity",
+                "avoid duplicate with class 837 and preserve WordNet synset identity",
+            ),
         )
-        selected.extend(ordered[: int(per_class)])
-    return selected
+    ]
+    if payload.get("identity_corrections") != expected_corrections:
+        raise ValueError("ImageNet class-name disambiguation contract mismatch")
+    for class_index, _, _, replacement in CLASS_IDENTITY_CORRECTIONS:
+        if names[class_index] != replacement:
+            raise ValueError(
+                f"disambiguated class name mismatch at index {class_index}"
+            )
+    provenance = {
+        key: payload[key]
+        for key in (
+            "schema",
+            "source_repository",
+            "source_commit",
+            "source_notebook",
+            "class_order",
+            "identity_corrections",
+        )
+    }
+    return names, provenance
 
 
 def score_text_candidates(
@@ -639,69 +679,32 @@ def score_candidates_with_backend(**kwargs) -> tuple[torch.Tensor, torch.Tensor]
     return score_text_candidates(**kwargs)
 
 
-def retrieval_direction_metrics(
-    score_matrix: torch.Tensor,
+def classification_metrics(
+    prior_debiased_loglikelihood: torch.Tensor,
     class_indices: torch.Tensor,
 ) -> dict[str, Any]:
-    count = int(score_matrix.shape[0])
-    order = torch.argsort(score_matrix, dim=1, descending=True, stable=True)
-    positives = torch.arange(count, dtype=torch.long).unsqueeze(1)
-    ranks = (order == positives).nonzero(as_tuple=False)[:, 1] + 1
-    query_classes = class_indices.unsqueeze(1)
-    retrieved_classes = class_indices[order]
-    output: dict[str, Any] = {
-        "median_rank": float(ranks.float().median().item()),
-        "mean_rank": float(ranks.float().mean().item()),
-    }
-    recalls: list[float] = []
-    for k in (1, 5, 10):
-        effective = min(k, count)
-        instance = float((ranks <= effective).float().mean().item())
-        class_relevant = float(
-            (retrieved_classes[:, :effective] == query_classes)
-            .any(dim=1)
-            .float()
-            .mean()
-            .item()
-        )
-        output[f"instance_recall_at_{k}"] = instance
-        output[f"class_relevance_recall_at_{k}"] = class_relevant
-        recalls.append(instance)
-    output["instance_mean_recall_at_1_5_10"] = sum(recalls) / len(recalls)
-    return output
+    """Compute only the canonical ImageNet Top-1 and Top-5 accuracies."""
 
-
-def retrieval_metrics(
-    scores: torch.Tensor,
-    class_indices: torch.Tensor,
-) -> dict[str, Any]:
-    if scores.ndim != 2 or scores.shape[0] != scores.shape[1]:
-        raise ValueError("retrieval score matrix must be square")
-    image_to_text = retrieval_direction_metrics(scores, class_indices)
-    text_to_image = retrieval_direction_metrics(scores.T, class_indices)
-    result: dict[str, Any] = {
-        "records": int(scores.shape[0]),
-        "exact_instance_positive": "matrix_diagonal",
-        "same_class_relevance_reported": True,
-        "primary_metric": (
-            "normalized_loglikelihood.mean_bidirectional_instance_recall_at_1"
-        ),
-        "normalized_loglikelihood": {
-            "image_to_text": image_to_text,
-            "text_to_image": text_to_image,
-            "mean_bidirectional_instance_recall_at_1": (
-                image_to_text["instance_recall_at_1"]
-                + text_to_image["instance_recall_at_1"]
-            )
-            / 2.0,
-            "mean_bidirectional_instance_recall_at_1_5_10": (
-                image_to_text["instance_mean_recall_at_1_5_10"]
-                + text_to_image["instance_mean_recall_at_1_5_10"]
-            )
-            / 2.0,
-        },
+    scores = prior_debiased_loglikelihood
+    targets = class_indices.long()
+    if scores.ndim != 2 or scores.shape[0] != targets.numel():
+        raise ValueError("classification scores and target labels do not align")
+    if int(scores.shape[1]) != 1_000:
+        raise ValueError("ImageNet-1K classification requires 1,000 class texts")
+    if targets.numel() and (
+        int(targets.min()) < 0 or int(targets.max()) >= int(scores.shape[1])
+    ):
+        raise ValueError("ImageNet class target is outside [0, 1000)")
+    top5 = torch.topk(scores, k=5, dim=1, largest=True, sorted=True).indices
+    top1_correct = top5[:, 0].eq(targets)
+    top5_correct = top5.eq(targets.unsqueeze(1)).any(dim=1)
+    return {
+        "records": int(targets.numel()),
+        "classes": int(scores.shape[1]),
+        "primary_metric": "top_1_accuracy",
+        "top_1_accuracy": float(top1_correct.float().mean().item()),
+        "top_5_accuracy": float(top5_correct.float().mean().item()),
     }
-    return result
 
 
 def atomic_torch_save(path: Path, payload: dict[str, Any]) -> None:
@@ -718,11 +721,10 @@ def atomic_torch_save(path: Path, payload: dict[str, Any]) -> None:
             temporary.unlink(missing_ok=True)
 
 
-def evaluate_retrieval(
+def evaluate_classification(
     *,
-    name: str,
     records: Sequence[ImageNetRecord],
-    per_class: int,
+    class_names: Sequence[str],
     model,
     tokenizer,
     cache: PosteriorCache,
@@ -733,12 +735,15 @@ def evaluate_retrieval(
     image_sigma_order: str,
     attention_contract: str,
 ) -> dict[str, Any] | None:
-    selected = stratified_records(records, per_class, int(args.seed))
+    selected = list(records)
     if int(args.limit) > 0:
         selected = selected[: int(args.limit)]
-    candidates = [record.caption for record in selected]
+    candidates = [
+        CLASS_TEXT_TEMPLATE.format(class_name=class_name)
+        for class_name in class_names
+    ]
     local_pairs = list(enumerate(selected))[rank::world_size]
-    local_scores = torch.empty((len(local_pairs), len(selected)), dtype=torch.float32)
+    local_scores = torch.empty((len(local_pairs), len(candidates)), dtype=torch.float32)
     query_indices: list[int] = []
     started = time.monotonic()
     for local_index, (query_index, record) in enumerate(local_pairs):
@@ -747,39 +752,44 @@ def evaluate_retrieval(
             tokenizer=tokenizer,
             cache=cache,
             image_id=record.img_id,
-            item_id=f"{name}/{record.image_id}",
+            item_id=f"{CLASSIFICATION_TASK}/{record.image_id}",
             prompt=RETRIEVAL_PROMPT,
             candidates=candidates,
             args=args,
             device=device,
             image_sigma_order=image_sigma_order,
             attention_contract=attention_contract,
+            evaluation_task=CLASSIFICATION_TASK,
         )
         local_scores[local_index] = scores
         query_indices.append(query_index)
-        print(
-            json.dumps(
-                {
-                    "event": "imagenet_retrieval_progress",
-                    "task": name,
-                    "rank": rank,
-                    "query_rows": local_index + 1,
-                    "query_rows_total": len(local_pairs),
-                    "candidate_captions": len(candidates),
-                    "elapsed_seconds": time.monotonic() - started,
-                },
-                sort_keys=True,
-            ),
-            flush=True,
-        )
-    shard = args.output_dir / name / "shards" / (
+        if (
+            (local_index + 1) % int(args.progress_every) == 0
+            or local_index + 1 == len(local_pairs)
+        ):
+            print(
+                json.dumps(
+                    {
+                        "event": "imagenet1k_zeroshot_classification_progress",
+                        "task": CLASSIFICATION_TASK,
+                        "rank": rank,
+                        "image_rows": local_index + 1,
+                        "image_rows_total": len(local_pairs),
+                        "candidate_class_texts": len(candidates),
+                        "elapsed_seconds": time.monotonic() - started,
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+    shard = args.output_dir / "shards" / (
         f"rank-{rank:05d}-of-{world_size:05d}.pt"
     )
     atomic_torch_save(
         shard,
         {
             "query_indices": torch.tensor(query_indices, dtype=torch.long),
-            "normalized_loglikelihood": local_scores,
+            "conditional_mean_token_loglikelihood": local_scores,
             "scoring_contract": LIKELIHOOD_SCORING_CONTRACT,
             "dual_stream_attention_contract": attention_contract,
             "runtime_hashing_enabled": False,
@@ -788,10 +798,10 @@ def evaluate_retrieval(
     barrier(device)
     if rank != 0:
         return None
-    matrix = torch.empty((len(selected), len(selected)), dtype=torch.float32)
+    matrix = torch.empty((len(selected), len(candidates)), dtype=torch.float32)
     seen = torch.zeros(len(selected), dtype=torch.bool)
     for shard_rank in range(world_size):
-        path = args.output_dir / name / "shards" / (
+        path = args.output_dir / "shards" / (
             f"rank-{shard_rank:05d}-of-{world_size:05d}.pt"
         )
         payload = torch.load(str(path), map_location="cpu", weights_only=True)
@@ -802,36 +812,51 @@ def evaluate_retrieval(
         if payload.get("dual_stream_attention_contract") != attention_contract:
             raise ValueError("retrieval shard uses the wrong attention contract")
         indices = payload["query_indices"].long()
+        shard_scores = payload["conditional_mean_token_loglikelihood"].float()
+        if shard_scores.shape != (indices.numel(), len(candidates)):
+            raise ValueError("classification shard shape mismatch")
+        if indices.unique().numel() != indices.numel():
+            raise ValueError("duplicate classification image rows within a shard")
+        if indices.numel() and (
+            int(indices.min()) < 0 or int(indices.max()) >= len(selected)
+        ):
+            raise ValueError("classification shard contains out-of-range image rows")
         if bool(seen[indices].any()):
-            raise ValueError("duplicate retrieval query rows across shards")
-        matrix[indices] = payload["normalized_loglikelihood"].float()
+            raise ValueError("duplicate classification image rows across shards")
+        matrix[indices] = shard_scores
         seen[indices] = True
     if not bool(seen.all()):
-        raise RuntimeError("retrieval matrix is incomplete")
+        raise RuntimeError("classification score matrix is incomplete")
     class_indices = torch.tensor(
         [record.class_index for record in selected], dtype=torch.long
     )
-    summary = retrieval_metrics(matrix, class_indices)
+    calibrated, class_text_log_prior = language_prior_debiased_scores(matrix)
+    summary = classification_metrics(calibrated, class_indices)
     summary.update(
         {
-            "task": name,
-            "formal_target_records": per_class * 1_000,
-            "complete_formal_target": len(selected) == per_class * 1_000,
-            "selection": "deterministic_class_balanced_arithmetic_order",
-            "images_per_class": per_class,
-            "prompt": RETRIEVAL_PROMPT,
+            "schema": "selfless_imagenet1k_zeroshot_classification_summary_v2",
+            "task": CLASSIFICATION_TASK,
+            "split": "imagenet_val",
+            "accuracy_unit": "unit_interval",
+            "formal_target_records": 50_000,
+            "complete_formal_target": len(selected) == 50_000,
+            "class_text_template": CLASS_TEXT_TEMPLATE,
+            "language_prior_alpha": LANGUAGE_PRIOR_ALPHA,
+            "language_prior_estimator": LANGUAGE_PRIOR_ESTIMATOR,
+            "language_prior_image_count": len(selected),
         }
     )
-    atomic_write_text(
-        args.output_dir / name / "summary.json",
-        json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-    )
     atomic_torch_save(
-        args.output_dir / name / "score_matrix.pt",
+        args.output_dir / "score_matrix.pt",
         {
-            "normalized_loglikelihood": matrix,
+            "prior_debiased_loglikelihood": calibrated,
+            "class_text_log_prior": class_text_log_prior,
             "img_ids": torch.tensor([record.img_id for record in selected]),
             "class_indices": class_indices,
+            "class_names": list(class_names),
+            "class_text_template": CLASS_TEXT_TEMPLATE,
+            "language_prior_alpha": LANGUAGE_PRIOR_ALPHA,
+            "language_prior_estimator": LANGUAGE_PRIOR_ESTIMATOR,
             "scoring_contract": LIKELIHOOD_SCORING_CONTRACT,
             "dual_stream_attention_contract": attention_contract,
             "runtime_hashing_enabled": False,
@@ -840,13 +865,13 @@ def evaluate_retrieval(
     return summary
 
 
-def validate_args(args: argparse.Namespace, source) -> tuple[str, ...]:
+def validate_args(args: argparse.Namespace, source) -> None:
     for path in (
         args.config,
         source.path,
         args.image_manifest,
-        args.captions,
         args.classes,
+        args.class_names,
         args.cache_shard_dir,
     ):
         if not path.exists():
@@ -856,23 +881,20 @@ def validate_args(args: argparse.Namespace, source) -> tuple[str, ...]:
         args.request_chunk_size,
         args.lm_head_chunk_tokens,
         args.max_length,
+        args.progress_every,
     ):
         if int(value) <= 0:
             raise ValueError("batch/chunk/length arguments must be positive")
     if int(args.limit) < 0:
         raise ValueError("limit must be non-negative")
-    tasks = tuple(value.strip() for value in str(args.tasks).split(",") if value.strip())
-    allowed = set(DEFAULT_TASKS)
-    unknown = sorted(set(tasks) - allowed)
-    if not tasks or unknown:
-        raise ValueError(f"invalid ImageNet pretraining-native tasks: {unknown}")
-    return tasks
+    if bool(args.require_formal_protocol) and int(args.limit) != 0:
+        raise ValueError("formal ImageNet classification forbids row limiting")
 
 
 def main() -> None:
     args = parse_args()
     source = model_source_from_args(args)
-    tasks = validate_args(args, source)
+    validate_args(args, source)
     checkpoint_step = source.global_step
     rank, world_size, _, device = initialize_device(args.device)
     config = OmegaConf.load(args.config)
@@ -894,8 +916,9 @@ def main() -> None:
     if image_sigma_order not in {"random", "sequential"}:
         raise ValueError(f"unknown image sigma order: {image_sigma_order}")
 
-    records = load_imagenet_records(
-        args.image_manifest, args.captions, args.classes
+    records = load_imagenet_records(args.image_manifest, args.classes)
+    class_names, class_name_provenance = load_openai_clip_class_names(
+        args.class_names
     )
     model_dtype = torch.bfloat16 if args.model_dtype == "bf16" else torch.float32
     model, tokenizer = load_model_tokenizer(config, model_dtype=model_dtype)
@@ -930,7 +953,7 @@ def main() -> None:
     manifest_path = args.output_dir / "manifest.json"
     if rank == 0:
         manifest = {
-            "schema": "selfless_imagenet_retrieval_evaluation_v3",
+            "schema": "selfless_imagenet1k_zeroshot_classification_evaluation_v2",
             "complete": False,
             "created_at": utc_now(),
             "runtime_hashing_enabled": False,
@@ -938,11 +961,21 @@ def main() -> None:
             "checkpoint_step": checkpoint_step,
             "weight_source": source.kind,
             "config": str(args.config.resolve()),
-            "tasks": list(tasks),
+            "task": CLASSIFICATION_TASK,
             "world_size": world_size,
             "dataset_split": "imagenet_val",
             "dataset_records": len(records),
+            "formal_target_records": 50_000,
+            "project_formal_protocol": bool(args.require_formal_protocol),
+            "classes": len(class_names),
             "training_overlap_allowed": False,
+            "class_text": {
+                "template": CLASS_TEXT_TEMPLATE,
+                "prompt": RETRIEVAL_PROMPT,
+                "class_names": str(args.class_names.resolve()),
+                "provenance": class_name_provenance,
+                "template_selection_used_imagenet_val_labels": False,
+            },
             "scoring": {
                 "model_contract": "selfless_same_position_query_stream",
                 "contract": LIKELIHOOD_SCORING_CONTRACT,
@@ -952,7 +985,14 @@ def main() -> None:
                     attention_contract == "xlnet_content_diagonal"
                 ),
                 "causal_lm_one_token_shift": False,
-                "primary_candidate_score": "mean_token_loglikelihood",
+                "conditional_candidate_score": "mean_token_loglikelihood",
+                "primary_candidate_score": (
+                    "language_prior_debiased_mean_token_loglikelihood"
+                ),
+                "language_prior_alpha": LANGUAGE_PRIOR_ALPHA,
+                "language_prior_estimator": LANGUAGE_PRIOR_ESTIMATOR,
+                "language_prior_image_set": "all_evaluation_images",
+                "language_prior_uses_labels": False,
                 "scoring_backend": str(args.scoring_backend),
                 "reference_backend": "streamed_repeated_full_sequence_likelihood",
             },
@@ -964,60 +1004,60 @@ def main() -> None:
         )
     barrier(device)
 
-    summaries: dict[str, Any] = {}
-    for task_name, per_class in (("retrieval_1k", 1), ("retrieval_5k", 5)):
-        if task_name not in tasks:
-            continue
-        summary = evaluate_retrieval(
-            name=task_name,
-            records=records,
-            per_class=per_class,
-            model=model,
-            tokenizer=tokenizer,
-            cache=cache,
-            args=args,
-            rank=rank,
-            world_size=world_size,
-            device=device,
-            image_sigma_order=image_sigma_order,
-            attention_contract=attention_contract,
-        )
-        if rank == 0 and summary is not None:
-            summaries[task_name] = summary
+    summary = evaluate_classification(
+        records=records,
+        class_names=class_names,
+        model=model,
+        tokenizer=tokenizer,
+        cache=cache,
+        args=args,
+        rank=rank,
+        world_size=world_size,
+        device=device,
+        image_sigma_order=image_sigma_order,
+        attention_contract=attention_contract,
+    )
     if rank == 0:
+        if summary is None:
+            raise RuntimeError("rank zero did not produce a classification summary")
+        summary.update(
+            {
+                "checkpoint": str(source.path),
+                "checkpoint_step": checkpoint_step,
+                "weight_source": source.kind,
+                "runtime_hashing_enabled": False,
+                "project_formal_protocol": bool(args.require_formal_protocol),
+                "scoring": {
+                    "contract": LIKELIHOOD_SCORING_CONTRACT,
+                    "dual_stream_attention_contract": attention_contract,
+                    "backend": str(args.scoring_backend),
+                    "conditional_candidate_score": "mean_token_loglikelihood",
+                    "primary_candidate_score": (
+                        "language_prior_debiased_mean_token_loglikelihood"
+                    ),
+                    "language_prior_alpha": LANGUAGE_PRIOR_ALPHA,
+                    "language_prior_estimator": LANGUAGE_PRIOR_ESTIMATOR,
+                },
+            }
+        )
+        atomic_write_text(
+            args.output_dir / "summary.json",
+            json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        )
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         manifest["complete"] = True
+        manifest["complete_formal_target"] = summary["complete_formal_target"]
+        if bool(args.require_formal_protocol) and not bool(
+            summary["complete_formal_target"]
+        ):
+            raise RuntimeError("formal ImageNet classification did not cover 50K images")
         manifest["completed_at"] = utc_now()
-        manifest["summaries"] = summaries
+        manifest["reported_metrics"] = ["top_1_accuracy", "top_5_accuracy"]
         atomic_write_text(
             manifest_path,
             json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         )
-        atomic_write_text(
-            args.output_dir / "summary.json",
-            json.dumps(
-                {
-                    "schema": "selfless_imagenet_retrieval_summary_v3",
-                    "checkpoint_step": checkpoint_step,
-                    "runtime_hashing_enabled": False,
-                    "scoring": {
-                        "contract": LIKELIHOOD_SCORING_CONTRACT,
-                        "dual_stream_attention_contract": attention_contract,
-                        "query_stream_diagonal": False,
-                        "content_stream_diagonal": (
-                            attention_contract == "xlnet_content_diagonal"
-                        ),
-                        "backend": str(args.scoring_backend),
-                    },
-                    "tasks": summaries,
-                },
-                ensure_ascii=False,
-                indent=2,
-                sort_keys=True,
-            )
-            + "\n",
-        )
-        print(json.dumps(summaries, ensure_ascii=False, indent=2, sort_keys=True))
+        print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
     barrier(device)
 
 

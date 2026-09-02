@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate COCO/Flickr Karpathy test retrieval with Selfless likelihood."""
+"""Evaluate calibrated COCO/Flickr Karpathy-test image-text retrieval."""
 
 from __future__ import annotations
 
@@ -36,6 +36,11 @@ from scripts.evaluate_multimodal_likelihood_benchmarks import (  # noqa: E402
     barrier,
     initialize_device,
     utc_now,
+)
+from scripts.language_prior_calibration import (  # noqa: E402
+    LANGUAGE_PRIOR_ALPHA,
+    LANGUAGE_PRIOR_ESTIMATOR,
+    language_prior_debiased_scores,
 )
 from utils.evaluation_model_source import (  # noqa: E402
     add_model_source_argument,
@@ -78,6 +83,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lm_head_chunk_tokens", type=int, default=256)
     parser.add_argument("--max_length", type=int, default=2048)
     parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument("--require_formal_protocol", action="store_true")
     parser.add_argument("--query_partition_index", type=int, default=0)
     parser.add_argument("--query_partition_count", type=int, default=1)
     parser.add_argument("--seed", type=int, default=424242)
@@ -106,6 +112,8 @@ def read_json(path: Path) -> dict[str, Any]:
 
 def load_records(asset_root: Path) -> tuple[dict[str, Any], list[RetrievalRecord]]:
     manifest = read_json(asset_root / "manifest.json")
+    if manifest.get("schema") != "selfless_cross_dataset_retrieval_assets_v1":
+        raise ValueError("cross-dataset retrieval assets use an obsolete schema")
     if manifest.get("complete") is not True:
         raise ValueError("cross-dataset retrieval assets are incomplete")
     if manifest.get("runtime_hashing_enabled", True) is not False:
@@ -113,6 +121,21 @@ def load_records(asset_root: Path) -> tuple[dict[str, Any], list[RetrievalRecord
     task = str(manifest.get("task"))
     if task not in SUPPORTED_TASKS:
         raise ValueError(f"unsupported cross-dataset retrieval task: {task}")
+    expected_dataset = {
+        "mscoco_karpathy_test_5k": "mscoco",
+        "flickr30k_karpathy_test_1k": "flickr30k",
+    }[task]
+    if manifest.get("dataset") != expected_dataset or manifest.get("split") != (
+        "karpathy_test"
+    ):
+        raise ValueError(f"formal {task} asset dataset/split identity is invalid")
+    protocol = manifest.get("protocol") or {}
+    if (
+        protocol.get("bidirectional") is not True
+        or protocol.get("coco_five_fold_1k_average") is not False
+        or protocol.get("recall_at") != [1, 5, 10]
+    ):
+        raise ValueError(f"formal {task} retrieval protocol metadata is invalid")
     records: list[RetrievalRecord] = []
     path = asset_root / str(manifest["files"]["retrieval"])
     with path.open(encoding="utf-8") as handle:
@@ -137,6 +160,7 @@ def load_records(asset_root: Path) -> tuple[dict[str, Any], list[RetrievalRecord
     if (
         len(records) != expected_images
         or captions != expected_captions
+        or int(manifest.get("images", -1)) != expected_images
         or int(manifest.get("captions", -1)) != expected_captions
     ):
         raise ValueError(f"formal {task} asset cardinality is invalid")
@@ -145,10 +169,20 @@ def load_records(asset_root: Path) -> tuple[dict[str, Any], list[RetrievalRecord
         EXPECTED_CAPTION_COUNT_DISTRIBUTIONS[task]
     ):
         raise ValueError(f"formal {task} caption-count distribution is invalid")
+    manifest_distribution = {
+        int(count): int(images)
+        for count, images in (manifest.get("caption_count_distribution") or {}).items()
+    }
+    if manifest_distribution != EXPECTED_CAPTION_COUNT_DISTRIBUTIONS[task]:
+        raise ValueError(f"formal {task} manifest caption counts are invalid")
     if [record.image_index for record in records] != list(range(len(records))):
         raise ValueError("retrieval image indices are not contiguous")
     if len({record.img_id for record in records}) != len(records):
         raise ValueError("retrieval image IDs are not unique")
+    if len({record.source_image_id for record in records}) != len(records):
+        raise ValueError("retrieval source image IDs are not unique")
+    if len({record.source_path for record in records}) != len(records):
+        raise ValueError("retrieval source image paths are not unique")
     return manifest, records
 
 
@@ -205,9 +239,12 @@ def direction_metrics(ranks: torch.Tensor, candidates: int) -> dict[str, Any]:
 
 
 def retrieval_metrics(
-    scores: torch.Tensor,
+    prior_debiased_loglikelihood: torch.Tensor,
     caption_counts: Sequence[int] | None = None,
 ) -> dict[str, Any]:
+    """Compute the six canonical recalls from an already calibrated matrix."""
+
+    scores = prior_debiased_loglikelihood
     if scores.ndim != 2:
         raise ValueError("retrieval scores must be a matrix")
     images, captions = map(int, scores.shape)
@@ -243,23 +280,23 @@ def retrieval_metrics(
     return {
         "images": images,
         "captions": captions,
+        "recall_unit": "unit_interval",
+        "rank_unit": "one_based_candidate_rank",
         "caption_count_distribution": {
             str(count): image_count
             for count, image_count in sorted(Counter(caption_counts).items())
         },
-        "primary_metric": "normalized_loglikelihood.mean_bidirectional_recall_at_1",
-        "normalized_loglikelihood": {
-            "image_to_text": i2t,
-            "text_to_image": t2i,
-            "mean_bidirectional_recall_at_1": (
-                i2t["recall_at_1"] + t2i["recall_at_1"]
-            )
-            / 2.0,
-            "mean_bidirectional_recall_at_1_5_10": (
-                i2t["mean_recall_at_1_5_10"] + t2i["mean_recall_at_1_5_10"]
-            )
-            / 2.0,
-        },
+        "primary_metric": "mean_recall_at_1_5_10",
+        "image_to_text": i2t,
+        "text_to_image": t2i,
+        "mean_recall_at_1": (
+            i2t["recall_at_1"] + t2i["recall_at_1"]
+        )
+        / 2.0,
+        "mean_recall_at_1_5_10": (
+            i2t["mean_recall_at_1_5_10"] + t2i["mean_recall_at_1_5_10"]
+        )
+        / 2.0,
     }
 
 
@@ -278,6 +315,8 @@ def validate_args(args: argparse.Namespace, source) -> None:
             raise ValueError(f"--{name} must be positive")
     if int(args.limit) < 0:
         raise ValueError("--limit must be non-negative")
+    if bool(args.require_formal_protocol) and int(args.limit) != 0:
+        raise ValueError("formal retrieval forbids row limiting")
     if int(args.query_partition_count) <= 0:
         raise ValueError("--query_partition_count must be positive")
     if not 0 <= int(args.query_partition_index) < int(args.query_partition_count):
@@ -350,7 +389,7 @@ def main() -> None:
     manifest_path = args.output_dir / "manifest.json"
     if rank == 0:
         manifest = {
-            "schema": "selfless_cross_dataset_retrieval_evaluation_v2",
+            "schema": "selfless_cross_dataset_retrieval_evaluation_v3",
             "complete": False,
             "created_at": utc_now(),
             "runtime_hashing_enabled": False,
@@ -368,6 +407,7 @@ def main() -> None:
             },
             "formal_target_images": formal_images,
             "formal_target_captions": formal_captions,
+            "project_formal_protocol": bool(args.require_formal_protocol),
             "world_size": world_size,
             "query_partition": {
                 "method": "image_index_modulo",
@@ -388,9 +428,18 @@ def main() -> None:
                     attention_contract == "xlnet_content_diagonal"
                 ),
                 "causal_lm_one_token_shift": False,
-                "primary_candidate_score": "mean_token_loglikelihood",
+                "conditional_candidate_score": "mean_token_loglikelihood",
+                "primary_candidate_score": (
+                    "language_prior_debiased_mean_token_loglikelihood"
+                ),
+                "language_prior_alpha": LANGUAGE_PRIOR_ALPHA,
+                "language_prior_estimator": LANGUAGE_PRIOR_ESTIMATOR,
+                "language_prior_image_set": "all_candidate_images",
+                "language_prior_uses_labels": False,
+                "calibration_deferred_until_partition_merge": (
+                    int(args.query_partition_count) > 1
+                ),
                 "scoring_backend": str(args.scoring_backend),
-                "visual_calibration_enabled": False,
             },
             "checkpoint_load": load_report,
         }
@@ -450,7 +499,7 @@ def main() -> None:
         shard_path,
         {
             "query_indices": torch.tensor(query_indices, dtype=torch.long),
-            "normalized_loglikelihood": local_scores,
+            "conditional_mean_token_loglikelihood": local_scores,
             "scoring_contract": LIKELIHOOD_SCORING_CONTRACT,
             "dual_stream_attention_contract": attention_contract,
             "runtime_hashing_enabled": False,
@@ -476,16 +525,22 @@ def main() -> None:
                 if payload.get("dual_stream_attention_contract") != attention_contract:
                     raise ValueError("retrieval shard uses the wrong attention contract")
                 indices = payload["query_indices"].long()
-                scores = payload["normalized_loglikelihood"]
+                scores = payload["conditional_mean_token_loglikelihood"]
                 if scores.shape != (indices.numel(), len(captions)):
                     raise ValueError("partition retrieval shard shape mismatch")
+                if indices.unique().numel() != indices.numel():
+                    raise ValueError("duplicate retrieval rows within a partition shard")
+                if indices.numel() and (
+                    int(indices.min()) < 0 or int(indices.max()) >= len(records)
+                ):
+                    raise ValueError("partition retrieval shard has out-of-range rows")
                 if bool(seen[indices].any()):
                     raise ValueError("duplicate retrieval rows across partition shards")
                 seen[indices] = True
             if not torch.equal(seen, expected):
                 raise RuntimeError("cross-dataset retrieval partition is incomplete")
             partition_summary = {
-                "schema": "selfless_cross_dataset_retrieval_partition_v2",
+                "schema": "selfless_cross_dataset_retrieval_partition_v3",
                 "complete": True,
                 "runtime_hashing_enabled": False,
                 "checkpoint": str(source.path),
@@ -494,6 +549,7 @@ def main() -> None:
                 "split": "karpathy_test",
                 "images": len(records),
                 "captions": len(captions),
+                "project_formal_protocol": bool(args.require_formal_protocol),
                 "query_partition": {
                     "method": "image_index_modulo",
                     "index": int(args.query_partition_index),
@@ -509,6 +565,13 @@ def main() -> None:
                         attention_contract == "xlnet_content_diagonal"
                     ),
                     "backend": str(args.scoring_backend),
+                    "conditional_candidate_score": "mean_token_loglikelihood",
+                    "primary_candidate_score": (
+                        "language_prior_debiased_mean_token_loglikelihood"
+                    ),
+                    "language_prior_alpha": LANGUAGE_PRIOR_ALPHA,
+                    "language_prior_estimator": LANGUAGE_PRIOR_ESTIMATOR,
+                    "calibration_deferred_until_partition_merge": True,
                 },
                 "completed_at": utc_now(),
             }
@@ -543,21 +606,31 @@ def main() -> None:
                 if payload.get("dual_stream_attention_contract") != attention_contract:
                     raise ValueError("retrieval shard uses the wrong attention contract")
                 indices = payload["query_indices"].long()
+                if indices.unique().numel() != indices.numel():
+                    raise ValueError("duplicate retrieval rows within a shard")
+                if indices.numel() and (
+                    int(indices.min()) < 0 or int(indices.max()) >= len(records)
+                ):
+                    raise ValueError("retrieval shard contains out-of-range rows")
                 if bool(seen[indices].any()):
                     raise ValueError("duplicate retrieval rows across shards")
-                matrix[indices] = payload["normalized_loglikelihood"].float()
+                matrix[indices] = payload[
+                    "conditional_mean_token_loglikelihood"
+                ].float()
                 seen[indices] = True
             if not bool(seen.all()):
                 raise RuntimeError("cross-dataset retrieval matrix is incomplete")
-            summary = retrieval_metrics(matrix, caption_counts)
+            calibrated, text_log_prior = language_prior_debiased_scores(matrix)
+            summary = retrieval_metrics(calibrated, caption_counts)
             summary.update(
                 {
-                    "schema": "selfless_cross_dataset_retrieval_summary_v2",
+                    "schema": "selfless_cross_dataset_retrieval_summary_v3",
                     "task": asset_manifest["task"],
                     "split": "karpathy_test",
                     "checkpoint": str(source.path),
                     "checkpoint_step": checkpoint_step,
                     "runtime_hashing_enabled": False,
+                    "project_formal_protocol": bool(args.require_formal_protocol),
                     "formal_target_images": formal_images,
                     "formal_target_captions": formal_captions,
                     "complete_formal_target": (
@@ -572,6 +645,15 @@ def main() -> None:
                             attention_contract == "xlnet_content_diagonal"
                         ),
                         "backend": str(args.scoring_backend),
+                        "conditional_candidate_score": "mean_token_loglikelihood",
+                        "primary_candidate_score": (
+                            "language_prior_debiased_mean_token_loglikelihood"
+                        ),
+                        "language_prior_alpha": LANGUAGE_PRIOR_ALPHA,
+                        "language_prior_estimator": LANGUAGE_PRIOR_ESTIMATOR,
+                        "language_prior_image_count": len(records),
+                        "language_prior_uses_labels": False,
+                        "text_to_image_ranking_invariant_to_correction": True,
                     },
                 }
             )
@@ -582,13 +664,16 @@ def main() -> None:
             atomic_torch_save(
                 args.output_dir / "score_matrix.pt",
                 {
-                    "normalized_loglikelihood": matrix,
+                    "prior_debiased_loglikelihood": calibrated,
+                    "text_log_prior": text_log_prior,
                     "img_ids": torch.tensor([record.img_id for record in records]),
                     "caption_to_image": torch.arange(len(records)).repeat_interleave(
                         torch.tensor(caption_counts, dtype=torch.long)
                     ),
                     "scoring_contract": LIKELIHOOD_SCORING_CONTRACT,
                     "dual_stream_attention_contract": attention_contract,
+                    "language_prior_alpha": LANGUAGE_PRIOR_ALPHA,
+                    "language_prior_estimator": LANGUAGE_PRIOR_ESTIMATOR,
                     "runtime_hashing_enabled": False,
                 },
             )

@@ -55,12 +55,17 @@ validation 保持一条样本一行。
 
 ## 评测
 
-正式 ImageNet-1K 协议是 50K samples、BF16、CFG 3.5、10-step Heun、
-`spatial_halton`。
+当前 ImageNet-1K 生成评测配方是 50K samples、BF16、CFG 3.5、10-step
+Heun、`spatial_halton`；除 50K 指标覆盖外，采样参数可按后续实验调整，并应随结果
+完整记录。
 评测核心入口是 `scripts/evaluate_single_stream_fid_is.py`；global batch 会先按
 rank 切分，再进入 dataset collation。
 
 正式 FID 必须传入与目标数据分布匹配的 real-stat cache。
+
+最终 checkpoint 另外全量报告官方 GenEval、DPG-Bench 和 MJHQ-30K clean-fid；
+生成在 Ascend 上执行，三套官方评分器使用各自独立 CUDA 环境。固定版本、命令和
+分辨率可比边界见 [官方图像生成评测](docs/OFFICIAL_T2I_BENCHMARKS.md)。
 
 ## 代码入口
 
@@ -69,6 +74,7 @@ rank 切分，再进入 dataset collation。
 - `utils/dataset_imagenet_flow_cache.py`：class/caption dataset 与 dataloader。
 - `utils/multimodal_segment_packing.py`：caption 变长样本 packing。
 - `scripts/evaluate_single_stream_fid_is.py`：FID/IS evaluator。
+- `scripts/evaluate_official_t2i_benchmarks.py`：GenEval、DPG-Bench、MJHQ 官方评分适配器。
 
 ## 验证
 

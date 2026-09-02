@@ -3,7 +3,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ASSET_ROOT="${ASSET_ROOT:-public/benchmarks/selfless_multimodal_likelihood_v1}"
-CACHE_ROOT="${CACHE_ROOT:-${ASSET_ROOT}/vae_posterior_mar_kl16}"
+CACHE_ROOT="${CACHE_ROOT:-${ASSET_ROOT}/vae_posterior_mar_kl16_v2}"
 COMPLETE_PATH="${CACHE_COMPLETE_PATH:-${CACHE_ROOT}/cache.complete.json}"
 STATUS_PATH="${CACHE_STATUS_PATH:-${CACHE_ROOT}/cache.status}"
 WAIT_TIMEOUT_SECONDS="${CACHE_WAIT_TIMEOUT_SECONDS:-21600}"
@@ -41,11 +41,19 @@ expected_source = {
     "bytes": int(stat.st_size),
     "mtime_ns": int(stat.st_mtime_ns),
 }
+if asset.get("schema") != "selfless_multimodal_likelihood_assets_v2":
+    raise SystemExit(1)
+if cache.get("schema") != "selfless_image_posterior_cache_v2":
+    raise SystemExit(1)
+if cache.get("asset_schema") != asset.get("schema"):
+    raise SystemExit(1)
 if cache.get("runtime_hashing_enabled", True) is not False:
     raise SystemExit(1)
 if int(cache.get("records", -1)) != int(asset.get("images", -2)):
     raise SystemExit(1)
 if cache.get("source_manifest") != expected_source:
+    raise SystemExit(1)
+if cache.get("language_prior_null_image_ids") != [9000000000, 9000000001, 9000000002]:
     raise SystemExit(1)
 PY
   then

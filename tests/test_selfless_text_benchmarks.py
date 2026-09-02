@@ -1,18 +1,26 @@
 import os
+from copy import deepcopy
 
 os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
 
 import torch
+import pytest
 from transformers import Qwen3Config
 
 from models.modeling_model.modeling_selfless_flow import Qwen3ForCausalLM
 from scripts.evaluate_selfless_text_benchmarks import (
     ChoiceRequest,
-    DEFAULT_TASKS,
     MultipleChoiceExample,
     encode_choice,
+    primary_metric,
     preprocess_hellaswag,
     score_choice_requests,
+)
+from scripts.summarize_unified_full_evaluation import (
+    LM_EVAL_REFERENCE_COMMIT,
+    TEXT_TASK_PROTOCOLS,
+    validate_generation_summary,
+    validate_text_summary,
 )
 from utils.utils import get_selfless_mask
 
@@ -160,3 +168,92 @@ def test_choice_scorer_uses_b_diagonal_content_and_strict_query_masks():
 
 def test_hellaswag_preprocessing_matches_public_task_contract():
     assert preprocess_hellaswag(" x [title] [artifact]  y ") == "x. y"
+
+
+def test_mmlu_primary_is_subject_macro_not_example_micro_accuracy():
+    metrics = {
+        "accuracy": 0.75,
+        "accuracy_macro": 0.625,
+        "accuracy_normalized": 0.80,
+    }
+    assert primary_metric("mmlu", metrics) == 0.625
+
+
+def _formal_text_summary():
+    tasks = {}
+    primary = {}
+    for task, (samples, metric_name) in TEXT_TASK_PROTOCOLS.items():
+        metrics = {
+            "schema": "selfless_text_multiple_choice_metrics_v1",
+            "complete": True,
+            "runtime_hashing_enabled": False,
+            "task": task,
+            "samples": samples,
+            "accuracy": 0.5,
+            "accuracy_normalized": 0.5,
+            "truncated_context_samples": 0,
+        }
+        if task == "mmlu":
+            metrics["accuracy_macro"] = 0.5
+            metrics["by_category"] = {
+                f"subject_{index:02d}": {
+                    "samples": samples - 56 if index == 0 else 1,
+                    "accuracy": 0.5,
+                }
+                for index in range(57)
+            }
+        tasks[task] = metrics
+        primary[task] = metrics[metric_name]
+    return {
+        "schema": "selfless_text_benchmark_summary_v3",
+        "accuracy_unit": "unit_interval",
+        "tasks": tasks,
+        "primary_metrics": primary,
+        "macro_average_primary": 0.5,
+        "macro_average_role": "internal_cross_task_summary_only",
+        "protocol": {
+            "protocol_schema": "selfless_text_benchmark_v2",
+            "lm_eval_reference": {"commit": LM_EVAL_REFERENCE_COMMIT},
+        },
+    }
+
+
+def test_formal_text_summary_requires_57_subject_mmlu_macro():
+    summary = _formal_text_summary()
+    validate_text_summary(summary, formal=True)
+
+    invalid = deepcopy(summary)
+    invalid["tasks"]["mmlu"]["by_category"].pop("subject_56")
+    with pytest.raises(ValueError, match="57 subjects"):
+        validate_text_summary(invalid, formal=True)
+
+
+def _formal_generation_summary():
+    return {
+        "project_formal_protocol": True,
+        "leaderboard_comparable_to_adm_dit": False,
+        "protocol_name": "imagenet_val_fid50k_torch_fidelity_stratified_is",
+        "reference_distribution": "imagenet_val_50000",
+        "comparison_scope": "same_protocol_only",
+        "not_adm_dit_reason": (
+            "validation_reference_and_pytorch_torch_fidelity_extractor"
+        ),
+        "fid_reducer": "symmetric_eigendecomposition",
+        "strategy": "spatial_halton",
+        "samples": 50_000,
+        "is_split_assignment": "stratified_by_synset",
+        "is_split_plan": {"splits": 10},
+        "fid": 5.0,
+        "inception_score_mean": 2.0,
+        "inception_score_std": 0.0,
+        "inception_score_splits": [2.0] * 10,
+    }
+
+
+def test_full_summary_validates_project_generation_protocol():
+    validate_generation_summary(_formal_generation_summary(), formal=True)
+
+    invalid = _formal_generation_summary()
+    invalid["leaderboard_comparable_to_adm_dit"] = True
+    with pytest.raises(ValueError, match="comparability"):
+        validate_generation_summary(invalid, formal=True)

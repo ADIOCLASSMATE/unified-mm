@@ -8,7 +8,7 @@ fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ASSET_ROOT="${ASSET_ROOT:-public/benchmarks/selfless_multimodal_likelihood_v1}"
-CACHE_ROOT="${CACHE_ROOT:-${ASSET_ROOT}/vae_posterior_mar_kl16}"
+CACHE_ROOT="${CACHE_ROOT:-${ASSET_ROOT}/vae_posterior_mar_kl16_v2}"
 COMPLETE_PATH="${CACHE_COMPLETE_PATH:-${CACHE_ROOT}/cache.complete.json}"
 
 cache_ready=0
@@ -29,9 +29,14 @@ expected_source = {
     "mtime_ns": int(stat.st_mtime_ns),
 }
 if (
-    cache.get("runtime_hashing_enabled", True) is not False
+    asset.get("schema") != "selfless_multimodal_likelihood_assets_v2"
+    or cache.get("schema") != "selfless_image_posterior_cache_v2"
+    or cache.get("asset_schema") != asset.get("schema")
+    or cache.get("runtime_hashing_enabled", True) is not False
     or int(cache.get("records", -1)) != int(asset.get("images", -2))
     or cache.get("source_manifest") != expected_source
+    or cache.get("language_prior_null_image_ids")
+    != [9000000000, 9000000001, 9000000002]
 ):
     raise SystemExit(1)
 PY

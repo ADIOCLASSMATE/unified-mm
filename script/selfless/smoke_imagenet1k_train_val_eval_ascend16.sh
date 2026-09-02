@@ -211,7 +211,7 @@ required = {
 if evaluation.get("samples_evaluated") != 16:
     raise SystemExit("evaluation did not process all 16 smoke samples")
 if strategy.get("fid") is not None:
-    raise SystemExit("smoke evaluation must not publish a non-official FID")
+    raise SystemExit("smoke evaluation must not publish a non-formal FID")
 if evaluation.get("metric_protocol", {}).get("fid_computed") is not False:
     raise SystemExit("smoke evaluation unexpectedly computed FID")
 if any(not math.isfinite(float(value)) for value in required.values()):

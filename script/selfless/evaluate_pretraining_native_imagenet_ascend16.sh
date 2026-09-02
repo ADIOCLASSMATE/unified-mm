@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ "$#" != 2 ]]; then
-  echo "Usage: $0 <model-source-dir> <imagenet-native-output-dir>" >&2
+  echo "Usage: $0 <model-source-dir> <imagenet-classification-output-dir>" >&2
   exit 2
 fi
 
@@ -12,7 +12,7 @@ OUTPUT_DIR="$2"
 PROFILE="${EVAL_PROFILE:-formal}"
 CONFIG="${CONFIG:-configs/selfless/unified_baseline_100b_ascend_64npu.yaml}"
 CACHE_SHARD_DIR="${CACHE_SHARD_DIR:-public/datasets/imagenet_full/vae_posterior_mar_kl16/val_shards}"
-TASKS="${TASKS:-retrieval_1k,retrieval_5k}"
+CLASS_NAMES="${CLASS_NAMES:-scripts/assets/imagenet1k_openai_clip_classnames.json}"
 SCORING_BACKEND="${SCORING_BACKEND:-cached_prefix}"
 NPU_COUNT=16
 
@@ -20,10 +20,12 @@ if [[ "${PROFILE}" == "smoke" ]]; then
   LIMIT="${LIMIT:-4}"
   BATCH_SIZE_PER_RANK="${BATCH_SIZE_PER_RANK:-2}"
   LM_HEAD_CHUNK_TOKENS="${LM_HEAD_CHUNK_TOKENS:-32}"
+  PROTOCOL_ARGS=()
 elif [[ "${PROFILE}" == "formal" ]]; then
-  LIMIT="${LIMIT:-0}"
+  LIMIT=0
   BATCH_SIZE_PER_RANK="${BATCH_SIZE_PER_RANK:-32}"
   LM_HEAD_CHUNK_TOKENS="${LM_HEAD_CHUNK_TOKENS:-256}"
+  PROTOCOL_ARGS=(--require_formal_protocol)
 else
   echo "ERROR: EVAL_PROFILE must be smoke or formal; got ${PROFILE}" >&2
   exit 3
@@ -43,8 +45,8 @@ cd "${REPO_ROOT}"
 for required in \
   "${CONFIG}" \
   public/datasets/imagenet_full/manifest_val.jsonl \
-  public/datasets/imagenet1k_synthetic_v1/captions/imagenet1k_val_visual_descriptions.jsonl \
-  public/datasets/imagenet1k_synthetic_v1/t2i/classes.json; do
+  public/datasets/imagenet1k_synthetic_v1/t2i/classes.json \
+  "${CLASS_NAMES}"; do
   if [[ ! -f "${required}" ]]; then
     echo "ERROR: missing pretraining-native evaluation asset: ${required}" >&2
     exit 5
@@ -95,8 +97,8 @@ env \
   --config "${CONFIG}" \
   --model_source "${MODEL_SOURCE}" \
   --cache_shard_dir "${CACHE_SHARD_DIR}" \
+  --class_names "${CLASS_NAMES}" \
   --output_dir "${OUTPUT_DIR}" \
-  --tasks "${TASKS}" \
   --batch_size_per_rank "${BATCH_SIZE_PER_RANK}" \
   --request_chunk_size 128 \
   --lm_head_chunk_tokens "${LM_HEAD_CHUNK_TOKENS}" \
@@ -106,4 +108,5 @@ env \
   --device npu \
   --model_dtype bf16 \
   --scoring_backend "${SCORING_BACKEND}" \
-  --image_sigma_order auto
+  --image_sigma_order auto \
+  "${PROTOCOL_ARGS[@]}"

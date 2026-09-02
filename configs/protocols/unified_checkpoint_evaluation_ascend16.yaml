@@ -1,4 +1,4 @@
-schema: unified_checkpoint_evaluation_protocol_v3
+schema: unified_checkpoint_evaluation_protocol_v4
 weights: hf_final_ema
 runtime_hashing_enabled: false
 hardware:
@@ -25,6 +25,9 @@ components:
       - weighted_contribution_i2t
     qualitative_outputs: [generated_images, generated_captions]
   t2i_fid_is:
+    protocol_name: imagenet_val_fid50k_torch_fidelity_stratified_is
+    leaderboard_comparable_to_adm_dit: false
+    comparison_scope: same_protocol_only
     formal_samples: 50000
     real_reference: imagenet_val_50000
     sampling_steps: 10
@@ -38,9 +41,9 @@ profiles:
     heldout_validation_max_batches_per_rank: 2
     i2t_max_new_tokens: 32
     t2i_samples: 32
-    official_fid: false
+    project_formal_fid: false
   formal:
     heldout_validation_max_batches_per_rank: 0
     i2t_max_new_tokens: 96
     t2i_samples: 50000
-    official_fid: true
+    project_formal_fid: true

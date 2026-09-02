@@ -16,6 +16,15 @@ from utils.evaluation_model_source import (
 )
 
 IS_SPLIT_ASSIGNMENT = "stratified_by_synset"
+GENERATION_PROTOCOL_NAME = (
+    "imagenet_val_fid50k_torch_fidelity_stratified_is"
+)
+GENERATION_REFERENCE_DISTRIBUTION = "imagenet_val_50000"
+GENERATION_COMPARISON_SCOPE = "same_protocol_only"
+GENERATION_NON_COMPARABILITY_REASON = (
+    "validation_reference_and_pytorch_torch_fidelity_extractor"
+)
+GENERATION_FID_REDUCER = "symmetric_eigendecomposition"
 
 
 def parse_args() -> argparse.Namespace:
@@ -90,6 +99,120 @@ def validate_t2i_is_protocol(
     return plan
 
 
+def validate_t2i_generation_protocol(
+    t2i: dict[str, Any], *, profile: str
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Validate and select the only reportable project FID/IS variant."""
+
+    if t2i.get("schema") != "selfless_imagenet_val_t2i_fid_is_v2":
+        raise ValueError("T2I FID/IS result uses an obsolete protocol")
+    if t2i.get("runtime_hashing_enabled") is not False:
+        raise ValueError("T2I FID/IS did not explicitly disable runtime hashing")
+    if t2i.get("leaderboard_comparable_to_adm_dit") is not False:
+        raise ValueError("ImageNet-val FID/IS comparability label is invalid")
+    if str(t2i.get("split")) != "val":
+        raise ValueError("T2I evaluation did not use ImageNet val")
+    if t2i.get("real_source") != "cached_original_imagenet_val":
+        raise ValueError("T2I FID uses an unexpected real-image source")
+
+    metric_protocol = t2i.get("metric_protocol")
+    if not isinstance(metric_protocol, dict):
+        raise ValueError("T2I metric protocol is missing")
+    expected_protocol = {
+        "protocol_name": GENERATION_PROTOCOL_NAME,
+        "reference_distribution": GENERATION_REFERENCE_DISTRIBUTION,
+        "comparison_scope": GENERATION_COMPARISON_SCOPE,
+        "not_adm_dit_reason": GENERATION_NON_COMPARABILITY_REASON,
+        "fid_reducer": GENERATION_FID_REDUCER,
+        "is_split_assignment": IS_SPLIT_ASSIGNMENT,
+        "is_std": "population",
+    }
+    mismatches = {
+        key: {"expected": expected, "actual": metric_protocol.get(key)}
+        for key, expected in expected_protocol.items()
+        if metric_protocol.get(key) != expected
+    }
+    if mismatches:
+        raise ValueError(f"T2I metric protocol metadata is invalid: {mismatches}")
+    is_splits = int(metric_protocol.get("is_splits", -1))
+    if is_splits <= 0:
+        raise ValueError("T2I Inception Score split count is invalid")
+    plan = validate_t2i_is_protocol(t2i, profile=profile)
+    if int(plan.get("splits", -1)) != is_splits:
+        raise ValueError("T2I Inception Score split count is inconsistent")
+
+    samples = int(t2i.get("samples_evaluated", -1))
+    if samples <= 0 or int(t2i.get("samples_requested", -2)) != samples:
+        raise ValueError("T2I requested/evaluated sample counts are inconsistent")
+    strategies = t2i.get("strategies")
+    if not isinstance(strategies, dict) or len(strategies) != 1:
+        raise ValueError("T2I result must contain exactly one generation strategy")
+    strategy_name, strategy = next(iter(strategies.items()))
+    if not strategy_name or not isinstance(strategy, dict):
+        raise ValueError("T2I generation strategy is invalid")
+    if int(strategy.get("count", -1)) != samples:
+        raise ValueError("T2I strategy sample count is inconsistent")
+
+    fid_raw = strategy.get("fid")
+    fid = None if fid_raw is None else require_finite(fid_raw, "t2i.fid")
+    if fid is not None and fid < 0.0:
+        raise ValueError(f"T2I FID must be non-negative, got {fid}")
+    is_mean = require_finite(
+        strategy.get("inception_score_mean"), "t2i.inception_score_mean"
+    )
+    is_std = require_finite(
+        strategy.get("inception_score_std"), "t2i.inception_score_std"
+    )
+    is_values = [
+        require_finite(value, f"t2i.inception_score_splits[{index}]")
+        for index, value in enumerate(
+            strategy.get("inception_score_splits", [])
+        )
+    ]
+    if len(is_values) != is_splits:
+        raise ValueError("T2I Inception Score split metrics are incomplete")
+    if is_mean < 1.0 - 1.0e-9 or any(
+        value < 1.0 - 1.0e-9 for value in is_values
+    ):
+        raise ValueError("T2I Inception Score is below its theoretical minimum")
+    if is_std < 0.0:
+        raise ValueError("T2I Inception Score standard deviation is negative")
+    expected_mean = sum(is_values) / len(is_values)
+    expected_std = math.sqrt(
+        sum((value - expected_mean) ** 2 for value in is_values)
+        / len(is_values)
+    )
+    if not math.isclose(is_mean, expected_mean, rel_tol=0.0, abs_tol=1.0e-10):
+        raise ValueError("T2I Inception Score mean is inconsistent with splits")
+    if not math.isclose(is_std, expected_std, rel_tol=0.0, abs_tol=1.0e-10):
+        raise ValueError("T2I Inception Score std is inconsistent with splits")
+    throughput = require_finite(
+        strategy.get("generation_samples_per_second"),
+        "t2i.generation_samples_per_second",
+    )
+    if throughput <= 0.0:
+        raise ValueError("T2I generation throughput must be positive")
+
+    if profile == "formal":
+        if t2i.get("project_formal_protocol") is not True:
+            raise ValueError("formal T2I evaluation is not marked project-formal")
+        if samples != 50_000:
+            raise ValueError("formal T2I evaluation must contain 50,000 samples")
+        if metric_protocol.get("fid_computed") is not True or fid is None:
+            raise ValueError("formal T2I evaluation did not compute FID")
+        if is_splits != 10:
+            raise ValueError("formal T2I evaluation must use 10 IS splits")
+
+    return plan, {
+        "strategy": strategy_name,
+        "fid": fid,
+        "inception_score_mean": is_mean,
+        "inception_score_std": is_std,
+        "inception_score_splits": is_values,
+        "generation_samples_per_second": throughput,
+    }
+
+
 def validate_t2i_model_source(
     t2i: dict[str, Any], source: EvaluationModelSource
 ) -> None:
@@ -148,16 +271,10 @@ def main() -> None:
     for name, payload in (("validation", validation_run), ("t2i", t2i)):
         if payload.get("runtime_hashing_enabled") is not False:
             raise ValueError(f"{name} did not explicitly disable runtime hashing")
-    if str(t2i.get("split")) != "val":
-        raise ValueError("T2I evaluation did not use ImageNet val")
     validate_t2i_model_source(t2i, source)
-    is_split_plan = validate_t2i_is_protocol(t2i, profile=args.profile)
-    if args.profile == "formal" and t2i.get("official_protocol") is not True:
-        raise ValueError("formal T2I evaluation is not marked official")
-    if args.profile == "formal" and t2i.get("metric_protocol", {}).get(
-        "fid_computed"
-    ) is not True:
-        raise ValueError("formal T2I evaluation did not compute FID")
+    is_split_plan, t2i_metrics = validate_t2i_generation_protocol(
+        t2i, profile=args.profile
+    )
 
     val_metrics = validation.get("metrics", {})
     required_validation = (
@@ -172,34 +289,7 @@ def main() -> None:
     selected_validation = {
         key: require_finite(val_metrics[key], key) for key in required_validation
     }
-    strategy_name = "spatial_halton"
-    strategy = t2i.get("strategies", {}).get(strategy_name)
-    if not isinstance(strategy, dict):
-        raise ValueError(f"missing T2I strategy metrics: {strategy_name}")
-    fid_value = strategy.get("fid")
-    t2i_metrics = {
-        "fid": (
-            require_finite(fid_value, "t2i.fid")
-            if fid_value is not None
-            else None
-        ),
-        "inception_score_mean": require_finite(
-            strategy["inception_score_mean"], "t2i.inception_score_mean"
-        ),
-        "inception_score_std": require_finite(
-            strategy["inception_score_std"], "t2i.inception_score_std"
-        ),
-        "inception_score_splits": [
-            require_finite(value, f"t2i.inception_score_splits[{index}]")
-            for index, value in enumerate(
-                strategy["inception_score_splits"]
-            )
-        ],
-        "generation_samples_per_second": require_finite(
-            strategy["generation_samples_per_second"],
-            "t2i.generation_samples_per_second",
-        ),
-    }
+    strategy_name = str(t2i_metrics["strategy"])
     caption_dir = validation_root / "validation_i2t_captions" / f"step-{step:08d}"
     caption_path = caption_dir / "captions.jsonl"
     if not caption_path.is_file():
@@ -232,7 +322,7 @@ def main() -> None:
         raise ValueError("qualitative validation artifacts are incomplete")
 
     summary = {
-        "schema": "unified_checkpoint_evaluation_summary_v2",
+        "schema": "unified_checkpoint_evaluation_summary_v3",
         "complete": True,
         "profile": args.profile,
         "runtime_hashing_enabled": False,
@@ -246,9 +336,14 @@ def main() -> None:
         },
         "heldout_validation": selected_validation,
         "t2i_fid_is": {
-            "official_protocol": bool(t2i["official_protocol"]),
+            "project_formal_protocol": bool(t2i["project_formal_protocol"]),
+            "leaderboard_comparable_to_adm_dit": False,
+            "protocol_name": GENERATION_PROTOCOL_NAME,
+            "reference_distribution": GENERATION_REFERENCE_DISTRIBUTION,
+            "comparison_scope": GENERATION_COMPARISON_SCOPE,
+            "not_adm_dit_reason": GENERATION_NON_COMPARABILITY_REASON,
+            "fid_reducer": GENERATION_FID_REDUCER,
             "samples": int(t2i["samples_evaluated"]),
-            "strategy": strategy_name,
             "is_split_assignment": IS_SPLIT_ASSIGNMENT,
             "is_split_plan": is_split_plan,
             **t2i_metrics,

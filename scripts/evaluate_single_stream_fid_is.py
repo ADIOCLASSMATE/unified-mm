@@ -276,7 +276,7 @@ def parse_args():
         help="Allow sigma/sigma_replay strategies. Disabled by default because real generation cannot know training sigma.",
     )
     parser.add_argument(
-        "--require_official_protocol",
+        "--require_formal_protocol",
         action="store_true",
         help=(
             "Fail unless shared real stats, the full matching fake sample count, "
@@ -1568,19 +1568,21 @@ def checkpoint_weight_dtypes(model_path: str | Path) -> list[str]:
         )
 
 
-def is_official_flow_protocol(
+def is_formal_flow_protocol(
     *,
     shared_real_count: int | None,
     samples: int,
     is_splits: int,
-    parallel_rate: int,
+    fid_feature: int,
     is_split_plan: Mapping[str, object],
 ) -> bool:
     return bool(
         shared_real_count is not None
+        and int(shared_real_count) == 50_000
+        and int(samples) == 50_000
         and int(samples) == int(shared_real_count)
         and int(is_splits) == 10
-        and int(parallel_rate) == 1
+        and int(fid_feature) == 2048
         and is_split_plan.get("assignment")
         == IS_SPLIT_ASSIGNMENT_STRATIFIED
         and is_split_plan.get("source_dataset_split") == "val"
@@ -1658,7 +1660,7 @@ def load_shared_original_real_stats(
     stats_path = Path(path)
     if not stats_path.is_file():
         raise FileNotFoundError(stats_path)
-    payload = torch.load(stats_path, map_location="cpu")
+    payload = torch.load(stats_path, map_location="cpu", weights_only=True)
     if not isinstance(payload, Mapping) or "stats" not in payload:
         raise ValueError(
             f"{stats_path} must contain a mapping with a 'stats' entry."
@@ -1688,6 +1690,45 @@ def load_shared_original_real_stats(
             "shared real stats feature dimension mismatch: "
             f"cache={recorded_feature}, requested={fid_feature}."
         )
+    schema = payload.get("schema")
+    if schema not in {
+        "imagenet_inception_feature_moments_v1",
+        "imagenet_val_inception_feature_moments_v2",
+    }:
+        raise ValueError(f"unsupported ImageNet-val real-stat schema: {schema!r}")
+    source_metadata = metadata.get("source", {})
+    transform_metadata = metadata.get("image_transform", {})
+    exact_contract = {
+        "classes": (source_metadata.get("classes"), 1_000),
+        "samples_per_class": (source_metadata.get("samples_per_class"), 50),
+        "extractor": (
+            feature_metadata.get("extractor"),
+            "torch-fidelity-inception-v3-compat",
+        ),
+        "accumulation_dtype": (
+            feature_metadata.get("accumulation_dtype"),
+            "torch.float32",
+        ),
+        "resize": (transform_metadata.get("resize"), 256),
+        "interpolation": (
+            transform_metadata.get("interpolation"),
+            "bicubic",
+        ),
+        "center_crop": (transform_metadata.get("center_crop"), 256),
+        "color_mode": (transform_metadata.get("color_mode"), "RGB"),
+    }
+    if source_metadata.get("split") not in {"val", "validation"}:
+        raise ValueError("real-stat source must be ImageNet validation")
+    for field, (actual, expected) in exact_contract.items():
+        if actual != expected:
+            raise ValueError(
+                f"ImageNet-val real-stat metadata mismatch for {field}: "
+                f"{actual!r} != {expected!r}"
+            )
+    for name in ("sum", "outer_sum"):
+        tensor = payload["stats"][name]
+        if not bool(torch.isfinite(tensor).all()):
+            raise ValueError(f"ImageNet-val real-stat {name} contains NaN/Inf")
     return payload
 
 
@@ -2008,21 +2049,20 @@ def main(*, model_loader=None):
         fid_feature=int(args.fid_feature),
     )
     shared_real_count = int(shared_real_payload["stats"]["count"])
-    official_protocol = is_official_flow_protocol(
+    formal_protocol = is_formal_flow_protocol(
         shared_real_count=shared_real_count,
         samples=int(args.samples),
         is_splits=int(args.is_splits),
-        parallel_rate=int(args.parallel_rate),
+        fid_feature=int(args.fid_feature),
         is_split_plan=is_split_plan,
     )
-    if args.require_official_protocol and not official_protocol:
+    if args.require_formal_protocol and not formal_protocol:
         raise ValueError(
-            "Official flow FID/IS protocol requires shared original-ImageNet "
+            "Project-formal flow FID/IS protocol requires shared ImageNet-val "
             f"stats, exactly its {shared_real_count} fake samples, 10 "
             "synset-stratified IS splits with all 1,000 classes represented "
-            "equally in every split, and --parallel_rate=1; "
+            "equally in every split; "
             f"got samples={args.samples}, is_splits={args.is_splits}, "
-            f"parallel_rate={args.parallel_rate}, "
             f"is_split_plan={is_split_plan!r}, "
             f"real_stats_path={real_stats_path!r}"
         )
@@ -2595,8 +2635,10 @@ def main(*, model_loader=None):
     )
 
     results = {
+        "schema": "selfless_imagenet_val_t2i_fid_is_v2",
         "runtime_hashing_enabled": False,
-        "official_protocol": official_protocol,
+        "project_formal_protocol": formal_protocol,
+        "leaderboard_comparable_to_adm_dit": False,
         "implementation_contracts": {
             "evaluator_rng_contract": EVALUATOR_RNG_CONTRACT,
             "canonical_initial_noise_enabled": bool(canonical_pairing_enabled),
@@ -2627,6 +2669,12 @@ def main(*, model_loader=None):
             **(pairing_manifests or {}),
         },
         "metric_protocol": {
+            "protocol_name": "imagenet_val_fid50k_torch_fidelity_stratified_is",
+            "reference_distribution": "imagenet_val_50000",
+            "comparison_scope": "same_protocol_only",
+            "not_adm_dit_reason": (
+                "validation_reference_and_pytorch_torch_fidelity_extractor"
+            ),
             "fid_reducer": "symmetric_eigendecomposition",
             "fid_computed": bool(compute_fid),
             "is_split_assignment": IS_SPLIT_ASSIGNMENT_STRATIFIED,

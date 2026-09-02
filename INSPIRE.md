@@ -116,12 +116,13 @@ not implicitly mount the official dataset.
   contamination/decontamination hashing remain disabled.
 - The canonical complete-suite entry is
   `script/selfless/evaluate_unified_native_full_checkpoint_ascend16.sh`. It
-  combines official ImageNet-val 50K T2I FID/IS, the eight-task text suite,
-  class-balanced ImageNet-val 1K/5K custom retrieval, MSCOCO Karpathy 5K test
-  retrieval, Flickr30K Karpathy test retrieval, SugarCrepe, and ARO. MMBench
-  and SEED are internal ablation-trend diagnostics only. ImageNet
-  classification/ReaL and the old I2T-CLIP score are not part of the paper
-  protocol. The text-only entry is
+  combines project-formal ImageNet-val 50K T2I FID/IS, the eight-task text
+  suite, complete ImageNet-val 50K generative zero-shot classification,
+  MSCOCO Karpathy 5K test retrieval, Flickr30K Karpathy test retrieval,
+  SugarCrepe, and ARO. All image-text scores use fixed-alpha language-prior
+  correction. MMBench and SEED are internal ablation-trend diagnostics only;
+  custom ImageNet 1K/5K retrieval, ReaL, and the old generated-caption CLIP
+  score have been removed. The text-only entry is
   `script/selfless/evaluate_selfless_text_ascend16.sh`.
 - The canonical final-evaluation input for ablation a is
   `output/unified-a-0p6b-100b-imagenet-split-s42-r1/hf_model-final-ema`.
@@ -129,10 +130,12 @@ not implicitly mount the official dataset.
   overlay; `ema_export_metadata.json` records source step 95415. Rank-sharded
   checkpoint directories remain legacy inputs only for historical trends.
 - The reusable T2I-only entry is
-  `script/selfless/evaluate_unified_t2i_fid_is_ascend16.sh`. Official IS uses
+  `script/selfless/evaluate_unified_t2i_fid_is_ascend16.sh`. Project-formal IS uses
   ten deterministic `stratified_by_synset` splits. Each split must contain
-  all 1,000 ImageNet classes with exactly five samples per class; the official
-  gate also requires the source dataset itself to declare `split=val`.
+  all 1,000 ImageNet classes with exactly five samples per class; the formal
+  gate also requires the source dataset itself to declare `split=val`. This
+  val-reference FID is for same-protocol comparisons and is not ADM/DiT
+  leaderboard-comparable.
 - Text scoring follows this model's same-position Selfless query-stream
   likelihood contract rather than a stock next-token lm-eval adapter. MMLU is
   5-shot; the evaluation-only maximum context is 4096 and does not change the
@@ -143,21 +146,19 @@ not implicitly mount the official dataset.
   Per-sample benchmark/text results and qualitative image/caption artifacts are
   retained, while rank shards, resume state, duplicate logs, smoke output, and
   results from removed protocols are excluded.
-- The historical checkpoint-protocol evaluation is complete for its latest
-  retained checkpoint, step 60000. Step 56000/58000 remain compact historical trend
-  rows and do not repeat standard cross-dataset retrieval. The canonical
-  archive manifest reports `paper_protocol_complete=true` with no pending
-  tasks.
-- Flickr30K Karpathy 1K test was evaluated by one 16-NPU Job. MSCOCO
-  Karpathy 5K test was evaluated by two independent 16-NPU query partitions;
-  every partition scored against all 25,010 captions, and
-  `script/selfless/finalize_unified_step60000_evaluation.sh` strictly merged
-  the duplicate-free 5,000-row result and produced the native/full summaries.
-- The complete no-hash multimodal-likelihood posterior cache for the current
-  readable asset manifest is
-  `public/benchmarks/selfless_multimodal_likelihood_v1/vae_posterior_mar_kl16`
-  (64,973 images in 16 shards). The superseded 6,164-image cache was moved to
-  the shared `.Trash` and is not a valid evaluation input.
+- The step-56000/58000/60000 archive predates language-prior correction and is
+  historical only. Its former `paper_protocol_complete` flag does not satisfy
+  the current v8 protocol, and its ImageNet/retrieval/benchmark metrics must
+  not be reused as new paper results.
+- New Flickr30K and MSCOCO runs must use retrieval schema v3. Independent COCO
+  query partitions may still be used, but every partition must score all
+  25,010 captions and `scripts/merge_cross_dataset_retrieval_partitions.py`
+  must calibrate the complete, duplicate-free 5,000-row matrix before R@K.
+- The current multimodal asset manifest is schema v2 with 61,036 images,
+  including three fixed language-prior null images. Its cache target is
+  `public/benchmarks/selfless_multimodal_likelihood_v1/vae_posterior_mar_kl16_v2`.
+  Build that 16-shard cache before evaluation. The former 64,973-image cache
+  lacks the null images and is explicitly not a valid evaluation input.
 - `output/evaluation-checkpoints` remains outside the result archive because it
   contains 77GB of legacy checkpoint-trend inputs, not evaluation output.
   Moving it would invalidate recorded historical paths; it is not the
@@ -240,7 +241,7 @@ not implicitly mount the official dataset.
   `script/selfless/evaluate_imagenet1k_t2i_seq_sigma_ascend16.sh`. Each uses 16
   Ascend NPUs, the matching final EMA HF export, 50,000 validation-image
   synthetic T2I prompts, 10-step Heun, CFG 3.5, canonical paired noise, and
-  the frozen official ImageNet validation moments for FID/IS. Baseline and
+  the frozen project ImageNet validation moments for FID/IS. Baseline and
   position-wise use `spatial_halton`; sequential sigma uses `sequential`. Each
   result is retained below its run root at
   `generation-evaluation/heun10/t2i-fid-is/metrics.json`. The former 100-step
@@ -298,7 +299,7 @@ not implicitly mount the official dataset.
   `public/models/torch-fidelity/weights-inception-2015-12-05-6726825d.pth`
   (SHA256
   `6726825d0af5f729cebd5821db510b11b1cfad8faad88a03f1befd49fb9129b2`).
-- The locally computed official-val moments are
+- The locally computed ImageNet-val moments are
   `public/datasets/imagenet_full/fid_stats/inception_v3_2048_imagenet_val50000_256.pt`
   (50,000 images, 1,000 classes, 2,048 features, SHA256
   `7eb801931347be917b34077c5ab94c4c7c6b9c42bbe40b442f39947d9bb133`).
@@ -313,9 +314,10 @@ not implicitly mount the official dataset.
   Its 16-sample FID/IS values are pipeline diagnostics, not paper metrics.
 - W&B remains enabled. `WANDB_MODE` defaults to `offline` and may be set to
   `online` for a platform environment with working W&B credentials/network.
-- The final EMA HF model completed the canonical official ImageNet-1K
+- The final EMA HF model completed the project-formal ImageNet-val
   evaluation on 2026-08-19: 50,000 samples, deterministic canonical pairing,
-  CFG 3.5, 100-step Heun, and the frozen official-val moments. The result is
+  CFG 3.5, 100-step Heun, and the frozen val moments. This historical result
+  is same-protocol-only, not ADM/DiT leaderboard-comparable. The result is
   FID `18.996944032440638` and IS `450.06854248046875 ± 4.259687366514454`.
   The retained result is
   `output/selfless-flow-imagenet1k-class-ascend64-b1024-800ep-fid-is/metrics.json`
@@ -340,10 +342,10 @@ not implicitly mount the official dataset.
   `public/datasets/imagenet_full/preparation/seq_sigma_train_val_eval_smoke_report_v2.json`;
   run the retained one-off smoke launcher with
   `script/selfless/smoke_imagenet1k_seq_sigma_train_val_eval_ascend16.sh`.
-- The sequential-image-sigma final EMA completed its canonical official 50K
+- The sequential-image-sigma final EMA completed its project-formal 50K
   evaluation on 2026-08-24 with deterministic canonical pairing, CFG 3.5,
   100-step Heun, the required `sequential` generation strategy, and the frozen
-  official-val moments. Its FID is `8.633703493770327`, IS is
+  ImageNet-val moments. Its FID is `8.633703493770327`, IS is
   `247.52949981689454 ± 3.36128814432888`, and generation throughput is
   `4.224009451221147 samples/s` on 16 NPUs. The retained result is
   `output/selfless-flow-imagenet1k-class-ascend64-b1024-800ep-seq-sigma-fid-is/metrics.json`
@@ -378,14 +380,14 @@ not implicitly mount the official dataset.
 - Dynamic-XT config and launcher:
   `configs/selfless/imagenet1k_class_dynamic_xt_800ep.yaml` and
   `script/selfless/pretraining_imagenet_class_dynamic_xt_800ep.sh`.
-- Its 16-NPU official 50K FID/IS launcher is
+- Its 16-NPU project-formal 50K ImageNet-val FID/IS launcher is
   `script/selfless/evaluate_imagenet1k_dynamic_xt_ema_ascend16.sh`; it uses the
   dedicated Dynamic-XT evaluator entry while retaining the static protocol.
 - The position-wise-head retained smoke report is
   `public/datasets/imagenet_full/preparation/positionwise_head_smoke_report.json`.
-- The position-wise-head final EMA completed the canonical official 50K
+- The position-wise-head final EMA completed the project-formal 50K
   evaluation on 2026-08-22 with deterministic canonical pairing, CFG 3.5,
-  100-step Heun, `spatial_halton`, and the frozen official-val moments. Its
+  100-step Heun, `spatial_halton`, and the frozen val moments. Its
   FID is `18.2875253165069`, IS is
   `438.955712890625 ± 3.8873937344382083`, and generation throughput is
   `18.023885168137856 samples/s` on 16 NPUs. Relative to the same-protocol

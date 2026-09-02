@@ -23,7 +23,7 @@ cd "${REPO_ROOT}"
 export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 for required in \
   "${CORE_ROOT}/full_evaluation_summary.json" \
-  "${NATIVE_ROOT}/imagenet-retrieval/manifest.json" \
+  "${NATIVE_ROOT}/imagenet-classification/manifest.json" \
   "${NATIVE_ROOT}/retained-benchmarks/manifest.json" \
   "${COCO_ASSET_ROOT}/manifest.json" \
   "${COCO_PARTITION_0}/partition_summary.json" \
@@ -66,7 +66,7 @@ TORCH_DEVICE_BACKEND_AUTOLOAD=0 "${PYTHON_BIN}" \
 
 "${PYTHON_BIN}" scripts/summarize_pretraining_native_understanding.py \
   --checkpoint "${CHECKPOINT}" \
-  --imagenet_retrieval_root "${NATIVE_ROOT}/imagenet-retrieval" \
+  --imagenet_classification_root "${NATIVE_ROOT}/imagenet-classification" \
   --coco_retrieval_root "${COCO_OUTPUT_ROOT}" \
   --flickr30k_retrieval_root "${FLICKR_OUTPUT_ROOT}" \
   --benchmark_root "${NATIVE_ROOT}/retained-benchmarks" \

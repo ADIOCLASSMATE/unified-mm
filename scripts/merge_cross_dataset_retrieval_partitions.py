@@ -17,8 +17,14 @@ from scripts.evaluate_cross_dataset_retrieval import (
 )
 from scripts.evaluate_imagenet_pretraining_native import atomic_torch_save
 from scripts.evaluate_multimodal_likelihood_benchmarks import (
+    LIKELIHOOD_SCORING_CONTRACT,
     atomic_write_text,
     utc_now,
+)
+from scripts.language_prior_calibration import (
+    LANGUAGE_PRIOR_ALPHA,
+    LANGUAGE_PRIOR_ESTIMATOR,
+    language_prior_debiased_scores,
 )
 
 
@@ -54,6 +60,7 @@ def merge_score_shards(
     *,
     images: int,
     captions: int,
+    dual_stream_attention_contract: str | None = None,
 ) -> torch.Tensor:
     """Load partition rank shards and require exact, duplicate-free coverage."""
 
@@ -73,9 +80,21 @@ def merge_score_shards(
             if payload.get("runtime_hashing_enabled", True) is not False:
                 raise ValueError(f"partition shard violates no-hash contract: {shard_path}")
             indices = payload["query_indices"].long()
-            scores = payload["normalized_loglikelihood"].float()
+            if payload.get("scoring_contract") != LIKELIHOOD_SCORING_CONTRACT:
+                raise ValueError(f"partition shard scoring mismatch: {shard_path}")
+            if (
+                dual_stream_attention_contract is not None
+                and payload.get("dual_stream_attention_contract")
+                != dual_stream_attention_contract
+            ):
+                raise ValueError(
+                    f"partition shard attention contract mismatch: {shard_path}"
+                )
+            scores = payload["conditional_mean_token_loglikelihood"].float()
             if indices.ndim != 1 or scores.shape != (indices.numel(), captions):
                 raise ValueError(f"invalid partition shard shape: {shard_path}")
+            if indices.unique().numel() != indices.numel():
+                raise ValueError(f"duplicate rows within partition shard: {shard_path}")
             if indices.numel() and (
                 int(indices.min()) < 0 or int(indices.max()) >= images
             ):
@@ -124,6 +143,14 @@ def main() -> None:
     checkpoint = str(first["checkpoint"])
     checkpoint_step = int(first["checkpoint_step"])
     for root, manifest, summary in zip(roots, manifests, summaries):
+        if manifest.get("schema") != "selfless_cross_dataset_retrieval_evaluation_v3":
+            raise ValueError(f"obsolete partition manifest protocol: {root}")
+        if summary.get("schema") != "selfless_cross_dataset_retrieval_partition_v3":
+            raise ValueError(f"obsolete partition summary protocol: {root}")
+        if manifest.get("project_formal_protocol") is not True:
+            raise ValueError(f"partition manifest is not a formal run: {root}")
+        if summary.get("project_formal_protocol") is not True:
+            raise ValueError(f"partition summary is not a formal run: {root}")
         partition = manifest.get("query_partition", {})
         index = int(partition.get("index", -1))
         count = int(partition.get("count", -1))
@@ -165,11 +192,23 @@ def main() -> None:
         specs,
         images=images,
         captions=caption_total,
+        dual_stream_attention_contract=str(
+            first["scoring"]["dual_stream_attention_contract"]
+        ),
     )
-    summary = retrieval_metrics(matrix, caption_counts)
+    calibrated, text_log_prior = language_prior_debiased_scores(matrix)
+    summary = retrieval_metrics(calibrated, caption_counts)
+    scoring = dict(first["scoring"])
+    scoring.update(
+        {
+            "calibration_deferred_until_partition_merge": False,
+            "language_prior_image_count": images,
+            "text_to_image_ranking_invariant_to_correction": True,
+        }
+    )
     summary.update(
         {
-            "schema": "selfless_cross_dataset_retrieval_summary_v1",
+            "schema": "selfless_cross_dataset_retrieval_summary_v3",
             "task": task,
             "split": "karpathy_test",
             "checkpoint": checkpoint,
@@ -181,6 +220,8 @@ def main() -> None:
                 images == formal_images and caption_total == formal_captions
             ),
             "coco_five_fold_1k_average": False,
+            "project_formal_protocol": True,
+            "scoring": scoring,
         }
     )
     manifest = {
@@ -198,13 +239,15 @@ def main() -> None:
     }
     manifest.update(
         {
-            "schema": "selfless_cross_dataset_retrieval_evaluation_v1",
+            "schema": "selfless_cross_dataset_retrieval_evaluation_v3",
             "complete": True,
             "complete_formal_target": summary["complete_formal_target"],
             "runtime_hashing_enabled": False,
+            "project_formal_protocol": True,
             "created_at": min(str(value["created_at"]) for value in manifests),
             "completed_at": utc_now(),
             "world_size": sum(int(value["world_size"]) for value in manifests),
+            "scoring": scoring,
             "query_partitioning": {
                 "method": "image_index_modulo",
                 "partitions": partition_count,
@@ -227,11 +270,15 @@ def main() -> None:
     atomic_torch_save(
         output_dir / "score_matrix.pt",
         {
-            "normalized_loglikelihood": matrix,
+            "prior_debiased_loglikelihood": calibrated,
+            "text_log_prior": text_log_prior,
             "img_ids": torch.tensor([record.img_id for record in records]),
             "caption_to_image": torch.arange(images).repeat_interleave(
                 torch.tensor(caption_counts, dtype=torch.long)
             ),
+            "scoring_contract": LIKELIHOOD_SCORING_CONTRACT,
+            "language_prior_alpha": LANGUAGE_PRIOR_ALPHA,
+            "language_prior_estimator": LANGUAGE_PRIOR_ESTIMATOR,
             "runtime_hashing_enabled": False,
         },
     )

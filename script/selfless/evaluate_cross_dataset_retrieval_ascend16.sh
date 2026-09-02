@@ -23,10 +23,12 @@ if [[ "${PROFILE}" == "smoke" ]]; then
   LIMIT="${LIMIT:-4}"
   BATCH_SIZE_PER_RANK="${BATCH_SIZE_PER_RANK:-2}"
   LM_HEAD_CHUNK_TOKENS="${LM_HEAD_CHUNK_TOKENS:-32}"
+  PROTOCOL_ARGS=()
 elif [[ "${PROFILE}" == "formal" ]]; then
-  LIMIT="${LIMIT:-0}"
+  LIMIT=0
   BATCH_SIZE_PER_RANK="${BATCH_SIZE_PER_RANK:-32}"
   LM_HEAD_CHUNK_TOKENS="${LM_HEAD_CHUNK_TOKENS:-256}"
+  PROTOCOL_ARGS=(--require_formal_protocol)
 else
   echo "ERROR: EVAL_PROFILE must be smoke or formal; got ${PROFILE}" >&2
   exit 3
@@ -65,8 +67,11 @@ import json
 from pathlib import Path
 import sys
 
-asset = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+asset_path = Path(sys.argv[1])
+asset = json.loads(asset_path.read_text(encoding="utf-8"))
 cache = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+if asset.get("schema") != "selfless_cross_dataset_retrieval_assets_v1":
+    raise RuntimeError("retrieval assets use an obsolete schema")
 if asset.get("complete") is not True or cache.get("status") != "ok":
     raise RuntimeError("retrieval assets or posterior cache are incomplete")
 if asset.get("runtime_hashing_enabled", True) is not False:
@@ -75,6 +80,20 @@ if cache.get("runtime_hashing_enabled", True) is not False:
     raise RuntimeError("retrieval cache violates the no-hash contract")
 if int(cache.get("records", -1)) != int(asset.get("images", -2)):
     raise RuntimeError("retrieval cache cardinality does not match the asset split")
+image_manifest = (asset_path.parent / "image_manifest.jsonl").resolve()
+stat = image_manifest.stat()
+expected_source = {
+    "path": str(image_manifest),
+    "bytes": int(stat.st_size),
+    "mtime_ns": int(stat.st_mtime_ns),
+}
+if cache.get("source_manifest") != expected_source:
+    raise RuntimeError("retrieval cache belongs to a different image manifest")
+if cache.get("schema") is not None and (
+    cache.get("schema") != "selfless_image_posterior_cache_v2"
+    or cache.get("asset_schema") != asset.get("schema")
+):
+    raise RuntimeError("retrieval cache schema is incompatible with its assets")
 PY
 
 read -r NPU_AVAILABLE VISIBLE_NPUS <<< "$(python - <<'PY'
@@ -131,4 +150,5 @@ env \
   --device npu \
   --model_dtype bf16 \
   --scoring_backend "${SCORING_BACKEND}" \
-  --image_sigma_order auto
+  --image_sigma_order auto \
+  "${PROTOCOL_ARGS[@]}"

@@ -60,6 +60,36 @@ DEFAULT_TASKS = (
 MC_TASKS = DEFAULT_TASKS
 CHOICE_LETTERS = ("A", "B", "C", "D")
 TEXT_SCORING_CONTRACT = "selfless_same_position_dual_stream_v2"
+TEXT_PROTOCOL_SCHEMA = "selfless_text_benchmark_v2"
+TEXT_ASSET_SCHEMA = "selfless_text_benchmark_assets_v2"
+LM_EVAL_REFERENCE = {
+    "repository": "https://github.com/EleutherAI/lm-evaluation-harness",
+    "commit": "b954108c9baaaa934b4ad842033b31a97ee30816",
+    "role": "task_prompt_split_and_metric_reference",
+    "adapter_equivalence": "not_bitwise_causal_lm_equivalent",
+}
+TASK_PROTOCOLS = {
+    "arc_easy": {"split": "test", "fewshot": 0, "primary": "accuracy_normalized"},
+    "arc_challenge": {
+        "split": "test",
+        "fewshot": 0,
+        "primary": "accuracy_normalized",
+    },
+    "hellaswag": {
+        "split": "validation",
+        "fewshot": 0,
+        "primary": "accuracy_normalized",
+    },
+    "piqa": {"split": "validation", "fewshot": 0, "primary": "accuracy_normalized"},
+    "winogrande": {"split": "validation", "fewshot": 0, "primary": "accuracy"},
+    "boolq": {"split": "validation", "fewshot": 0, "primary": "accuracy"},
+    "openbookqa": {
+        "split": "test",
+        "fewshot": 0,
+        "primary": "accuracy_normalized",
+    },
+    "mmlu": {"split": "test", "fewshot": 5, "primary": "accuracy_macro"},
+}
 
 
 @dataclass(frozen=True)
@@ -185,6 +215,11 @@ def validate_args(args: argparse.Namespace, source) -> tuple[str, ...]:
     if not manifest.is_file():
         raise FileNotFoundError(manifest)
     asset_report = json.loads(manifest.read_text(encoding="utf-8"))
+    if asset_report.get("schema") != TEXT_ASSET_SCHEMA:
+        raise ValueError(
+            "text benchmark assets use an obsolete split protocol; rerun "
+            "scripts/prepare_text_benchmark_assets.py"
+        )
     if not bool(asset_report.get("complete", False)):
         raise ValueError("text benchmark asset manifest is incomplete")
     if bool(asset_report.get("runtime_hashing_enabled", True)):
@@ -233,7 +268,7 @@ def preprocess_hellaswag(text: str) -> str:
 
 
 def load_arc(task: str, root: Path) -> list[MultipleChoiceExample]:
-    rows = read_parquet(root / task / "validation.parquet")
+    rows = read_parquet(root / task / "test.parquet")
     examples = []
     for index, row in enumerate(rows):
         choices = row["choices"]
@@ -345,7 +380,7 @@ def load_boolq(root: Path) -> list[MultipleChoiceExample]:
 
 
 def load_openbookqa(root: Path) -> list[MultipleChoiceExample]:
-    rows = read_parquet(root / "openbookqa" / "validation.parquet")
+    rows = read_parquet(root / "openbookqa" / "test.parquet")
     examples = []
     for index, row in enumerate(rows):
         choices = row["choices"]
@@ -653,8 +688,10 @@ def completed_rank_shard(
         return False
     marker = json.loads(marker_path.read_text(encoding="utf-8"))
     expected = {
-        "schema": "selfless_text_benchmark_rank_complete_v2",
+        "schema": "selfless_text_benchmark_rank_complete_v3",
         "complete": True,
+        "protocol_schema": TEXT_PROTOCOL_SCHEMA,
+        "task_protocol": TASK_PROTOCOLS[task],
         "scoring_contract": TEXT_SCORING_CONTRACT,
         "task": task,
         "rank": rank,
@@ -691,8 +728,10 @@ def write_rank_shard(
     shard_path, marker_path = rank_shard_paths(output_dir, task, rank, world_size)
     atomic_write_text(shard_path, jsonl_text(rows))
     marker = {
-        "schema": "selfless_text_benchmark_rank_complete_v2",
+        "schema": "selfless_text_benchmark_rank_complete_v3",
         "complete": True,
+        "protocol_schema": TEXT_PROTOCOL_SCHEMA,
+        "task_protocol": TASK_PROTOCOLS[task],
         "scoring_contract": TEXT_SCORING_CONTRACT,
         "runtime_hashing_enabled": False,
         "task": task,
@@ -902,6 +941,12 @@ def aggregate_mc_task(
                 / len(category_rows),
             }
         metrics["by_category"] = by_category
+        metrics["accuracy_macro"] = sum(
+            value["accuracy"] for value in by_category.values()
+        ) / len(by_category)
+        metrics["accuracy_normalized_macro"] = sum(
+            value["accuracy_normalized"] for value in by_category.values()
+        ) / len(by_category)
     task_dir = output_dir / "tasks" / task
     atomic_write_text(task_dir / "samples.jsonl", jsonl_text(rows))
     atomic_write_text(
@@ -920,8 +965,10 @@ def primary_metric(task: str, metrics: dict[str, Any]) -> float:
         "openbookqa",
     }:
         return float(metrics["accuracy_normalized"])
-    if task in {"winogrande", "boolq", "mmlu"}:
+    if task in {"winogrande", "boolq"}:
         return float(metrics["accuracy"])
+    if task == "mmlu":
+        return float(metrics["accuracy_macro"])
     raise ValueError(task)
 
 
@@ -973,7 +1020,7 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     if rank == 0:
         run = {
-            "schema": "selfless_text_benchmark_run_v2",
+            "schema": "selfless_text_benchmark_run_v3",
             "complete": False,
             "runtime_hashing_enabled": False,
             "checkpoint": str(source.path),
@@ -988,10 +1035,13 @@ def main() -> None:
             "model_dtype": args.model_dtype,
             "dual_stream_attention_contract": attention_contract,
             "scoring_contract": TEXT_SCORING_CONTRACT,
+            "protocol_schema": TEXT_PROTOCOL_SCHEMA,
             "max_length": args.max_length,
             "limit": args.limit,
             "seed": args.seed,
             "contamination_check": "disabled",
+            "lm_eval_reference": LM_EVAL_REFERENCE,
+            "task_protocols": {task: TASK_PROTOCOLS[task] for task in tasks},
             "started_at": utc_now(),
         }
         atomic_write_text(
@@ -1032,18 +1082,21 @@ def main() -> None:
             for task, metrics in task_metrics.items()
         }
         summary = {
-            "schema": "selfless_text_benchmark_summary_v2",
+            "schema": "selfless_text_benchmark_summary_v3",
             "complete": True,
             "runtime_hashing_enabled": False,
             "checkpoint": str(source.path),
             "checkpoint_step": checkpoint_step,
             "weight_source": source.kind,
             "world_size": world_size,
+            "accuracy_unit": "unit_interval",
             "tasks": task_metrics,
             "primary_metrics": primary,
             "macro_average_primary": sum(primary.values()) / len(primary),
+            "macro_average_role": "internal_cross_task_summary_only",
             "protocol": {
                 "scoring_contract": TEXT_SCORING_CONTRACT,
+                "protocol_schema": TEXT_PROTOCOL_SCHEMA,
                 "selfless_query_stream_same_position_scoring": True,
                 "dual_stream_attention_contract": attention_contract,
                 "query_stream_diagonal": False,
@@ -1054,6 +1107,10 @@ def main() -> None:
                 "mmlu_fewshot": 5,
                 "fewshot_sampler": "first_n",
                 "contamination_check": "disabled",
+                "lm_eval_reference": LM_EVAL_REFERENCE,
+                "task_protocols": {
+                    task: TASK_PROTOCOLS[task] for task in tasks
+                },
             },
             "completed_at": utc_now(),
         }

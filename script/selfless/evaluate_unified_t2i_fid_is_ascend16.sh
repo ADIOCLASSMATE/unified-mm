@@ -26,7 +26,7 @@ elif [[ "${PROFILE}" == "formal" ]]; then
   GLOBAL_BATCH="${T2I_GLOBAL_BATCH:-4096}"
   VAE_BATCH_PER_RANK="${T2I_VAE_BATCH_PER_RANK:-16}"
   IS_SPLITS="${T2I_IS_SPLITS:-10}"
-  PROTOCOL_ARGS=(--require_official_protocol --resume_progress --resume_checkpoint_interval_batches 1)
+  PROTOCOL_ARGS=(--require_formal_protocol --resume_progress --resume_checkpoint_interval_batches 1)
 else
   echo "ERROR: EVAL_PROFILE must be smoke or formal; got ${PROFILE}" >&2
   exit 3
@@ -107,8 +107,31 @@ write_launcher_status() {
 trap write_launcher_status EXIT
 
 if [[ -f "${OUTPUT_DIR}/metrics.json" ]]; then
-  echo "Evaluation metrics already exist: ${OUTPUT_DIR}/metrics.json"
-  exit 0
+  if python - "${OUTPUT_DIR}/metrics.json" "${PROFILE}" "${SAMPLES}" <<'PY'
+import json
+import sys
+
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+profile, samples = sys.argv[2], int(sys.argv[3])
+protocol = payload.get("metric_protocol", {})
+valid = (
+    payload.get("schema") == "selfless_imagenet_val_t2i_fid_is_v2"
+    and payload.get("samples_evaluated") == samples
+    and payload.get("leaderboard_comparable_to_adm_dit") is False
+    and protocol.get("protocol_name")
+    == "imagenet_val_fid50k_torch_fidelity_stratified_is"
+    and protocol.get("reference_distribution") == "imagenet_val_50000"
+    and protocol.get("comparison_scope") == "same_protocol_only"
+    and bool(payload.get("project_formal_protocol")) == (profile == "formal")
+)
+raise SystemExit(0 if valid else 1)
+PY
+  then
+    echo "Validated evaluation metrics already exist: ${OUTPUT_DIR}/metrics.json"
+    exit 0
+  fi
+  echo "ERROR: existing metrics use an obsolete or mismatched protocol" >&2
+  exit 10
 fi
 
 export HCCL_INTRA_ROCE_ENABLE="${HCCL_INTRA_ROCE_ENABLE:-1}"

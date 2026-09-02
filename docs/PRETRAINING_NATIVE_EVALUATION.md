@@ -2,121 +2,98 @@
 
 The frozen protocol is
 `configs/protocols/pretraining_native_understanding_evaluation_ascend16.yaml`.
-Every new final metric loads the FP32 `hf_model-final-ema` Hugging Face export
-directly with `from_pretrained`, without a rank-sharded EMA overlay. Its step
-comes from `ema_export_metadata.json.source_global_step`. Rank-sharded EMA
-directories remain accepted only for retained historical checkpoint trends.
-No evaluation uses downstream fine-tuning, instruction tuning, or a learned
-linear probe. Runtime content hashing is disabled.
+New final runs load the FP32 `hf_model-final-ema` export directly, without
+fine-tuning, instruction tuning, a linear probe, or runtime content hashing.
+Rank-sharded EMA inputs are accepted only for retained historical trends.
 
-## ImageNet-val custom retrieval
+## ImageNet-1K zero-shot classification
 
-`scripts/evaluate_imagenet_pretraining_native.py` reads only the official
-50,000-image ImageNet validation split and its val-only KL16 posterior cache.
-ImageNet train is never used by an evaluation loader.
+`scripts/evaluate_imagenet_pretraining_native.py` evaluates all 50,000
+official ImageNet validation images against all 1,000 class texts. It does not
+subsample a custom 1K or 5K retrieval set.
 
-- Retrieval uses deterministic class-balanced 1K and 5K subsets drawn from
-  ImageNet val. Both I2T and T2I exact-instance R@1, R@5, and R@10 are primary
-  outputs. Same-class relevance recall and median rank remain secondary
-  diagnostics because different images in one ImageNet class can have
-  semantically similar synthetic descriptions.
-- Only the uncalibrated normalized likelihood is evaluated and written.
-  Visual calibration has been removed from the evaluator and launcher.
+- Class order and names come from OpenAI CLIP's ImageNet notebook. The two
+  duplicate labels are disambiguated by WordNet synset identity (`projectile`
+  versus `missile`, and `sunglass` versus `sunglasses`).
+- The single frozen class text is `a photo of a {class_name}.`; no template is
+  selected by looking at ImageNet-val labels.
+- Selfless, not an external CLIP encoder, supplies the mean token
+  log-likelihood `s(i,c)=log P(t_c|i)`.
+- The text prior is estimated from all 50,000 evaluation images:
+  `b(c)=logmeanexp_i s(i,c)`. Ranking uses only `s(i,c)-b(c)` with fixed
+  `alpha=1`.
+- Only debiased Top-1 and Top-5 accuracy are reportable. The raw score matrix
+  is not exposed as an alternative metric.
 
-The large candidate sets use a shared-prefix KV cache. A
-repeated-full-sequence backend remains available as a correctness reference.
+This is a fixed *generative zero-shot classification* protocol. It uses CLIP's
+class vocabulary convention, but it must not be described as OpenAI CLIP
+cosine-similarity evaluation.
 
-ImageNet class-name Top-1/Top-5 and ReaL are not part of the protocol. Their
-generative class-caption likelihood did not match the training objective well
-enough to support a classification claim in the paper main table.
+## Standard bidirectional retrieval
 
-## Standard image-text retrieval
+The paper-facing retrieval suite uses the Karpathy test split and the complete
+candidate pool:
 
-The paper main table uses the standard Karpathy test splits in addition to the
-custom ImageNet-val diagnostic:
+- MSCOCO 5K test: 5,000 images and the 25,010 captions present in the source
+  split (4,990 images have five captions and ten have six);
+- Flickr30K 1K test: 1,000 images and 5,000 captions.
 
-- MSCOCO 5K test: 5,000 images and 25,000 captions;
-- Flickr30K test: 1,000 images and 5,000 captions.
+Both datasets report I2T and T2I R@1/R@5/R@10. COCO is one full 5K run, not
+the legacy five-fold 1K average. Every I2T query accepts all reference
+captions of its image; every T2I caption accepts its paired image.
 
-Both report I2T and T2I R@1, R@5, and R@10. COCO is evaluated once on the full
-5K test set; it is not the legacy five-fold 1K average. Every image has five
-positive captions, and every caption has one positive image.
+For the complete image-by-text score matrix `S`, the only retained score is
+`S'[:,c] = S[:,c] - logmeanexp_i S[i,c]` (`alpha=1`). The estimator uses every
+candidate image and no relevance labels. This correction can substantially
+change I2T because one query ranks different texts. It cannot change T2I
+ranks: all images for a fixed caption receive the same subtracted constant.
+That invariance is a mathematical consequence of the requested calibration,
+not evidence that T2I was left uncalibrated.
 
-Normalize an authorized Karpathy split with
-`scripts/prepare_cross_dataset_retrieval_assets.py`, then build its no-hash
-KL16 cache with
-`script/selfless/prepare_cross_dataset_retrieval_cache_ascend16.sh`. Formal
-scoring uses `script/selfless/evaluate_cross_dataset_retrieval_ascend16.sh`.
-COCO images can be obtained from the official 2014 release; Flickr30K images
-require the dataset owner's access flow.
+Assets are normalized with `scripts/prepare_cross_dataset_retrieval_assets.py`,
+cached with
+`script/selfless/prepare_cross_dataset_retrieval_cache_ascend16.sh`, and scored
+with `script/selfless/evaluate_cross_dataset_retrieval_ascend16.sh`.
 
-## Hard negatives and compositionality
+## Compositional and hard-negative matching
 
-The custom ImageNet random-class, same-class, and WordNet-near caption
-negative protocols have been removed. Correct-caption versus hard-negative
-evaluation now uses the official benchmark examples from:
+The paper-facing tasks are SugarCrepe (all seven perturbation categories), ARO
+VG Relation, and ARO VG Attribution. Each example compares the positive and
+official negative caption. Candidate scores use fixed `alpha=1` and a prior
+estimated with the log-mean-exp score over exactly three fixed, label-free,
+Gaussian null images in the model's normalized `[-1,1]` VAE input space
+(`mean=0`, `std=0.25`). Only strict debiased pairwise win rate is reportable;
+ties are not counted as wins.
 
-- SugarCrepe, including all seven perturbation categories;
-- ARO Visual Genome Relation;
-- ARO Visual Genome Attribution.
+The number and distribution of null images are frozen project choices. They
+are compatible with the VisualGPTScore calibration family but must be stated
+when comparing results, because the paper reports model/dataset-specific null
+image choices rather than one universal protocol.
 
-All three are scored by positive-versus-negative mean token log-likelihood.
-Their pairwise random baseline is 50%.
+After preparing asset schema v2, build the corresponding cache once with
+`script/selfless/prepare_multimodal_likelihood_cache_ascend16.sh`. Its default
+target is `vae_posterior_mar_kl16_v2`; the former 64,973-row cache is rejected
+because it predates the three null images.
 
-## Internal ablation diagnostics
+## Internal diagnostics and removed protocols
 
-MMBench Dev-EN circular and the single-image portion of SEED-Bench remain only
-for internal ablation trends because the three-checkpoint audit found clear
-margins over their random baselines. They are excluded from paper main tables:
-both use our semantic candidate-likelihood scorer rather than the leaderboards'
-free-form answer extraction.
+MMBench Dev-EN circular and single-image SEED-Bench remain internal ablation
+diagnostics. Their semantic candidate-likelihood adapter is not comparable to
+the official free-form leaderboards.
 
-POPE was removed because accuracy stayed at chance while the model predicted
-“yes” for only about 3% of examples. COCO Caption PPL was removed from the
-image-understanding table because it has neither a random baseline nor a
-matched reference checkpoint that makes the absolute value interpretable.
-Winoground, SVO-Probes, and What’sUp are not part of the selected protocol
-because their complete official assets were unavailable in the completed
-runs.
+The following are rejected by the current schemas and are not reusable:
+custom ImageNet-val 1K/5K retrieval, ImageNet ReaL, generated-caption CLIP
+score, raw/uncalibrated likelihood, custom ImageNet caption negatives, POPE,
+COCO caption perplexity, and incomplete Winoground/SVO-Probes/What'sUp runs.
 
-The numerical selection audit is recorded in
-`docs/IMAGE_UNDERSTANDING_BENCHMARK_SELECTION.md`.
-
-## Launchers
-
-Run the canonical complete evaluation:
+## Canonical launch
 
 ```bash
 RUN_ROOT=output/unified-a-0p6b-100b-imagenet-split-s42-r1
-OUTPUT_ROOT=/path/to/unified-a-0p6b-final-ema-native-full
 EVAL_PROFILE=formal \
   script/selfless/evaluate_unified_native_full_checkpoint_ascend16.sh \
-  "${RUN_ROOT}/hf_model-final-ema" "${OUTPUT_ROOT}"
+  "${RUN_ROOT}/hf_model-final-ema" /path/to/evaluation-output
 ```
 
-This launcher uses one 16-NPU Job and runs every component serially.
-
-The model-source directory must contain `config.json`, `model.safetensors`,
-`tokenizer.json`, and `ema_export_metadata.json`. The ablation-a export above
-records `source_global_step=95415`. The launcher's historical `checkpoint`
-naming does not change the load contract: this path is loaded as the final HF
-model, and no `ema_manifest.json` is read.
-
-Set `REUSE_CORE_EVAL_ROOT` to a completed core evaluation to avoid repeating
-generation, validation, and text evaluation. Set
-`REUSE_BENCHMARK_EVAL_ROOT` to a completed likelihood benchmark root for the
-same model source to reuse previously computed MMBench, SEED, SugarCrepe, and
-ARO predictions. Both reuse paths validate model-source identity, completion,
-and the no-hash contract.
-
-Set `REUSE_COCO_RETRIEVAL_ROOT` and `REUSE_FLICKR30K_RETRIEVAL_ROOT` to reuse
-completed standard-retrieval results for the same model source.
-
-Run only the selected understanding suite:
-
-```bash
-RUN_ROOT=output/unified-a-0p6b-100b-imagenet-split-s42-r1
-EVAL_PROFILE=formal \
-  script/selfless/evaluate_pretraining_native_understanding_ascend16.sh \
-  "${RUN_ROOT}/hf_model-final-ema" /path/to/output
-```
+The launcher validates completeness, model-source identity, schema versions,
+fixed calibration, and the no-hash contract before reusing any result.

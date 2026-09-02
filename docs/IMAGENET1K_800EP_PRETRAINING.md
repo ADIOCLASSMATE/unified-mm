@@ -139,7 +139,7 @@ It executes one real optimizer step, checkpoint and FP32 sharded-EMA save,
 validation loss and image decoding, raw/EMA HF export, and an independent
 fixed-Inception IS pipeline check. Smoke runs do not publish FID: comparable
 FID results require exactly 50,000 fake samples, the frozen original
-ImageNet-val moments, and `--require_official_protocol`. The latest successful
+ImageNet-val moments, and `--require_formal_protocol`. The latest successful
 smoke conclusion is kept
 in
 `public/datasets/imagenet_full/preparation/train_val_eval_smoke_report.json`;
@@ -159,9 +159,11 @@ RESUME_FROM=output/selfless-flow-imagenet1k-class-ascend64-b1024-800ep/checkpoin
   bash script/selfless/pretraining_imagenet1k_class_ascend_64npu_bs1024_800ep.sh
 ```
 
-After training, formal FID/IS uses 50,000 generated samples, deterministic
-canonical noise pairing, CFG 3.5, 10-step Heun, and the frozen official-val
-moments:
+The current reference recipe uses 50,000 generated samples, deterministic
+canonical noise pairing, CFG 3.5, 10-step Heun, and the project ImageNet-val
+moments. Sampling settings may change in later experiments and must be reported
+with the result. This is a same-configuration project metric, not an ADM/DiT
+leaderboard-comparable FID:
 
 The permanently retained 10-epoch EMA evaluation exports are complete model
 weights, not partial flow adapters. Evaluate one by passing its directory, for
@@ -182,7 +184,7 @@ torchrun --standalone --nproc_per_node=16 \
   --parallel_rate 1 --strategies spatial_halton \
   --inception_weights_path public/models/torch-fidelity/weights-inception-2015-12-05-6726825d.pth \
   --real_stats_path public/datasets/imagenet_full/fid_stats/inception_v3_2048_imagenet_val50000_256.pt \
-  --require_official_protocol --canonical_pairing \
+  --require_formal_protocol --canonical_pairing \
   --resume_progress --resume_checkpoint_interval_batches 1
 ```
 
@@ -201,10 +203,11 @@ that blocking process remains active.
 
 ## Final EMA evaluation result
 
-The final EMA HF export completed the canonical official evaluation on
+The final EMA HF export completed the project-formal ImageNet-val evaluation on
 2026-08-19. All 50,000 requested samples were evaluated with deterministic
 canonical pairing, CFG 3.5, 100-step Heun, `spatial_halton`, and the frozen
-official ImageNet-val moments.
+ImageNet-val moments. These historical values are valid only for comparisons
+using exactly this project protocol; they are not ADM/DiT leaderboard values.
 
 | Metric | Result |
 | --- | ---: |
@@ -218,9 +221,9 @@ The retained machine-readable result is
 
 ### Position-wise flow-head ablation
 
-The position-wise-head final EMA completed the same canonical official
+The position-wise-head final EMA completed the same project-formal
 evaluation on 2026-08-22. It used the same 50,000 canonically paired samples,
-CFG 3.5, 100-step Heun solver, `spatial_halton` strategy, and frozen official
+CFG 3.5, 100-step Heun solver, `spatial_halton` strategy, and frozen project
 ImageNet-val moments as the baseline above.
 
 | Metric | Position-wise | Baseline | Change |
@@ -237,10 +240,10 @@ is
 
 ### Sequential image-sigma ablation
 
-The sequential-image-sigma final EMA completed its canonical official
+The sequential-image-sigma final EMA completed its project-formal
 evaluation on 2026-08-24. All 50,000 requested samples were evaluated with
 canonical initial noise and sample pairing, CFG 3.5, a 100-step Heun solver,
-the required `sequential` generation strategy, and the same frozen official
+the required `sequential` generation strategy, and the same frozen project
 ImageNet-val moments.
 
 | Metric | Seq-sigma (`sequential`) | Baseline (`spatial_halton`) | Descriptive change |

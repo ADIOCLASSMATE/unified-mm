@@ -61,13 +61,14 @@ def test_baseline_configuration_freezes_no_hash_training_contract(monkeypatch):
     assert "caption_manifest_sha256" not in dataset_source
 
 
-def test_official_fid50k_launcher_uses_independent_val_and_no_hashing():
+def test_project_formal_fid50k_launcher_uses_independent_val_and_no_hashing():
     launcher = Path(
-        "script/selfless/evaluate_t2i_fid50k_official_ascend16.sh"
+        "script/selfless/evaluate_unified_t2i_fid_is_ascend16.sh"
     ).read_text(encoding="utf-8")
 
-    assert "--samples 50000" in launcher
-    assert "--require_official_protocol" in launcher
+    assert 'SAMPLES="${T2I_SAMPLES:-50000}"' in launcher
+    assert '--samples "${SAMPLES}"' in launcher
+    assert "--require_formal_protocol" in launcher
     assert "--no_runtime_hashing" not in launcher
     assert "--split" not in launcher
     assert "--is_split_assignment" not in launcher
@@ -140,8 +141,12 @@ def test_pretraining_native_evaluation_never_calculates_content_hashes():
     )
     assert protocol.runtime_hashing_enabled is False
     assert protocol.outputs.no_hashes is True
-    assert protocol.scoring.score_variant == "normalized_loglikelihood"
-    assert protocol.outputs.score_variant == "normalized_loglikelihood_only"
+    assert protocol.scoring.retrieval_and_classification_primary_score == (
+        "language_prior_debiased_mean_token_loglikelihood"
+    )
+    assert protocol.outputs.image_text_matching_score_variant == (
+        "language_prior_debiased_only"
+    )
 
     evaluator = Path("scripts/evaluate_imagenet_pretraining_native.py").read_text(
         encoding="utf-8"
@@ -149,6 +154,36 @@ def test_pretraining_native_evaluation_never_calculates_content_hashes():
     launcher = Path(
         "script/selfless/evaluate_pretraining_native_imagenet_ascend16.sh"
     ).read_text(encoding="utf-8")
-    assert "calibration_images" not in evaluator
     assert "visual_calibrated_loglikelihood" not in evaluator
     assert "CALIBRATION_IMAGES" not in launcher
+    assert "language_prior_debiased_scores" in evaluator
+    assert "LANGUAGE_PRIOR_ALPHA" in evaluator
+
+
+def test_removed_image_text_protocols_have_no_executable_entrypoint():
+    assert not Path("scripts/evaluate_imagenet1k_i2t_clip.py").exists()
+    assert not Path(
+        "script/selfless/evaluate_t2i_fid50k_official_ascend16.sh"
+    ).exists()
+    imagenet = Path(
+        "scripts/evaluate_imagenet_pretraining_native.py"
+    ).read_text(encoding="utf-8")
+    assert "retrieval_1k" not in imagenet
+    assert "retrieval_5k" not in imagenet
+
+
+def test_formal_image_text_launchers_pin_complete_protocols():
+    imagenet = Path(
+        "script/selfless/evaluate_pretraining_native_imagenet_ascend16.sh"
+    ).read_text(encoding="utf-8")
+    retrieval = Path(
+        "script/selfless/evaluate_cross_dataset_retrieval_ascend16.sh"
+    ).read_text(encoding="utf-8")
+    multimodal = Path(
+        "script/selfless/evaluate_multimodal_likelihood_ascend16.sh"
+    ).read_text(encoding="utf-8")
+    assert "LIMIT=0" in imagenet and "--require_formal_protocol" in imagenet
+    assert "LIMIT=0" in retrieval and "--require_formal_protocol" in retrieval
+    assert "LIMIT=0" in multimodal and "MC=64" in multimodal
+    assert "--require_formal_protocol" in multimodal
+    assert "vae_posterior_mar_kl16_v2" in multimodal

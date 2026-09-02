@@ -46,6 +46,8 @@ summary = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
 profile = sys.argv[3]
 if summary.get("complete") is not True or summary.get("profile") != profile:
     raise RuntimeError("reused core evaluation is not complete for this profile")
+if summary.get("schema") != "unified_full_checkpoint_evaluation_summary_v3":
+    raise RuntimeError("reused core evaluation uses an obsolete protocol")
 if Path(summary["checkpoint"]).resolve() != checkpoint:
     raise RuntimeError("reused core evaluation belongs to another checkpoint")
 if summary.get("runtime_hashing_enabled", True) is not False:
@@ -55,6 +57,20 @@ if contract.get("training_split") != "imagenet_train":
     raise RuntimeError("reused core training split is not ImageNet train")
 if contract.get("evaluation_split") != "imagenet_val":
     raise RuntimeError("reused core evaluation split is not ImageNet val")
+generation = summary.get("generation", {}).get("imagenet_val_t2i", {})
+expected_generation = {
+    "leaderboard_comparable_to_adm_dit": False,
+    "protocol_name": "imagenet_val_fid50k_torch_fidelity_stratified_is",
+    "reference_distribution": "imagenet_val_50000",
+    "comparison_scope": "same_protocol_only",
+}
+if any(generation.get(key) != value for key, value in expected_generation.items()):
+    raise RuntimeError("reused core generation result uses an obsolete protocol")
+if profile == "formal" and (
+    generation.get("project_formal_protocol") is not True
+    or generation.get("samples") != 50_000
+):
+    raise RuntimeError("reused core generation result is not formal FID50K")
 PY
 else
   EVAL_PROFILE="${PROFILE}" \

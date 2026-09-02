@@ -1,7 +1,7 @@
-# Frozen no-finetune understanding protocol selected after the 56K/58K/60K audit.
+# Current no-finetune understanding protocol selected after the 56K/58K/60K audit.
 # New final runs load the exported final EMA directly; the audited sharded
 # checkpoints remain readable only for historical checkpoint-trend continuity.
-schema: pretraining_native_understanding_evaluation_v4
+schema: pretraining_native_understanding_evaluation_v8
 weights: hf_final_ema
 runtime_hashing_enabled: false
 hardware:
@@ -19,7 +19,7 @@ adaptation:
   linear_probe: false
 dataset_contract:
   image_training_split: imagenet_train
-  custom_in_domain_evaluation_split: imagenet_val
+  zero_shot_classification_split: imagenet_val_50k
   standard_retrieval_evaluation_splits:
     - mscoco_karpathy_test_5k
     - flickr30k_karpathy_test_1k
@@ -27,42 +27,54 @@ dataset_contract:
 scoring:
   model_contract: selfless_same_position_query_stream
   causal_lm_one_token_shift: false
-  primary_candidate_score: mean_token_loglikelihood
-  score_variant: normalized_loglikelihood
+  conditional_candidate_score: mean_token_loglikelihood
+  retrieval_and_classification_primary_score: language_prior_debiased_mean_token_loglikelihood
+  language_prior:
+    alpha: 1.0
+    estimator: candidate_image_logmeanexp
+    uses_labels: false
   efficient_backend: shared_prompt_and_image_prefix_kv_cache
   reference_backend: repeated_full_sequence_likelihood
   required_equivalence_check: cached_and_reference_scores_match
+  retained_benchmark_image_order_monte_carlo:
+    samples: 64
+    estimator: mean_loglikelihood
+    execution: expand_batch_dimension
+    common_random_numbers_across_candidates_and_models: true
+    posterior_resampled: false
+  retained_benchmark_language_prior:
+    alpha: 1.0
+    estimator: content_free_gaussian_image_logmeanexp
+    null_images: 3
+    normalized_pixel_distribution: {mean: 0.0, std: 0.25}
+    uses_labels: false
 
-imagenet_retrieval:
-  status: retained_custom_in_domain_protocol
+imagenet_zero_shot_classification:
+  status: paper_facing_transductive_calibrated_generative_zero_shot_protocol
   runner: scripts/evaluate_imagenet_pretraining_native.py
   split: official_imagenet_val
-  subsets:
-    - name: retrieval_1k
-      images: 1000
-      captions: 1000
-      selection: one_deterministically_selected_image_per_class
-    - name: retrieval_5k
-      images: 5000
-      captions: 5000
-      selection: five_deterministically_selected_images_per_class
-  primary_metrics:
-    - image_to_text_instance_recall_at_1
-    - image_to_text_instance_recall_at_5
-    - image_to_text_instance_recall_at_10
-    - text_to_image_instance_recall_at_1
-    - text_to_image_instance_recall_at_5
-    - text_to_image_instance_recall_at_10
-  secondary_metrics:
-    - same_class_relevance_recall_at_1_5_10
-    - median_rank
-  ambiguity_note: exact_instance_and_same_class_relevance_are_reported_separately
+  images: 50000
+  classes: 1000
+  class_names: openai_clip_curated_imagenet1k_names_with_two_synset_identity_corrections
+  openai_clip_external_encoder_used: false
+  instruction_prefix: "Describe this image in one detailed caption:"
+  template: "a photo of a {class_name}."
+  template_selection_uses_validation_labels: false
+  language_prior_images: all_50000_evaluation_images
+  language_prior_is_transductive_test_distribution_calibration: true
+  directly_comparable_to_openai_clip_cosine_zeroshot: false
+  primary_metrics: [top_1_accuracy, top_5_accuracy]
+  reported_score_variant: language_prior_debiased_only
 
 standard_cross_dataset_retrieval:
   status: paper_main_standard_protocol
   runner: scripts/evaluate_cross_dataset_retrieval.py
   merge_runner: scripts/merge_cross_dataset_retrieval_partitions.py
-  scoring: image_conditioned_caption_normalized_loglikelihood
+  scoring: language_prior_debiased_mean_token_loglikelihood
+  language_prior_images: all_candidate_images
+  language_prior_is_transductive_test_distribution_calibration: true
+  directly_comparable_to_uncalibrated_cosine_retrieval: false
+  language_prior_alpha: 1.0
   metrics:
     - image_to_text_recall_at_1
     - image_to_text_recall_at_5
@@ -95,19 +107,24 @@ standard_cross_dataset_retrieval:
 
 official_hard_negative_and_compositional_benchmarks:
   runner: scripts/evaluate_multimodal_likelihood_benchmarks.py
+  scoring: language_prior_debiased_mean_token_loglikelihood
+  reported_score_variant: language_prior_debiased_only
+  language_prior_alpha: 1.0
+  language_prior_estimator: content_free_gaussian_image_logmeanexp
+  language_prior_null_images: 3
   tasks:
     - name: sugarcrepe
       records: 7511
       chance_accuracy: 0.5
-      metrics: [overall_accuracy, seven_category_accuracy]
+      metrics: [strict_pairwise_win_rate, seven_category_win_rate]
     - name: aro_vg_relation
       records: 23937
       chance_accuracy: 0.5
-      metrics: [pairwise_accuracy]
+      metrics: [strict_pairwise_win_rate]
     - name: aro_vg_attribution
       records: 28748
       chance_accuracy: 0.5
-      metrics: [pairwise_accuracy]
+      metrics: [strict_pairwise_win_rate]
 
 internal_ablation_trend_only:
   paper_main_table: false
@@ -116,25 +133,29 @@ internal_ablation_trend_only:
     - name: mmbench_dev_en
       original_questions: 1164
       circular_rows: 4329
-      scoring: semantic_candidate_same_position_likelihood
-      primary_metric: circular_accuracy_normalized_loglikelihood
+      scoring: semantic_candidate_language_prior_debiased_mean_token_loglikelihood
+      primary_metric: circular_accuracy_language_prior_debiased
       reason_retained: clearly_above_conservative_random_baseline_in_three_checkpoint_audit
     - name: seed_bench_image
       records: 14233
       subset: official_SEED_Bench_1_single_image_dimensions_1_to_9
-      scoring: semantic_candidate_normalized_loglikelihood
-      primary_metric: accuracy_normalized_loglikelihood
+      scoring: semantic_candidate_language_prior_debiased_mean_token_loglikelihood
+      primary_metric: accuracy_language_prior_debiased
       reason_retained: clearly_above_four_choice_random_baseline_in_three_checkpoint_audit
 
 removed_from_protocol:
+  custom_imagenet_retrieval:
+    - retrieval_1k
+    - retrieval_5k
   custom_imagenet_caption_negatives:
     - imagenet_caption_random_negative
     - imagenet_caption_same_class_negative
     - imagenet_caption_near_class_negative
   score_variants:
-    - visual_calibration
+    - uncalibrated_retrieval_loglikelihood
+    - uncalibrated_compositional_loglikelihood
+    - legacy_visual_calibration
   benchmarks:
-    imagenet_classification_top1_top5: training_objective_mismatch
     imagenet_real_top1_top5: training_objective_mismatch
     pope_coco: chance_level_and_degenerate_no_prediction_bias
     coco_caption_ppl: no_chance_baseline_or_matched_reference_for_interpretation
@@ -145,5 +166,5 @@ removed_from_protocol:
 outputs:
   per_sample_scores: true
   per_category_scores: true
-  score_variant: normalized_loglikelihood_only
+  image_text_matching_score_variant: language_prior_debiased_only
   no_hashes: true

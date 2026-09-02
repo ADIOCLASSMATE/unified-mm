@@ -19,6 +19,9 @@ RETAINED_BENCHMARKS = (
     "aro_vg_relation",
     "aro_vg_attribution",
 )
+GENERATION_PROTOCOL = "imagenet_val_fid50k_torch_fidelity_stratified_is"
+GENERATION_REFERENCE = "imagenet_val_50000"
+GENERATION_SCOPE = "same_protocol_only"
 
 
 def parse_args() -> argparse.Namespace:
@@ -54,26 +57,12 @@ def metric(metrics: dict[str, Any], key: str, label: str) -> float:
     return finite(metrics[key], label)
 
 
-def retrieval_row(summary: dict[str, Any], label: str) -> dict[str, float]:
-    values = summary["normalized_loglikelihood"]
-    row: dict[str, float] = {}
-    for direction, prefix in (("image_to_text", "i2t"), ("text_to_image", "t2i")):
-        direction_metrics = values[direction]
-        for k in (1, 5, 10):
-            name = f"instance_recall_at_{k}"
-            row[f"{prefix}_r{k}"] = metric(
-                direction_metrics, name, f"{label}.{prefix}.r{k}"
-            )
-    return row
-
-
 def standard_retrieval_row(
     summary: dict[str, Any], label: str
 ) -> dict[str, float]:
-    values = summary["normalized_loglikelihood"]
     row: dict[str, float] = {}
     for direction, prefix in (("image_to_text", "i2t"), ("text_to_image", "t2i")):
-        direction_metrics = values[direction]
+        direction_metrics = summary[direction]
         for k in (1, 5, 10):
             row[f"{prefix}_r{k}"] = metric(
                 direction_metrics, f"recall_at_{k}", f"{label}.{prefix}.r{k}"
@@ -88,6 +77,10 @@ def trend_row(root: Path) -> dict[str, Any]:
         raise ValueError(f"input is not a complete formal evaluation: {path}")
     if summary.get("runtime_hashing_enabled", True) is not False:
         raise ValueError(f"input violates the no-hash contract: {path}")
+    if summary.get("schema") != (
+        "unified_native_full_checkpoint_evaluation_summary_v5"
+    ):
+        raise ValueError(f"input uses an obsolete evaluation protocol: {path}")
     contract = summary.get("dataset_contract", {})
     if contract.get("training_split") != "imagenet_train":
         raise ValueError(f"training split is not ImageNet train: {path}")
@@ -97,12 +90,24 @@ def trend_row(root: Path) -> dict[str, Any]:
         raise ValueError(f"ImageNet train/val overlap is permitted: {path}")
 
     generation = summary["generation"]["imagenet_val_t2i"]
-    if generation.get("official_protocol") is not True:
-        raise ValueError(f"generation result is not official: {path}")
-    if int(generation.get("samples", 0)) != 50_000:
-        raise ValueError(f"generation result is not 50K: {path}")
-    if generation.get("is_split_assignment") != "stratified_by_synset":
-        raise ValueError(f"generation IS split is not synset-stratified: {path}")
+    expected_generation = {
+        "project_formal_protocol": True,
+        "leaderboard_comparable_to_adm_dit": False,
+        "protocol_name": GENERATION_PROTOCOL,
+        "reference_distribution": GENERATION_REFERENCE,
+        "comparison_scope": GENERATION_SCOPE,
+        "samples": 50_000,
+        "is_split_assignment": "stratified_by_synset",
+    }
+    mismatches = {
+        key: {"expected": value, "actual": generation.get(key)}
+        for key, value in expected_generation.items()
+        if generation.get(key) != value
+    }
+    if mismatches:
+        raise ValueError(f"generation protocol is invalid in {path}: {mismatches}")
+    if not str(generation.get("strategy", "")).strip():
+        raise ValueError(f"generation strategy is missing in {path}")
 
     understanding = summary["understanding"]
     native = understanding["pretraining_native"]
@@ -120,23 +125,38 @@ def trend_row(root: Path) -> dict[str, Any]:
     }
     mmbench = benchmark_metrics["mmbench_dev_en"]
     sugarcrepe = benchmark_metrics["sugarcrepe"]
+    fid = finite(generation["fid"], "fid")
+    is_mean = finite(
+        generation["inception_score_mean"], "inception_score_mean"
+    )
+    is_std = finite(
+        generation["inception_score_std"], "inception_score_std"
+    )
+    if fid < 0.0 or is_mean < 1.0 - 1.0e-9 or is_std < 0.0:
+        raise ValueError(f"generation metric range is invalid: {path}")
     return {
         "global_step": int(summary["global_step"]),
         "checkpoint": str(summary["checkpoint"]),
         "evaluation_root": str(root.resolve()),
-        "fid": finite(generation["fid"], "fid"),
-        "inception_score_mean": finite(
-            generation["inception_score_mean"], "inception_score_mean"
-        ),
-        "inception_score_std": finite(
-            generation["inception_score_std"], "inception_score_std"
-        ),
+        "fid": fid,
+        "inception_score_mean": is_mean,
+        "inception_score_std": is_std,
         "validation_loss": finite(validation["val/loss"], "validation_loss"),
         "pure_text_macro": finite(
             summary["pure_text"]["macro_average_primary"], "pure_text_macro"
         ),
-        "retrieval_1k": retrieval_row(native["retrieval_1k"], "retrieval_1k"),
-        "retrieval_5k": retrieval_row(native["retrieval_5k"], "retrieval_5k"),
+        "imagenet1k_zeroshot": {
+            "top_1_accuracy": metric(
+                native["imagenet1k_zeroshot_classification"],
+                "top_1_accuracy",
+                "imagenet1k.top_1_accuracy",
+            ),
+            "top_5_accuracy": metric(
+                native["imagenet1k_zeroshot_classification"],
+                "top_5_accuracy",
+                "imagenet1k.top_5_accuracy",
+            ),
+        },
         "standard_retrieval": {
             task: standard_retrieval_row(result, task)
             for task, result in native["standard_cross_dataset_retrieval"].items()
@@ -144,37 +164,45 @@ def trend_row(root: Path) -> dict[str, Any]:
         "benchmarks": {
             "mmbench_dev_en": metric(
                 mmbench,
-                "circular_accuracy_normalized_loglikelihood",
+                "circular_accuracy_language_prior_debiased",
                 "mmbench.circular",
             ),
             "mmbench_dev_en_vanilla": metric(
                 mmbench,
-                "vanilla_accuracy_normalized_loglikelihood",
+                "vanilla_accuracy_language_prior_debiased",
                 "mmbench.vanilla",
             ),
             "seed_bench_image": metric(
                 benchmark_metrics["seed_bench_image"],
-                "accuracy_normalized_loglikelihood",
+                "accuracy_language_prior_debiased",
                 "seed_bench_image",
             ),
             "sugarcrepe": metric(
-                sugarcrepe,
-                "accuracy_normalized_loglikelihood",
+                sugarcrepe["language_prior_debiased_pairwise"],
+                "win_rate",
                 "sugarcrepe",
             ),
             "aro_vg_relation": metric(
-                benchmark_metrics["aro_vg_relation"],
-                "accuracy_normalized_loglikelihood",
+                benchmark_metrics["aro_vg_relation"][
+                    "language_prior_debiased_pairwise"
+                ],
+                "win_rate",
                 "aro_vg_relation",
             ),
             "aro_vg_attribution": metric(
-                benchmark_metrics["aro_vg_attribution"],
-                "accuracy_normalized_loglikelihood",
+                benchmark_metrics["aro_vg_attribution"][
+                    "language_prior_debiased_pairwise"
+                ],
+                "win_rate",
                 "aro_vg_attribution",
             ),
         },
         "sugarcrepe_categories": {
-            name: metric(values, "accuracy_normalized_loglikelihood", f"sugar.{name}")
+            name: metric(
+                values["language_prior_debiased_pairwise"],
+                "win_rate",
+                f"sugar.{name}",
+            )
             for name, values in sugarcrepe["categories"].items()
         },
         "pure_text_primary_metrics": {
@@ -206,13 +234,14 @@ def markdown(rows: list[dict[str, Any]]) -> str:
     lines = [
         "# Unified 0.6B selected-protocol checkpoint trend",
         "",
-        "Image training uses ImageNet train. The custom ImageNet retrieval protocol "
-        "uses only official ImageNet val images. Scores use normalized same-position "
-        "likelihood without visual calibration. Runtime hashing is disabled.",
+        "Image training uses ImageNet train. ImageNet zero-shot classification uses "
+        "all 50K official validation images; classification and retrieval use fixed "
+        "alpha-1 language-prior-debiased mean-token likelihood. Runtime hashing is "
+        "disabled.",
         "",
         "## Generation, held-out validation, and text",
         "",
-        "| step | FID ↓ | IS ↑ | val loss ↓ | text macro ↑ |",
+        "| step | FID ↓ | IS ↑ | val loss ↓ | text macro ↑ (%) |",
         "| ---: | ---: | ---: | ---: | ---: |",
     ]
     for row in rows:
@@ -220,28 +249,24 @@ def markdown(rows: list[dict[str, Any]]) -> str:
             f"| {row['global_step']} | {row['fid']:.6f} | "
             f"{row['inception_score_mean']:.6f} ± {row['inception_score_std']:.6f} | "
             f"{row['validation_loss']:.6f} | "
-            f"{row['pure_text_macro']:.6f} |"
+            f"{100.0 * row['pure_text_macro']:.2f} |"
         )
 
-    for subset in ("retrieval_1k", "retrieval_5k"):
-        label = "1K" if subset.endswith("1k") else "5K"
-        lines.extend(
-            [
-                "",
-                f"## ImageNet-val {label} exact-instance retrieval",
-                "",
-                "| step | I2T R@1 ↑ | I2T R@5 ↑ | I2T R@10 ↑ | T2I R@1 ↑ | T2I R@5 ↑ | T2I R@10 ↑ |",
-                "| ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
-            ]
+    lines.extend(
+        [
+            "",
+            "## ImageNet-1K zero-shot classification (50K validation images)",
+            "",
+            "| step | Top-1 accuracy ↑ (%) | Top-5 accuracy ↑ (%) |",
+            "| ---: | ---: | ---: |",
+        ]
+    )
+    for row in rows:
+        values = row["imagenet1k_zeroshot"]
+        lines.append(
+            f"| {row['global_step']} | {100.0 * values['top_1_accuracy']:.2f} | "
+            f"{100.0 * values['top_5_accuracy']:.2f} |"
         )
-        for row in rows:
-            values = row[subset]
-            lines.append(
-                f"| {row['global_step']} | {values['i2t_r1']:.6f} | "
-                f"{values['i2t_r5']:.6f} | {values['i2t_r10']:.6f} | "
-                f"{values['t2i_r1']:.6f} | {values['t2i_r5']:.6f} | "
-                f"{values['t2i_r10']:.6f} |"
-            )
 
     for task, label in (
         ("mscoco_karpathy_test_5k", "MSCOCO Karpathy 5K test"),
@@ -252,17 +277,19 @@ def markdown(rows: list[dict[str, Any]]) -> str:
                 "",
                 f"## {label} retrieval",
                 "",
-                "| step | I2T R@1 ↑ | I2T R@5 ↑ | I2T R@10 ↑ | T2I R@1 ↑ | T2I R@5 ↑ | T2I R@10 ↑ |",
+                "| step | I2T R@1 ↑ (%) | I2T R@5 ↑ (%) | I2T R@10 ↑ (%) | T2I R@1 ↑ (%) | T2I R@5 ↑ (%) | T2I R@10 ↑ (%) |",
                 "| ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
             ]
         )
         for row in rows:
             values = row["standard_retrieval"][task]
             lines.append(
-                f"| {row['global_step']} | {values['i2t_r1']:.6f} | "
-                f"{values['i2t_r5']:.6f} | {values['i2t_r10']:.6f} | "
-                f"{values['t2i_r1']:.6f} | {values['t2i_r5']:.6f} | "
-                f"{values['t2i_r10']:.6f} |"
+                f"| {row['global_step']} | {100.0 * values['i2t_r1']:.2f} | "
+                f"{100.0 * values['i2t_r5']:.2f} | "
+                f"{100.0 * values['i2t_r10']:.2f} | "
+                f"{100.0 * values['t2i_r1']:.2f} | "
+                f"{100.0 * values['t2i_r5']:.2f} | "
+                f"{100.0 * values['t2i_r10']:.2f} |"
             )
 
     lines.extend(
@@ -275,25 +302,26 @@ def markdown(rows: list[dict[str, Any]]) -> str:
             "only; their candidate-likelihood values are not paper-table or "
             "leaderboard-comparable free-form scores.",
             "",
-            "| step | MMBench circular ↑ | MMBench vanilla ↑ | SEED ↑ | SugarCrepe ↑ | ARO relation ↑ | ARO attribution ↑ |",
+            "| step | MMBench circular ↑ (%) | MMBench vanilla ↑ (%) | SEED ↑ (%) | SugarCrepe ↑ (%) | ARO relation ↑ (%) | ARO attribution ↑ (%) |",
             "| ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
     for row in rows:
         values = row["benchmarks"]
         lines.append(
-            f"| {row['global_step']} | {values['mmbench_dev_en']:.6f} | "
-            f"{values['mmbench_dev_en_vanilla']:.6f} | "
-            f"{values['seed_bench_image']:.6f} | {values['sugarcrepe']:.6f} | "
-            f"{values['aro_vg_relation']:.6f} | "
-            f"{values['aro_vg_attribution']:.6f} |"
+            f"| {row['global_step']} | {100.0 * values['mmbench_dev_en']:.2f} | "
+            f"{100.0 * values['mmbench_dev_en_vanilla']:.2f} | "
+            f"{100.0 * values['seed_bench_image']:.2f} | "
+            f"{100.0 * values['sugarcrepe']:.2f} | "
+            f"{100.0 * values['aro_vg_relation']:.2f} | "
+            f"{100.0 * values['aro_vg_attribution']:.2f} |"
         )
     lines.extend(
         [
             "",
-            "Removed from the selected protocol: ImageNet classification/ReaL, "
-            "custom ImageNet caption negatives, "
-            "visual calibration, POPE, COCO Caption PPL, Winoground, SVO-Probes, "
+            "Removed from the selected protocol: custom ImageNet 1K/5K retrieval, "
+            "ImageNet-ReaL, custom ImageNet caption negatives, uncalibrated retrieval "
+            "scores, POPE, COCO Caption PPL, Winoground, SVO-Probes, "
             "and What’sUp.",
         ]
     )
@@ -308,7 +336,7 @@ def main() -> None:
     if len(steps) != len(set(steps)):
         raise ValueError(f"duplicate checkpoint steps: {steps}")
     payload = {
-        "schema": "unified_native_checkpoint_trend_v2",
+        "schema": "unified_native_checkpoint_trend_v4",
         "complete": True,
         "runtime_hashing_enabled": False,
         "dataset_contract": {

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import json
 import math
@@ -47,11 +47,24 @@ from utils.utils import get_selfless_mask, load_model_tokenizer  # noqa: E402
 
 DEFAULT_CONFIG = Path("configs/selfless/unified_baseline_100b_ascend_64npu.yaml")
 DEFAULT_ASSET_ROOT = Path("public/benchmarks/selfless_multimodal_likelihood_v1")
-ASSET_SCHEMA = "selfless_multimodal_likelihood_assets_v1"
+ASSET_SCHEMA = "selfless_multimodal_likelihood_assets_v2"
 TASK_SCHEMA = "selfless_multimodal_likelihood_task_v1"
 CACHE_FORMAT = "imagenet_kl16_scaled_posterior_v1"
 CACHE_LAYOUT = "scaled_mean_then_scaled_std"
-LIKELIHOOD_SCORING_CONTRACT = "selfless_same_position_dual_stream_v2"
+LIKELIHOOD_SCORING_CONTRACT = "selfless_same_position_dual_stream_v3"
+IMAGE_ORDER_MC_CONTRACT = "shared_image_order_expected_loglikelihood_v1"
+IMAGE_ORDER_MC_SEED_STRIDE = 1_000_003
+LANGUAGE_PRIOR_ALPHA = 1.0
+LANGUAGE_PRIOR_ESTIMATOR = "content_free_gaussian_image_logmeanexp"
+LANGUAGE_PRIOR_NULL_IMAGE_COUNT = 3
+LANGUAGE_PRIOR_NULL_IMAGE_IDS = tuple(
+    9_000_000_000 + index for index in range(LANGUAGE_PRIOR_NULL_IMAGE_COUNT)
+)
+LANGUAGE_PRIOR_NULL_IMAGE_SEEDS = (17_071, 29_129, 43_231)
+LANGUAGE_PRIOR_NULL_PIXEL_SPACE = "vae_preprocess_normalized_minus1_to_plus1"
+LANGUAGE_PRIOR_NULL_CLAMP = [-1.0, 1.0]
+LANGUAGE_PRIOR_NULL_STORAGE = "lossless_rgb_png"
+DEBIASED_SCORE = "language_prior_debiased_mean_token_loglikelihood"
 DEFAULT_TASKS = (
     "mmbench_dev_en",
     "seed_bench_image",
@@ -59,6 +72,13 @@ DEFAULT_TASKS = (
     "aro_vg_relation",
     "aro_vg_attribution",
 )
+FORMAL_TASK_RECORDS = {
+    "mmbench_dev_en": 4_329,
+    "seed_bench_image": 14_233,
+    "sugarcrepe": 7_511,
+    "aro_vg_relation": 23_937,
+    "aro_vg_attribution": 28_748,
+}
 
 
 @dataclass(frozen=True)
@@ -86,6 +106,7 @@ class CandidateRequest:
     target_start: int
     image_start: int
     truncated_prompt_tokens: int
+    mc_sample_index: int = 0
 
 
 @dataclass(frozen=True)
@@ -179,9 +200,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_dir", type=Path, required=True)
     parser.add_argument("--tasks", default=",".join(DEFAULT_TASKS))
     parser.add_argument("--batch_size_per_rank", type=int, default=4)
+    parser.add_argument(
+        "--mc",
+        type=int,
+        default=1,
+        help=(
+            "Number of random image-token orders per candidate. The effective "
+            "forward batch is batch_size_per_rank * mc."
+        ),
+    )
     parser.add_argument("--lm_head_chunk_tokens", type=int, default=256)
     parser.add_argument("--max_length", type=int, default=2048)
     parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument("--require_formal_protocol", action="store_true")
     parser.add_argument("--seed", type=int, default=424242)
     parser.add_argument("--device", choices=("npu", "cuda", "cpu"), default="npu")
     parser.add_argument("--model_dtype", choices=("bf16", "fp32"), default="bf16")
@@ -198,6 +229,40 @@ def read_checkpoint_step(checkpoint: Path) -> int:
     return resolve_evaluation_model_source(checkpoint).global_step
 
 
+def validate_language_prior_contract(prior: Any) -> None:
+    if not isinstance(prior, dict):
+        raise ValueError("asset manifest has no language-prior null-image contract")
+    if prior.get("estimator") != LANGUAGE_PRIOR_ESTIMATOR:
+        raise ValueError("asset manifest uses an unexpected language-prior estimator")
+    if int(prior.get("count", -1)) != LANGUAGE_PRIOR_NULL_IMAGE_COUNT:
+        raise ValueError("formal protocol requires exactly three null images")
+    if bool(prior.get("uses_benchmark_labels", True)):
+        raise ValueError("language-prior estimation must not use benchmark labels")
+    if prior.get("pixel_space") != LANGUAGE_PRIOR_NULL_PIXEL_SPACE:
+        raise ValueError("null images use an unexpected pixel space")
+    if float(prior.get("normalized_gaussian_mean", math.inf)) != 0.0:
+        raise ValueError("null images must have normalized Gaussian mean zero")
+    if float(prior.get("normalized_gaussian_std", math.inf)) != 0.25:
+        raise ValueError("null images must have normalized Gaussian std 0.25")
+    if prior.get("clamp") != LANGUAGE_PRIOR_NULL_CLAMP:
+        raise ValueError("null images must be clamped to the normalized [-1, 1] range")
+    if prior.get("storage") != LANGUAGE_PRIOR_NULL_STORAGE:
+        raise ValueError("formal null images must use lossless RGB PNG storage")
+    null_rows = prior.get("images")
+    if not isinstance(null_rows, list) or len(null_rows) != 3:
+        raise ValueError("language-prior null-image records are incomplete")
+    null_ids = tuple(int(row["image_id"]) for row in null_rows)
+    if null_ids != LANGUAGE_PRIOR_NULL_IMAGE_IDS:
+        raise ValueError("language-prior null-image IDs do not match the formal contract")
+    null_seeds = tuple(int(row["seed"]) for row in null_rows)
+    if null_seeds != LANGUAGE_PRIOR_NULL_IMAGE_SEEDS:
+        raise ValueError("language-prior null-image seeds do not match the formal contract")
+    for row in null_rows:
+        path = Path(str(row.get("path", "")))
+        if not path.is_file() or path.suffix.lower() != ".png":
+            raise ValueError(f"language-prior null image is missing or not PNG: {path}")
+
+
 def validate_args(
     args: argparse.Namespace, source
 ) -> tuple[tuple[str, ...], dict[str, Any]]:
@@ -211,6 +276,7 @@ def validate_args(
             raise FileNotFoundError(path)
     for value in (
         args.batch_size_per_rank,
+        args.mc,
         args.lm_head_chunk_tokens,
         args.max_length,
         args.progress_every,
@@ -225,9 +291,19 @@ def validate_args(
         raise ValueError(f"unexpected asset schema in {manifest_path}")
     if bool(manifest.get("runtime_hashing_enabled", True)):
         raise ValueError("multimodal likelihood assets violate the no-hash contract")
+    validate_language_prior_contract(manifest.get("language_prior_null_images"))
     tasks = tuple(value.strip() for value in str(args.tasks).split(",") if value.strip())
     if not tasks:
         raise ValueError("at least one task is required")
+    if bool(args.require_formal_protocol):
+        if int(args.limit) != 0:
+            raise ValueError("formal multimodal evaluation forbids row limiting")
+        if int(args.mc) != 64:
+            raise ValueError("formal multimodal evaluation requires MC=64")
+        if tasks != DEFAULT_TASKS:
+            raise ValueError(
+                "formal multimodal evaluation requires the complete ordered task suite"
+            )
     missing = sorted(set(tasks) - set(manifest.get("tasks", {})))
     if missing:
         unavailable = manifest.get("unavailable", {})
@@ -236,8 +312,25 @@ def validate_args(
     return tasks, manifest
 
 
+def language_prior_null_image_ids(asset_manifest: dict[str, Any]) -> tuple[int, ...]:
+    return tuple(
+        int(row["image_id"])
+        for row in asset_manifest["language_prior_null_images"]["images"]
+    )
+
+
 def arithmetic_seed(seed: int, image_id: int, offset: int) -> int:
     return (int(seed) + 97_409 * int(image_id) + int(offset)) & ((1 << 63) - 1)
+
+
+def image_order_mc_seed(seed: int, image_id: int, mc_sample_index: int) -> int:
+    if int(mc_sample_index) < 0:
+        raise ValueError("mc_sample_index must be non-negative")
+    return arithmetic_seed(
+        seed,
+        image_id,
+        53 + IMAGE_ORDER_MC_SEED_STRIDE * int(mc_sample_index),
+    )
 
 
 class PosteriorCache:
@@ -393,6 +486,7 @@ def encode_candidate(
     max_length: int,
     image_sigma_order: str,
     seed: int,
+    mc_sample_index: int = 0,
 ) -> CandidateRequest:
     prompt_ids = [
         int(value)
@@ -446,7 +540,7 @@ def encode_candidate(
     reveal = build_image_sigma(
         image_tokens,
         order=image_sigma_order,
-        seed=arithmetic_seed(seed, example.image_id, 53),
+        seed=image_order_mc_seed(seed, example.image_id, mc_sample_index),
     )
     for local_index, order_value in enumerate(reveal):
         sigma[image_start + local_index] = prompt_len + 2 + int(order_value)
@@ -464,7 +558,62 @@ def encode_candidate(
         target_start=candidate_start,
         image_start=image_start,
         truncated_prompt_tokens=truncated,
+        mc_sample_index=int(mc_sample_index),
     )
+
+
+def encode_candidate_mc(
+    tokenizer,
+    example: LikelihoodExample,
+    candidate_index: int,
+    *,
+    image_tokens: int,
+    boi_token_id: int,
+    eoi_token_id: int,
+    image_mask_token_id: int,
+    max_length: int,
+    image_sigma_order: str,
+    seed: int,
+    mc_samples: int,
+) -> list[CandidateRequest]:
+    """Encode text once, then expand random image orders along the batch axis."""
+
+    if int(mc_samples) <= 0:
+        raise ValueError("mc_samples must be positive")
+    first = encode_candidate(
+        tokenizer,
+        example,
+        candidate_index,
+        image_tokens=image_tokens,
+        boi_token_id=boi_token_id,
+        eoi_token_id=eoi_token_id,
+        image_mask_token_id=image_mask_token_id,
+        max_length=max_length,
+        image_sigma_order=image_sigma_order,
+        seed=seed,
+        mc_sample_index=0,
+    )
+    requests = [first]
+    prompt_length = int(first.image_start) - 1
+    for mc_sample_index in range(1, int(mc_samples)):
+        reveal = build_image_sigma(
+            image_tokens,
+            order=image_sigma_order,
+            seed=image_order_mc_seed(seed, example.image_id, mc_sample_index),
+        )
+        sigma = list(first.sigma)
+        for local_index, order_value in enumerate(reveal):
+            sigma[first.image_start + local_index] = (
+                prompt_length + 2 + int(order_value)
+            )
+        requests.append(
+            replace(
+                first,
+                sigma=tuple(sigma),
+                mc_sample_index=mc_sample_index,
+            )
+        )
+    return requests
 
 
 def build_attention_masks(
@@ -630,41 +779,147 @@ def argmax(values: Sequence[float]) -> int:
     return max(range(len(values)), key=lambda index: (float(values[index]), -index))
 
 
-def finite_perplexity(normalized_loglikelihood: float) -> float:
-    exponent = -float(normalized_loglikelihood)
-    return math.exp(exponent) if exponent < 700.0 else float("inf")
+def logmeanexp(values: Sequence[float]) -> float:
+    if not values:
+        raise ValueError("logmeanexp requires at least one value")
+    if any(not math.isfinite(float(value)) for value in values):
+        raise ValueError("logmeanexp requires finite values")
+    maximum = max(float(value) for value in values)
+    return maximum + math.log(
+        sum(math.exp(float(value) - maximum) for value in values) / len(values)
+    )
 
 
 def build_prediction_rows(
     examples: Sequence[LikelihoodExample],
     requests: Sequence[CandidateRequest],
     scores: Sequence[CandidateScore],
+    *,
+    prior_requests: Sequence[CandidateRequest],
+    prior_scores: Sequence[CandidateScore],
+    null_image_ids: Sequence[int],
+    mc_samples: int = 1,
 ) -> list[dict[str, Any]]:
-    grouped: dict[int, list[tuple[CandidateRequest, CandidateScore]]] = defaultdict(list)
+    if len(requests) != len(scores):
+        raise ValueError("candidate requests and scores must have equal lengths")
+    if len(prior_requests) != len(prior_scores):
+        raise ValueError("prior requests and scores must have equal lengths")
+    if int(mc_samples) <= 0:
+        raise ValueError("mc_samples must be positive")
+    null_image_ids = tuple(int(value) for value in null_image_ids)
+    if len(null_image_ids) != LANGUAGE_PRIOR_NULL_IMAGE_COUNT:
+        raise ValueError("formal scoring requires exactly three null images")
+    if len(set(null_image_ids)) != len(null_image_ids):
+        raise ValueError("null image IDs must be unique")
+    grouped: dict[
+        tuple[int, int], list[tuple[CandidateRequest, CandidateScore]]
+    ] = defaultdict(list)
     for request, score in zip(requests, scores):
-        grouped[int(request.example_index)].append((request, score))
+        grouped[(int(request.example_index), int(request.candidate_index))].append(
+            (request, score)
+        )
+    grouped_prior: dict[
+        tuple[int, int, int], list[tuple[CandidateRequest, CandidateScore]]
+    ] = defaultdict(list)
+    for request, score in zip(prior_requests, prior_scores):
+        grouped_prior[
+            (
+                int(request.example_index),
+                int(request.candidate_index),
+                int(request.image_id),
+            )
+        ].append((request, score))
     rows: list[dict[str, Any]] = []
     for example in examples:
-        pairs = sorted(grouped[example.item_index], key=lambda pair: pair[0].candidate_index)
-        if len(pairs) != len(example.candidates):
-            raise RuntimeError(f"incomplete candidate scores for {example.task}/{example.item_id}")
         candidate_scores = []
-        for candidate, (request, score) in zip(example.candidates, pairs):
+        for candidate_index, candidate in enumerate(example.candidates):
+            pairs = sorted(
+                grouped[(int(example.item_index), candidate_index)],
+                key=lambda pair: pair[0].mc_sample_index,
+            )
+            if len(pairs) != int(mc_samples):
+                raise RuntimeError(
+                    f"expected {mc_samples} MC scores for "
+                    f"{example.task}/{example.item_id}/candidate-{candidate_index}, "
+                    f"got {len(pairs)}"
+                )
+            sample_indices = [pair[0].mc_sample_index for pair in pairs]
+            if sample_indices != list(range(int(mc_samples))):
+                raise RuntimeError(
+                    f"invalid MC sample indices for "
+                    f"{example.task}/{example.item_id}/candidate-{candidate_index}: "
+                    f"{sample_indices}"
+                )
+            token_counts = {pair[1].token_count for pair in pairs}
+            truncated_counts = {
+                pair[0].truncated_prompt_tokens for pair in pairs
+            }
+            if len(token_counts) != 1 or len(truncated_counts) != 1:
+                raise RuntimeError(
+                    f"MC samples disagree on candidate shape for "
+                    f"{example.task}/{example.item_id}/candidate-{candidate_index}"
+                )
+            request = pairs[0][0]
+            conditional_values = [
+                pair[1].normalized_loglikelihood for pair in pairs
+            ]
+            null_means: list[float] = []
+            for null_image_id in null_image_ids:
+                null_pairs = sorted(
+                    grouped_prior[
+                        (
+                            int(example.item_index),
+                            candidate_index,
+                            null_image_id,
+                        )
+                    ],
+                    key=lambda pair: pair[0].mc_sample_index,
+                )
+                if len(null_pairs) != int(mc_samples):
+                    raise RuntimeError(
+                        f"expected {mc_samples} prior MC scores for "
+                        f"{example.task}/{example.item_id}/candidate-{candidate_index}/"
+                        f"null-{null_image_id}, got {len(null_pairs)}"
+                    )
+                if [pair[0].mc_sample_index for pair in null_pairs] != list(
+                    range(int(mc_samples))
+                ):
+                    raise RuntimeError("invalid prior MC sample indices")
+                prior_token_counts = {pair[1].token_count for pair in null_pairs}
+                if prior_token_counts != token_counts:
+                    raise RuntimeError("conditional and prior token counts disagree")
+                null_means.append(
+                    mean(
+                        [
+                            pair[1].normalized_loglikelihood
+                            for pair in null_pairs
+                        ]
+                    )
+                )
+            conditional_score = mean(conditional_values)
+            language_prior = logmeanexp(null_means)
+            debiased_score = conditional_score - language_prior
             candidate_scores.append(
                 {
-                    "candidate_index": int(request.candidate_index),
+                    "candidate_index": candidate_index,
                     "text": candidate,
-                    "loglikelihood": float(score.loglikelihood),
-                    "normalized_loglikelihood": float(score.normalized_loglikelihood),
-                    "perplexity": finite_perplexity(score.normalized_loglikelihood),
-                    "token_count": int(score.token_count),
-                    "greedy": bool(score.greedy),
+                    DEBIASED_SCORE: debiased_score,
+                    "estimated_language_prior_log_score": language_prior,
+                    "token_count": int(next(iter(token_counts))),
                     "truncated_prompt_tokens": int(request.truncated_prompt_tokens),
+                    "mc_samples": int(mc_samples),
+                    "conditional_mc_mean_token_loglikelihood_std": float(
+                        statistics.pstdev(conditional_values)
+                    ),
+                    "null_image_mean_token_loglikelihood_std": float(
+                        statistics.pstdev(null_means)
+                    ),
+                    "language_prior_alpha": LANGUAGE_PRIOR_ALPHA,
+                    "language_prior_null_images": len(null_image_ids),
                 }
             )
-        raw_prediction = argmax([value["loglikelihood"] for value in candidate_scores])
-        normalized_prediction = argmax(
-            [value["normalized_loglikelihood"] for value in candidate_scores]
+        prediction = argmax(
+            [value[DEBIASED_SCORE] for value in candidate_scores]
         )
         rows.append(
             {
@@ -677,15 +932,9 @@ def build_prediction_rows(
                 "category": example.category,
                 "metadata": example.metadata,
                 "candidate_scores": candidate_scores,
-                "prediction_raw": raw_prediction,
-                "prediction_normalized": normalized_prediction,
-                "correct_raw": (
-                    bool(raw_prediction == example.label)
-                    if example.label is not None
-                    else None
-                ),
-                "correct_normalized": (
-                    bool(normalized_prediction == example.label)
+                "prediction_language_prior_debiased": prediction,
+                "correct_language_prior_debiased": (
+                    bool(prediction == example.label)
                     if example.label is not None
                     else None
                 ),
@@ -694,38 +943,52 @@ def build_prediction_rows(
     return rows
 
 
+def chunk_examples_by_candidate_count(
+    examples: Sequence[LikelihoodExample],
+    max_candidates: int,
+) -> Iterable[list[LikelihoodExample]]:
+    """Yield whole-example chunks while bounding logical candidate count."""
+
+    if int(max_candidates) <= 0:
+        raise ValueError("max_candidates must be positive")
+    chunk: list[LikelihoodExample] = []
+    candidates = 0
+    for example in examples:
+        example_candidates = len(example.candidates)
+        if chunk and candidates + example_candidates > int(max_candidates):
+            yield chunk
+            chunk = []
+            candidates = 0
+        chunk.append(example)
+        candidates += example_candidates
+    if chunk:
+        yield chunk
+
+
 def mean(values: Sequence[float]) -> float:
     return float(sum(float(value) for value in values) / len(values)) if values else 0.0
 
 
 def classification_metrics(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
-    raw_correct = [float(bool(row["correct_raw"])) for row in rows]
-    norm_correct = [float(bool(row["correct_normalized"])) for row in rows]
+    correct = [
+        float(bool(row["correct_language_prior_debiased"])) for row in rows
+    ]
     margins: list[float] = []
-    gold_ll = 0.0
-    gold_tokens = 0
     for row in rows:
         label = int(row["label"])
         scores = row["candidate_scores"]
-        gold = float(scores[label]["normalized_loglikelihood"])
+        gold = float(scores[label][DEBIASED_SCORE])
         best_other = max(
-            float(value["normalized_loglikelihood"])
+            float(value[DEBIASED_SCORE])
             for index, value in enumerate(scores)
             if index != label
         )
         margins.append(gold - best_other)
-        gold_ll += float(scores[label]["loglikelihood"])
-        gold_tokens += int(scores[label]["token_count"])
-    token_nll = -gold_ll / max(1, gold_tokens)
     return {
         "records": len(rows),
-        "accuracy_raw_loglikelihood": mean(raw_correct),
-        "accuracy_normalized_loglikelihood": mean(norm_correct),
-        "primary_metric": "accuracy_normalized_loglikelihood",
-        "mean_normalized_margin": mean(margins),
-        "gold_token_nll": token_nll,
-        "gold_token_perplexity": math.exp(token_nll) if token_nll < 700.0 else float("inf"),
-        "gold_tokens": gold_tokens,
+        "accuracy_language_prior_debiased": mean(correct),
+        "primary_metric": "accuracy_language_prior_debiased",
+        "mean_language_prior_debiased_margin": mean(margins),
     }
 
 
@@ -741,30 +1004,27 @@ def pairwise_ranking_metrics(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
     if any(len(row["candidate_scores"]) != 2 for row in rows):
         raise ValueError("pairwise ranking rows must contain exactly two candidates")
     result = classification_metrics(rows)
-    variants: dict[str, dict[str, Any]] = {}
-    for score_name in ("loglikelihood", "normalized_loglikelihood"):
-        margins: list[float] = []
-        for row in rows:
-            label = int(row["label"])
-            scores = row["candidate_scores"]
-            margins.append(
-                float(scores[label][score_name])
-                - float(scores[1 - label][score_name])
-            )
-        wins = sum(value > 0.0 for value in margins)
-        ties = sum(value == 0.0 for value in margins)
-        variants[score_name] = {
-            "win_rate": wins / max(1, len(margins)),
-            "tie_rate": ties / max(1, len(margins)),
-            "loss_rate": (len(margins) - wins - ties) / max(1, len(margins)),
-            "mean_margin": mean(margins),
-            "median_margin": float(statistics.median(margins)) if margins else 0.0,
-        }
+    margins: list[float] = []
+    for row in rows:
+        label = int(row["label"])
+        scores = row["candidate_scores"]
+        margins.append(
+            float(scores[label][DEBIASED_SCORE])
+            - float(scores[1 - label][DEBIASED_SCORE])
+        )
+    wins = sum(value > 0.0 for value in margins)
+    ties = sum(value == 0.0 for value in margins)
+    pairwise = {
+        "win_rate": wins / max(1, len(margins)),
+        "tie_rate": ties / max(1, len(margins)),
+        "loss_rate": (len(margins) - wins - ties) / max(1, len(margins)),
+        "mean_margin": mean(margins),
+        "median_margin": float(statistics.median(margins)) if margins else 0.0,
+    }
     result.update(
         {
-            "raw_pairwise": variants["loglikelihood"],
-            "normalized_pairwise": variants["normalized_loglikelihood"],
-            "primary_metric": "normalized_pairwise.win_rate",
+            "language_prior_debiased_pairwise": pairwise,
+            "primary_metric": "language_prior_debiased_pairwise.win_rate",
         }
     )
     return result
@@ -788,7 +1048,7 @@ def binary_metrics(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
     true_positive = false_positive = false_negative = 0
     predicted_yes = 0
     for row in rows:
-        prediction = int(row["prediction_normalized"])
+        prediction = int(row["prediction_language_prior_debiased"])
         label = int(row["label"])
         predicted_yes += int(prediction == 0)
         true_positive += int(prediction == 0 and label == 0)
@@ -829,15 +1089,14 @@ def mmbench_circular_metrics(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
             "MMBench circular rows must contain exactly one original row per group"
         )
 
-    def accuracy(selected: Sequence[dict[str, Any]], field: str) -> float:
-        return mean([float(bool(row[field])) for row in selected])
-
-    circular_raw = mean(
-        [float(all(bool(row["correct_raw"]) for row in group)) for group in grouped.values()]
-    )
-    circular_normalized = mean(
+    circular = mean(
         [
-            float(all(bool(row["correct_normalized"]) for row in group))
+            float(
+                all(
+                    bool(row["correct_language_prior_debiased"])
+                    for row in group
+                )
+            )
             for group in grouped.values()
         ]
     )
@@ -849,13 +1108,14 @@ def mmbench_circular_metrics(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
             "original_questions": len(grouped),
             "circular_rows": len(rows),
             "circular_group_size_counts": dict(sorted(group_size_counts.items())),
-            "vanilla_accuracy_raw_loglikelihood": accuracy(originals, "correct_raw"),
-            "vanilla_accuracy_normalized_loglikelihood": accuracy(
-                originals, "correct_normalized"
+            "vanilla_accuracy_language_prior_debiased": mean(
+                [
+                    float(bool(row["correct_language_prior_debiased"]))
+                    for row in originals
+                ]
             ),
-            "circular_accuracy_raw_loglikelihood": circular_raw,
-            "circular_accuracy_normalized_loglikelihood": circular_normalized,
-            "primary_metric": "circular_accuracy_normalized_loglikelihood",
+            "circular_accuracy_language_prior_debiased": circular,
+            "primary_metric": "circular_accuracy_language_prior_debiased",
             "answer_scoring": "semantic_candidate_same_position_likelihood",
             "official_free_form_answer_extraction": False,
         }
@@ -863,61 +1123,36 @@ def mmbench_circular_metrics(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def caption_perplexity_metrics(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
-    total_ll = 0.0
-    total_tokens = 0
-    sequence_ppl: list[float] = []
-    for row in rows:
-        if len(row["candidate_scores"]) != 1:
-            raise ValueError("caption_perplexity rows must contain one candidate")
-        score = row["candidate_scores"][0]
-        total_ll += float(score["loglikelihood"])
-        total_tokens += int(score["token_count"])
-        sequence_ppl.append(float(score["perplexity"]))
-    token_nll = -total_ll / max(1, total_tokens)
-    return {
-        "records": len(rows),
-        "tokens": total_tokens,
-        "token_nll": token_nll,
-        "token_perplexity": math.exp(token_nll) if token_nll < 700.0 else float("inf"),
-        "mean_sequence_perplexity": mean(sequence_ppl),
-        "primary_metric": "token_perplexity",
-    }
-
-
 def winoground_metrics(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
     grouped: dict[str, dict[int, dict[str, Any]]] = defaultdict(dict)
     for row in rows:
         metadata = row.get("metadata") or {}
         grouped[str(metadata["group_id"])][int(metadata["image_slot"])] = row
-    results: dict[str, dict[str, float]] = {}
-    for score_name in ("loglikelihood", "normalized_loglikelihood"):
-        text_correct: list[float] = []
-        image_correct: list[float] = []
-        group_correct: list[float] = []
-        for group_id, pair in grouped.items():
-            if set(pair) != {0, 1}:
-                raise ValueError(f"incomplete Winoground group {group_id}")
-            s00 = float(pair[0]["candidate_scores"][0][score_name])
-            s01 = float(pair[0]["candidate_scores"][1][score_name])
-            s10 = float(pair[1]["candidate_scores"][0][score_name])
-            s11 = float(pair[1]["candidate_scores"][1][score_name])
-            text_ok = s00 > s01 and s11 > s10
-            image_ok = s00 > s10 and s11 > s01
-            text_correct.append(float(text_ok))
-            image_correct.append(float(image_ok))
-            group_correct.append(float(text_ok and image_ok))
-        results[score_name] = {
-            "text_score": mean(text_correct),
-            "image_score": mean(image_correct),
-            "group_score": mean(group_correct),
-        }
+    text_correct: list[float] = []
+    image_correct: list[float] = []
+    group_correct: list[float] = []
+    for group_id, pair in grouped.items():
+        if set(pair) != {0, 1}:
+            raise ValueError(f"incomplete Winoground group {group_id}")
+        s00 = float(pair[0]["candidate_scores"][0][DEBIASED_SCORE])
+        s01 = float(pair[0]["candidate_scores"][1][DEBIASED_SCORE])
+        s10 = float(pair[1]["candidate_scores"][0][DEBIASED_SCORE])
+        s11 = float(pair[1]["candidate_scores"][1][DEBIASED_SCORE])
+        text_ok = s00 > s01 and s11 > s10
+        image_ok = s00 > s10 and s11 > s01
+        text_correct.append(float(text_ok))
+        image_correct.append(float(image_ok))
+        group_correct.append(float(text_ok and image_ok))
+    result = {
+        "text_score": mean(text_correct),
+        "image_score": mean(image_correct),
+        "group_score": mean(group_correct),
+    }
     return {
         "records": len(rows),
         "groups": len(grouped),
-        "raw": results["loglikelihood"],
-        "normalized": results["normalized_loglikelihood"],
-        "primary_metric": "normalized.group_score",
+        "language_prior_debiased": result,
+        "primary_metric": "language_prior_debiased.group_score",
     }
 
 
@@ -944,55 +1179,52 @@ def paired_image_ranking_metrics(
             raise ValueError("paired-image rows must contain one shared caption")
         grouped[pair_id][role] = row
 
-    results: dict[str, dict[str, Any]] = {}
-    for score_name in ("loglikelihood", "normalized_loglikelihood"):
-        margins: list[float] = []
-        category_margins: dict[str, list[float]] = defaultdict(list)
-        for pair_id, pair in grouped.items():
-            if set(pair) != {"positive", "negative"}:
-                raise ValueError(f"incomplete paired-image item {pair_id}")
-            positive = pair["positive"]
-            negative = pair["negative"]
-            positive_score = float(positive["candidate_scores"][0][score_name])
-            negative_score = float(negative["candidate_scores"][0][score_name])
-            margin = positive_score - negative_score
-            margins.append(margin)
-            category = str(
-                (positive.get("metadata") or {}).get("negative_type")
-                or positive.get("category")
-                or "uncategorized"
-            )
-            category_margins[category].append(margin)
+    margins: list[float] = []
+    category_margins: dict[str, list[float]] = defaultdict(list)
+    for pair_id, pair in grouped.items():
+        if set(pair) != {"positive", "negative"}:
+            raise ValueError(f"incomplete paired-image item {pair_id}")
+        positive = pair["positive"]
+        negative = pair["negative"]
+        positive_score = float(positive["candidate_scores"][0][DEBIASED_SCORE])
+        negative_score = float(negative["candidate_scores"][0][DEBIASED_SCORE])
+        margin = positive_score - negative_score
+        margins.append(margin)
+        category = str(
+            (positive.get("metadata") or {}).get("negative_type")
+            or positive.get("category")
+            or "uncategorized"
+        )
+        category_margins[category].append(margin)
 
-        def summarize_margins(values: Sequence[float]) -> dict[str, float]:
-            wins = sum(value > 0.0 for value in values)
-            ties = sum(value == 0.0 for value in values)
-            return {
-                "win_rate": wins / max(1, len(values)),
-                "tie_rate": ties / max(1, len(values)),
-                "loss_rate": (len(values) - wins - ties) / max(1, len(values)),
-                "mean_margin": mean(values),
-                "median_margin": (
-                    float(statistics.median(values)) if values else 0.0
-                ),
-            }
-
-        results[score_name] = {
-            **summarize_margins(margins),
-            "categories": {
-                category: {
-                    "pairs": len(values),
-                    **summarize_margins(values),
-                }
-                for category, values in sorted(category_margins.items())
-            },
+    def summarize_margins(values: Sequence[float]) -> dict[str, float]:
+        wins = sum(value > 0.0 for value in values)
+        ties = sum(value == 0.0 for value in values)
+        return {
+            "win_rate": wins / max(1, len(values)),
+            "tie_rate": ties / max(1, len(values)),
+            "loss_rate": (len(values) - wins - ties) / max(1, len(values)),
+            "mean_margin": mean(values),
+            "median_margin": (
+                float(statistics.median(values)) if values else 0.0
+            ),
         }
+
+    result = {
+        **summarize_margins(margins),
+        "categories": {
+            category: {
+                "pairs": len(values),
+                **summarize_margins(values),
+            }
+            for category, values in sorted(category_margins.items())
+        },
+    }
     return {
         "records": len(rows),
         "pairs": len(grouped),
-        "raw": results["loglikelihood"],
-        "normalized": results["normalized_loglikelihood"],
-        "primary_metric": "normalized.win_rate",
+        "language_prior_debiased": result,
+        "primary_metric": "language_prior_debiased.win_rate",
         "scoring_direction": "shared_caption_positive_image_over_negative_image",
     }
 
@@ -1017,61 +1249,56 @@ def whatsup_metrics(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
         "A": ({"left", "right"}, {"on", "under"}),
         "B": ({"left", "right"}, {"in-front", "behind"}),
     }
-    variants: dict[str, dict[str, Any]] = {}
-    for prediction_field, score_key in (
-        ("prediction_raw", "raw"),
-        ("prediction_normalized", "normalized"),
-    ):
-        individual: list[float] = []
-        pair_correct: list[float] = []
-        set_correct: list[float] = []
-        subset_values: dict[str, dict[str, list[float]]] = defaultdict(
-            lambda: defaultdict(list)
-        )
-        for (subset, set_id), relation_rows in grouped.items():
-            relation_pairs = expected_relations[subset]
-            expected = set().union(*relation_pairs)
-            if set(relation_rows) != expected:
-                raise ValueError(
-                    f"incomplete What’sUp set {(subset, set_id)}: "
-                    f"{sorted(relation_rows)} != {sorted(expected)}"
-                )
-            correctness = {
-                relation: int(row[prediction_field]) == int(row["label"])
-                for relation, row in relation_rows.items()
-            }
-            individual.extend(float(value) for value in correctness.values())
-            subset_values[subset]["individual"].extend(
-                float(value) for value in correctness.values()
+    individual: list[float] = []
+    pair_correct: list[float] = []
+    set_correct: list[float] = []
+    subset_values: dict[str, dict[str, list[float]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    for (subset, set_id), relation_rows in grouped.items():
+        relation_pairs = expected_relations[subset]
+        expected = set().union(*relation_pairs)
+        if set(relation_rows) != expected:
+            raise ValueError(
+                f"incomplete What’sUp set {(subset, set_id)}: "
+                f"{sorted(relation_rows)} != {sorted(expected)}"
             )
-            current_pair_values = [
-                float(all(correctness[relation] for relation in relation_pair))
-                for relation_pair in relation_pairs
-            ]
-            pair_correct.extend(current_pair_values)
-            subset_values[subset]["pair"].extend(current_pair_values)
-            current_set = float(all(correctness.values()))
-            set_correct.append(current_set)
-            subset_values[subset]["set"].append(current_set)
-        variants[score_key] = {
-            "individual_accuracy": mean(individual),
-            "pair_accuracy": mean(pair_correct),
-            "set_accuracy": mean(set_correct),
-            "subsets": {
-                subset: {
-                    "individual_accuracy": mean(values["individual"]),
-                    "pair_accuracy": mean(values["pair"]),
-                    "set_accuracy": mean(values["set"]),
-                }
-                for subset, values in sorted(subset_values.items())
-            },
+        correctness = {
+            relation: int(row["prediction_language_prior_debiased"])
+            == int(row["label"])
+            for relation, row in relation_rows.items()
         }
+        individual.extend(float(value) for value in correctness.values())
+        subset_values[subset]["individual"].extend(
+            float(value) for value in correctness.values()
+        )
+        current_pair_values = [
+            float(all(correctness[relation] for relation in relation_pair))
+            for relation_pair in relation_pairs
+        ]
+        pair_correct.extend(current_pair_values)
+        subset_values[subset]["pair"].extend(current_pair_values)
+        current_set = float(all(correctness.values()))
+        set_correct.append(current_set)
+        subset_values[subset]["set"].append(current_set)
+    result = {
+        "individual_accuracy": mean(individual),
+        "pair_accuracy": mean(pair_correct),
+        "set_accuracy": mean(set_correct),
+        "subsets": {
+            subset: {
+                "individual_accuracy": mean(values["individual"]),
+                "pair_accuracy": mean(values["pair"]),
+                "set_accuracy": mean(values["set"]),
+            }
+            for subset, values in sorted(subset_values.items())
+        },
+    }
     return {
         "records": len(rows),
         "sets": len(grouped),
-        "raw": variants["raw"],
-        "normalized": variants["normalized"],
-        "primary_metric": "normalized.individual_accuracy",
+        "language_prior_debiased": result,
+        "primary_metric": "language_prior_debiased.individual_accuracy",
     }
 
 
@@ -1082,8 +1309,11 @@ def summarize_task(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
     if any(str(row["kind"]) != kind for row in rows):
         raise ValueError("task rows mix kinds")
     if kind == "caption_perplexity":
-        metrics = caption_perplexity_metrics(rows)
-    elif kind == "binary_classification":
+        raise ValueError(
+            "caption perplexity was removed from the formal protocol; it is not "
+            "a language-prior-debiased image-text matching metric"
+        )
+    if kind == "binary_classification":
         metrics = binary_metrics(rows)
     elif kind == "mmbench_circular_multiple_choice":
         metrics = mmbench_circular_metrics(rows)
@@ -1108,7 +1338,6 @@ def summarize_task(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
     elif kind == "pairwise_caption_ranking":
         metrics["categories"] = category_metrics(rows, pairwise_ranking_metrics)
     elif kind not in {
-        "caption_perplexity",
         "winoground_pair",
         "svo_image_pair",
         "whatsup_controlled_spatial",
@@ -1126,6 +1355,7 @@ def validate_prediction_shard(
     examples: Sequence[LikelihoodExample],
     *,
     task: str,
+    mc_samples: int,
 ) -> None:
     expected_indices = [int(example.item_index) for example in examples]
     actual_indices = [int(row["item_index"]) for row in rows]
@@ -1136,6 +1366,24 @@ def validate_prediction_shard(
             raise ValueError(f"resumable prediction shard identity mismatch for {task}")
         if len(row.get("candidate_scores", [])) != len(example.candidates):
             raise ValueError(f"resumable prediction shard candidate mismatch for {task}")
+        candidate_mc = {
+            int(score.get("mc_samples", 1)) for score in row["candidate_scores"]
+        }
+        if candidate_mc != {int(mc_samples)}:
+            raise ValueError(
+                f"resumable prediction shard MC mismatch for {task}: "
+                f"{sorted(candidate_mc)}"
+            )
+        if any(DEBIASED_SCORE not in score for score in row["candidate_scores"]):
+            raise ValueError(
+                f"resumable prediction shard uses the removed score protocol for {task}"
+            )
+        prior_counts = {
+            int(score.get("language_prior_null_images", -1))
+            for score in row["candidate_scores"]
+        }
+        if prior_counts != {LANGUAGE_PRIOR_NULL_IMAGE_COUNT}:
+            raise ValueError(f"resumable prediction shard has wrong prior for {task}")
 
 
 def evaluate_task(
@@ -1151,13 +1399,19 @@ def evaluate_task(
     device: torch.device,
     image_sigma_order: str,
     attention_contract: str,
+    null_image_ids: Sequence[int],
 ) -> dict[str, Any] | None:
     local_examples = list(examples[rank::world_size])
     started = time.monotonic()
     local_shard = shard_path(args.output_dir, task, rank, world_size)
     if local_shard.is_file():
         predictions = read_jsonl_predictions(local_shard)
-        validate_prediction_shard(predictions, local_examples, task=task)
+        validate_prediction_shard(
+            predictions,
+            local_examples,
+            task=task,
+            mc_samples=int(args.mc),
+        )
         print(
             json.dumps(
                 {
@@ -1171,37 +1425,82 @@ def evaluate_task(
             flush=True,
         )
     else:
-        requests = [
-            encode_candidate(
-                tokenizer,
-                example,
-                candidate_index,
-                image_tokens=int(model.config.image_tokens_per_img),
-                boi_token_id=int(model.config.boi_token_id),
-                eoi_token_id=int(model.config.eoi_token_id),
-                image_mask_token_id=int(model.config.image_mask_token_id),
-                max_length=int(args.max_length),
-                image_sigma_order=image_sigma_order,
-                seed=int(args.seed),
+        predictions = []
+        logical_total = sum(len(example.candidates) for example in local_examples)
+        logical_completed = 0
+        for example_chunk in chunk_examples_by_candidate_count(
+            local_examples,
+            int(args.progress_every),
+        ):
+            requests = [
+                request
+                for example in example_chunk
+                for candidate_index in range(len(example.candidates))
+                for request in encode_candidate_mc(
+                    tokenizer,
+                    example,
+                    candidate_index,
+                    image_tokens=int(model.config.image_tokens_per_img),
+                    boi_token_id=int(model.config.boi_token_id),
+                    eoi_token_id=int(model.config.eoi_token_id),
+                    image_mask_token_id=int(model.config.image_mask_token_id),
+                    max_length=int(args.max_length),
+                    image_sigma_order=image_sigma_order,
+                    seed=int(args.seed),
+                    mc_samples=int(args.mc),
+                )
+            ]
+            scores = score_candidate_requests(
+                model,
+                requests,
+                cache,
+                batch_size=int(args.batch_size_per_rank) * int(args.mc),
+                lm_head_chunk_tokens=int(args.lm_head_chunk_tokens),
+                attention_contract=attention_contract,
+                device=device,
             )
-            for example in local_examples
-            for candidate_index in range(len(example.candidates))
-        ]
-        scores: list[CandidateScore] = []
-        for offset in range(0, len(requests), int(args.progress_every)):
-            chunk = requests[offset : offset + int(args.progress_every)]
-            scores.extend(
-                score_candidate_requests(
-                    model,
-                    chunk,
-                    cache,
-                    batch_size=int(args.batch_size_per_rank),
-                    lm_head_chunk_tokens=int(args.lm_head_chunk_tokens),
-                    attention_contract=attention_contract,
-                    device=device,
+            prior_requests = [
+                request
+                for example in example_chunk
+                for candidate_index in range(len(example.candidates))
+                for null_image_id in null_image_ids
+                for request in encode_candidate_mc(
+                    tokenizer,
+                    replace(example, image_id=int(null_image_id)),
+                    candidate_index,
+                    image_tokens=int(model.config.image_tokens_per_img),
+                    boi_token_id=int(model.config.boi_token_id),
+                    eoi_token_id=int(model.config.eoi_token_id),
+                    image_mask_token_id=int(model.config.image_mask_token_id),
+                    max_length=int(args.max_length),
+                    image_sigma_order=image_sigma_order,
+                    seed=int(args.seed),
+                    mc_samples=int(args.mc),
+                )
+            ]
+            prior_scores = score_candidate_requests(
+                model,
+                prior_requests,
+                cache,
+                batch_size=int(args.batch_size_per_rank) * int(args.mc),
+                lm_head_chunk_tokens=int(args.lm_head_chunk_tokens),
+                attention_contract=attention_contract,
+                device=device,
+            )
+            predictions.extend(
+                build_prediction_rows(
+                    example_chunk,
+                    requests,
+                    scores,
+                    prior_requests=prior_requests,
+                    prior_scores=prior_scores,
+                    null_image_ids=null_image_ids,
+                    mc_samples=int(args.mc),
                 )
             )
-            completed = min(offset + len(chunk), len(requests))
+            logical_completed += sum(
+                len(example.candidates) for example in example_chunk
+            )
             elapsed = time.monotonic() - started
             print(
                 json.dumps(
@@ -1209,16 +1508,27 @@ def evaluate_task(
                         "event": "multimodal_likelihood_progress",
                         "task": task,
                         "rank": rank,
-                        "candidate_requests": completed,
-                        "candidate_requests_total": len(requests),
+                        "candidate_groups": logical_completed,
+                        "candidate_groups_total": logical_total,
+                        "mc_samples": int(args.mc),
+                        "forward_sequences": logical_completed
+                        * int(args.mc)
+                        * (1 + len(null_image_ids)),
+                        "forward_sequences_total": logical_total
+                        * int(args.mc)
+                        * (1 + len(null_image_ids)),
                         "elapsed_seconds": elapsed,
-                        "requests_per_second": completed / max(elapsed, 1.0e-9),
+                        "sequences_per_second": (
+                            logical_completed
+                            * int(args.mc)
+                            * (1 + len(null_image_ids))
+                        )
+                        / max(elapsed, 1.0e-9),
                     },
                     sort_keys=True,
                 ),
                 flush=True,
             )
-        predictions = build_prediction_rows(local_examples, requests, scores)
         atomic_write_text(local_shard, jsonl_text(predictions))
     barrier(device)
     if rank != 0:
@@ -1237,7 +1547,12 @@ def evaluate_task(
     summary.update(
         {
             "task": task,
-            "candidate_requests": sum(len(example.candidates) for example in examples),
+            "candidate_groups": sum(len(example.candidates) for example in examples),
+            "candidate_requests": int(args.mc)
+            * (1 + len(null_image_ids))
+            * sum(len(example.candidates) for example in examples),
+            "mc_samples": int(args.mc),
+            "language_prior_null_images": len(null_image_ids),
             "elapsed_seconds_max_rank_approx": time.monotonic() - started,
         }
     )
@@ -1281,6 +1596,11 @@ def main() -> None:
     )
     if image_sigma_order not in {"random", "sequential"}:
         raise ValueError(f"unknown image sigma order: {image_sigma_order}")
+    if int(args.mc) > 1 and image_sigma_order != "random":
+        raise ValueError(
+            "--mc > 1 requires random image_sigma_order; a sequential order has "
+            "no image-order distribution to sample"
+        )
 
     model_dtype = torch.bfloat16 if args.model_dtype == "bf16" else torch.float32
     model, tokenizer = load_model_tokenizer(config, model_dtype=model_dtype)
@@ -1309,6 +1629,16 @@ def main() -> None:
     examples_by_task = {
         task: load_examples(task, asset_manifest, int(args.limit)) for task in tasks
     }
+    if bool(args.require_formal_protocol):
+        actual_records = {
+            task: len(examples) for task, examples in examples_by_task.items()
+        }
+        if actual_records != FORMAL_TASK_RECORDS:
+            raise ValueError(
+                "formal multimodal task cardinality mismatch: "
+                f"{actual_records} != {FORMAL_TASK_RECORDS}"
+            )
+    null_image_ids = language_prior_null_image_ids(asset_manifest)
     missing_cache_ids = sorted(
         {
             example.image_id
@@ -1316,6 +1646,7 @@ def main() -> None:
             for example in examples
             if example.image_id not in cache
         }
+        | {image_id for image_id in null_image_ids if image_id not in cache}
     )
     if missing_cache_ids:
         raise ValueError(
@@ -1327,7 +1658,7 @@ def main() -> None:
     if rank == 0:
         asset_manifest_path = (args.asset_root / "manifest.json").resolve()
         run_identity = {
-            "schema": "selfless_multimodal_likelihood_evaluation_v2",
+            "schema": "selfless_multimodal_likelihood_evaluation_v5",
             "runtime_hashing_enabled": False,
             "checkpoint": str(source.path),
             "checkpoint_step": checkpoint_step,
@@ -1348,6 +1679,19 @@ def main() -> None:
             "device": args.device,
             "model_dtype": args.model_dtype,
             "batch_size_per_rank": int(args.batch_size_per_rank),
+            "mc_samples": int(args.mc),
+            "project_formal_protocol": bool(args.require_formal_protocol),
+            "effective_forward_batch_size_per_rank": (
+                int(args.batch_size_per_rank) * int(args.mc)
+            ),
+            "mc_aggregation": "mean_loglikelihood",
+            "mc_common_random_numbers_across_candidates": True,
+            "image_order_mc_contract": IMAGE_ORDER_MC_CONTRACT,
+            "language_prior_alpha": LANGUAGE_PRIOR_ALPHA,
+            "language_prior_estimator": LANGUAGE_PRIOR_ESTIMATOR,
+            "language_prior_null_image_ids": list(null_image_ids),
+            "language_prior_null_image_count": len(null_image_ids),
+            "language_prior_uses_labels": False,
             "max_length": int(args.max_length),
             "seed": int(args.seed),
             "image_sigma_order": image_sigma_order,
@@ -1357,7 +1701,8 @@ def main() -> None:
             "content_stream_diagonal": (
                 attention_contract == "xlnet_content_diagonal"
             ),
-            "primary_candidate_score": "normalized_loglikelihood",
+            "primary_candidate_score": DEBIASED_SCORE,
+            "reported_score_variant": "language_prior_debiased_only",
             "candidate_target": "answer_or_caption_text_only_without_eos",
             "free_form_generation_required": False,
         }
@@ -1405,6 +1750,7 @@ def main() -> None:
             device=device,
             image_sigma_order=image_sigma_order,
             attention_contract=attention_contract,
+            null_image_ids=null_image_ids,
         )
         if rank == 0 and summary is not None:
             summaries[task] = summary
@@ -1423,9 +1769,11 @@ def main() -> None:
             args.output_dir / "summary.json",
             json.dumps(
                 {
-                    "schema": "selfless_multimodal_likelihood_summary_v2",
+                    "schema": "selfless_multimodal_likelihood_summary_v5",
+                    "project_formal_protocol": bool(args.require_formal_protocol),
                     "checkpoint_step": checkpoint_step,
                     "runtime_hashing_enabled": False,
+                    "accuracy_and_rate_unit": "unit_interval",
                     "scoring": {
                         "contract": LIKELIHOOD_SCORING_CONTRACT,
                         "dual_stream_attention_contract": attention_contract,
@@ -1433,6 +1781,16 @@ def main() -> None:
                         "content_stream_diagonal": (
                             attention_contract == "xlnet_content_diagonal"
                         ),
+                        "mc_samples": int(args.mc),
+                        "mc_aggregation": "mean_loglikelihood",
+                        "mc_common_random_numbers_across_candidates": True,
+                        "image_order_mc_contract": IMAGE_ORDER_MC_CONTRACT,
+                        "primary_candidate_score": DEBIASED_SCORE,
+                        "reported_score_variant": "language_prior_debiased_only",
+                        "language_prior_alpha": LANGUAGE_PRIOR_ALPHA,
+                        "language_prior_estimator": LANGUAGE_PRIOR_ESTIMATOR,
+                        "language_prior_null_image_count": len(null_image_ids),
+                        "language_prior_uses_labels": False,
                     },
                     "tasks": summaries,
                 },

@@ -12,10 +12,11 @@ OUTPUT_DIR="$2"
 PROFILE="${EVAL_PROFILE:-formal}"
 CONFIG="${CONFIG:-configs/selfless/unified_baseline_100b_ascend_64npu.yaml}"
 ASSET_ROOT="${ASSET_ROOT:-public/benchmarks/selfless_multimodal_likelihood_v1}"
-CACHE_ROOT="${CACHE_ROOT:-${ASSET_ROOT}/vae_posterior_mar_kl16}"
+CACHE_ROOT="${CACHE_ROOT:-${ASSET_ROOT}/vae_posterior_mar_kl16_v2}"
 CACHE_SHARD_DIR="${CACHE_SHARD_DIR:-${CACHE_ROOT}/shards}"
 CACHE_COMPLETE_PATH="${CACHE_COMPLETE_PATH:-${CACHE_ROOT}/cache.complete.json}"
 TASKS="${TASKS:-}"
+MC="${MC:-64}"
 NPU_COUNT=16
 
 if [[ "${PROFILE}" == "smoke" ]]; then
@@ -23,11 +24,14 @@ if [[ "${PROFILE}" == "smoke" ]]; then
   BATCH_SIZE_PER_RANK="${BATCH_SIZE_PER_RANK:-1}"
   LM_HEAD_CHUNK_TOKENS="${LM_HEAD_CHUNK_TOKENS:-32}"
   PROGRESS_EVERY="${PROGRESS_EVERY:-2}"
+  PROTOCOL_ARGS=()
 elif [[ "${PROFILE}" == "formal" ]]; then
-  LIMIT="${LIMIT:-0}"
+  LIMIT=0
+  MC=64
   BATCH_SIZE_PER_RANK="${BATCH_SIZE_PER_RANK:-4}"
   LM_HEAD_CHUNK_TOKENS="${LM_HEAD_CHUNK_TOKENS:-256}"
   PROGRESS_EVERY="${PROGRESS_EVERY:-50}"
+  PROTOCOL_ARGS=(--require_formal_protocol)
 else
   echo "ERROR: EVAL_PROFILE must be smoke or formal; got ${PROFILE}" >&2
   exit 3
@@ -36,6 +40,7 @@ fi
 for integer in \
   "${LIMIT}" \
   "${BATCH_SIZE_PER_RANK}" \
+  "${MC}" \
   "${LM_HEAD_CHUNK_TOKENS}" \
   "${PROGRESS_EVERY}"; do
   if [[ ! "${integer}" =~ ^[0-9]+$ ]]; then
@@ -103,12 +108,20 @@ expected_source = {
     "bytes": int(stat.st_size),
     "mtime_ns": int(stat.st_mtime_ns),
 }
+if asset.get("schema") != "selfless_multimodal_likelihood_assets_v2":
+    raise RuntimeError("multimodal likelihood assets use an obsolete schema")
+if cache.get("schema") != "selfless_image_posterior_cache_v2":
+    raise RuntimeError("posterior cache uses an obsolete schema")
+if cache.get("asset_schema") != asset.get("schema"):
+    raise RuntimeError("posterior cache asset schema mismatch")
 if cache.get("runtime_hashing_enabled", True) is not False:
     raise RuntimeError("posterior cache violates the no-hash contract")
 if int(cache.get("records", -1)) != int(asset.get("images", -2)):
     raise RuntimeError("posterior cache record count does not match assets")
 if cache.get("source_manifest") != expected_source:
     raise RuntimeError("posterior cache was built for a different readable manifest revision")
+if cache.get("language_prior_null_image_ids") != [9000000000, 9000000001, 9000000002]:
+    raise RuntimeError("posterior cache lacks the formal null-image contract")
 PY
 
 read -r NPU_AVAILABLE VISIBLE_NPUS <<< "$(python - <<'PY'
@@ -131,8 +144,8 @@ unset CUDA_VISIBLE_DEVICES PYTORCH_CUDA_ALLOC_CONF
 mkdir -p "${OUTPUT_DIR}"
 
 STATUS_PATH="${OUTPUT_DIR}/launcher.status"
-printf 'state=RUNNING\nprofile=%s\nstarted_at=%s\nruntime_hashing_enabled=false\n' \
-  "${PROFILE}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"${STATUS_PATH}"
+printf 'state=RUNNING\nprofile=%s\nmc=%s\nstarted_at=%s\nruntime_hashing_enabled=false\n' \
+  "${PROFILE}" "${MC}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"${STATUS_PATH}"
 finish() {
   launch_status=$?
   if (( launch_status == 0 )); then
@@ -140,8 +153,8 @@ finish() {
   else
     launch_state=FAILED
   fi
-  printf 'state=%s\nprofile=%s\nexit_code=%s\nfinished_at=%s\nruntime_hashing_enabled=false\n' \
-    "${launch_state}" "${PROFILE}" "${launch_status}" \
+  printf 'state=%s\nprofile=%s\nmc=%s\nexit_code=%s\nfinished_at=%s\nruntime_hashing_enabled=false\n' \
+    "${launch_state}" "${PROFILE}" "${MC}" "${launch_status}" \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"${STATUS_PATH}"
   exit "${launch_status}"
 }
@@ -159,6 +172,7 @@ env \
   --output_dir "${OUTPUT_DIR}" \
   --tasks "${TASKS}" \
   --batch_size_per_rank "${BATCH_SIZE_PER_RANK}" \
+  --mc "${MC}" \
   --lm_head_chunk_tokens "${LM_HEAD_CHUNK_TOKENS}" \
   --max_length 2048 \
   --limit "${LIMIT}" \
@@ -166,4 +180,5 @@ env \
   --device npu \
   --model_dtype bf16 \
   --image_sigma_order auto \
-  --progress_every "${PROGRESS_EVERY}"
+  --progress_every "${PROGRESS_EVERY}" \
+  "${PROTOCOL_ARGS[@]}"

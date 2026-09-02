@@ -5,26 +5,30 @@ from pathlib import Path
 
 os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
 
+import pytest
 import torch
 from transformers import Qwen3Config
 
 from models.modeling_model.modeling_selfless_flow import Qwen3ForCausalLM
 from scripts.evaluate_multimodal_likelihood_benchmarks import (
+    CandidateScore,
+    DEBIASED_SCORE,
     LikelihoodExample,
     PosteriorCache,
     arithmetic_seed,
-    caption_perplexity_metrics,
+    build_prediction_rows,
     encode_candidate,
+    encode_candidate_mc,
     mmbench_circular_metrics,
     paired_image_ranking_metrics,
     pairwise_ranking_metrics,
     score_candidate_requests,
     summarize_task,
+    validate_language_prior_contract,
     whatsup_metrics,
     winoground_metrics,
 )
 from scripts.evaluate_imagenet_pretraining_native import (
-    retrieval_metrics,
     score_text_candidates,
     score_text_candidates_cached_prefix,
 )
@@ -53,6 +57,36 @@ def example(**overrides):
     }
     values.update(overrides)
     return LikelihoodExample(**values)
+
+
+def test_formal_null_image_contract_is_fully_pinned(tmp_path):
+    images = []
+    for index, seed in enumerate((17_071, 29_129, 43_231)):
+        path = tmp_path / f"gaussian-{index:02d}.png"
+        path.touch()
+        images.append(
+            {
+                "image_id": 9_000_000_000 + index,
+                "path": str(path),
+                "seed": seed,
+            }
+        )
+    prior = {
+        "estimator": "content_free_gaussian_image_logmeanexp",
+        "count": 3,
+        "images": images,
+        "pixel_space": "vae_preprocess_normalized_minus1_to_plus1",
+        "normalized_gaussian_mean": 0.0,
+        "normalized_gaussian_std": 0.25,
+        "clamp": [-1.0, 1.0],
+        "storage": "lossless_rgb_png",
+        "uses_benchmark_labels": False,
+    }
+    validate_language_prior_contract(prior)
+
+    prior["images"][0]["seed"] += 1
+    with pytest.raises(ValueError, match="seeds"):
+        validate_language_prior_contract(prior)
 
 
 def test_candidate_sequence_scores_same_position_suffix_after_complete_image():
@@ -136,24 +170,134 @@ def test_arithmetic_seeds_and_random_order_are_deterministic_without_hashes():
     assert first.sigma == second.sigma
 
 
-def score(ll, tokens):
-    normalized = ll / tokens
+def test_mc_expands_image_orders_and_shares_them_across_candidates():
+    kwargs = {
+        "image_tokens": 8,
+        "boi_token_id": 101,
+        "eoi_token_id": 102,
+        "image_mask_token_id": 103,
+        "max_length": 64,
+        "image_sigma_order": "random",
+        "seed": 42,
+        "mc_samples": 64,
+    }
+    candidates = [
+        encode_candidate_mc(CharacterTokenizer(), example(), index, **kwargs)
+        for index in range(2)
+    ]
+    mc_one = encode_candidate(
+        CharacterTokenizer(),
+        example(),
+        0,
+        **{key: value for key, value in kwargs.items() if key != "mc_samples"},
+    )
+    assert candidates[0][0] == mc_one
+    assert all(len(requests) == 64 for requests in candidates)
+    assert [request.mc_sample_index for request in candidates[0]] == list(range(64))
+    assert len({request.sigma for request in candidates[0]}) > 1
+    for left, right in zip(*candidates):
+        left_order = left.sigma[left.image_start : left.image_start + 8]
+        right_order = right.sigma[right.image_start : right.image_start + 8]
+        assert left_order == right_order
+    assert candidates[0][0].input_ids is candidates[0][1].input_ids
+
+
+def test_mc_prediction_uses_mean_loglikelihood_and_records_dispersion():
+    requests = [
+        request
+        for candidate_index in range(2)
+        for request in encode_candidate_mc(
+            CharacterTokenizer(),
+            example(),
+            candidate_index,
+            image_tokens=4,
+            boi_token_id=101,
+            eoi_token_id=102,
+            image_mask_token_id=103,
+            max_length=64,
+            image_sigma_order="random",
+            seed=42,
+            mc_samples=2,
+        )
+    ]
+    scores = [
+        CandidateScore(-3.0, -1.0, 3, True),
+        CandidateScore(-6.0, -2.0, 3, False),
+        CandidateScore(-4.0, -1.0, 4, True),
+        CandidateScore(-4.0, -1.0, 4, True),
+    ]
+    null_image_ids = (9_000_000_000, 9_000_000_001, 9_000_000_002)
+    prior_requests = [
+        request
+        for candidate_index in range(2)
+        for null_image_id in null_image_ids
+        for request in encode_candidate_mc(
+            CharacterTokenizer(),
+            example(image_id=null_image_id),
+            candidate_index,
+            image_tokens=4,
+            boi_token_id=101,
+            eoi_token_id=102,
+            image_mask_token_id=103,
+            max_length=64,
+            image_sigma_order="random",
+            seed=42,
+            mc_samples=2,
+        )
+    ]
+    prior_scores = []
+    for candidate_index in range(2):
+        token_count = 3 if candidate_index == 0 else 4
+        prior_value = -2.0 if candidate_index == 0 else -0.5
+        for _ in null_image_ids:
+            prior_scores.extend(
+                [
+                    CandidateScore(
+                        prior_value * token_count,
+                        prior_value,
+                        token_count,
+                        False,
+                    ),
+                    CandidateScore(
+                        prior_value * token_count,
+                        prior_value,
+                        token_count,
+                        False,
+                    ),
+                ]
+            )
+    row = build_prediction_rows(
+        [example()],
+        requests,
+        scores,
+        prior_requests=prior_requests,
+        prior_scores=prior_scores,
+        null_image_ids=null_image_ids,
+        mc_samples=2,
+    )[0]
+    first, second = row["candidate_scores"]
+    assert first[DEBIASED_SCORE] == 0.5
+    assert second[DEBIASED_SCORE] == -0.5
+    assert first["estimated_language_prior_log_score"] == -2.0
+    assert first["conditional_mc_mean_token_loglikelihood_std"] == 0.5
+    assert "normalized_loglikelihood" not in first
+    assert "loglikelihood" not in first
+    assert second["mc_samples"] == 2
+    assert row["prediction_language_prior_debiased"] == 0
+
+
+def score(value, tokens=1):
     return {
-        "loglikelihood": float(ll),
-        "normalized_loglikelihood": float(normalized),
-        "perplexity": math.exp(-normalized),
+        DEBIASED_SCORE: float(value),
         "token_count": int(tokens),
-        "greedy": False,
         "truncated_prompt_tokens": 0,
+        "mc_samples": 1,
+        "language_prior_null_images": 3,
     }
 
 
 def classification_row(item_index, label, scores, category="all"):
-    raw = max(range(len(scores)), key=lambda index: scores[index]["loglikelihood"])
-    normalized = max(
-        range(len(scores)),
-        key=lambda index: scores[index]["normalized_loglikelihood"],
-    )
+    prediction = max(range(len(scores)), key=lambda index: scores[index][DEBIASED_SCORE])
     return {
         "item_index": item_index,
         "item_id": str(item_index),
@@ -164,35 +308,32 @@ def classification_row(item_index, label, scores, category="all"):
         "category": category,
         "metadata": {},
         "candidate_scores": scores,
-        "prediction_raw": raw,
-        "prediction_normalized": normalized,
-        "correct_raw": raw == label,
-        "correct_normalized": normalized == label,
+        "prediction_language_prior_debiased": prediction,
+        "correct_language_prior_debiased": prediction == label,
     }
 
 
-def test_primary_multiple_choice_metric_uses_length_normalized_likelihood():
-    row = classification_row(0, 0, [score(-4.0, 4), score(-3.0, 2)])
+def test_primary_multiple_choice_metric_uses_only_debiased_likelihood():
+    row = classification_row(0, 0, [score(0.4, 4), score(0.3, 2)])
     summary = summarize_task([row])
     metrics = summary["metrics"]
-    assert metrics["accuracy_raw_loglikelihood"] == 0.0
-    assert metrics["accuracy_normalized_loglikelihood"] == 1.0
-    assert metrics["primary_metric"] == "accuracy_normalized_loglikelihood"
+    assert metrics["accuracy_language_prior_debiased"] == 1.0
+    assert metrics["primary_metric"] == "accuracy_language_prior_debiased"
 
 
 def test_pairwise_ranking_reports_strict_tie_instead_of_index_tie_break_win():
-    row = classification_row(0, 0, [score(-2.0, 2), score(-2.0, 2)])
+    row = classification_row(0, 0, [score(0.0, 2), score(0.0, 2)])
     row["kind"] = "pairwise_caption_ranking"
     metrics = pairwise_ranking_metrics([row])
-    assert metrics["accuracy_normalized_loglikelihood"] == 1.0
-    assert metrics["normalized_pairwise"] == {
+    assert metrics["accuracy_language_prior_debiased"] == 1.0
+    assert metrics["language_prior_debiased_pairwise"] == {
         "win_rate": 0.0,
         "tie_rate": 1.0,
         "loss_rate": 0.0,
         "mean_margin": 0.0,
         "median_margin": 0.0,
     }
-    assert metrics["primary_metric"] == "normalized_pairwise.win_rate"
+    assert metrics["primary_metric"] == "language_prior_debiased_pairwise.win_rate"
 
 
 def test_mmbench_strict_circular_metric_requires_every_rotation():
@@ -206,7 +347,7 @@ def test_mmbench_strict_circular_metric_requires_every_rotation():
         row = classification_row(
             item_index,
             label,
-            [score(-1.0, 1), score(-2.0, 1)],
+            [score(1.0), score(0.0)],
         )
         row["kind"] = "mmbench_circular_multiple_choice"
         row["metadata"] = {
@@ -216,26 +357,11 @@ def test_mmbench_strict_circular_metric_requires_every_rotation():
         rows.append(row)
     metrics = mmbench_circular_metrics(rows)
     assert metrics["original_questions"] == 2
-    assert metrics["vanilla_accuracy_normalized_loglikelihood"] == 1.0
-    assert metrics["circular_accuracy_normalized_loglikelihood"] == 0.5
+    assert metrics["vanilla_accuracy_language_prior_debiased"] == 1.0
+    assert metrics["circular_accuracy_language_prior_debiased"] == 0.5
     assert metrics["primary_metric"] == (
-        "circular_accuracy_normalized_loglikelihood"
+        "circular_accuracy_language_prior_debiased"
     )
-
-
-def test_caption_perplexity_is_token_weighted():
-    rows = []
-    for index, value in enumerate((score(-2.0, 1), score(-6.0, 3))):
-        rows.append(
-            {
-                "kind": "caption_perplexity",
-                "candidate_scores": [value],
-            }
-        )
-    metrics = caption_perplexity_metrics(rows)
-    assert metrics["tokens"] == 4
-    assert metrics["token_nll"] == 2.0
-    assert metrics["token_perplexity"] == math.exp(2.0)
 
 
 def test_winoground_reports_text_image_and_group_scores():
@@ -248,12 +374,12 @@ def test_winoground_reports_text_image_and_group_scores():
 
     metrics = winoground_metrics(
         [
-            row("g0", 0, -1.0, -2.0),
-            row("g0", 1, -3.0, -1.0),
+            row("g0", 0, 2.0, 1.0),
+            row("g0", 1, 0.0, 2.0),
         ]
     )
     assert metrics["groups"] == 1
-    assert metrics["normalized"] == {
+    assert metrics["language_prior_debiased"] == {
         "text_score": 1.0,
         "image_score": 1.0,
         "group_score": 1.0,
@@ -275,16 +401,16 @@ def test_svo_pairing_reports_shared_caption_image_win_and_categories():
 
     metrics = paired_image_ranking_metrics(
         [
-            row("s0", "positive", "subject", -2.0),
-            row("s0", "negative", "subject", -4.0),
-            row("s1", "positive", "verb", -6.0),
-            row("s1", "negative", "verb", -4.0),
+            row("s0", "positive", "subject", 2.0),
+            row("s0", "negative", "subject", 1.0),
+            row("s1", "positive", "verb", 0.0),
+            row("s1", "negative", "verb", 1.0),
         ]
     )
     assert metrics["pairs"] == 2
-    assert metrics["normalized"]["win_rate"] == 0.5
-    assert metrics["normalized"]["categories"]["subject"]["win_rate"] == 1.0
-    assert metrics["normalized"]["categories"]["verb"]["win_rate"] == 0.0
+    assert metrics["language_prior_debiased"]["win_rate"] == 0.5
+    assert metrics["language_prior_debiased"]["categories"]["subject"]["win_rate"] == 1.0
+    assert metrics["language_prior_debiased"]["categories"]["verb"]["win_rate"] == 0.0
 
 
 def test_whatsup_reports_official_individual_pair_and_set_accuracy():
@@ -295,8 +421,9 @@ def test_whatsup_reports_official_individual_pair_and_set_accuracy():
             {
                 "kind": "whatsup_controlled_spatial",
                 "label": 0,
-                "prediction_raw": 0,
-                "prediction_normalized": 1 if relation == "under" else 0,
+                "prediction_language_prior_debiased": (
+                    1 if relation == "under" else 0
+                ),
                 "metadata": {
                     "subset": "A",
                     "set_id": "cup::0",
@@ -306,29 +433,9 @@ def test_whatsup_reports_official_individual_pair_and_set_accuracy():
         )
     metrics = whatsup_metrics(rows)
     assert metrics["sets"] == 1
-    assert metrics["raw"]["individual_accuracy"] == 1.0
-    assert metrics["raw"]["pair_accuracy"] == 1.0
-    assert metrics["raw"]["set_accuracy"] == 1.0
-    assert metrics["normalized"]["individual_accuracy"] == 0.75
-    assert metrics["normalized"]["pair_accuracy"] == 0.5
-    assert metrics["normalized"]["set_accuracy"] == 0.0
-
-
-def test_retrieval_metrics_report_instance_and_same_class_relevance():
-    matrix = torch.tensor(
-        [
-            [3.0, 2.0, 0.0],
-            [2.5, 2.0, 0.0],
-            [0.0, 0.5, 3.0],
-        ]
-    )
-    metrics = retrieval_metrics(
-        matrix,
-        torch.tensor([0, 0, 1]),
-    )
-    i2t = metrics["normalized_loglikelihood"]["image_to_text"]
-    assert math.isclose(i2t["instance_recall_at_1"], 2 / 3, rel_tol=1.0e-6)
-    assert i2t["class_relevance_recall_at_1"] == 1.0
+    assert metrics["language_prior_debiased"]["individual_accuracy"] == 0.75
+    assert metrics["language_prior_debiased"]["pair_accuracy"] == 0.5
+    assert metrics["language_prior_debiased"]["set_accuracy"] == 0.0
 
 
 def test_posterior_cache_uses_deterministic_arithmetic_sampling(tmp_path):

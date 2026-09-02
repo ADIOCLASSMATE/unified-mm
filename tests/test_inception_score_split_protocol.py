@@ -5,10 +5,13 @@ from torch.utils.data import Subset
 from scripts.evaluate_single_stream_fid_is import (
     IS_SPLIT_ASSIGNMENT_STRATIFIED,
     build_inception_score_split_plan,
-    is_official_flow_protocol,
+    is_formal_flow_protocol,
 )
 from scripts.image_evaluation_metrics import InceptionScoreMoments
-from scripts.summarize_unified_evaluation import validate_t2i_is_protocol
+from scripts.summarize_unified_evaluation import (
+    validate_t2i_generation_protocol,
+    validate_t2i_is_protocol,
+)
 
 
 class _Dataset:
@@ -52,11 +55,11 @@ def test_stratified_is_plan_balances_every_class_in_every_split():
         "samples_per_class_per_split_min": 5,
         "samples_per_class_per_split_max": 5,
     }
-    assert is_official_flow_protocol(
+    assert is_formal_flow_protocol(
         shared_real_count=50000,
         samples=50000,
         is_splits=10,
-        parallel_rate=1,
+        fid_feature=2048,
         is_split_plan=plan,
     )
 
@@ -145,3 +148,82 @@ def test_summary_accepts_only_balanced_formal_stratified_is():
     assert validate_t2i_is_protocol(payload, profile="formal") == (
         payload["metric_protocol"]["is_split_plan"]
     )
+
+
+def _formal_generation_metrics():
+    split_values = [2.0] * 10
+    payload = _formal_t2i_protocol()
+    payload.update(
+        {
+            "schema": "selfless_imagenet_val_t2i_fid_is_v2",
+            "runtime_hashing_enabled": False,
+            "project_formal_protocol": True,
+            "leaderboard_comparable_to_adm_dit": False,
+            "split": "val",
+            "real_source": "cached_original_imagenet_val",
+            "samples_requested": 50_000,
+            "samples_evaluated": 50_000,
+            "strategies": {
+                "spatial_halton": {
+                    "count": 50_000,
+                    "fid": 5.0,
+                    "inception_score_mean": 2.0,
+                    "inception_score_std": 0.0,
+                    "inception_score_splits": split_values,
+                    "generation_samples_per_second": 20.0,
+                }
+            },
+        }
+    )
+    payload["metric_protocol"].update(
+        {
+            "protocol_name": (
+                "imagenet_val_fid50k_torch_fidelity_stratified_is"
+            ),
+            "reference_distribution": "imagenet_val_50000",
+            "comparison_scope": "same_protocol_only",
+            "not_adm_dit_reason": (
+                "validation_reference_and_pytorch_torch_fidelity_extractor"
+            ),
+            "fid_reducer": "symmetric_eigendecomposition",
+            "fid_computed": True,
+            "is_std": "population",
+            "is_splits": 10,
+        }
+    )
+    return payload
+
+
+def test_generation_summary_accepts_complete_project_formal_protocol():
+    plan, selected = validate_t2i_generation_protocol(
+        _formal_generation_metrics(), profile="formal"
+    )
+
+    assert plan["samples"] == 50_000
+    assert selected["fid"] == 5.0
+    assert selected["inception_score_splits"] == [2.0] * 10
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid", "match"),
+    [
+        ("leaderboard_comparable_to_adm_dit", True, "comparability"),
+        ("samples_evaluated", 49_999, "sample counts"),
+    ],
+)
+def test_generation_summary_rejects_invalid_formal_contract(
+    field, invalid, match
+):
+    payload = _formal_generation_metrics()
+    payload[field] = invalid
+
+    with pytest.raises(ValueError, match=match):
+        validate_t2i_generation_protocol(payload, profile="formal")
+
+
+def test_generation_summary_rejects_inconsistent_is_moments():
+    payload = _formal_generation_metrics()
+    payload["strategies"]["spatial_halton"]["inception_score_mean"] = 3.0
+
+    with pytest.raises(ValueError, match="mean is inconsistent"):
+        validate_t2i_generation_protocol(payload, profile="formal")

@@ -31,7 +31,7 @@ elif [[ "${PROFILE}" == "formal" ]]; then
   T2I_GLOBAL_BATCH="${T2I_GLOBAL_BATCH:-256}"
   T2I_VAE_BATCH_PER_RANK="${T2I_VAE_BATCH_PER_RANK:-16}"
   T2I_IS_SPLITS="${T2I_IS_SPLITS:-10}"
-  T2I_PROTOCOL_ARGS=(--require_official_protocol --resume_progress --resume_checkpoint_interval_batches 10)
+  T2I_PROTOCOL_ARGS=(--require_formal_protocol --resume_progress --resume_checkpoint_interval_batches 10)
 else
   echo "ERROR: EVAL_PROFILE must be smoke or formal; got ${PROFILE}" >&2
   exit 3

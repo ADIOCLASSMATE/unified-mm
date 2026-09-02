@@ -85,16 +85,34 @@ def test_production_config_records_final_training_contract():
     assert config.evaluation.batch_size_per_npu == 256
 
 
-def test_real_stats_loader_is_not_bound_to_an_ablation_split(tmp_path):
+def test_real_stats_loader_requires_canonical_imagenet_val_contract(tmp_path):
     path = tmp_path / "stats.pt"
     torch.save(
         {
+            "schema": "imagenet_val_inception_feature_moments_v2",
             "stats": {
-                "count": 10,
-                "sum": torch.zeros(2, dtype=torch.float64),
-                "outer_sum": torch.eye(2, dtype=torch.float64),
+                "count": 50_000,
+                "sum": torch.zeros(2, dtype=torch.float32),
+                "outer_sum": torch.eye(2, dtype=torch.float32),
             },
-            "metadata": {"feature": {"feature": 2}},
+            "metadata": {
+                "source": {
+                    "split": "val",
+                    "classes": 1_000,
+                    "samples_per_class": 50,
+                },
+                "feature": {
+                    "feature": 2,
+                    "extractor": "torch-fidelity-inception-v3-compat",
+                    "accumulation_dtype": "torch.float32",
+                },
+                "image_transform": {
+                    "resize": 256,
+                    "interpolation": "bicubic",
+                    "center_crop": 256,
+                    "color_mode": "RGB",
+                },
+            },
         },
         path,
     )
@@ -102,4 +120,4 @@ def test_real_stats_loader_is_not_bound_to_an_ablation_split(tmp_path):
         str(path),
         fid_feature=2,
     )
-    assert payload["stats"]["count"] == 10
+    assert payload["stats"]["count"] == 50_000

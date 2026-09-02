@@ -1,11 +1,20 @@
 import json
+import math
 from pathlib import Path
 
 from PIL import Image
 import pytest
 import torch
 
-from scripts.evaluate_cross_dataset_retrieval import retrieval_metrics
+from scripts.evaluate_cross_dataset_retrieval import (
+    LIKELIHOOD_SCORING_CONTRACT,
+    retrieval_metrics,
+)
+from scripts.evaluate_imagenet_pretraining_native import (
+    classification_metrics,
+    load_openai_clip_class_names,
+)
+from scripts.language_prior_calibration import language_prior_debiased_scores
 from scripts.merge_cross_dataset_retrieval_partitions import merge_score_shards
 from scripts.prepare_cross_dataset_retrieval_assets import (
     load_karpathy_test_records,
@@ -62,8 +71,8 @@ def test_cross_dataset_retrieval_uses_five_positive_captions_per_image():
 
     assert metrics["images"] == 2
     assert metrics["captions"] == 10
-    assert metrics["normalized_loglikelihood"]["image_to_text"]["recall_at_1"] == 1.0
-    assert metrics["normalized_loglikelihood"]["text_to_image"]["recall_at_1"] == 1.0
+    assert metrics["image_to_text"]["recall_at_1"] == 1.0
+    assert metrics["text_to_image"]["recall_at_1"] == 1.0
 
 
 def test_cross_dataset_retrieval_supports_canonical_ragged_caption_counts():
@@ -77,8 +86,65 @@ def test_cross_dataset_retrieval_supports_canonical_ragged_caption_counts():
     metrics = retrieval_metrics(scores, caption_counts=[2, 3])
 
     assert metrics["caption_count_distribution"] == {"2": 1, "3": 1}
-    assert metrics["normalized_loglikelihood"]["image_to_text"]["recall_at_1"] == 1.0
-    assert metrics["normalized_loglikelihood"]["text_to_image"]["recall_at_1"] == 1.0
+    assert metrics["image_to_text"]["recall_at_1"] == 1.0
+    assert metrics["text_to_image"]["recall_at_1"] == 1.0
+
+
+def test_language_prior_uses_probability_space_mean_and_fixed_alpha_one():
+    conditional = torch.tensor(
+        [[math.log(0.8), math.log(0.2)], [math.log(0.4), math.log(0.6)]]
+    )
+    calibrated, prior = language_prior_debiased_scores(conditional)
+
+    assert torch.allclose(prior.exp(), torch.tensor([0.6, 0.4]), atol=1.0e-6)
+    assert torch.allclose(
+        calibrated,
+        conditional - torch.log(torch.tensor([0.6, 0.4])),
+        atol=1.0e-6,
+    )
+
+
+def test_pinned_openai_clip_class_names_are_unique_and_disambiguated():
+    root = Path(__file__).resolve().parents[1]
+    names, provenance = load_openai_clip_class_names(
+        root / "scripts/assets/imagenet1k_openai_clip_classnames.json"
+    )
+    assert len(names) == len(set(names)) == 1_000
+    assert names[744] == "projectile"
+    assert names[836] == "sunglass"
+    assert provenance["source_commit"] == (
+        "d05afc436d78f1c48dc0dbf8e5980a9d471f35f6"
+    )
+
+
+def test_imagenet_classification_reports_only_top1_and_top5():
+    scores = torch.zeros(2, 1_000)
+    scores[0, 7] = 2.0
+    scores[1, :6] = torch.arange(1.0, 7.0)
+    result = classification_metrics(scores, torch.tensor([7, 999]))
+    assert result["top_1_accuracy"] == 0.5
+    assert result["top_5_accuracy"] == 0.5
+    assert set(result) == {
+        "records",
+        "classes",
+        "primary_metric",
+        "top_1_accuracy",
+        "top_5_accuracy",
+    }
+
+
+def test_columnwise_prior_correction_leaves_t2i_ranks_invariant():
+    conditional = torch.tensor(
+        [
+            [-0.4, -0.1, -1.0, -0.9],
+            [-0.6, -0.3, -0.2, -0.5],
+        ]
+    )
+    calibrated, _ = language_prior_debiased_scores(conditional)
+
+    before = retrieval_metrics(conditional, caption_counts=[2, 2])
+    after = retrieval_metrics(calibrated, caption_counts=[2, 2])
+    assert before["text_to_image"] == after["text_to_image"]
 
 
 def test_independent_query_partitions_merge_with_exact_coverage(tmp_path: Path):
@@ -91,7 +157,10 @@ def test_independent_query_partitions_merge_with_exact_coverage(tmp_path: Path):
             torch.save(
                 {
                     "query_indices": torch.tensor([query_index]),
-                    "normalized_loglikelihood": expected[query_index : query_index + 1],
+                    "conditional_mean_token_loglikelihood": expected[
+                        query_index : query_index + 1
+                    ],
+                    "scoring_contract": LIKELIHOOD_SCORING_CONTRACT,
                     "runtime_hashing_enabled": False,
                 },
                 root / "shards" / f"rank-{rank:05d}-of-00002.pt",
@@ -112,7 +181,8 @@ def test_independent_query_partition_merge_rejects_missing_rows(tmp_path: Path):
     torch.save(
         {
             "query_indices": torch.tensor([0]),
-            "normalized_loglikelihood": torch.zeros((1, 3)),
+            "conditional_mean_token_loglikelihood": torch.zeros((1, 3)),
+            "scoring_contract": LIKELIHOOD_SCORING_CONTRACT,
             "runtime_hashing_enabled": False,
         },
         root / "shards" / "rank-00000-of-00001.pt",
@@ -126,7 +196,28 @@ def test_independent_query_partition_merge_rejects_missing_rows(tmp_path: Path):
         )
 
 
-def test_paper_protocol_excludes_imagenet_classification_and_real():
+def test_independent_query_partition_merge_rejects_duplicate_rows(tmp_path: Path):
+    root = tmp_path / "partition-0"
+    (root / "shards").mkdir(parents=True)
+    torch.save(
+        {
+            "query_indices": torch.tensor([0, 0]),
+            "conditional_mean_token_loglikelihood": torch.zeros((2, 3)),
+            "scoring_contract": LIKELIHOOD_SCORING_CONTRACT,
+            "runtime_hashing_enabled": False,
+        },
+        root / "shards" / "rank-00000-of-00001.pt",
+    )
+
+    with pytest.raises(ValueError, match="duplicate rows within"):
+        merge_score_shards(
+            [(root, 0, 2, 1)],
+            images=4,
+            captions=3,
+        )
+
+
+def test_paper_protocol_requires_full_imagenet_classification_and_removes_custom_retrieval():
     root = Path(__file__).resolve().parents[1]
     protocol = (
         root / "configs/protocols/pretraining_native_understanding_evaluation_ascend16.yaml"
@@ -134,6 +225,10 @@ def test_paper_protocol_excludes_imagenet_classification_and_real():
     evaluator = (root / "scripts/evaluate_imagenet_pretraining_native.py").read_text(
         encoding="utf-8"
     )
-    assert "imagenet_classification:" not in protocol
+    assert "imagenet_zero_shot_classification:" in protocol
+    assert "images: 50000" in protocol
+    assert "classes: 1000" in protocol
+    assert "language_prior_debiased_only" in protocol
     assert "real_labels" not in evaluator
-    assert "task: classification" not in protocol
+    assert "retrieval_1k" not in evaluator
+    assert "retrieval_5k" not in evaluator

@@ -24,9 +24,10 @@ T2I_STRATEGIES="${T2I_STRATEGIES:-spatial_halton}"
 SAMPLING_STEPS="${SAMPLING_STEPS:-10}"
 MODEL_PATH="${RUN_ROOT}/${MODEL_SUBDIR}"
 EVAL_ROOT="${RUN_ROOT}/${EVAL_SUBDIR}"
-I2T_ROOT="${EVAL_ROOT}/i2t-clip"
+CLASSIFICATION_ROOT="${EVAL_ROOT}/imagenet1k-zero-shot-classification"
 T2I_ROOT="${EVAL_ROOT}/t2i-fid-is"
-CLIP_MODEL="${CLIP_MODEL:-public/models/openai--clip-vit-base-patch32}"
+CACHE_SHARD_DIR="${CACHE_SHARD_DIR:-public/datasets/imagenet_full/vae_posterior_mar_kl16/val_shards}"
+CLASS_NAMES="${CLASS_NAMES:-scripts/assets/imagenet1k_openai_clip_classnames.json}"
 NPU_COUNT=16
 
 if [[ ! "${RUN_PROJECT}" =~ ^[a-zA-Z0-9._-]+$ ]]; then
@@ -41,8 +42,8 @@ if [[ ! "${EVAL_SUBDIR}" =~ ^[a-zA-Z0-9._/-]+$ || "${EVAL_SUBDIR}" == /* || "${E
   echo "ERROR: unsafe EVAL_SUBDIR=${EVAL_SUBDIR}" >&2
   exit 9
 fi
-if [[ "${EVAL_ONLY}" != "both" && "${EVAL_ONLY}" != "i2t" && "${EVAL_ONLY}" != "t2i" ]]; then
-  echo "ERROR: EVAL_ONLY must be both, i2t, or t2i; got ${EVAL_ONLY}" >&2
+if [[ "${EVAL_ONLY}" != "both" && "${EVAL_ONLY}" != "classification" && "${EVAL_ONLY}" != "t2i" ]]; then
+  echo "ERROR: EVAL_ONLY must be both, classification, or t2i; got ${EVAL_ONLY}" >&2
   exit 3
 fi
 if [[ ! "${SAMPLING_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
@@ -54,8 +55,7 @@ for required in \
   "${MODEL_PATH}/config.json" \
   "${MODEL_PATH}/model.safetensors" \
   "${MODEL_PATH}/tokenizer.json" \
-  "${CLIP_MODEL}/config.json" \
-  "${CLIP_MODEL}/pytorch_model.bin" \
+  "${CLASS_NAMES}" \
   public/models/torch-fidelity/weights-inception-2015-12-05-6726825d.pth \
   public/datasets/imagenet_full/fid_stats/inception_v3_2048_imagenet_val50000_256.pt; do
   if [[ ! -f "${required}" ]]; then
@@ -81,40 +81,29 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 unset CUDA_VISIBLE_DEVICES PYTORCH_CUDA_ALLOC_CONF
 mkdir -p "${EVAL_ROOT}/prelaunch_audit"
 
-python - "${RUN_PROJECT}" "${MODEL_PATH}" "${CLIP_MODEL}" >"${EVAL_ROOT}/prelaunch_audit/assets.json" <<'PY'
+python - "${RUN_PROJECT}" "${MODEL_PATH}" "${CLASS_NAMES}" >"${EVAL_ROOT}/prelaunch_audit/assets.json" <<'PY'
 import json
 import sys
 
-run_project, model_path, clip_model = sys.argv[1:]
+run_project, model_path, class_names = sys.argv[1:]
 payload = {
     "schema": "selfless_imagenet1k_caption_joint_generation_preflight_v2",
     "run_project": run_project,
     "model_path": model_path,
-    "clip_model_path": clip_model,
+    "class_names_path": class_names,
     "runtime_hashing_enabled": False,
 }
 print(json.dumps(payload, indent=2, sort_keys=True))
 PY
 
-run_i2t() {
-  env \
-    -u WORLD_SIZE -u RANK -u LOCAL_RANK -u LOCAL_WORLD_SIZE \
-    -u GROUP_RANK -u GROUP_WORLD_SIZE -u ROLE_RANK -u ROLE_WORLD_SIZE \
-    torchrun --standalone --nproc_per_node="${NPU_COUNT}" \
-    scripts/evaluate_imagenet1k_i2t_clip.py \
-    --config "${CONFIG}" \
-    --model_source "${MODEL_PATH}" \
-    --clip_model_dir "${CLIP_MODEL}" \
-    --output_dir "${I2T_ROOT}" \
-    --samples 1000 \
-    --batch_size_per_rank 4 \
-    --clip_batch_size_per_rank 16 \
-    --max_new_tokens 96 \
-    --temperature 0 \
-    --seed 424242 \
-    --device npu \
-    --model_dtype bf16 \
-    2>&1 | tee "${EVAL_ROOT}/i2t-clip.log"
+run_classification() {
+  EVAL_PROFILE=formal \
+  CONFIG="${CONFIG}" \
+  CACHE_SHARD_DIR="${CACHE_SHARD_DIR}" \
+  CLASS_NAMES="${CLASS_NAMES}" \
+    script/selfless/evaluate_pretraining_native_imagenet_ascend16.sh \
+    "${MODEL_PATH}" "${CLASSIFICATION_ROOT}" \
+    2>&1 | tee "${EVAL_ROOT}/imagenet1k-zero-shot-classification.log"
 }
 
 run_t2i() {
@@ -142,15 +131,15 @@ run_t2i() {
     --vae_decode_batch_size 16 \
     --inception_weights_path public/models/torch-fidelity/weights-inception-2015-12-05-6726825d.pth \
     --real_stats_path public/datasets/imagenet_full/fid_stats/inception_v3_2048_imagenet_val50000_256.pt \
-    --require_official_protocol \
+    --require_formal_protocol \
     --canonical_pairing \
     --resume_progress \
     --resume_checkpoint_interval_batches 1 \
     2>&1 | tee "${EVAL_ROOT}/t2i-fid-is.log"
 }
 
-if [[ "${EVAL_ONLY}" == "both" || "${EVAL_ONLY}" == "i2t" ]]; then
-  run_i2t
+if [[ "${EVAL_ONLY}" == "both" || "${EVAL_ONLY}" == "classification" ]]; then
+  run_classification
 fi
 if [[ "${EVAL_ONLY}" == "both" || "${EVAL_ONLY}" == "t2i" ]]; then
   run_t2i
