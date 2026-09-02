@@ -268,11 +268,7 @@ def main() -> None:
     prompt_prefix = str(
         dataset_params.get("caption_t2i_prefix", DEFAULT_CAPTION_PREFIX)
     ).strip()
-    max_length = int(
-        dataset_params.get(
-            "max_seq_length", config.dataset.preprocessing.max_seq_length
-        )
-    )
+    model_context_length = int(dataset_params.get("model_context_length", 32768))
 
     flat_tasks = [
         (prompt.index * images_per_prompt + sample_index, prompt, sample_index)
@@ -300,9 +296,11 @@ def main() -> None:
             )
             for task_index, prompt, _ in chunk
         ]
-        if any(item["input_ids"].numel() > max_length for item in items):
+        if any(
+            item["input_ids"].numel() > model_context_length for item in items
+        ):
             raise ValueError(
-                "a benchmark prompt exceeds dataset.preprocessing.max_seq_length"
+                "a benchmark prompt exceeds the configured model context length"
             )
         batch = collate_imagenet_flow_cache(items)
         spans = [
