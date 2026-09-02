@@ -131,7 +131,11 @@ def _parse_args():
     parser.add_argument("--backbone-lr", type=float)
     parser.add_argument("--flow-lr", type=float)
     parser.add_argument("--save-ema-eval-every", type=int)
-    parser.add_argument("--ablation", choices=("a", "b", "c"), default="a")
+    parser.add_argument("--ablation", choices=("b", "c", "d"), default="b")
+    parser.add_argument(
+        "--dynamic-xt-t2i-gradient-checkpointing",
+        choices=("true", "false"),
+    )
     return parser.parse_args()
 
 
@@ -193,12 +197,22 @@ def main():
         raise ValueError("baseline must initialize from Qwen pretrained weights")
     if str(config.model.backbone_attention_output_gate) != "none":
         raise ValueError("baseline backbone attention output gate must be none")
+    if str(config.model.architecture_variant) != "selfless_contextual":
+        raise ValueError("base config must use the baseline-b architecture")
+    if str(config.model.training_objective) != "selfless_dual_stream":
+        raise ValueError("base config must use the baseline-b training objective")
+    if (
+        str(config.model.dual_stream_attention_contract)
+        != "xlnet_content_diagonal"
+    ):
+        raise ValueError(
+            "base config must use baseline b's xlnet_content_diagonal contract"
+        )
+    if int(config.model.image_flow_batch_mul) != 4:
+        raise ValueError(
+            "unified B-based ablations require model.image_flow_batch_mul=4"
+        )
     ablation_contracts = {
-        "a": (
-            "selfless_contextual",
-            "selfless_dual_stream",
-            "selfless_strict",
-        ),
         "b": (
             "selfless_contextual",
             "selfless_dual_stream",
@@ -207,12 +221,40 @@ def main():
         "c": (
             "single_stream_text_ar",
             "selfless_dual_stream",
-            "selfless_strict",
+            "xlnet_content_diagonal",
+        ),
+        "d": (
+            "dynamic_xt",
+            "selfless_dual_stream",
+            "xlnet_content_diagonal",
         ),
     }
     architecture_variant, training_objective, attention_contract = ablation_contracts[
         args.ablation
     ]
+    dynamic_xt_t2i_gradient_checkpointing = (
+        args.dynamic_xt_t2i_gradient_checkpointing == "true"
+        if args.dynamic_xt_t2i_gradient_checkpointing is not None
+        else bool(
+            config.model.get(
+                "dynamic_xt_t2i_gradient_checkpointing",
+                False,
+            )
+        )
+    )
+    if bool(config.training.get("use_gradient_checkpointing", False)):
+        raise ValueError(
+            "unified 0.6B training keeps global gradient checkpointing off"
+        )
+    if args.ablation == "d" and not dynamic_xt_t2i_gradient_checkpointing:
+        raise ValueError(
+            "ablation D requires T2I-only Dynamic-XT activation "
+            "checkpointing for the formal B16 x image_flow_batch_mul=4 shape"
+        )
+    if args.ablation != "d" and dynamic_xt_t2i_gradient_checkpointing:
+        raise ValueError(
+            "T2I-only Dynamic-XT checkpointing is valid only for ablation D"
+        )
     backbone_lr = float(
         args.backbone_lr
         if args.backbone_lr is not None
@@ -240,7 +282,7 @@ def main():
 
     if str(image.get("image_sigma_order", "")).lower() != "random":
         raise ValueError(
-            "ablation-a baseline requires random image reveal order"
+            "baseline b requires random image reveal order"
         )
     if str(image.get("expected_split", "")) != "train":
         raise ValueError("training image dataset must set expected_split=train")
@@ -414,7 +456,26 @@ def main():
             "text_prediction": (
                 "causal_next_token_shift" if args.ablation == "c" else "same_position"
             ),
-            "image_path": "identical_to_a" if args.ablation == "c" else None,
+            "image_path": (
+                "identical_to_b"
+                if args.ablation == "c"
+                else "dynamic_xt_on_b"
+                if args.ablation == "d"
+                else None
+            ),
+            "image_flow_batch_mul": int(config.model.image_flow_batch_mul),
+            "backbone_condition": (
+                "dynamic_xt_every_ode_evaluation"
+                if args.ablation == "d"
+                else "static_semantic"
+            ),
+            "dynamic_query_scope": (
+                "t2i_only" if args.ablation == "d" else None
+            ),
+            "global_gradient_checkpointing": False,
+            "dynamic_xt_t2i_gradient_checkpointing": (
+                dynamic_xt_t2i_gradient_checkpointing
+            ),
         },
         "optimizer": {
             "backbone_and_special_lr": backbone_lr,

@@ -6,8 +6,8 @@
 #   16 * 8 * 4 * 2048 = 1,048,576 physical positions/update.
 # 95,368 updates consume exactly 100,000,595,968 physical positions.
 experiment:
-    project: "unified-a-0p6b-text-only-100bphys-s42-r1"
-    name: "unified-a-0p6b-text-only-100bphys-s42-r1"
+    project: "unified-b-0p6b-text-only-100bphys-s42-r1"
+    name: "unified-b-0p6b-text-only-100bphys-s42-r1"
     wandb_project: "unified-mm"
     output_dir: "output"
     save_every: 2000
@@ -51,7 +51,7 @@ model:
     model_path: "public/models/Qwen--Qwen3-0.6B-Base"
     architecture_variant: "selfless_contextual"
     training_objective: "selfless_dual_stream"
-    dual_stream_attention_contract: "selfless_strict"
+    dual_stream_attention_contract: "xlnet_content_diagonal"
     showo_mask_schedule: "cosine"
     showo_min_masking_rate: 0.0
     use_flex_attention: true
@@ -146,7 +146,7 @@ training:
     save_image_flow_adapter: true
 
 evaluation:
-    checkpoint: "output/unified-a-0p6b-text-only-100bphys-s42-r1/hf_model-final-ema"
+    checkpoint: "output/unified-b-0p6b-text-only-100bphys-s42-r1/hf_model-final-ema"
     model_dtype: "bf16"
     samples: 50000
     batch_size: 4096

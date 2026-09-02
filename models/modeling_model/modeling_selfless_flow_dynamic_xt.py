@@ -1,15 +1,20 @@
-"""Dynamic-XT successor backbone for Selfless-Flow.
+"""Ablation D: Dynamic-``x_t`` queries on top of baseline B.
 
-Dynamic-XT keeps the clean X0 stream and strict selfless mask, but replaces
-image XT mask queries with ``embed(x_t) + time_embed(t)``. Training uses one
-rectified-flow state per image and therefore one backbone execution per step.
+The B content stream is evaluated once with the XLNet-style content diagonal.
+Four rectified-flow states share that content computation while their XT query
+streams receive ``embed(x_t) + time_embed(t)``.  This preserves B's
+``image_flow_batch_mul=4`` estimator without executing four complete
+backbones.
 """
 
 from __future__ import annotations
 
+from functools import partial
+
 import torch
 from torch import nn
-from torch.nn.attention.flex_attention import create_block_mask
+from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
 from transformers import AutoConfig
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.modeling_outputs import (
@@ -18,20 +23,31 @@ from transformers.modeling_outputs import (
 )
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
-from .image_flow_loss import FlowLoss, TimestepEmbedder
+from .image_flow_loss import TimestepEmbedder
 from .modeling_selfless_flow import (
     Qwen3ForCausalLM,
     Qwen3Model,
-    Qwen3PreTrainedModel,
+    Qwen3Attention,
     _debug_require_finite_tensor,
     _normal_init_fp32_,
     _to_bool_atten_mask,
     build_row_col_position_ids,
+    compiled_flex_attention,
+    rotate_half,
+)
+from .modeling_selfless_flow_dynamic_xt_generation import (
+    DynamicXtGenerationMixin,
 )
 
 
+DYNAMIC_XT_ARCHITECTURE = "dynamic_xt"
+DYNAMIC_XT_ATTENTION_CONTRACT = "xlnet_content_diagonal"
+DYNAMIC_XT_FLOW_BATCH_MUL = 4
+DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING = True
+
+
 class SelflessFlowDynamicXtConfig(Qwen3Config):
-    """Checkpoint-identifying config for the isolated Dynamic-XT model."""
+    """Checkpoint-identifying configuration for ablation D."""
 
     model_type = "selfless_flow_dynamic_xt"
 
@@ -39,20 +55,242 @@ class SelflessFlowDynamicXtConfig(Qwen3Config):
 AutoConfig.register(SelflessFlowDynamicXtConfig.model_type, SelflessFlowDynamicXtConfig)
 
 
+def _repeat_prepared_attention_mask(attention_mask, repeats: int):
+    if isinstance(attention_mask, tuple):
+        if len(attention_mask) != 2:
+            raise ValueError(
+                "prepared attention_mask must contain (safe_mask, valid_rows)"
+            )
+        return tuple(
+            value.repeat(repeats, *([1] * (value.ndim - 1)))
+            for value in attention_mask
+        )
+    if isinstance(attention_mask, torch.Tensor):
+        return attention_mask.repeat(
+            repeats,
+            *([1] * (attention_mask.ndim - 1)),
+        )
+    raise TypeError(
+        "Dynamic-XT multi-state NPU attention requires a dense or prepared "
+        f"attention mask, got {type(attention_mask).__name__}"
+    )
+
+
+def _apply_dynamic_rotary_pos_emb(X0_q, XT_q, key, cos, sin):
+    cos = cos.unsqueeze(1)
+    sin = sin.unsqueeze(1)
+    query_batch_mul = int(XT_q.shape[0]) // int(X0_q.shape[0])
+    query_cos = cos.repeat(query_batch_mul, 1, 1, 1)
+    query_sin = sin.repeat(query_batch_mul, 1, 1, 1)
+    return (
+        (X0_q * cos) + (rotate_half(X0_q) * sin),
+        (XT_q * query_cos) + (rotate_half(XT_q) * query_sin),
+        (key * cos) + (rotate_half(key) * sin),
+    )
+
+
+class DynamicXtQwen3Attention(Qwen3Attention):
+    """D-only attention supporting R query streams over one B content stream."""
+
+    def forward(
+        self,
+        X0_hidden_states: torch.Tensor,
+        XT_hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask,
+        content_attention_mask=None,
+        past_key_values: Cache | None = None,
+        cache_read_only: bool = False,
+        cache_write_mask: torch.BoolTensor | None = None,
+        cache_write_prefix: int | None = None,
+        cache_position: torch.LongTensor | None = None,
+        **kwargs,
+    ):
+        if (
+            XT_hidden_states is None
+            or XT_hidden_states.shape[0] == X0_hidden_states.shape[0]
+        ):
+            return super().forward(
+                X0_hidden_states=X0_hidden_states,
+                XT_hidden_states=XT_hidden_states,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                content_attention_mask=content_attention_mask,
+                past_key_values=past_key_values,
+                cache_read_only=cache_read_only,
+                cache_write_mask=cache_write_mask,
+                cache_write_prefix=cache_write_prefix,
+                cache_position=cache_position,
+                **kwargs,
+            )
+
+        content_batch = int(X0_hidden_states.shape[0])
+        query_batch = int(XT_hidden_states.shape[0])
+        if query_batch % content_batch:
+            raise ValueError(
+                "Dynamic-XT query batch must be an integer multiple of the "
+                f"content batch: query={query_batch}, content={content_batch}"
+            )
+        query_batch_mul = query_batch // content_batch
+        if past_key_values is not None:
+            raise ValueError(
+                "Dynamic-XT multi-state training does not support a KV cache"
+            )
+
+        debug_finite = bool(kwargs.pop("debug_finite_backbone", False))
+        debug_label = str(kwargs.pop("debug_backbone_label", ""))
+        record_gate_stats = bool(
+            kwargs.pop("record_backbone_gate_stats", False)
+        )
+        detailed_gate_stats = (
+            str(kwargs.pop("backbone_gate_stats_level", "summary"))
+            .strip()
+            .lower()
+            == "detailed"
+        )
+        self.last_gate_stats.clear()
+        prefix = f"layers.{self.layer_idx}.self_attn"
+        _debug_require_finite_tensor(
+            debug_finite,
+            debug_label,
+            f"{prefix}.input_x0",
+            X0_hidden_states,
+        )
+        x0_shape = X0_hidden_states.shape[:-1]
+        xt_shape = XT_hidden_states.shape[:-1]
+        x0_hidden_shape = (*x0_shape, -1, self.head_dim)
+        xt_hidden_shape = (*xt_shape, -1, self.head_dim)
+
+        XT_query_states = self.q_norm(
+            self.q_proj(XT_hidden_states).view(xt_hidden_shape)
+        ).transpose(1, 2)
+        X0_query_states = self.q_norm(
+            self.q_proj(X0_hidden_states).view(x0_hidden_shape)
+        ).transpose(1, 2)
+        X0_key_states = self.k_norm(
+            self.k_proj(X0_hidden_states).view(x0_hidden_shape)
+        ).transpose(1, 2)
+        X0_value_states = self.v_proj(X0_hidden_states).view(
+            x0_hidden_shape
+        ).transpose(1, 2)
+        cos, sin = position_embeddings
+        X0_query_states, XT_query_states, X0_key_states = (
+            _apply_dynamic_rotary_pos_emb(
+                X0_query_states,
+                XT_query_states,
+                X0_key_states,
+                cos,
+                sin,
+            )
+        )
+        enable_gqa = (
+            self.config.num_attention_heads
+            != self.config.num_key_value_heads
+        )
+        x0_attention_mask = (
+            attention_mask
+            if content_attention_mask is None
+            else content_attention_mask
+        )
+        X0_attn_output = compiled_flex_attention(
+            X0_query_states,
+            X0_key_states,
+            X0_value_states,
+            x0_attention_mask,
+            self.scaling,
+            enable_gqa,
+        )
+        if XT_query_states.device.type == "npu":
+            XT_attn_output = compiled_flex_attention(
+                XT_query_states,
+                X0_key_states.repeat(query_batch_mul, 1, 1, 1),
+                X0_value_states.repeat(query_batch_mul, 1, 1, 1),
+                _repeat_prepared_attention_mask(
+                    attention_mask,
+                    query_batch_mul,
+                ),
+                self.scaling,
+                enable_gqa,
+            )
+        else:
+            # CPU FlexAttention uses an opaque BlockMask.  Chunk only the query
+            # attention for unit tests; the formal NPU path is one fused call.
+            XT_attn_output = torch.cat(
+                [
+                    compiled_flex_attention(
+                        query_chunk,
+                        X0_key_states,
+                        X0_value_states,
+                        attention_mask,
+                        self.scaling,
+                        enable_gqa,
+                    )
+                    for query_chunk in XT_query_states.chunk(
+                        query_batch_mul,
+                        dim=0,
+                    )
+                ],
+                dim=0,
+            )
+
+        query_token_types = kwargs.get("token_types", None)
+        query_flow_sigma = kwargs.get("flow_sigma", None)
+        if query_token_types is not None:
+            query_token_types = query_token_types.repeat(query_batch_mul, 1)
+        if query_flow_sigma is not None:
+            query_flow_sigma = query_flow_sigma.repeat(query_batch_mul, 1)
+        X0_attn_output = self._apply_attention_output_gate(
+            X0_attn_output,
+            X0_hidden_states,
+            stream="x0",
+            token_types=kwargs.get("token_types", None),
+            flow_sigma=kwargs.get("flow_sigma", None),
+            record_stats=record_gate_stats,
+            detailed_stats=detailed_gate_stats,
+        )
+        XT_attn_output = self._apply_attention_output_gate(
+            XT_attn_output,
+            XT_hidden_states,
+            stream="xt",
+            token_types=query_token_types,
+            flow_sigma=query_flow_sigma,
+            record_stats=record_gate_stats,
+            detailed_stats=detailed_gate_stats,
+        )
+        X0_attn_output = X0_attn_output.transpose(1, 2).reshape(
+            *x0_shape,
+            -1,
+        ).contiguous()
+        XT_attn_output = XT_attn_output.transpose(1, 2).reshape(
+            *xt_shape,
+            -1,
+        ).contiguous()
+        X0_attn_output = self.o_proj(X0_attn_output)
+        XT_attn_output = self.o_proj(XT_attn_output)
+        _debug_require_finite_tensor(
+            debug_finite,
+            debug_label,
+            f"{prefix}.dynamic_xt.output_x0",
+            X0_attn_output,
+        )
+        _debug_require_finite_tensor(
+            debug_finite,
+            debug_label,
+            f"{prefix}.dynamic_xt.output_xt",
+            XT_attn_output,
+        )
+        return X0_attn_output, XT_attn_output, None
+
+
 class DynamicXtQwen3Model(Qwen3Model):
-    """Selfless two-stream Qwen with a flow-state-dependent XT image query."""
+    """Baseline-B backbone with flow-state-dependent image XT queries."""
 
     def _initialize_weights(
         self,
         module,
         is_remote_code: bool = False,
     ) -> None:
-        """Initialize Dynamic-XT parameters without shifting shared RNG.
-
-        Transformers also invokes this hook for base-checkpoint keys created
-        on a meta device. Initializing the complete timestep module at its
-        root guarantees materialized weights and zero biases on that path.
-        """
+        """Initialize the D-only time module without shifting shared RNG."""
 
         time_embedder = getattr(
             self,
@@ -72,16 +310,17 @@ class DynamicXtQwen3Model(Qwen3Model):
 
     def __init__(self, config: Qwen3Config):
         super().__init__(config)
-        # Do not advance the global RNG for ablation-only parameters: with the
-        # same seed, all parameters shared with the static model must retain
-        # identical initialization and RF sampling must start at the same RNG
-        # state.  Initialization inside the fork still follows the repository
-        # convention below.
+        # Reuse every baseline-B parameter object and replace behavior only.
+        # The D attention subclass adds no parameters or buffers.
+        for layer in self.layers:
+            layer.self_attn.__class__ = DynamicXtQwen3Attention
+        # The extra module must not alter initialization of any B parameter.
         with torch.random.fork_rng(devices=[]):
             self.backbone_flow_time_embedder = TimestepEmbedder(
                 config.hidden_size
             )
             self._reset_backbone_flow_time_embedder_impl()
+        self.last_dynamic_xt_checkpointed_layers = 0
 
     def reset_backbone_flow_time_embedder(self) -> None:
         with torch.random.fork_rng(devices=[]):
@@ -110,7 +349,7 @@ class DynamicXtQwen3Model(Qwen3Model):
         xt_flow_times: torch.Tensor | None,
         xt_flow_query_mask: torch.Tensor | None,
     ) -> torch.Tensor:
-        inputs_embeds = self._build_xt_inputs_embeds(
+        static_queries = self._build_xt_inputs_embeds(
             input_ids=input_ids,
             token_types=token_types,
             image_spans_present=image_spans_present,
@@ -121,74 +360,124 @@ class DynamicXtQwen3Model(Qwen3Model):
             xt_flow_query_mask is not None,
         )
         if not any(supplied):
-            return inputs_embeds
+            return static_queries
         if not all(supplied):
             raise ValueError(
-                "xt_flow_latents, xt_flow_times, and xt_flow_query_mask must be "
-                "provided together"
+                "xt_flow_latents, xt_flow_times, and xt_flow_query_mask must "
+                "be provided together"
             )
         if token_types is None:
             raise ValueError("Dynamic-XT image queries require token_types")
-        if tuple(xt_flow_latents.shape[:2]) != tuple(input_ids.shape):
-            raise ValueError("xt_flow_latents must align with input_ids")
-        if xt_flow_latents.shape[-1] != self.image_latent_dim:
-            raise ValueError("xt_flow_latents has the wrong latent dimension")
-        if tuple(xt_flow_times.shape) != tuple(input_ids.shape):
-            raise ValueError("xt_flow_times must align with input_ids")
-        if tuple(xt_flow_query_mask.shape) != tuple(input_ids.shape):
-            raise ValueError("xt_flow_query_mask must align with input_ids")
 
-        device = inputs_embeds.device
+        content_batch, sequence_length = input_ids.shape
+        query_batch = int(xt_flow_latents.shape[0])
+        if query_batch % content_batch:
+            raise ValueError(
+                "Dynamic-XT query batch must be an integer multiple of the "
+                f"content batch: query={query_batch}, content={content_batch}"
+            )
+        query_batch_mul = query_batch // content_batch
+        expected_prefix = (query_batch, sequence_length)
+        if tuple(xt_flow_latents.shape[:2]) != expected_prefix:
+            raise ValueError(
+                "xt_flow_latents must have shape [R*B,L,D] aligned with input_ids"
+            )
+        if int(xt_flow_latents.shape[-1]) != self.image_latent_dim:
+            raise ValueError("xt_flow_latents has the wrong latent dimension")
+        if tuple(xt_flow_times.shape) != expected_prefix:
+            raise ValueError("xt_flow_times must align with Dynamic-XT queries")
+        if tuple(xt_flow_query_mask.shape) != expected_prefix:
+            raise ValueError(
+                "xt_flow_query_mask must align with Dynamic-XT queries"
+            )
+
+        repeated_queries = static_queries.repeat(query_batch_mul, 1, 1)
+        repeated_token_types = token_types.to(input_ids.device).repeat(
+            query_batch_mul,
+            1,
+        )
         query_mask = (
-            xt_flow_query_mask.to(device=device, dtype=torch.bool)
-            & token_types.to(device=device).eq(1)
+            xt_flow_query_mask.to(device=input_ids.device, dtype=torch.bool)
+            & repeated_token_types.eq(1)
         )
         projected_state = self.image_token_embedder(
             xt_flow_latents.to(
-                device=device,
+                device=input_ids.device,
                 dtype=self.image_token_embedder.weight_dtype,
             )
         )
-        scaled_times = xt_flow_times.to(device=device, dtype=torch.float32)
-        scaled_times = scaled_times * float(
-            getattr(self.config, "image_flow_time_scale", 1000.0)
-        )
+        scaled_times = xt_flow_times.to(
+            device=input_ids.device,
+            dtype=torch.float32,
+        ) * float(getattr(self.config, "image_flow_time_scale", 1000.0))
         time_condition = self.backbone_flow_time_embedder(
             scaled_times.reshape(-1)
         ).view(*scaled_times.shape, -1)
         dynamic_queries = (projected_state + time_condition).to(
-            dtype=inputs_embeds.dtype
+            dtype=repeated_queries.dtype
         )
         return torch.where(
             query_mask.unsqueeze(-1),
             dynamic_queries,
-            inputs_embeds,
+            repeated_queries,
         )
 
     def forward(
         self,
         X0_input_ids: torch.LongTensor | None = None,
-        attention_mask: torch.Tensor | None = None,
+        attention_mask=None,
+        content_attention_mask=None,
         position_ids: torch.LongTensor | None = None,
         past_key_values: Cache | None = None,
         X0_inputs_embeds: torch.FloatTensor | None = None,
         use_cache: bool | None = None,
         cache_position: torch.LongTensor | None = None,
         calculate_likelihood: bool | None = None,
-        XT_input_ids: torch.LongTensor | None = None,
         xt_flow_latents: torch.Tensor | None = None,
         xt_flow_times: torch.Tensor | None = None,
         xt_flow_query_mask: torch.Tensor | None = None,
         **kwargs,
     ) -> BaseModelOutputWithPast:
-        if (X0_input_ids is None) == (X0_inputs_embeds is None):
+        # The ordinary B path (ClimbMix and I2T) must never inherit D's
+        # activation-checkpointing cost. Only the four-query T2I path below is
+        # selectively checkpointed.
+        self.last_dynamic_xt_checkpointed_layers = 0
+        supplied = (
+            xt_flow_latents is not None,
+            xt_flow_times is not None,
+            xt_flow_query_mask is not None,
+        )
+        if not any(supplied):
+            return super().forward(
+                X0_input_ids=X0_input_ids,
+                attention_mask=attention_mask,
+                content_attention_mask=content_attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                X0_inputs_embeds=X0_inputs_embeds,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                calculate_likelihood=calculate_likelihood,
+                **kwargs,
+            )
+        if not all(supplied):
             raise ValueError(
-                "You must specify exactly one of X0_input_ids or X0_inputs_embeds"
+                "xt_flow_latents, xt_flow_times, and xt_flow_query_mask must "
+                "be provided together"
+            )
+        if X0_input_ids is None or X0_inputs_embeds is not None:
+            raise ValueError(
+                "Dynamic-XT queries require X0_input_ids and do not accept "
+                "precomputed X0_inputs_embeds"
             )
         if attention_mask is None:
-            raise ValueError("Dynamic-XT requires the strict selfless attention mask")
+            raise ValueError("Dynamic-XT requires a strict query attention mask")
         if isinstance(attention_mask, torch.Tensor):
             attention_mask = _to_bool_atten_mask(attention_mask)
+        if isinstance(content_attention_mask, torch.Tensor):
+            content_attention_mask = _to_bool_atten_mask(
+                content_attention_mask
+            )
 
         debug_finite = bool(kwargs.get("debug_finite_backbone", False))
         debug_label = str(kwargs.get("debug_backbone_label", ""))
@@ -200,43 +489,38 @@ class DynamicXtQwen3Model(Qwen3Model):
             if image_span_table is not None
             else None
         )
-        if X0_inputs_embeds is None:
-            X0_inputs_embeds = self._build_x0_inputs_embeds(
-                input_ids=X0_input_ids,
-                token_types=token_types,
-                image_latents=kwargs.get("image_latents", None),
-                image_latent_mask=kwargs.get("image_latent_mask", None),
-                image_spans_present=image_spans_present,
-                image_latents_are_noisy=bool(
-                    kwargs.get("image_latents_are_noisy", False)
-                ),
-                debug_finite=debug_finite,
-                debug_label=debug_label,
-            )
+        X0_inputs_embeds = self._build_x0_inputs_embeds(
+            input_ids=X0_input_ids,
+            token_types=token_types,
+            image_latents=kwargs.get("image_latents", None),
+            image_latent_mask=kwargs.get("image_latent_mask", None),
+            image_spans_present=image_spans_present,
+            image_latents_are_noisy=bool(
+                kwargs.get("image_latents_are_noisy", False)
+            ),
+            debug_finite=debug_finite,
+            debug_label=debug_label,
+        )
+        XT_inputs_embeds = self._build_dynamic_xt_inputs_embeds(
+            input_ids=X0_input_ids,
+            token_types=token_types,
+            image_spans_present=image_spans_present,
+            xt_flow_latents=xt_flow_latents,
+            xt_flow_times=xt_flow_times,
+            xt_flow_query_mask=xt_flow_query_mask,
+        )
         _debug_require_finite_tensor(
             debug_finite,
             debug_label,
             "input_embeddings.dynamic_xt.x0",
             X0_inputs_embeds,
         )
-
-        needs_xt = bool(self.training or calculate_likelihood)
-        if needs_xt:
-            xt_ids = X0_input_ids if X0_input_ids is not None else XT_input_ids
-            if xt_ids is None:
-                raise ValueError(
-                    "XT_input_ids are required when X0_inputs_embeds are precomputed"
-                )
-            XT_inputs_embeds = self._build_dynamic_xt_inputs_embeds(
-                input_ids=xt_ids,
-                token_types=token_types,
-                image_spans_present=image_spans_present,
-                xt_flow_latents=xt_flow_latents,
-                xt_flow_times=xt_flow_times,
-                xt_flow_query_mask=xt_flow_query_mask,
-            )
-        else:
-            XT_inputs_embeds = None
+        _debug_require_finite_tensor(
+            debug_finite,
+            debug_label,
+            "input_embeddings.dynamic_xt.xt",
+            XT_inputs_embeds,
+        )
 
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache(config=self.config)
@@ -262,100 +546,148 @@ class DynamicXtQwen3Model(Qwen3Model):
 
         X0_hidden_states = X0_inputs_embeds
         XT_hidden_states = XT_inputs_embeds
-        position_embeddings = self.rotary_emb(X0_hidden_states, position_ids)
+        position_embeddings = self.rotary_emb(
+            X0_hidden_states,
+            position_ids,
+        )
+        checkpoint_dynamic_layers = bool(
+            self.training
+            and torch.is_grad_enabled()
+            and getattr(
+                self.config,
+                "dynamic_xt_t2i_gradient_checkpointing",
+                False,
+            )
+        )
         for layer_idx, decoder_layer in enumerate(
             self.layers[: self.config.num_hidden_layers]
         ):
-            X0_hidden_states, XT_hidden_states = decoder_layer(
-                X0_hidden_states,
-                XT_hidden_states,
-                attention_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                use_cache=use_cache,
-                cache_position=cache_position,
-                position_embeddings=position_embeddings,
+            layer_kwargs = {
+                "content_attention_mask": content_attention_mask,
+                "position_ids": position_ids,
+                "past_key_values": past_key_values,
+                "use_cache": use_cache,
+                "cache_position": cache_position,
+                "position_embeddings": position_embeddings,
                 **kwargs,
-            )
+            }
+            if checkpoint_dynamic_layers:
+                X0_hidden_states, XT_hidden_states = checkpoint(
+                    partial(decoder_layer.__call__, **layer_kwargs),
+                    X0_hidden_states,
+                    XT_hidden_states,
+                    attention_mask,
+                    use_reentrant=False,
+                )
+                self.last_dynamic_xt_checkpointed_layers += 1
+            else:
+                X0_hidden_states, XT_hidden_states = decoder_layer(
+                    X0_hidden_states,
+                    XT_hidden_states,
+                    attention_mask,
+                    **layer_kwargs,
+                )
             _debug_require_finite_tensor(
                 debug_finite,
                 debug_label,
                 f"layers.{layer_idx}.dynamic_xt.output_x0",
                 X0_hidden_states,
             )
-            if XT_hidden_states is not None:
-                _debug_require_finite_tensor(
-                    debug_finite,
-                    debug_label,
-                    f"layers.{layer_idx}.dynamic_xt.output_xt",
-                    XT_hidden_states,
-                )
-
-        hidden_states = XT_hidden_states if needs_xt else X0_hidden_states
-        hidden_states = self.norm(hidden_states)
+            _debug_require_finite_tensor(
+                debug_finite,
+                debug_label,
+                f"layers.{layer_idx}.dynamic_xt.output_xt",
+                XT_hidden_states,
+            )
         return BaseModelOutputWithPast(
-            last_hidden_state=hidden_states,
+            last_hidden_state=self.norm(XT_hidden_states),
             past_key_values=past_key_values if use_cache else None,
         )
 
 
-class DynamicXtQwen3ForCausalLM(Qwen3ForCausalLM):
-    """Dynamic-XT model with the unchanged contextual dual-stream flow head."""
+class DynamicXtQwen3ForCausalLM(
+    DynamicXtGenerationMixin,
+    Qwen3ForCausalLM,
+):
+    """Unified ablation D with one B content stream and four XT states."""
 
     config_class = SelflessFlowDynamicXtConfig
-    model_type = "selfless_flow_dynamic_xt"
-    _supports_paired_backbone_cfg = False
+    model_type = SelflessFlowDynamicXtConfig.model_type
+    architecture_variant = DYNAMIC_XT_ARCHITECTURE
+    dynamic_xt_attention_contract = DYNAMIC_XT_ATTENTION_CONTRACT
+    dynamic_xt_flow_batch_mul = DYNAMIC_XT_FLOW_BATCH_MUL
+    backbone_model_class = DynamicXtQwen3Model
+
+    def _initialize_weights(
+        self,
+        module,
+        is_remote_code: bool = False,
+    ) -> None:
+        """Keep D-only initialization outside B's shared RNG sequence."""
+
+        dynamic_model = getattr(self, "model", None)
+        time_embedder = getattr(
+            dynamic_model,
+            "backbone_flow_time_embedder",
+            None,
+        )
+        if time_embedder is not None and any(
+            module is child for child in time_embedder.modules()
+        ):
+            if module is time_embedder:
+                dynamic_model.reset_backbone_flow_time_embedder()
+                for child in time_embedder.modules():
+                    child._is_hf_initialized = True
+            return
+        super()._initialize_weights(module, is_remote_code)
 
     def __init__(self, config: Qwen3Config):
-        Qwen3PreTrainedModel.__init__(self, config)
-        self.model = DynamicXtQwen3Model(config)
-        self.vocab_size = config.vocab_size
-        self.image_latent_dim = int(getattr(config, "image_latent_dim", 4))
-        self.image_flow_batch_mul = int(
-            getattr(config, "image_flow_batch_mul", 1)
-        )
-        if self.image_flow_batch_mul != 1:
+        super().__init__(config)
+        architecture = str(
+            getattr(config, "architecture_variant", DYNAMIC_XT_ARCHITECTURE)
+        ).strip().lower()
+        if architecture != DYNAMIC_XT_ARCHITECTURE:
             raise ValueError(
-                "Dynamic-XT single-state training requires "
-                "image_flow_batch_mul=1"
+                "Dynamic-XT requires architecture_variant='dynamic_xt', got "
+                f"{architecture!r}"
             )
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.image_flow_condition_proj = nn.Linear(
-            config.hidden_size, config.hidden_size, bias=True
-        )
-        self.image_flow_head = FlowLoss(
-            target_channels=self.image_latent_dim,
-            z_channels=config.hidden_size,
-            width=getattr(config, "image_flow_width", 1280),
-            depth=getattr(config, "image_flow_depth", 8),
-            num_sampling_steps=str(
-                getattr(config, "image_flow_num_sampling_steps", "10")
-            ),
-            grad_checkpointing=getattr(
-                config, "image_flow_grad_checkpointing", False
-            ),
-            time_scale=getattr(config, "image_flow_time_scale", 1000.0),
-            time_sampling=getattr(
-                config, "image_flow_time_sampling", "logit_normal"
-            ),
-            logit_mean=getattr(config, "image_flow_logit_mean", 0.0),
-            logit_std=getattr(config, "image_flow_logit_std", 1.0),
-            time_eps=getattr(config, "image_flow_time_eps", 1.0e-4),
-            uniform_mix=getattr(
-                config, "image_flow_time_uniform_mix", 0.1
-            ),
-            solver=getattr(config, "image_flow_solver", "heun"),
-            image_tokens_per_img=getattr(config, "image_tokens_per_img", 256),
-        )
-        self._dynamic_xt_eval_counts = {"conditional": 0, "unconditional": 0}
-
-        self.post_init()
-        self.reset_backbone_attention_output_gates()
-        self.reset_image_modules()
+        objective = str(
+            getattr(config, "training_objective", "selfless_dual_stream")
+        ).strip().lower()
+        if objective != "selfless_dual_stream":
+            raise ValueError(
+                "Dynamic-XT requires training_objective='selfless_dual_stream'"
+            )
+        attention_contract = str(
+            getattr(config, "dual_stream_attention_contract", "")
+        ).strip().lower()
+        if attention_contract != DYNAMIC_XT_ATTENTION_CONTRACT:
+            raise ValueError(
+                "Ablation D is defined on baseline B and requires "
+                "dual_stream_attention_contract='xlnet_content_diagonal', got "
+                f"{attention_contract!r}"
+            )
+        if self.image_flow_batch_mul != DYNAMIC_XT_FLOW_BATCH_MUL:
+            raise ValueError(
+                "Ablation D must preserve baseline B's image_flow_batch_mul=4, "
+                f"got {self.image_flow_batch_mul}"
+            )
 
     def reset_image_modules(self) -> None:
         super().reset_image_modules()
         self.model.reset_backbone_flow_time_embedder()
+
+    def _zero_image_module_loss(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """Keep D's time embedder in every distributed microbatch graph."""
+
+        zero = super()._zero_image_module_loss(hidden_states)
+        for parameter in self.model.backbone_flow_time_embedder.parameters():
+            if parameter.requires_grad and parameter.numel() > 0:
+                zero = zero + parameter.reshape(-1)[0].float() * 0.0
+        return zero
 
     def dynamic_xt_parameter_count(self) -> int:
         return self.model.dynamic_xt_parameter_count()
@@ -363,42 +695,41 @@ class DynamicXtQwen3ForCausalLM(Qwen3ForCausalLM):
     def _image_training_layout(
         self,
         *,
-        hidden_device: torch.device,
+        device: torch.device,
         image_latents: torch.Tensor,
         image_span_table: torch.Tensor,
         image_local_positions: torch.Tensor | None,
         flow_sigma: torch.Tensor | None,
         image_loss_mask: torch.Tensor | None,
     ) -> dict[str, torch.Tensor | None]:
-        table = image_span_table.to(device=hidden_device, dtype=torch.long)
+        table = image_span_table.to(device=device, dtype=torch.long)
         if table.ndim != 2 or table.shape[1] < 4 or table.shape[0] == 0:
             raise ValueError("image_span_table must have shape [num_images, >=4]")
         image_tokens = int(self.config.image_tokens_per_img)
         rows = table[:, 0]
         starts = table[:, 2]
         offsets = torch.arange(
-            image_tokens, device=hidden_device, dtype=torch.long
+            image_tokens,
+            device=device,
+            dtype=torch.long,
         ).unsqueeze(0)
         token_indices = starts.unsqueeze(1) + offsets
-        targets = image_latents.to(hidden_device)[
-            rows.unsqueeze(1), token_indices
-        ]
+        targets = image_latents.to(device)[rows.unsqueeze(1), token_indices]
         if flow_sigma is None:
             sigmas = offsets.expand(table.shape[0], -1).float()
         else:
-            sigma = flow_sigma.to(device=hidden_device, dtype=torch.float32)
+            sigma = flow_sigma.to(device=device, dtype=torch.float32)
             sigmas = sigma[rows.unsqueeze(1), token_indices]
         if image_local_positions is None:
             positions = offsets.expand(table.shape[0], -1)
         else:
-            local = image_local_positions.to(device=hidden_device, dtype=torch.long)
+            local = image_local_positions.to(device=device, dtype=torch.long)
             positions = local[rows.unsqueeze(1), token_indices]
         loss_mask = None
         if image_loss_mask is not None:
-            full_mask = image_loss_mask.to(device=hidden_device, dtype=torch.bool)
+            full_mask = image_loss_mask.to(device=device, dtype=torch.bool)
             loss_mask = full_mask[rows.unsqueeze(1), token_indices]
         return {
-            "table": table,
             "rows": rows,
             "token_indices": token_indices,
             "targets": targets,
@@ -424,7 +755,16 @@ class DynamicXtQwen3ForCausalLM(Qwen3ForCausalLM):
     ) -> CausalLMOutputWithPast:
         token_types = kwargs.get("token_types", None)
         image_span_table = kwargs.get("image_span_table", None)
-        if labels is None or token_types is None:
+        compute_image_loss_arg = kwargs.get("compute_image_loss", None)
+        compute_image_loss = (
+            bool(compute_image_loss_arg)
+            if compute_image_loss_arg is not None
+            else bool(
+                image_span_table is not None
+                and image_span_table.shape[0] > 0
+            )
+        )
+        if labels is None or token_types is None or not compute_image_loss:
             return super().forward(
                 X0_input_ids=X0_input_ids,
                 attention_mask=attention_mask,
@@ -439,95 +779,124 @@ class DynamicXtQwen3ForCausalLM(Qwen3ForCausalLM):
                 calculate_likelihood=calculate_likelihood,
                 **kwargs,
             )
-        if inputs_embeds is not None:
-            raise ValueError("Dynamic-XT image training expects X0_input_ids")
+        if X0_input_ids is None or inputs_embeds is not None:
+            raise ValueError("Dynamic-XT image training requires X0_input_ids")
         if image_latents is None or image_span_table is None:
             raise ValueError(
-                "Dynamic-XT image training requires image_latents and image_span_table"
+                "Dynamic-XT image training requires image_latents and "
+                "image_span_table"
             )
+        if past_key_values is not None or bool(use_cache):
+            raise ValueError("Dynamic-XT multi-state training does not use a KV cache")
 
         model_kwargs = dict(kwargs)
         return_per_modality_loss_graph = bool(
             model_kwargs.pop("return_per_modality_loss_graph", False)
         )
+        compute_text_loss = bool(model_kwargs.pop("compute_text_loss", True))
+        model_kwargs.pop("compute_image_loss", None)
         image_loss_mask = model_kwargs.pop("image_loss_mask", None)
         record_flow_stats = bool(model_kwargs.pop("record_flow_stats", True))
         image_local_positions = model_kwargs.get("image_local_positions", None)
         flow_sigma = model_kwargs.get("flow_sigma", None)
         layout = self._image_training_layout(
-            hidden_device=X0_input_ids.device,
+            device=X0_input_ids.device,
             image_latents=image_latents,
             image_span_table=image_span_table,
             image_local_positions=image_local_positions,
             flow_sigma=flow_sigma,
             image_loss_mask=image_loss_mask,
         )
-        targets = layout["targets"]
-        # Preserve static RNG ordering: X0 input noise is sampled first.  The
-        # complete RF state is still sampled before any backbone evaluation.
+
+        # Match B's stochastic contract: one shared noisy X0 context, then four
+        # independent RF states.  Only the XT stream is expanded fourfold.
         context_image_latents = self._shared_noisy_image_latents(
             image_latents,
             token_types,
         )
-        training_state = self.image_flow_head.sample_training_state(targets)
-        x0_inputs_embeds = self.model._build_x0_inputs_embeds(
-            input_ids=X0_input_ids,
-            token_types=token_types,
-            image_latents=context_image_latents,
-            image_latent_mask=model_kwargs.get("image_latent_mask", None),
-            image_spans_present=True,
-            image_latents_are_noisy=context_image_latents is not image_latents,
-            debug_finite=bool(model_kwargs.get("debug_finite_backbone", False)),
-            debug_label=str(model_kwargs.get("debug_backbone_label", "")),
+        repeats = int(self.image_flow_batch_mul)
+        targets = layout["targets"]
+        repeated_targets = targets.repeat(repeats, 1, 1)
+        training_state = self.image_flow_head.sample_training_state(
+            repeated_targets
         )
 
         rows = layout["rows"]
         token_indices = layout["token_indices"]
-        batch_size, seq_len = X0_input_ids.shape
+        batch_size, sequence_length = X0_input_ids.shape
+        query_batch = repeats * batch_size
         aligned_x_t = torch.zeros(
-            batch_size,
-            seq_len,
+            query_batch,
+            sequence_length,
             self.image_latent_dim,
             device=X0_input_ids.device,
             dtype=training_state.x_t.dtype,
         )
         aligned_t = torch.zeros(
-            batch_size,
-            seq_len,
+            query_batch,
+            sequence_length,
             device=X0_input_ids.device,
             dtype=torch.float32,
         )
         query_mask = torch.zeros(
-            batch_size,
-            seq_len,
+            query_batch,
+            sequence_length,
             device=X0_input_ids.device,
             dtype=torch.bool,
         )
-        aligned_x_t[rows.unsqueeze(1), token_indices] = training_state.x_t
-        aligned_t[rows.unsqueeze(1), token_indices] = training_state.t
-        local_loss_mask = layout["loss_mask"]
-        if local_loss_mask is None:
-            query_mask[rows.unsqueeze(1), token_indices] = True
-        else:
-            query_mask[rows.unsqueeze(1), token_indices] = local_loss_mask
+        expanded_rows = torch.cat(
+            [rows + repeat_idx * batch_size for repeat_idx in range(repeats)]
+        )
+        expanded_token_indices = token_indices.repeat(repeats, 1)
+        aligned_x_t[
+            expanded_rows.unsqueeze(1),
+            expanded_token_indices,
+        ] = training_state.x_t
+        aligned_t[
+            expanded_rows.unsqueeze(1),
+            expanded_token_indices,
+        ] = training_state.t
+        repeated_loss_mask = (
+            layout["loss_mask"].repeat(repeats, 1)
+            if layout["loss_mask"] is not None
+            else None
+        )
+        query_mask[
+            expanded_rows.unsqueeze(1),
+            expanded_token_indices,
+        ] = (
+            repeated_loss_mask
+            if repeated_loss_mask is not None
+            else torch.ones_like(training_state.t, dtype=torch.bool)
+        )
 
+        if context_image_latents is not image_latents:
+            model_kwargs["image_latents_are_noisy"] = True
         hidden_states = self.model(
-            X0_inputs_embeds=x0_inputs_embeds,
-            XT_input_ids=X0_input_ids,
+            X0_input_ids=X0_input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=None,
             use_cache=False,
             cache_position=cache_position,
             calculate_likelihood=True,
+            image_latents=context_image_latents,
             xt_flow_latents=aligned_x_t,
             xt_flow_times=aligned_t,
             xt_flow_query_mask=query_mask,
             **model_kwargs,
         ).last_hidden_state
-        selected_hidden = torch.index_select(hidden_states, 0, rows)
-        gather_index = token_indices.unsqueeze(-1).expand(
-            -1, -1, hidden_states.shape[-1]
+        if int(hidden_states.shape[0]) != query_batch:
+            raise RuntimeError(
+                "Dynamic-XT backbone returned the wrong query batch: "
+                f"{hidden_states.shape[0]} != {query_batch}"
+            )
+
+        selected_hidden = torch.index_select(hidden_states, 0, expanded_rows)
+        gather_index = expanded_token_indices.unsqueeze(-1).expand(
+            -1,
+            -1,
+            hidden_states.shape[-1],
         )
         image_hidden = torch.gather(selected_hidden, 1, gather_index)
         image_conditions = self._prepare_image_flow_condition(image_hidden)
@@ -537,48 +906,58 @@ class DynamicXtQwen3ForCausalLM(Qwen3ForCausalLM):
             else context_image_latents
         ).to(X0_input_ids.device)
         image_context = context_for_loss[
-            rows.unsqueeze(1), token_indices
-        ]
-        sigmas = layout["sigmas"]
-        positions = layout["positions"]
-        loss_mask = layout["loss_mask"]
+            rows.unsqueeze(1),
+            token_indices,
+        ].repeat(repeats, 1, 1)
+        repeated_sigmas = layout["sigmas"].repeat(repeats, 1)
+        repeated_positions = layout["positions"].repeat(repeats, 1)
         image_loss = self.image_flow_head(
-            target=targets,
+            target=repeated_targets,
             z=image_conditions,
-            mask=loss_mask,
-            sigma=sigmas,
-            image_positions=positions,
+            mask=repeated_loss_mask,
+            sigma=repeated_sigmas,
+            image_positions=repeated_positions,
             context_latents=image_context,
             record_stats=record_flow_stats,
             training_state=training_state,
         )
-        # Keep the training output contract identical to the static model.
-        # Dynamic-XT is image-only, but the trainer aggregates both modalities
-        # on every rank and therefore still requires an explicit zero text loss
-        # and the corresponding token counts.
-        labels_on_device = labels.to(hidden_states.device)
-        token_types_on_device = token_types.to(hidden_states.device)
+
+        # Query repeats are independent across positions, so their text hidden
+        # states are identical.  Use the first repeat to preserve B's text count
+        # while avoiding a second backbone pass in joint validation.
+        original_hidden = hidden_states[:batch_size]
+        labels_on_device = labels.to(original_hidden.device)
+        token_types_on_device = token_types.to(original_hidden.device)
         valid_text_mask = (
             ((token_types_on_device == 0) | (token_types_on_device == 2))
-            & (labels_on_device != -100)
+            & labels_on_device.ne(-100)
+            & compute_text_loss
         )
-        text_loss = hidden_states.sum() * 0.0
         text_token_count = valid_text_mask.sum()
+        text_loss = original_hidden.sum() * 0.0
+        if compute_text_loss and self.lambda_text > 0.0:
+            text_logits = self.lm_head(original_hidden[valid_text_mask])
+            text_loss = F.cross_entropy(
+                text_logits,
+                labels_on_device[valid_text_mask],
+                reduction="sum",
+            ) / text_token_count.clamp_min(1).to(text_logits.dtype)
         image_token_count = (
-            loss_mask.sum()
-            if loss_mask is not None
+            repeated_loss_mask.sum()
+            if repeated_loss_mask is not None
             else torch.tensor(
-                targets.shape[0] * targets.shape[1],
-                device=hidden_states.device,
+                repeated_targets.shape[0] * repeated_targets.shape[1],
+                device=original_hidden.device,
                 dtype=torch.long,
             )
         )
+        loss = self.lambda_text * text_loss + self.lambda_image * image_loss
         output = CausalLMOutputWithPast(
-            loss=image_loss,
+            loss=loss,
             logits=None,
             past_key_values=None,
         )
-        output["last_hidden_state"] = hidden_states
+        output["last_hidden_state"] = original_hidden
         output["per_modality_loss"] = {
             "text_loss": text_loss.detach(),
             "image_loss": image_loss.detach(),
@@ -597,183 +976,23 @@ class DynamicXtQwen3ForCausalLM(Qwen3ForCausalLM):
             for key, value in self.image_flow_head.last_forward_stats.items()
             if isinstance(value, torch.Tensor)
         }
+        gate_stats = self.model.backbone_attention_gate_stats()
+        if gate_stats:
+            output["backbone_gate_stats"] = gate_stats
         output["dynamic_xt_parameter_count"] = self.dynamic_xt_parameter_count()
+        output["dynamic_xt_query_batch_mul"] = repeats
+        output["dynamic_xt_content_batch_size"] = batch_size
+        output["dynamic_xt_query_batch_size"] = query_batch
+        output["dynamic_xt_checkpointed_layers"] = int(
+            self.model.last_dynamic_xt_checkpointed_layers
+        )
         return output
 
-    def _make_backbone_flow_condition_evaluator(self, **state):
-        sample_indices = state["sample_indices"]
-        seq_positions = state["seq_positions"]
-        selected_input_ids = state["selected_input_ids"]
-        selected_token_types = state["selected_token_types"]
-        current_sigma = state["current_sigma"]
-        work_latents = state["work_latents"]
-        use_cfg = bool(state["use_flow_cfg"])
-        cache_enabled = bool(state["backbone_cache_enabled"])
-        debug_finite = bool(state["debug_finite"])
-        generation_step = int(state["generation_step"])
-        batch_size = int(sample_indices.numel())
-        device = selected_input_ids.device
-
-        def cache_mask(image_uncond: bool):
-            query_sigma = current_sigma[
-                sample_indices, seq_positions
-            ].unsqueeze(1)
-            allowed = (
-                state["backbone_key_valid"].unsqueeze(1)
-                & (
-                    state["backbone_key_sigma"].unsqueeze(1)
-                    < query_sigma.unsqueeze(-1)
-                )
-            )
-            if image_uncond:
-                allowed &= state["backbone_key_is_image"].unsqueeze(1)
-            if device.type == "npu":
-                return (~allowed).unsqueeze(1)
-
-            def mask_mod(b, h, q_idx, kv_idx):
-                del h
-                return allowed[b, q_idx, kv_idx]
-
-            return create_block_mask(
-                mask_mod,
-                B=batch_size,
-                H=None,
-                Q_LEN=1,
-                KV_LEN=int(state["backbone_max_cache_len"]),
-                device=device,
-            )
-
-        def evaluate_branch(x_t, t, *, image_uncond: bool):
-            aligned_x_t = x_t.unsqueeze(1)
-            aligned_t = t.unsqueeze(1)
-            query_mask = torch.ones(
-                batch_size, 1, device=device, dtype=torch.bool
-            )
-            if cache_enabled:
-                expected = torch.arange(batch_size, device=device)
-                if not torch.equal(sample_indices, expected):
-                    raise RuntimeError(
-                        "Dynamic-XT cached flow evaluation requires one query per row"
-                    )
-                query_indices = seq_positions.unsqueeze(1)
-                position_ids = torch.gather(
-                    state["full_position_ids"],
-                    dim=2,
-                    index=query_indices.unsqueeze(0).expand(2, -1, -1),
-                )
-                query_latents = work_latents[
-                    sample_indices, seq_positions
-                ].unsqueeze(1)
-                hidden = self.model(
-                    X0_input_ids=torch.gather(
-                        selected_input_ids, 1, query_indices
-                    ),
-                    attention_mask=cache_mask(image_uncond),
-                    position_ids=position_ids,
-                    past_key_values=(
-                        state["backbone_uncond_cache"]
-                        if image_uncond
-                        else state["backbone_cond_cache"]
-                    ),
-                    use_cache=False,
-                    cache_position=query_indices,
-                    cache_read_only=True,
-                    token_types=torch.gather(
-                        selected_token_types, 1, query_indices
-                    ),
-                    image_latents=query_latents,
-                    image_latent_mask=torch.zeros_like(query_mask),
-                    calculate_likelihood=True,
-                    xt_flow_latents=aligned_x_t,
-                    xt_flow_times=aligned_t,
-                    xt_flow_query_mask=query_mask,
-                    debug_finite_backbone=debug_finite,
-                    debug_backbone_label=(
-                        f"dynamic_xt_{'uncond' if image_uncond else 'cond'}_"
-                        f"flow_eval_generation_step={generation_step}"
-                    ),
-                ).last_hidden_state[:, 0]
-            else:
-                full_x_t = torch.zeros(
-                    *selected_input_ids.shape,
-                    self.image_latent_dim,
-                    device=device,
-                    dtype=x_t.dtype,
-                )
-                full_t = torch.zeros_like(current_sigma, dtype=torch.float32)
-                full_query_mask = torch.zeros_like(
-                    selected_token_types, dtype=torch.bool
-                )
-                full_x_t[sample_indices, seq_positions] = x_t
-                full_t[sample_indices, seq_positions] = t
-                full_query_mask[sample_indices, seq_positions] = True
-                image_latent_mask = state["base_image_latent_mask"].clone()
-                offsets = torch.arange(
-                    int(state["image_tokens_per_img"]),
-                    device=device,
-                    dtype=torch.long,
-                ).unsqueeze(0)
-                span_indices = state["span_starts"].unsqueeze(1) + offsets
-                span_rows = torch.arange(
-                    state["span_starts"].shape[0],
-                    device=device,
-                    dtype=torch.long,
-                ).unsqueeze(1)
-                image_latent_mask[span_rows, span_indices] = state["filled"]
-                hidden_all = self.model(
-                    X0_input_ids=selected_input_ids,
-                    attention_mask=(
-                        state["uncond_attention_mask"]
-                        if image_uncond
-                        else state["attention_mask"]
-                    ),
-                    token_types=selected_token_types,
-                    image_latents=work_latents,
-                    image_latent_mask=image_latent_mask,
-                    calculate_likelihood=True,
-                    xt_flow_latents=full_x_t,
-                    xt_flow_times=full_t,
-                    xt_flow_query_mask=full_query_mask,
-                    debug_finite_backbone=debug_finite,
-                ).last_hidden_state
-                hidden = hidden_all[sample_indices, seq_positions]
-            branch = "unconditional" if image_uncond else "conditional"
-            self._dynamic_xt_eval_counts[branch] += 1
-            return self._prepare_image_flow_condition(hidden)
-
-        def evaluator(x_t, t):
-            conditional = evaluate_branch(x_t, t, image_uncond=False)
-            if not use_cfg:
-                return conditional
-            unconditional = evaluate_branch(x_t, t, image_uncond=True)
-            return torch.cat([conditional, unconditional], dim=0)
-
-        return evaluator
-
-    @torch.no_grad()
-    def generate_image(self, *args, **kwargs):
-        self._dynamic_xt_eval_counts = {"conditional": 0, "unconditional": 0}
-        result = super().generate_image(*args, **kwargs)
-        if not bool(kwargs.get("return_trace", False)) or result is None:
-            return result
-        generated, trace = result
-        trace.update(
-            {
-                "backbone_condition_mode": "dynamic_xt",
-                "dynamic_xt_conditional_velocity_evaluations": int(
-                    self._dynamic_xt_eval_counts["conditional"]
-                ),
-                "dynamic_xt_unconditional_velocity_evaluations": int(
-                    self._dynamic_xt_eval_counts["unconditional"]
-                ),
-                "dynamic_xt_query_cache_policy": "read_only_x0_kv",
-                "dynamic_xt_parameter_count": self.dynamic_xt_parameter_count(),
-            }
-        )
-        return generated, trace
-
-
 __all__ = [
+    "DYNAMIC_XT_ARCHITECTURE",
+    "DYNAMIC_XT_ATTENTION_CONTRACT",
+    "DYNAMIC_XT_FLOW_BATCH_MUL",
+    "DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING",
     "DynamicXtQwen3ForCausalLM",
     "DynamicXtQwen3Model",
     "SelflessFlowDynamicXtConfig",

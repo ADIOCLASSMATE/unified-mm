@@ -32,7 +32,7 @@ def _tiny_config(config_class=SingleStreamTextARConfig):
             else "selfless_contextual"
         ),
         "training_objective": "selfless_dual_stream",
-        "dual_stream_attention_contract": "selfless_strict",
+        "dual_stream_attention_contract": "xlnet_content_diagonal",
         "mask_token_id": 7,
         "image_mask_token_id": 8,
         "boi_token_id": 11,
@@ -442,16 +442,17 @@ def test_c_caption_cache_matches_full_reference_and_never_builds_xt():
     assert full_trace["backbone_kv_cache_enabled"] is False
 
 
-def test_c_image_generation_is_locked_to_ablation_a_attention():
+def test_c_image_generation_inherits_configured_baseline_b_attention():
     _, model = _paired_models()
+    assert model._generation_attention_contract() == "xlnet_content_diagonal"
+
+    # Old checkpoints remain readable even though new formal C runs use B.
+    model.config.dual_stream_attention_contract = "selfless_strict"
     assert model._generation_attention_contract() == "selfless_strict"
-    model.config.dual_stream_attention_contract = "xlnet_content_diagonal"
-    with pytest.raises(ValueError, match="must use selfless_strict"):
-        model._generation_attention_contract()
 
 
 @torch.no_grad()
-def test_c_image_cache_matches_its_ablation_a_full_reference():
+def test_c_on_b_image_cache_matches_its_full_reference():
     _, model = _paired_models()
     model.eval()
     common = {
@@ -482,7 +483,7 @@ def test_c_image_cache_matches_its_ablation_a_full_reference():
     )
 
     torch.testing.assert_close(cached, full, rtol=0, atol=0)
-    assert cached_trace["attention_contract"] == "selfless_strict"
+    assert cached_trace["attention_contract"] == "xlnet_content_diagonal"
     assert cached_trace["backbone_kv_cache_enabled"] is True
     assert full_trace["backbone_kv_cache_enabled"] is False
 

@@ -31,42 +31,70 @@ SAVE_EMA_EVAL_EVERY="${SAVE_EMA_EVAL_EVERY:-12510}"
 SAVE_FINAL="${SAVE_FINAL:-true}"
 SAVE_FINAL_CHECKPOINT="${SAVE_FINAL_CHECKPOINT:-true}"
 WANDB_MODE="${WANDB_MODE:-disabled}"
-RUN_PROJECT="${RUN_PROJECT:-unified-a-0p6b-100b-imagenet-split-s42-r1}"
-RUN_NAME="${RUN_NAME:-${RUN_PROJECT//\//-}}"
 BACKBONE_LR="${BACKBONE_LR:-3.0e-4}"
 FLOW_LR="${FLOW_LR:-5.0e-5}"
-ABLATION="${ABLATION:-a}"
+IMAGE_FLOW_BATCH_MUL="${IMAGE_FLOW_BATCH_MUL:-4}"
+ABLATION="${ABLATION:-b}"
 PRESERVE_MODEL_CONTRACT="${PRESERVE_MODEL_CONTRACT:-false}"
 OUTPUT_DIR_BASE="${OUTPUT_DIR_BASE:-output}"
 
 case "${ABLATION}" in
-  a)
-    ARCHITECTURE_VARIANT="selfless_contextual"
-    TRAINING_OBJECTIVE="selfless_dual_stream"
-    DUAL_STREAM_ATTENTION_CONTRACT="selfless_strict"
-    ;;
   b)
     ARCHITECTURE_VARIANT="selfless_contextual"
     TRAINING_OBJECTIVE="selfless_dual_stream"
     DUAL_STREAM_ATTENTION_CONTRACT="xlnet_content_diagonal"
+    DEFAULT_RUN_PROJECT="unified-b-0p6b-100b-imagenet-split-s42-r1"
+    TRAIN_ENTRY="pretrain/train_selfless_flow.py"
+    DEFAULT_DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING="false"
     ;;
   c)
     ARCHITECTURE_VARIANT="single_stream_text_ar"
     TRAINING_OBJECTIVE="selfless_dual_stream"
-    DUAL_STREAM_ATTENTION_CONTRACT="selfless_strict"
+    DUAL_STREAM_ATTENTION_CONTRACT="xlnet_content_diagonal"
+    DEFAULT_RUN_PROJECT="unified-c-on-b-0p6b-100b-imagenet-split-s42-r1"
+    TRAIN_ENTRY="pretrain/train_selfless_flow.py"
+    DEFAULT_DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING="false"
+    ;;
+  d)
+    ARCHITECTURE_VARIANT="dynamic_xt"
+    TRAINING_OBJECTIVE="selfless_dual_stream"
+    DUAL_STREAM_ATTENTION_CONTRACT="xlnet_content_diagonal"
+    DEFAULT_RUN_PROJECT="unified-d-on-b-0p6b-100b-imagenet-split-s42-r1"
+    TRAIN_ENTRY="pretrain/train_selfless_flow_dynamic_xt.py"
+    # D's T2I branch carries four dynamic query states. Layer activation
+    # checkpointing preserves the B16 logical batch and mul=4 estimator while
+    # keeping the per-rank 910B memory footprint bounded.
+    DEFAULT_DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING="true"
     ;;
   *)
-    echo "ERROR: ABLATION must be one of a, b, c; got ${ABLATION}" >&2
+    echo "ERROR: ABLATION must be b, c, or d; got ${ABLATION}" >&2
     exit 2
     ;;
 esac
+
+DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING="${DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING:-${DEFAULT_DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING}}"
+
+RUN_PROJECT="${RUN_PROJECT:-${DEFAULT_RUN_PROJECT}}"
+RUN_NAME="${RUN_NAME:-${RUN_PROJECT//\//-}}"
 
 if [[ "${PRESERVE_MODEL_CONTRACT}" != "false" && "${PRESERVE_MODEL_CONTRACT}" != "true" ]]; then
   echo "ERROR: PRESERVE_MODEL_CONTRACT must be true or false" >&2
   exit 2
 fi
-if [[ "${PRESERVE_MODEL_CONTRACT}" == "true" && "${ABLATION}" != "a" ]]; then
-  echo "ERROR: only ablation a may preserve a selected sweep checkpoint's model contract" >&2
+if [[ "${IMAGE_FLOW_BATCH_MUL}" != "4" ]]; then
+  echo "ERROR: B-based unified ablations require IMAGE_FLOW_BATCH_MUL=4" >&2
+  exit 2
+fi
+if [[ "${DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING}" != "true" && "${DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING}" != "false" ]]; then
+  echo "ERROR: DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING must be true or false" >&2
+  exit 2
+fi
+if [[ "${ABLATION}" == "d" && "${DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING}" != "true" ]]; then
+  echo "ERROR: ablation D requires T2I activation checkpointing at formal B16" >&2
+  exit 2
+fi
+if [[ "${PRESERVE_MODEL_CONTRACT}" == "true" && "${ABLATION}" != "b" ]]; then
+  echo "ERROR: only baseline b may preserve a selected sweep checkpoint's model contract" >&2
   exit 2
 fi
 
@@ -142,6 +170,7 @@ PREFLIGHT=(
   --flow-lr "${FLOW_LR}"
   --save-ema-eval-every "${SAVE_EMA_EVAL_EVERY}"
   --ablation "${ABLATION}"
+  --dynamic-xt-t2i-gradient-checkpointing "${DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING}"
 )
 if [[ "${NODE_RANK}" == "0" ]]; then
   PREFLIGHT+=(--tokenizer-probe)
@@ -158,7 +187,7 @@ COMMAND=(
   --main_process_port "${MAIN_PROCESS_PORT}"
   --rdzv_backend static
   --same_network
-  pretrain/train_selfless_flow.py
+  "${TRAIN_ENTRY}"
   "config=${CONFIG}"
   "experiment.project=${RUN_PROJECT}"
   "experiment.name=${RUN_NAME}"
@@ -180,6 +209,8 @@ COMMAND=(
   "optimizer.params.special_token_learning_rate=${BACKBONE_LR}"
   "optimizer.params.projector_learning_rate=${FLOW_LR}"
   "optimizer.params.flow_learning_rate=${FLOW_LR}"
+  "training.use_gradient_checkpointing=false"
+  "model.dynamic_xt_t2i_gradient_checkpointing=${DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING}"
   "training.stop_after_steps=${STOP_AFTER_STEPS}"
 )
 if [[ "${PRESERVE_MODEL_CONTRACT}" == "false" ]]; then
@@ -187,6 +218,7 @@ if [[ "${PRESERVE_MODEL_CONTRACT}" == "false" ]]; then
     "model.architecture_variant=${ARCHITECTURE_VARIANT}"
     "model.training_objective=${TRAINING_OBJECTIVE}"
     "model.dual_stream_attention_contract=${DUAL_STREAM_ATTENTION_CONTRACT}"
+    "model.image_flow_batch_mul=${IMAGE_FLOW_BATCH_MUL}"
     "model.showo_mask_schedule=cosine"
     "model.showo_min_masking_rate=0.0"
   )

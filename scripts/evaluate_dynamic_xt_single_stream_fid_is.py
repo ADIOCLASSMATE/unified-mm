@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dedicated offline FID/IS entry for Dynamic-XT checkpoints."""
+"""Dedicated offline FID/IS entry for B-based ablation-D checkpoints."""
 
 from __future__ import annotations
 

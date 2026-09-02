@@ -63,7 +63,7 @@ not implicitly mount the official dataset.
 - Project: `多模态大模型新架构评测探索与scaling-law`
   (`high-dimensionaldata`).
 - Project override for the unified ClimbMix + ImageNet work: every 1B LR-sweep
-  Job and every formal 100B a/b/c ablation Job must use
+  Job and every formal 100B baseline-b, C-on-B, or D-on-B Job must use
   `随机序语言建模-统一自回归与掩码扩散的随机顺序生成框架`. Never submit those
   Jobs to `high-dimensionaldata`.
 - Unified training sets `training.runtime_hashing_enabled: false`. Its data
@@ -77,14 +77,19 @@ not implicitly mount the official dataset.
   `script/selfless/pretraining_unified_baseline_lr_sweep_arm_ascend64.sh` and
   select only after all nine complete with
   `scripts/select_unified_lr_sweep.py`.
-- The formal a/b/c contract is
+- The formal baseline-b/C-on-B/D-on-B contract is
   `configs/protocols/unified_ablation_100b_ascend64.yaml`; launch each selected
   condition with
   `script/selfless/pretraining_unified_ablation_100b_ascend64.sh`. The 0.6B
   historical winner is frozen at backbone/special-token LR `3.0e-4` and
   flow/projector LR `5.0e-5`; every formal arm starts from Qwen3-0.6B-Base at
-  optimizer step zero and never resumes a sweep checkpoint. Ablation b must
-  differ from a only by the XLNet-style content-stream diagonal.
+  optimizer step zero and never resumes a sweep checkpoint. Baseline b uses
+  the XLNet-style content-stream diagonal. C-on-B differs only by switching
+  the text path to single-stream next-token AR; its image path remains
+  identical to baseline b and it must not resume a retired C-on-A checkpoint.
+  D-on-B uses the dedicated Dynamic-XT model and generation implementation,
+  preserves `image_flow_batch_mul: 4`, and must not resume the retired A-based
+  Dynamic-XT checkpoint.
 - Dedicated Workspace: `昇腾卡公共空间`; use it only for Ascend workloads.
 - Compute Group: `910B资源` (`ASCEND 910B (64GB)`).
 - The `high-dimensionaldata` Ascend training allocation ceiling is 256
@@ -124,8 +129,8 @@ not implicitly mount the official dataset.
   custom ImageNet 1K/5K retrieval, ReaL, and the old generated-caption CLIP
   score have been removed. The text-only entry is
   `script/selfless/evaluate_selfless_text_ascend16.sh`.
-- The canonical final-evaluation input for ablation a is
-  `output/unified-a-0p6b-100b-imagenet-split-s42-r1/hf_model-final-ema`.
+- The canonical final-evaluation input for baseline b is
+  `output/unified-b-0p6b-100b-imagenet-split-s42-r1/hf_model-final-ema`.
   It is loaded directly as the Hugging Face model, without a sharded EMA
   overlay; `ema_export_metadata.json` records source step 95415. Rank-sharded
   checkpoint directories remain legacy inputs only for historical trends.
@@ -356,10 +361,8 @@ not implicitly mount the official dataset.
 
 ### ImageNet-1K architecture variants
 
-- The position-wise control preserves the formal 64-NPU, global-batch-1024,
-  800-epoch optimization/data contract. Dynamic-XT is instead a successor
-  backbone recipe and is not a controlled architecture comparison because it
-  intentionally uses one RF state per image rather than the baseline's four.
+- The position-wise control preserves the historical formal 64-NPU,
+  global-batch-1024, 800-epoch optimization/data contract.
 - The position-wise-head control keeps the random-sigma selfless two-stream
   Qwen backbone and replaces only the contextual flow head with a vectorized
   MAR/NextStep-style AdaLN MLP. The head has no cross-token attention, content
@@ -368,21 +371,21 @@ not implicitly mount the official dataset.
   `configs/selfless/imagenet1k_class_pretrain_800ep_ascend_64npu_bs1024_positionwise_head.yaml`
   and
   `script/selfless/pretraining_imagenet1k_class_ascend_64npu_bs1024_800ep_positionwise_head.sh`.
-- The Dynamic-XT successor keeps the same strict selfless X0/XT backbone and
-  contextual dual-stream flow head. It replaces only predicted-image XT
-  queries with `image_token_embedder(x_t) + backbone_flow_time_embedder(t)`;
-  Heun predictor/corrector evaluations recompute XT while reading fixed X0
-  K/V without committing XT to the cache.
-- Its training contract is `backbone_single_flow_state_v2` with
-  `image_flow_batch_mul: 1`. A training step samples one `(x_t, t)`, executes
-  the backbone once, and executes the flow head once. The old four-state loop
-  and Dynamic-only backbone activation rematerialization are removed.
-- Dynamic-XT config and launcher:
-  `configs/selfless/imagenet1k_class_dynamic_xt_800ep.yaml` and
-  `script/selfless/pretraining_imagenet_class_dynamic_xt_800ep.sh`.
-- Its 16-NPU project-formal 50K ImageNet-val FID/IS launcher is
-  `script/selfless/evaluate_imagenet1k_dynamic_xt_ema_ascend16.sh`; it uses the
-  dedicated Dynamic-XT evaluator entry while retaining the static protocol.
+- Ablation D is the new Dynamic-XT implementation on unified baseline B. It
+  keeps B's `xlnet_content_diagonal` attention contract, contextual flow head,
+  data/schedule/LR contract, and `image_flow_batch_mul: 4`. One X0 content
+  stream is computed while four independent RF states form a `4B` XT query
+  stream; predicted-image queries use
+  `image_token_embedder(x_t) + backbone_flow_time_embedder(t)`.
+- D's model and generation behavior live in the dedicated files
+  `models/modeling_model/modeling_selfless_flow_dynamic_xt.py` and
+  `models/modeling_model/modeling_selfless_flow_dynamic_xt_generation.py`.
+  During Heun generation every predictor/corrector evaluation rebuilds the XT
+  query while reading fixed X0 K/V without committing XT to the cache.
+- The formal D launcher is
+  `script/selfless/pretraining_unified_ablation_d_on_b_0p6b_formal_ascend64.sh`;
+  the independent evaluation entry is
+  `scripts/evaluate_dynamic_xt_single_stream_fid_is.py`.
 - The position-wise-head retained smoke report is
   `public/datasets/imagenet_full/preparation/positionwise_head_smoke_report.json`.
 - The position-wise-head final EMA completed the project-formal 50K
@@ -396,10 +399,8 @@ not implicitly mount the official dataset.
   The retained result is
   `output/selfless-flow-imagenet1k-class-ascend64-b1024-800ep-positionwise-head-fid-is/metrics.json`
   (SHA256 `a5850bc1072db7e5d5480ca02f6be33a849fb834682137e914bb1747fa405f83`).
-- The old four-state Dynamic-XT Job was stopped on 2026-08-26 and all of its
-  training and evaluation outputs were permanently deleted. The single-state
-  contract must start a fresh run and must never resume an old Dynamic-XT
-  checkpoint.
+- The retired ImageNet-only, A-based Dynamic-XT recipe must not be resumed or
+  used for D. D starts fresh from the same Qwen3-0.6B weights as B.
 
 ## Waiting
 

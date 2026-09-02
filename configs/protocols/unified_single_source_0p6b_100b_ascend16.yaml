@@ -3,7 +3,7 @@
 # "Batch tokens" means physical input tensor positions, including any remaining
 # padding.  Each control matches only its source's contribution to one optimizer
 # update of the 64-NPU combined schedule, not the full combined update.
-schema: unified_single_source_0p6b_100b_v1
+schema: unified_single_source_0p6b_100b_v2
 base_config: configs/selfless/unified_baseline_100b_ascend_64npu.yaml
 platform_project: "随机序语言建模-统一自回归与掩码扩散的随机顺序生成框架"
 world_size: 16
@@ -13,7 +13,7 @@ seed: 42
 initialization: qwen3_0p6b_base_step_zero
 architecture_variant: selfless_contextual
 training_objective: selfless_dual_stream
-dual_stream_attention_contract: selfless_strict
+dual_stream_attention_contract: xlnet_content_diagonal
 # Smallest common optimizer-boundary total at or above 100B.  Text updates
 # contain exactly twice as many physical positions as either image-source
 # update, so image runs use exactly twice the number of optimizer steps.
@@ -90,8 +90,8 @@ combined_reference:
 single_source_runs:
     climbmix:
         config: configs/selfless/unified_single_text_0p6b_100b_ascend16.yaml
-        job_name: umm-0p6b-text-only-100b-16-s42-r1
-        output_root: output/unified-a-0p6b-text-only-100bphys-s42-r1
+        job_name: umm-b-0p6b-text-only-100b-16-s42-r1
+        output_root: output/unified-b-0p6b-text-only-100bphys-s42-r1
         per_rank_micro_batch: 4
         pad_to_length_schedule: [2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048]
         gradient_accumulation_steps: 8
@@ -104,8 +104,8 @@ single_source_runs:
         decay_steps: 23842
     i2t:
         config: configs/selfless/unified_single_caption_0p6b_100b_ascend16.yaml
-        job_name: umm-0p6b-caption-only-100b-16-s42-r1
-        output_root: output/unified-a-0p6b-caption-only-100bphys-s42-r1
+        job_name: umm-b-0p6b-caption-only-100b-16-s42-r1
+        output_root: output/unified-b-0p6b-caption-only-100bphys-s42-r1
         per_rank_micro_batch: 32
         pad_to_length_schedule: [512, 512]
         gradient_accumulation_steps: 2
@@ -120,8 +120,8 @@ single_source_runs:
         decay_steps: 47684
     t2i:
         config: configs/selfless/unified_single_t2i_0p6b_100b_ascend16.yaml
-        job_name: umm-0p6b-t2i-only-100b-16-s42-r1
-        output_root: output/unified-a-0p6b-t2i-only-100bphys-s42-r1
+        job_name: umm-b-0p6b-t2i-only-100b-16-s42-r1
+        output_root: output/unified-b-0p6b-t2i-only-100bphys-s42-r1
         per_rank_micro_batch: 16
         pad_to_length_schedule: [512, 512, 512, 512]
         gradient_accumulation_steps: 4

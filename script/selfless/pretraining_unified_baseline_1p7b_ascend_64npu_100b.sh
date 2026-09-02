@@ -31,16 +31,16 @@ SAVE_EMA_EVAL_EVERY="${SAVE_EMA_EVAL_EVERY:-12510}"
 SAVE_FINAL="${SAVE_FINAL:-false}"
 SAVE_FINAL_CHECKPOINT="${SAVE_FINAL_CHECKPOINT:-true}"
 WANDB_MODE="${WANDB_MODE:-disabled}"
-RUN_PROJECT="${RUN_PROJECT:-unified-baseline-qwen3-1.7b-100b}"
+RUN_PROJECT="${RUN_PROJECT:-unified-b-qwen3-1.7b-100b-s42-r1}"
 RUN_NAME="${RUN_NAME:-${RUN_PROJECT//\//-}}"
 BACKBONE_LR="${BACKBONE_LR:-2.4e-4}"
 FLOW_LR="${FLOW_LR:-6.0e-5}"
-ABLATION="${ABLATION:-a}"
+ABLATION="${ABLATION:-b}"
 PRESERVE_MODEL_CONTRACT="${PRESERVE_MODEL_CONTRACT:-false}"
 OUTPUT_DIR_BASE="${OUTPUT_DIR_BASE:-output}"
 
-if [[ "${ABLATION}" != "a" ]]; then
-  echo "ERROR: the Qwen3-1.7B experiment is frozen to baseline a" >&2
+if [[ "${ABLATION}" != "b" ]]; then
+  echo "ERROR: the Qwen3-1.7B experiment is frozen to baseline b" >&2
   exit 2
 fi
 if [[ "${PRESERVE_MODEL_CONTRACT}" != "false" && "${PRESERVE_MODEL_CONTRACT}" != "true" ]]; then
@@ -123,7 +123,7 @@ PREFLIGHT=(
   --backbone-lr "${BACKBONE_LR}"
   --flow-lr "${FLOW_LR}"
   --save-ema-eval-every "${SAVE_EMA_EVAL_EVERY}"
-  --ablation a
+  --ablation b
 )
 if [[ "${NODE_RANK}" == "0" ]]; then
   PREFLIGHT+=(--tokenizer-probe)
@@ -167,7 +167,7 @@ COMMAND=(
 if [[ "${PRESERVE_MODEL_CONTRACT}" == "false" ]]; then
   COMMAND+=(
     "model.training_objective=selfless_dual_stream"
-    "model.dual_stream_attention_contract=selfless_strict"
+    "model.dual_stream_attention_contract=xlnet_content_diagonal"
     "model.showo_mask_schedule=cosine"
     "model.showo_min_masking_rate=0.0"
   )

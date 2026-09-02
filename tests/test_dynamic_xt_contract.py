@@ -1,4 +1,7 @@
 import inspect
+import os
+
+os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
 
 import pytest
 import torch
@@ -18,13 +21,19 @@ from models.modeling_model.modeling_selfless_flow import (
     Qwen3Model,
 )
 from models.modeling_model.modeling_selfless_flow_dynamic_xt import (
+    DYNAMIC_XT_ATTENTION_CONTRACT,
+    DYNAMIC_XT_FLOW_BATCH_MUL,
     DynamicXtQwen3ForCausalLM,
     DynamicXtQwen3Model,
     SelflessFlowDynamicXtConfig,
 )
+from models.modeling_model.modeling_selfless_flow_dynamic_xt_generation import (
+    DynamicXtGenerationMixin,
+)
 from models.modeling_model.rectified_flow_state import (
     sample_rectified_flow_training_state,
 )
+from utils.utils import get_selfless_mask
 
 
 def tiny_config(config_class=SelflessFlowDynamicXtConfig):
@@ -50,13 +59,19 @@ def tiny_config(config_class=SelflessFlowDynamicXtConfig):
     config.image_flow_width = 32
     config.image_flow_depth = 2
     config.image_flow_num_sampling_steps = "10"
-    config.image_flow_batch_mul = 1
+    config.image_flow_batch_mul = DYNAMIC_XT_FLOW_BATCH_MUL
     config.image_flow_time_scale = 1000.0
     config.image_flow_time_sampling = "uniform"
     config.image_flow_time_eps = 1.0e-4
     config.image_flow_time_uniform_mix = 0.0
     config.image_flow_solver = "heun"
     config.image_input_noise_strength = 0.0
+    config.image_uncond_prob = 0.1
+    config.lambda_text = 0.05
+    config.lambda_image = 1.0
+    config.architecture_variant = "dynamic_xt"
+    config.training_objective = "selfless_dual_stream"
+    config.dual_stream_attention_contract = DYNAMIC_XT_ATTENTION_CONTRACT
     config.use_cache = False
     return config
 
@@ -145,17 +160,41 @@ def test_dynamic_model_has_distinct_type_and_only_time_embedder_capacity():
     assert not hasattr(Qwen3Model(tiny_config(Qwen3Config)), "backbone_flow_time_embedder")
 
 
-def test_dynamic_training_contract_requires_one_flow_state_without_rematerialization():
+def test_dynamic_training_contract_preserves_four_states_with_shared_content():
     source = inspect.getsource(DynamicXtQwen3ForCausalLM.forward)
-    assert "for repeat_idx in range(repeats)" not in source
     assert "checkpoint(" not in source
+    assert "repeated_targets = targets.repeat(repeats, 1, 1)" in source
+    assert source.count("hidden_states = self.model(") == 1
     assert 'output["per_modality_loss"]' in source
     assert 'output["per_modality_count"]' in source
 
     invalid = tiny_config()
-    invalid.image_flow_batch_mul = 4
-    with pytest.raises(ValueError, match="image_flow_batch_mul=1"):
+    invalid.image_flow_batch_mul = 1
+    with pytest.raises(ValueError, match="image_flow_batch_mul=4"):
         DynamicXtQwen3ForCausalLM(invalid)
+
+
+def test_dynamic_xt_is_isolated_from_baseline_model_file():
+    baseline_source = inspect.getsourcefile(StaticQwen3ForCausalLM)
+    assert baseline_source is not None
+    assert "dynamic_xt" not in open(
+        baseline_source,
+        encoding="utf-8",
+    ).read().lower()
+
+
+def test_dynamic_xt_generation_is_a_separate_implementation_file():
+    model_source = inspect.getsourcefile(DynamicXtQwen3ForCausalLM)
+    generation_source = inspect.getsourcefile(DynamicXtGenerationMixin)
+    assert model_source is not None
+    assert generation_source is not None
+    assert model_source != generation_source
+    model_text = open(model_source, encoding="utf-8").read()
+    generation_text = open(generation_source, encoding="utf-8").read()
+    assert "def generate_image(" not in model_text
+    assert "def _make_backbone_flow_condition_evaluator(" not in model_text
+    assert "def generate_image(" in generation_text
+    assert "def _make_backbone_flow_condition_evaluator(" in generation_text
 
 
 def test_dynamic_only_initialization_preserves_static_parameters_and_rng():
@@ -208,10 +247,13 @@ def test_dynamic_presampling_keeps_static_x0_then_rf_rng_order():
 
     torch.manual_seed(789)
     static_context = static._shared_noisy_image_latents(image_latents, token_types)
-    static_state = static.image_flow_head.sample_training_state(targets)
+    repeated_targets = targets.repeat(DYNAMIC_XT_FLOW_BATCH_MUL, 1, 1)
+    static_state = static.image_flow_head.sample_training_state(repeated_targets)
     torch.manual_seed(789)
     dynamic_context = dynamic._shared_noisy_image_latents(image_latents, token_types)
-    dynamic_state = dynamic.image_flow_head.sample_training_state(targets)
+    dynamic_state = dynamic.image_flow_head.sample_training_state(
+        repeated_targets
+    )
 
     torch.testing.assert_close(dynamic_context, static_context, rtol=0, atol=0)
     for field in ("t", "noise", "x_t", "v_target"):
@@ -221,6 +263,144 @@ def test_dynamic_presampling_keeps_static_x0_then_rf_rng_order():
             rtol=0,
             atol=0,
         )
+
+
+def test_dynamic_training_runs_one_content_batch_and_four_query_batches():
+    config = tiny_config()
+    config.dynamic_xt_t2i_gradient_checkpointing = True
+    model = DynamicXtQwen3ForCausalLM(config).train()
+    assert model.model.gradient_checkpointing is False
+    assert all(not layer.gradient_checkpointing for layer in model.model.layers)
+    input_ids = torch.tensor([[3, 11, 8, 8, 8, 8, 12, 9]])
+    token_types = torch.tensor(
+        [[0, 2, 1, 1, 1, 1, 2, 0]],
+        dtype=torch.uint8,
+    )
+    sigma = torch.tensor([[0.0, 1.0, 4.0, 5.0, 6.0, 7.0, 2.0, 3.0]])
+    image_latents = torch.randn(1, 8, 4)
+    strict_mask = get_selfless_mask(sigma, 8, "cpu")
+    content_mask = get_selfless_mask(
+        sigma,
+        8,
+        "cpu",
+        include_diagonal=True,
+    )
+
+    output = model(
+        X0_input_ids=input_ids,
+        labels=input_ids,
+        attention_mask=strict_mask,
+        content_attention_mask=content_mask,
+        token_types=token_types,
+        image_latents=image_latents,
+        image_local_positions=torch.tensor(
+            [[-1, -1, 0, 1, 2, 3, -1, -1]]
+        ),
+        image_span_table=torch.tensor([[0, 0, 2, 6, 0]]),
+        flow_sigma=sigma,
+        compute_text_loss=False,
+        compute_image_loss=True,
+    )
+
+    assert torch.isfinite(output.loss)
+    assert output.dynamic_xt_query_batch_mul == 4
+    assert output.dynamic_xt_content_batch_size == 1
+    assert output.dynamic_xt_query_batch_size == 4
+    assert output.dynamic_xt_checkpointed_layers == config.num_hidden_layers
+    assert int(output.per_modality_count["image_tokens"]) == 16
+    torch.testing.assert_close(output.loss, output.per_modality_loss["image_loss"])
+    output.loss.backward()
+    time_gradient = model.model.backbone_flow_time_embedder.mlp[0].weight.grad
+    assert time_gradient is not None
+    assert torch.isfinite(time_gradient).all()
+    assert all(not layer.gradient_checkpointing for layer in model.model.layers)
+
+
+def test_four_query_streams_match_four_independent_dynamic_forwards():
+    model = DynamicXtQwen3Model(tiny_config()).eval()
+    input_ids = torch.tensor([[3, 11, 8, 8, 8, 8, 12, 9]])
+    token_types = torch.tensor(
+        [[0, 2, 1, 1, 1, 1, 2, 0]],
+        dtype=torch.uint8,
+    )
+    sigma = torch.tensor([[0.0, 1.0, 4.0, 5.0, 6.0, 7.0, 2.0, 3.0]])
+    image_latents = torch.randn(1, 8, 4)
+    x_t = torch.randn(4, 8, 4)
+    times = torch.rand(4, 8)
+    query_mask = token_types.eq(1).repeat(4, 1)
+    strict_mask = get_selfless_mask(sigma, 8, "cpu")
+    content_mask = get_selfless_mask(
+        sigma,
+        8,
+        "cpu",
+        include_diagonal=True,
+    )
+
+    batched = model(
+        X0_input_ids=input_ids,
+        attention_mask=strict_mask,
+        content_attention_mask=content_mask,
+        token_types=token_types,
+        image_latents=image_latents,
+        calculate_likelihood=True,
+        xt_flow_latents=x_t,
+        xt_flow_times=times,
+        xt_flow_query_mask=query_mask,
+    ).last_hidden_state
+    independent = torch.cat(
+        [
+            model(
+                X0_input_ids=input_ids,
+                attention_mask=strict_mask,
+                content_attention_mask=content_mask,
+                token_types=token_types,
+                image_latents=image_latents,
+                calculate_likelihood=True,
+                xt_flow_latents=x_t[index : index + 1],
+                xt_flow_times=times[index : index + 1],
+                xt_flow_query_mask=query_mask[index : index + 1],
+            ).last_hidden_state
+            for index in range(4)
+        ],
+        dim=0,
+    )
+
+    torch.testing.assert_close(batched, independent, rtol=1.0e-5, atol=1.0e-6)
+
+
+def test_non_t2i_microbatch_keeps_dynamic_parameters_in_backward_graph():
+    config = tiny_config()
+    config.dynamic_xt_t2i_gradient_checkpointing = True
+    model = DynamicXtQwen3ForCausalLM(config).train()
+    input_ids = torch.tensor([[3, 4, 5, 9]])
+    token_types = torch.zeros_like(input_ids, dtype=torch.uint8)
+    sigma = torch.arange(4, dtype=torch.float32).unsqueeze(0)
+    strict_mask = get_selfless_mask(sigma, 4, "cpu")
+    content_mask = get_selfless_mask(
+        sigma,
+        4,
+        "cpu",
+        include_diagonal=True,
+    )
+
+    output = model(
+        X0_input_ids=input_ids,
+        labels=input_ids,
+        attention_mask=strict_mask,
+        content_attention_mask=content_mask,
+        token_types=token_types,
+        flow_sigma=sigma,
+        compute_text_loss=True,
+        compute_image_loss=False,
+    )
+    output.loss.backward()
+
+    assert model.model.last_dynamic_xt_checkpointed_layers == 0
+    assert model.model.gradient_checkpointing is False
+    assert all(not layer.gradient_checkpointing for layer in model.model.layers)
+    for parameter in model.model.backbone_flow_time_embedder.parameters():
+        assert parameter.grad is not None
+        assert torch.isfinite(parameter.grad).all()
 
 
 def test_dynamic_checkpoint_roundtrip_keeps_distinct_model_identity(tmp_path):
@@ -302,6 +482,43 @@ def test_inference_contract_uses_read_only_x0_cache_and_dynamic_heun_hook():
     assert "cache_read_only=True" in source
     assert "xt_flow_latents=aligned_x_t" in source
     assert "torch.cat([conditional, unconditional]" in source
+
+
+@pytest.mark.parametrize("use_cache", [False, True])
+def test_dynamic_generation_recomputes_condition_in_dedicated_path(use_cache):
+    model = DynamicXtQwen3ForCausalLM(tiny_config()).eval()
+    input_ids = torch.tensor([[3, 11, 8, 8, 8, 8, 12, 9]])
+    token_types = torch.tensor(
+        [[0, 2, 1, 1, 1, 1, 2, 0]],
+        dtype=torch.uint8,
+    )
+    sigma = torch.tensor([[0.0, 1.0, 4.0, 5.0, 6.0, 7.0, 2.0, 3.0]])
+
+    generated, trace = model.generate(
+        "t2i",
+        input_ids=input_ids,
+        token_types=token_types,
+        sigma=sigma,
+        spans=[(0, 2, 6)],
+        image_latent_dim=4,
+        initial_noise_bank=torch.zeros(1, 4, 4),
+        flow_temperature=1.0,
+        flow_cfg=1.0,
+        flow_solver="heun",
+        flow_num_steps=1,
+        parallel_rate=1,
+        order_strategy="sigma",
+        use_cache=use_cache,
+        return_trace=True,
+        _debug_max_generation_steps=1,
+    )
+
+    assert tuple(generated.shape) == (1, 4, 2, 2)
+    assert torch.isfinite(generated).all()
+    assert trace["backbone_condition_mode"] == "dynamic_xt"
+    assert trace["dynamic_xt_conditional_velocity_evaluations"] == 2
+    assert trace["dynamic_xt_unconditional_velocity_evaluations"] == 0
+    assert trace["dynamic_xt_query_cache_policy"] == "read_only_x0_kv"
 
 
 def test_heun_calls_dynamic_condition_for_predictor_and_corrector():

@@ -260,21 +260,11 @@ The retained machine-readable seq-sigma result is
 `output/selfless-flow-imagenet1k-class-ascend64-b1024-800ep-seq-sigma-fid-is/metrics.json`
 (SHA256 `443a67f83ee365065eac074de45eadfb9ac00ff4ef8ed1cd2c4dcfec397e6458`).
 
-### Dynamic-XT successor-backbone contract
+### Retired Dynamic-XT recipe
 
-Dynamic-XT adds `backbone_flow_time_embedder(t)` to predicted-image XT queries
-and recomputes XT-dependent backbone states during generation while retaining
-fixed X0 K/V context. It is intended as the backbone for the next training
-stage, not as a controlled comparison against the static baseline.
-
-Training uses contract `backbone_single_flow_state_v2` and
-`image_flow_batch_mul: 1`. Each optimizer step samples one rectified-flow
-state per image, calls the backbone once, and calls the contextual flow head
-once. The former four-state backbone loop and its Dynamic-only activation
-rematerialization have been removed. This changes the flow-loss sampling
-contract relative to the baseline by design.
-
-The old four-state Dynamic-XT training Job was stopped on 2026-08-26. Its
-checkpoint, validation, generation, and metric output directories were
-permanently deleted. Any new Dynamic-XT training must start from the configured
-Qwen base model and must not resume the deleted four-state run.
+The ImageNet-only Dynamic-XT successor recipe described by older revisions of
+this document is retired. The current Dynamic-XT implementation is unified
+ablation D on baseline B and is specified by
+`configs/protocols/unified_ablation_100b_ascend64.yaml`. It preserves
+`image_flow_batch_mul: 4` and the B attention contract. Do not use an old
+ImageNet-only Dynamic-XT checkpoint as its initialization.

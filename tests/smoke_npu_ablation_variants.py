@@ -1,4 +1,4 @@
-"""One-NPU kernel smoke for the two isolated architecture ablations.
+"""One-NPU kernel smoke for isolated architecture ablations.
 
 Run only inside the fixed Ascend development Notebook:
 
@@ -40,8 +40,10 @@ def tiny_config(model_label: str) -> Qwen3Config:
         bos_token_id=1,
         eos_token_id=9,
     )
-    if model_label == "positionwise_selfless":
+    if model_label in {"positionwise_selfless", "dynamic_xt"}:
         config.architecture_variant = model_label
+    config.training_objective = "selfless_dual_stream"
+    config.dual_stream_attention_contract = "xlnet_content_diagonal"
     config.mask_token_id = 7
     config.image_mask_token_id = 8
     config.boi_token_id = 11
@@ -51,7 +53,7 @@ def tiny_config(model_label: str) -> Qwen3Config:
     config.image_flow_width = 32
     config.image_flow_depth = 2
     config.image_flow_num_sampling_steps = "10"
-    config.image_flow_batch_mul = 1
+    config.image_flow_batch_mul = 4 if model_label == "dynamic_xt" else 1
     config.image_flow_time_scale = 1000.0
     config.image_flow_time_sampling = "uniform"
     config.image_flow_time_eps = 1.0e-4
@@ -119,6 +121,12 @@ def run_variant(
         payload["input_ids"].shape[1],
         device,
     )
+    content_attention_mask = get_selfless_mask(
+        payload["sigma"],
+        payload["input_ids"].shape[1],
+        device,
+        include_diagonal=True,
+    )
 
     model.train()
     backbone_calls = 0
@@ -136,6 +144,7 @@ def run_variant(
         X0_input_ids=payload["input_ids"],
         labels=payload["labels"],
         attention_mask=attention_mask,
+        content_attention_mask=content_attention_mask,
         token_types=payload["token_types"],
         image_latents=payload["image_latents"],
         image_local_positions=payload["image_local_positions"],
@@ -156,6 +165,10 @@ def run_variant(
     if final_grad is None or not bool(torch.isfinite(final_grad).all().item()):
         raise AssertionError(f"{model_label} flow backward failed")
     if model_label == "dynamic_xt":
+        if output.dynamic_xt_query_batch_mul != 4:
+            raise AssertionError("Dynamic-XT did not preserve four RF states")
+        if int(output.per_modality_count["image_tokens"].item()) != 16:
+            raise AssertionError("Dynamic-XT image-token count is not 4x")
         time_grad = (
             model.model.backbone_flow_time_embedder.mlp[0].weight.grad
         )

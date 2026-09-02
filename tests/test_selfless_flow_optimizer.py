@@ -1,4 +1,8 @@
-from utils.selfless_flow_optimizer import weight_decay_for_parameter
+from utils.selfless_flow_optimizer import (
+    learning_rate_for_parameter,
+    optimizer_parameter_role,
+    weight_decay_for_parameter,
+)
 from omegaconf import OmegaConf
 from transformers import Qwen3Config
 
@@ -73,6 +77,29 @@ def test_backbone_matrix_uses_global_weight_decay():
         global_weight_decay=0.01,
         flow_weight_decay=0.03,
     ) == 0.01
+
+
+def test_dynamic_xt_time_embedder_uses_backbone_optimizer_contract():
+    weight = "model.backbone_flow_time_embedder.mlp.0.weight"
+    bias = "model.backbone_flow_time_embedder.mlp.0.bias"
+    assert optimizer_parameter_role(weight) == "backbone"
+    assert learning_rate_for_parameter(
+        weight,
+        backbone_lr=3.0e-4,
+        flow_lr=5.0e-5,
+        projector_lr=5.0e-5,
+        special_token_lr=3.0e-4,
+    ) == 3.0e-4
+    assert weight_decay_for_parameter(
+        weight,
+        global_weight_decay=0.01,
+        flow_weight_decay=0.01,
+    ) == 0.01
+    assert weight_decay_for_parameter(
+        bias,
+        global_weight_decay=0.01,
+        flow_weight_decay=0.01,
+    ) == 0.0
 
 
 def test_image_flow_head_scope_freezes_qwen_and_keeps_condition_projection():

@@ -30,35 +30,50 @@ VALIDATION_MAX_BATCHES="${VALIDATION_MAX_BATCHES:-1}"
 VALIDATION_IMAGE_SAMPLES="${VALIDATION_IMAGE_SAMPLES:-2}"
 VALIDATION_SINGLE_STREAM_PARALLEL_RATE="${VALIDATION_SINGLE_STREAM_PARALLEL_RATE:-1}"
 RESUME_FROM="${RESUME_FROM:-none}"
+SAVE_FINAL="${SAVE_FINAL:-false}"
 SAVE_FINAL_CHECKPOINT="${SAVE_FINAL_CHECKPOINT:-true}"
 WANDB_MODE="${WANDB_MODE:-disabled}"
-ABLATION="${ABLATION:-a}"
+ABLATION="${ABLATION:-b}"
 BACKBONE_LR="${BACKBONE_LR:-3.0e-4}"
 FLOW_LR="${FLOW_LR:-5.0e-5}"
+IMAGE_FLOW_BATCH_MUL="${IMAGE_FLOW_BATCH_MUL:-4}"
 FORMAL_WORLD_SIZE="${FORMAL_WORLD_SIZE:-64}"
 NPROC_PER_NODE=16
 
 case "${ABLATION}" in
-  a)
-    ARCHITECTURE_VARIANT="selfless_contextual"
-    TRAINING_OBJECTIVE="selfless_dual_stream"
-    DUAL_STREAM_ATTENTION_CONTRACT="selfless_strict"
-    ;;
   b)
     ARCHITECTURE_VARIANT="selfless_contextual"
     TRAINING_OBJECTIVE="selfless_dual_stream"
     DUAL_STREAM_ATTENTION_CONTRACT="xlnet_content_diagonal"
+    DEFAULT_RUN_PROJECT="unified-b-qwen3-0.6b-smoke-ascend16"
+    TRAIN_ENTRY="pretrain/train_selfless_flow.py"
+    DEFAULT_DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING="false"
     ;;
   c)
     ARCHITECTURE_VARIANT="single_stream_text_ar"
     TRAINING_OBJECTIVE="selfless_dual_stream"
-    DUAL_STREAM_ATTENTION_CONTRACT="selfless_strict"
+    DUAL_STREAM_ATTENTION_CONTRACT="xlnet_content_diagonal"
+    DEFAULT_RUN_PROJECT="unified-c-on-b-qwen3-0.6b-smoke-ascend16"
+    TRAIN_ENTRY="pretrain/train_selfless_flow.py"
+    DEFAULT_DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING="false"
+    ;;
+  d)
+    ARCHITECTURE_VARIANT="dynamic_xt"
+    TRAINING_OBJECTIVE="selfless_dual_stream"
+    DUAL_STREAM_ATTENTION_CONTRACT="xlnet_content_diagonal"
+    DEFAULT_RUN_PROJECT="unified-d-on-b-qwen3-0.6b-smoke-ascend16"
+    TRAIN_ENTRY="pretrain/train_selfless_flow_dynamic_xt.py"
+    # D keeps four RF query states for T2I. Checkpoint only those dynamic
+    # decoder-layer activations so the formal B16 image microbatch fits 910B.
+    DEFAULT_DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING="true"
     ;;
   *)
-    echo "ERROR: ABLATION must be one of a, b, c; got ${ABLATION}" >&2
+    echo "ERROR: ABLATION must be b, c, or d; got ${ABLATION}" >&2
     exit 2
     ;;
 esac
+
+DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING="${DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING:-${DEFAULT_DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING}}"
 
 export HCCL_INTRA_ROCE_ENABLE="${HCCL_INTRA_ROCE_ENABLE:-1}"
 export HCCL_CONNECT_TIMEOUT="${HCCL_CONNECT_TIMEOUT:-600}"
@@ -71,6 +86,18 @@ unset CUDA_VISIBLE_DEVICES PYTORCH_CUDA_ALLOC_CONF
 
 if [[ ! "${SMOKE_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
   echo "ERROR: SMOKE_STEPS must be a positive integer" >&2
+  exit 2
+fi
+if [[ "${IMAGE_FLOW_BATCH_MUL}" != "4" ]]; then
+  echo "ERROR: B-based unified ablations require IMAGE_FLOW_BATCH_MUL=4" >&2
+  exit 2
+fi
+if [[ "${DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING}" != "true" && "${DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING}" != "false" ]]; then
+  echo "ERROR: DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING must be true or false" >&2
+  exit 2
+fi
+if [[ "${ABLATION}" == "d" && "${DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING}" != "true" ]]; then
+  echo "ERROR: ablation D requires T2I activation checkpointing at formal B16" >&2
   exit 2
 fi
 if [[ "${FORMAL_WORLD_SIZE}" != "64" && "${FORMAL_WORLD_SIZE}" != "128" ]]; then
@@ -93,7 +120,7 @@ if [[ "${NPU_AVAILABLE}" != "1" || "${LOCAL_NPUS}" != "${NPROC_PER_NODE}" ]]; th
   exit 4
 fi
 
-RUN_PROJECT="${RUN_PROJECT:-unified-${ABLATION}-qwen3-0.6b-smoke-ascend16}"
+RUN_PROJECT="${RUN_PROJECT:-${DEFAULT_RUN_PROJECT}}"
 RUN_ROOT="${RUN_ROOT:-output/${RUN_PROJECT}}"
 AUDIT_DIR="${AUDIT_DIR:-${RUN_ROOT}/prelaunch_audit}"
 mkdir -p "${AUDIT_DIR}"
@@ -108,6 +135,7 @@ python scripts/validate_unified_baseline.py \
   --flow-lr "${FLOW_LR}" \
   --save-ema-eval-every 0 \
   --ablation "${ABLATION}" \
+  --dynamic-xt-t2i-gradient-checkpointing "${DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING}" \
   >"${AUDIT_DIR}/asset_preflight.json"
 
 COMMAND=(
@@ -115,7 +143,7 @@ COMMAND=(
   --config_file "${ACCELERATE_CONFIG}"
   --num_machines 1
   --num_processes "${NPROC_PER_NODE}"
-  pretrain/train_selfless_flow.py
+  "${TRAIN_ENTRY}"
   "config=${CONFIG}"
   "experiment.project=${RUN_PROJECT}"
   "experiment.name=${RUN_PROJECT}-steps${SMOKE_STEPS}"
@@ -133,7 +161,7 @@ COMMAND=(
   "experiment.validation_image_samples=${VALIDATION_IMAGE_SAMPLES}"
   "experiment.validation_single_stream_parallel_rate=${VALIDATION_SINGLE_STREAM_PARALLEL_RATE}"
   "experiment.save_ema_eval_every=0"
-  "experiment.save_final=false"
+  "experiment.save_final=${SAVE_FINAL}"
   "experiment.save_final_checkpoint=${SAVE_FINAL_CHECKPOINT}"
   "optimizer.params.learning_rate=${BACKBONE_LR}"
   "optimizer.params.backbone_learning_rate=${BACKBONE_LR}"
@@ -143,6 +171,9 @@ COMMAND=(
   "model.architecture_variant=${ARCHITECTURE_VARIANT}"
   "model.training_objective=${TRAINING_OBJECTIVE}"
   "model.dual_stream_attention_contract=${DUAL_STREAM_ATTENTION_CONTRACT}"
+  "model.image_flow_batch_mul=${IMAGE_FLOW_BATCH_MUL}"
+  "training.use_gradient_checkpointing=false"
+  "model.dynamic_xt_t2i_gradient_checkpointing=${DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING}"
   "model.showo_mask_schedule=cosine"
   "model.showo_min_masking_rate=0.0"
   "training.stop_after_steps=${SMOKE_STEPS}"

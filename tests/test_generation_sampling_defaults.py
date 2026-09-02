@@ -73,7 +73,6 @@ def test_all_model_fallbacks_default_to_ten_sampling_steps():
     model_paths = (
         "models/modeling_model/modeling_selfless_flow.py",
         "models/modeling_model/modeling_positionwise_flow.py",
-        "models/modeling_model/modeling_selfless_flow_dynamic_xt.py",
     )
     pattern = re.compile(
         r'getattr\(\s*config,\s*"image_flow_num_sampling_steps",\s*"10"\s*,?\s*\)'

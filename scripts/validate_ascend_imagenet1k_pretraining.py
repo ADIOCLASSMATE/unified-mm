@@ -41,15 +41,6 @@ def validate_config(config, *, world_size: int) -> dict[str, object]:
     architecture_variant = str(
         config.model.get("architecture_variant", "selfless_contextual")
     ).lower()
-    if (
-        str(config.model.get("dynamic_xt_contract", ""))
-        == "backbone_single_flow_state_v2"
-    ):
-        if config.model.get("architecture_variant", None) is not None:
-            raise RuntimeError(
-                "Dynamic-XT formal config must not use architecture_variant"
-            )
-        architecture_variant = "dynamic_xt"
     image_sigma_order = str(params.get("image_sigma_order", "random")).lower()
     project_by_variant = {
         ("selfless_contextual", "random"): (
@@ -61,9 +52,6 @@ def validate_config(config, *, world_size: int) -> dict[str, object]:
         ("positionwise_selfless", "random"): (
             "selfless-flow-imagenet1k-class-ascend64-b1024-800ep-"
             "positionwise-head"
-        ),
-        ("dynamic_xt", "random"): (
-            "selfless-flow-imagenet1k-class-dynamic-xt-ascend64-b1024-800ep"
         ),
     }
     variant_key = (architecture_variant, image_sigma_order)
@@ -148,24 +136,6 @@ def validate_config(config, *, world_size: int) -> dict[str, object]:
     for label, (actual, expected) in required.items():
         if actual != expected:
             raise RuntimeError(f"config {label} mismatch: {actual!r} != {expected!r}")
-    if architecture_variant == "dynamic_xt":
-        if int(config.model.get("image_flow_batch_mul", -1)) != 1:
-            raise RuntimeError(
-                "Dynamic-XT successor-backbone training requires "
-                "model.image_flow_batch_mul=1"
-            )
-        accounting = {
-            "target_epochs": EPOCHS,
-            "steps_per_epoch": STEPS_PER_EPOCH,
-            "target_train_steps": MAX_STEPS,
-            "effective_samples_seen": TRAIN_SAMPLES_PER_EPOCH * EPOCHS,
-        }
-        for key, expected in accounting.items():
-            actual = int(config.training.get(key, -1))
-            if actual != expected:
-                raise RuntimeError(
-                    f"Dynamic-XT training.{key} mismatch: {actual} != {expected}"
-                )
     if str(config.model.model_path) != "public/models/Qwen--Qwen3-0.6B-Base":
         raise RuntimeError("formal pretraining must initialize from Qwen3-0.6B-Base")
     expected_evaluation_checkpoint = f"output/{expected_project}/hf_model-final-ema"

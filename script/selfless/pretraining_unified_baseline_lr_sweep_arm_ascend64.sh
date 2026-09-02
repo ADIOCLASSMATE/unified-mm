@@ -22,11 +22,11 @@ case "${ARM_ID}" in
 esac
 
 export CONFIG="configs/selfless/unified_baseline_100b_ascend_64npu.yaml"
-export RUN_PROJECT="unified-a-lr-sweep-1b-s42/${ARM_ID}"
-export RUN_NAME="unified-a-${ARM_ID}-1b-s42"
+export RUN_PROJECT="unified-b-lr-sweep-1b-s42/${ARM_ID}"
+export RUN_NAME="unified-b-${ARM_ID}-1b-s42"
 export RUN_ROOT="output/${RUN_PROJECT}"
 export BACKBONE_LR FLOW_LR
-export ABLATION="a"
+export ABLATION="b"
 export RESUME_FROM="none"
 export STOP_AFTER_STEPS="955"
 export SAVE_EVERY="955"

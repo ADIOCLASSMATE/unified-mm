@@ -1,4 +1,4 @@
-# Unified baseline initialized from Qwen3-0.6B-Base.
+# Unified baseline-B initialized from Qwen3-0.6B-Base.
 #
 # One optimizer update on 64 NPUs is frozen to four microbatches:
 #   ClimbMix B4xL2048 -> ImageNet T2I B16xL512 ->
@@ -10,8 +10,8 @@
 # runs the complete 100B nominal text-target horizon. Its historical LR winner
 # is frozen here; no new 0.6B sweep or sweep-checkpoint resume is permitted.
 experiment:
-    project: "unified-baseline-qwen3-0.6b-100b"
-    name: "baseline-qwen3-0.6b-climbmix-imagenet-t2i-i2t-64x910b"
+    project: "unified-b-0p6b-100b-imagenet-split-s42-r1"
+    name: "unified-b-qwen3-0.6b-100b-imagenet-split-s42-r1"
     wandb_project: "unified-mm"
     output_dir: "output"
     save_every: 2000
@@ -57,7 +57,7 @@ model:
     model_path: "public/models/Qwen--Qwen3-0.6B-Base"
     architecture_variant: "selfless_contextual"
     training_objective: "selfless_dual_stream"
-    dual_stream_attention_contract: "selfless_strict"
+    dual_stream_attention_contract: "xlnet_content_diagonal"
     showo_mask_schedule: "cosine"
     showo_min_masking_rate: 0.0
     use_flex_attention: true
@@ -68,6 +68,9 @@ model:
     image_flow_width: 1280
     image_flow_num_sampling_steps: "10"
     image_flow_batch_mul: 4
+    # Globally off for B/C and overridden only by D's dedicated launcher.
+    # D applies it inside the T2I Dynamic-XT branch, never to ClimbMix/I2T.
+    dynamic_xt_t2i_gradient_checkpointing: false
     image_flow_time_scale: 1000.0
     image_flow_time_sampling: "logit_normal"
     image_flow_logit_mean: 0.0
@@ -197,7 +200,7 @@ training:
     save_image_flow_adapter: true
 
 evaluation:
-    checkpoint: "output/unified-baseline-qwen3-0.6b-100b/hf_model-final-ema"
+    checkpoint: "output/unified-b-0p6b-100b-imagenet-split-s42-r1/hf_model-final-ema"
     model_dtype: "bf16"
     samples: 50000
     batch_size: 4096

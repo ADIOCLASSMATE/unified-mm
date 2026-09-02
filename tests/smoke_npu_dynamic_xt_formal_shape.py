@@ -26,8 +26,9 @@ def main() -> None:
     valid_end = image_end + 2
 
     config = OmegaConf.load(
-        "configs/selfless/imagenet1k_class_dynamic_xt_800ep.yaml"
+        "configs/selfless/unified_baseline_100b_ascend_64npu.yaml"
     )
+    config.model.architecture_variant = "dynamic_xt"
     model, _ = load_dynamic_xt_model_tokenizer(
         config,
         model_dtype=torch.bfloat16,
@@ -97,6 +98,13 @@ def main() -> None:
         device,
         segment_ids=segment_ids,
     )
+    content_attention_mask = get_selfless_mask(
+        sigma,
+        seq_len,
+        device,
+        segment_ids=segment_ids,
+        include_diagonal=True,
+    )
     backbone_calls = 0
 
     def count_backbone_calls(_module, _args, _output):
@@ -108,11 +116,14 @@ def main() -> None:
         X0_input_ids=input_ids,
         labels=input_ids,
         attention_mask=attention_mask,
+        content_attention_mask=content_attention_mask,
         token_types=token_types,
         image_latents=image_latents,
         image_local_positions=local_positions,
         image_span_table=span_table,
         flow_sigma=sigma,
+        compute_text_loss=False,
+        compute_image_loss=True,
         record_flow_stats=True,
     )
     if not bool(torch.isfinite(output.loss).item()):
@@ -122,10 +133,17 @@ def main() -> None:
     if set(output.per_modality_count) != {"text_tokens", "image_tokens"}:
         raise AssertionError("Dynamic-XT did not return per-modality counts")
     if int(output.per_modality_count["image_tokens"].item()) != (
-        batch_size * image_tokens
+        batch_size * image_tokens * 4
     ):
         raise AssertionError("Dynamic-XT returned the wrong image-token count")
-    torch.testing.assert_close(output.per_modality_loss["image_loss"], output.loss)
+    torch.testing.assert_close(
+        output.per_modality_loss["image_loss"],
+        output.loss,
+    )
+    if int(output.dynamic_xt_query_batch_mul) != 4:
+        raise AssertionError("Dynamic-XT query batch multiplier changed")
+    if int(output.dynamic_xt_content_batch_size) != batch_size:
+        raise AssertionError("Dynamic-XT repeated the content stream")
     output.loss.backward()
     hook.remove()
     if backbone_calls != 1:

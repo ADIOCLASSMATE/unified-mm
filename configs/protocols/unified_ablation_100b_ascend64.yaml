@@ -1,6 +1,7 @@
-# Formal a/b/c protocol.  The historical 0.6B LR winner is frozen as readable
-# constants; every arm starts from the same Qwen weights at optimizer step zero.
-schema: unified_ablation_100b_v2
+# Formal baseline-b, C-on-B, and D-on-B protocol. The selected 0.6B learning rates are
+# frozen as readable constants; every fresh arm starts from the same Qwen
+# weights at optimizer step zero.
+schema: unified_ablation_100b_v4
 base_config: configs/selfless/unified_baseline_100b_ascend_64npu.yaml
 platform_project: "随机序语言建模-统一自回归与掩码扩散的随机顺序生成框架"
 world_size: 64
@@ -50,9 +51,9 @@ shared:
     source_schedule: [climbmix, t2i, climbmix, i2t]
     climbmix_tokenization: online
     text_sequence_length: 2048
-    historical_lr_sweep:
+    image_flow_batch_mul: 4
+    selected_lr:
         rerun: false
-        winner_id: b30e5-f5e5
         backbone_and_special_lr: 3.0e-4
         flow_and_projector_lr: 5.0e-5
     imagenet:
@@ -66,24 +67,27 @@ shared:
             tasks_per_image: [t2i, i2t]
         train_validation_overlap_allowed: false
 comparability:
-    a_vs_b_only_allowed_difference: model.dual_stream_attention_contract
-    a_vs_c_only_allowed_difference: model.architecture_variant
-    query_stream_identical: true
+    baseline: b
+    b_vs_c_only_allowed_difference: model.architecture_variant
+    b_vs_d_only_allowed_difference: model.architecture_variant
+    b_vs_c_query_stream_identical: true
+    b_vs_d_query_stream_identical: false
+    b_vs_d_static_contract_identical: true
+    b_vs_d_image_flow_batch_mul_identical: true
     initialization_identical: true
     data_and_schedule_identical: true
     optimizer_and_lr_identical: true
     token_budget_identical: true
+    systems_only_differences:
+        d: [t2i_dynamic_decoder_activation_checkpointing]
+    systems_only_differences_change_objective: false
 run_projects:
-    a: unified-a-0p6b-100b-imagenet-split-s42-r1
     b: unified-b-0p6b-100b-imagenet-split-s42-r1
-    c: unified-c-0p6b-100b-imagenet-split-s42-r1
+    c: unified-c-on-b-0p6b-100b-imagenet-split-s42-r1
+    d: unified-d-on-b-0p6b-100b-imagenet-split-s42-r1
 ablations:
-    a:
-        training_objective: selfless_dual_stream
-        query_attention: "sigma_kv < sigma_q"
-        content_attention: "sigma_kv < sigma_q"
-        start: qwen_pretrained_step_0
     b:
+        status: main_baseline
         training_objective: selfless_dual_stream
         query_attention: "sigma_kv < sigma_q"
         content_attention: "sigma_kv <= sigma_q"
@@ -94,9 +98,29 @@ ablations:
         text_stream: single_x0
         text_attention: physical_position_causal
         text_prediction: "hidden[j-1] -> token[j]"
-        image_stream: identical_to_a_selfless_dual_stream
-        image_attention: "sigma_kv < sigma_q"
-        image_loss_positions: identical_to_a
+        dual_stream_attention_contract: xlnet_content_diagonal
+        image_stream: identical_to_b_selfless_dual_stream
+        image_attention: "sigma_kv <= sigma_q"
+        image_loss_positions: identical_to_b
+        start: qwen_pretrained_step_0
+    d:
+        architecture_variant: dynamic_xt
+        training_objective: selfless_dual_stream
+        dual_stream_attention_contract: xlnet_content_diagonal
+        query_attention: "sigma_kv < sigma_q"
+        content_attention: "sigma_kv <= sigma_q"
+        backbone_condition: "embed(x_t) + time_embed(t)"
+        condition_refresh: every_ode_velocity_evaluation
+        dynamic_query_scope: t2i_only
+        content_stream_batch: B
+        query_stream_batch: 4B_for_t2i_B_otherwise
+        image_flow_batch_mul: 4
+        t2i_micro_batch_size_per_rank: 16
+        rf_states_per_t2i_microbatch_per_rank: 64
+        global_gradient_checkpointing: false
+        gradient_checkpointing: t2i_dynamic_decoder_layers_only
+        time_embedder_optimizer_role: backbone
+        content_compute: once_per_layer
         start: qwen_pretrained_step_0
     g:
         status: deferred

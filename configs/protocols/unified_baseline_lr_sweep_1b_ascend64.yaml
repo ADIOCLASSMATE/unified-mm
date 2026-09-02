@@ -1,10 +1,10 @@
-# Frozen 1B learning-rate sweep for ablation-a. This manifest contains only
+# Frozen 1B learning-rate sweep for baseline b. This manifest contains only
 # readable fields; training, resume validation, and selection compute no hashes.
 schema: unified_lr_sweep_v1
 base_config: configs/selfless/unified_baseline_100b_ascend_64npu.yaml
 platform_project: "随机序语言建模-统一自回归与掩码扩散的随机顺序生成框架"
-sweep_project: unified-a-lr-sweep-1b-s42
-output_root: output/unified-a-lr-sweep-1b-s42
+sweep_project: unified-b-lr-sweep-1b-s42
+output_root: output/unified-b-lr-sweep-1b-s42
 world_size: 64
 nodes: 4
 npu_per_node: 16
@@ -35,45 +35,45 @@ arms:
     - id: b20e5-f3e5
       backbone_lr: 2.0e-4
       flow_lr: 3.0e-5
-      job_name: umm-a-b20-f3-1b-s42
+      job_name: umm-b-b20-f3-1b-s42
       wave: 3
     - id: b20e5-f4e5
       backbone_lr: 2.0e-4
       flow_lr: 4.0e-5
-      job_name: umm-a-b20-f4-1b-s42
+      job_name: umm-b-b20-f4-1b-s42
       wave: 2
     - id: b20e5-f5e5
       backbone_lr: 2.0e-4
       flow_lr: 5.0e-5
-      job_name: umm-a-b20-f5-1b-s42
+      job_name: umm-b-b20-f5-1b-s42
       wave: 3
     - id: b24e5-f3e5
       backbone_lr: 2.4e-4
       flow_lr: 3.0e-5
-      job_name: umm-a-b24-f3-1b-s42
+      job_name: umm-b-b24-f3-1b-s42
       wave: 2
     - id: b24e5-f4e5
       backbone_lr: 2.4e-4
       flow_lr: 4.0e-5
-      job_name: umm-a-b24-f4-1b-s42-r1
+      job_name: umm-b-b24-f4-1b-s42-r1
       wave: 1
     - id: b24e5-f5e5
       backbone_lr: 2.4e-4
       flow_lr: 5.0e-5
-      job_name: umm-a-b24-f5-1b-s42
+      job_name: umm-b-b24-f5-1b-s42
       wave: 2
     - id: b30e5-f3e5
       backbone_lr: 3.0e-4
       flow_lr: 3.0e-5
-      job_name: umm-a-b30-f3-1b-s42
+      job_name: umm-b-b30-f3-1b-s42
       wave: 3
     - id: b30e5-f4e5
       backbone_lr: 3.0e-4
       flow_lr: 4.0e-5
-      job_name: umm-a-b30-f4-1b-s42
+      job_name: umm-b-b30-f4-1b-s42
       wave: 1
     - id: b30e5-f5e5
       backbone_lr: 3.0e-4
       flow_lr: 5.0e-5
-      job_name: umm-a-b30-f5-1b-s42
+      job_name: umm-b-b30-f5-1b-s42
       wave: 1

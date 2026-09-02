@@ -100,6 +100,13 @@ def load_model_tokenizer(
         SingleStreamTextARConfig,
         SingleStreamTextARQwen3ForCausalLM,
     )
+    # Register the dedicated D checkpoint type before AutoConfig inspects the
+    # model source.  This is required when evaluating or resuming a saved D
+    # checkpoint whose model_type is already selfless_flow_dynamic_xt.
+    from models.modeling_model.modeling_selfless_flow_dynamic_xt import (
+        DynamicXtQwen3ForCausalLM,
+        SelflessFlowDynamicXtConfig,
+    )
 
     validate_image_data_layout(config)
     if model_dtype not in {torch.bfloat16, torch.float32}:
@@ -139,11 +146,16 @@ def load_model_tokenizer(
         if model_config_class is None:
             model_config_class = SingleStreamTextARConfig
         implementation_label = "single_stream_text_ar"
+    elif architecture_variant == "dynamic_xt":
+        Qwen3ForCausalLM = DynamicXtQwen3ForCausalLM
+        if model_config_class is None:
+            model_config_class = SelflessFlowDynamicXtConfig
+        implementation_label = "dynamic_xt_on_b"
     else:
         raise ValueError(
             f"Unknown model.architecture_variant={architecture_variant!r}; "
             "expected selfless_contextual, positionwise_selfless, or "
-            "single_stream_text_ar."
+            "single_stream_text_ar, or dynamic_xt."
         )
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -190,7 +202,6 @@ def load_model_tokenizer(
         "dual_stream_attention_contract",
         "showo_mask_schedule",
         "showo_min_masking_rate",
-        "dynamic_xt_contract",
         "boi_token_id",
         "eoi_token_id",
         "image_mask_token_id",
@@ -201,6 +212,7 @@ def load_model_tokenizer(
         "image_flow_num_sampling_steps",
         "image_flow_batch_mul",
         "image_flow_grad_checkpointing",
+        "dynamic_xt_t2i_gradient_checkpointing",
         "image_flow_time_scale",
         "image_flow_time_sampling",
         "image_flow_logit_mean",

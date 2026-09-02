@@ -10,8 +10,13 @@ LAUNCHER = Path(
 B_LAUNCHER = Path(
     "script/selfless/pretraining_unified_ablation_b_0p6b_formal_ascend64.sh"
 )
-RESUME_C_LAUNCHER = Path(
-    "script/selfless/pretraining_unified_ablation_c_resume_ascend64.sh"
+C_LAUNCHER = Path(
+    "script/selfless/"
+    "pretraining_unified_ablation_c_on_b_0p6b_formal_ascend64.sh"
+)
+D_LAUNCHER = Path(
+    "script/selfless/"
+    "pretraining_unified_ablation_d_on_b_0p6b_formal_ascend64.sh"
 )
 BASE_LAUNCHER = Path(
     "script/selfless/pretraining_unified_baseline_ascend_64npu_100b.sh"
@@ -25,7 +30,7 @@ def test_formal_protocol_is_comparable_complete_and_no_hash():
     protocol = OmegaConf.load(MANIFEST)
     base = OmegaConf.load(protocol.base_config)
 
-    assert protocol.schema == "unified_ablation_100b_v2"
+    assert protocol.schema == "unified_ablation_100b_v4"
     assert protocol.world_size == 64
     assert protocol.nodes * protocol.npu_per_node == protocol.world_size
     assert protocol.target_text_tokens == 100_000_000_000
@@ -61,42 +66,83 @@ def test_formal_protocol_is_comparable_complete_and_no_hash():
     assert base.training.runtime_hashing_enabled is False
     assert protocol.shared.climbmix_tokenization == "online"
     assert protocol.shared.text_sequence_length == 2048
+    assert protocol.shared.image_flow_batch_mul == 4
     assert protocol.shared.start == "qwen_pretrained_step_0"
     assert protocol.shared.resume_from_checkpoint == "none"
-    assert protocol.shared.historical_lr_sweep.rerun is False
+    assert protocol.shared.selected_lr.rerun is False
     assert float(
-        protocol.shared.historical_lr_sweep.backbone_and_special_lr
+        protocol.shared.selected_lr.backbone_and_special_lr
     ) == 3.0e-4
     assert float(
-        protocol.shared.historical_lr_sweep.flow_and_projector_lr
+        protocol.shared.selected_lr.flow_and_projector_lr
     ) == 5.0e-5
     assert protocol.shared.imagenet.train.split == "train"
     assert protocol.shared.imagenet.validation.split == "val"
     assert protocol.shared.imagenet.train_validation_overlap_allowed is False
 
-    assert protocol.ablations.a.start == "qwen_pretrained_step_0"
+    assert set(protocol.ablations) == {"b", "c", "d", "g"}
+    assert set(protocol.run_projects) == {"b", "c", "d"}
+    assert base.model.dual_stream_attention_contract == (
+        "xlnet_content_diagonal"
+    )
     assert protocol.ablations.b.start == "qwen_pretrained_step_0"
-    assert protocol.ablations.a.query_attention == (
-        protocol.ablations.b.query_attention
-    )
-    assert protocol.ablations.a.content_attention == "sigma_kv < sigma_q"
+    assert protocol.ablations.b.status == "main_baseline"
+    assert protocol.ablations.b.query_attention == "sigma_kv < sigma_q"
     assert protocol.ablations.b.content_attention == "sigma_kv <= sigma_q"
-    assert protocol.comparability.a_vs_b_only_allowed_difference == (
-        "model.dual_stream_attention_contract"
-    )
-    assert protocol.comparability.query_stream_identical is True
+    assert protocol.comparability.baseline == "b"
+    assert protocol.comparability.b_vs_c_query_stream_identical is True
+    assert protocol.comparability.b_vs_d_query_stream_identical is False
+    assert protocol.comparability.b_vs_d_static_contract_identical is True
+    assert protocol.comparability.b_vs_d_image_flow_batch_mul_identical is True
     assert protocol.ablations.c.start == "qwen_pretrained_step_0"
-    assert protocol.comparability.a_vs_c_only_allowed_difference == (
+    assert protocol.comparability.b_vs_c_only_allowed_difference == (
         "model.architecture_variant"
     )
     assert protocol.ablations.c.architecture_variant == "single_stream_text_ar"
     assert protocol.ablations.c.training_objective == "selfless_dual_stream"
     assert protocol.ablations.c.text_stream == "single_x0"
     assert protocol.ablations.c.text_attention == "physical_position_causal"
-    assert protocol.ablations.c.image_stream == (
-        "identical_to_a_selfless_dual_stream"
+    assert protocol.ablations.c.dual_stream_attention_contract == (
+        "xlnet_content_diagonal"
     )
-    assert protocol.ablations.c.image_loss_positions == "identical_to_a"
+    assert protocol.ablations.c.image_stream == (
+        "identical_to_b_selfless_dual_stream"
+    )
+    assert protocol.ablations.c.image_attention == "sigma_kv <= sigma_q"
+    assert protocol.ablations.c.image_loss_positions == "identical_to_b"
+    assert protocol.ablations.d.start == "qwen_pretrained_step_0"
+    assert protocol.comparability.b_vs_d_only_allowed_difference == (
+        "model.architecture_variant"
+    )
+    assert protocol.ablations.d.architecture_variant == "dynamic_xt"
+    assert protocol.ablations.d.training_objective == "selfless_dual_stream"
+    assert protocol.ablations.d.dual_stream_attention_contract == (
+        "xlnet_content_diagonal"
+    )
+    assert protocol.ablations.d.query_attention == "sigma_kv < sigma_q"
+    assert protocol.ablations.d.content_attention == "sigma_kv <= sigma_q"
+    assert protocol.ablations.d.condition_refresh == (
+        "every_ode_velocity_evaluation"
+    )
+    assert protocol.ablations.d.content_stream_batch == "B"
+    assert protocol.ablations.d.dynamic_query_scope == "t2i_only"
+    assert protocol.ablations.d.query_stream_batch == "4B_for_t2i_B_otherwise"
+    assert protocol.ablations.d.image_flow_batch_mul == 4
+    assert protocol.ablations.d.t2i_micro_batch_size_per_rank == 16
+    assert protocol.ablations.d.rf_states_per_t2i_microbatch_per_rank == 64
+    assert protocol.ablations.d.global_gradient_checkpointing is False
+    assert protocol.ablations.d.gradient_checkpointing == (
+        "t2i_dynamic_decoder_layers_only"
+    )
+    assert protocol.comparability.systems_only_differences.d == [
+        "t2i_dynamic_decoder_activation_checkpointing"
+    ]
+    assert (
+        protocol.comparability.systems_only_differences_change_objective
+        is False
+    )
+    assert protocol.ablations.d.time_embedder_optimizer_role == "backbone"
+    assert protocol.ablations.d.content_compute == "once_per_layer"
     assert protocol.ablations.g.status == "deferred"
 
 
@@ -115,23 +161,31 @@ def test_formal_launcher_freezes_current_baseline_contract():
     assert 'PRESERVE_MODEL_CONTRACT="false"' in source
     assert 'WANDB_MODE="disabled"' in source
     assert "SELECTION" not in source
-    assert "sweep checkpoint" in source
+    assert "baseline-b contract" in source
     assert "hashlib" not in source.lower()
     assert "sha256" not in source.lower()
 
     base_source = BASE_LAUNCHER.read_text(encoding="utf-8")
     assert 'SAVE_EMA_EVAL_EVERY="${SAVE_EMA_EVAL_EVERY:-12510}"' in base_source
     assert '--save-ema-eval-every "${SAVE_EMA_EVAL_EVERY}"' in base_source
-    assert 'DUAL_STREAM_ATTENTION_CONTRACT="selfless_strict"' in base_source
-    assert (
-        'DUAL_STREAM_ATTENTION_CONTRACT="xlnet_content_diagonal"'
-        in base_source
-    )
+    assert 'ABLATION="${ABLATION:-b}"' in base_source
+    assert 'DUAL_STREAM_ATTENTION_CONTRACT="selfless_strict"' not in base_source
+    assert 'DUAL_STREAM_ATTENTION_CONTRACT="xlnet_content_diagonal"' in base_source
+    assert "unified-c-on-b-0p6b-100b-imagenet-split-s42-r1" in base_source
+    assert "unified-d-on-b-0p6b-100b-imagenet-split-s42-r1" in base_source
     assert (
         '"model.dual_stream_attention_contract=${DUAL_STREAM_ATTENTION_CONTRACT}"'
         in base_source
     )
     assert 'ARCHITECTURE_VARIANT="single_stream_text_ar"' in base_source
+    assert 'ARCHITECTURE_VARIANT="dynamic_xt"' in base_source
+    assert 'TRAIN_ENTRY="pretrain/train_selfless_flow_dynamic_xt.py"' in base_source
+    assert '"model.image_flow_batch_mul=${IMAGE_FLOW_BATCH_MUL}"' in base_source
+    assert (
+        '"model.dynamic_xt_t2i_gradient_checkpointing=${DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING}"'
+        in base_source
+    )
+    assert '"training.use_gradient_checkpointing=false"' in base_source
     assert (
         '"model.architecture_variant=${ARCHITECTURE_VARIANT}"' in base_source
     )
@@ -149,23 +203,50 @@ def test_dedicated_b_launcher_selects_only_xlnet_content_diagonal_arm():
     ) in source
 
     smoke_source = SMOKE_LAUNCHER.read_text(encoding="utf-8")
-    assert 'ABLATION="${ABLATION:-a}"' in smoke_source
+    assert 'ABLATION="${ABLATION:-b}"' in smoke_source
+    assert 'SAVE_FINAL="${SAVE_FINAL:-false}"' in smoke_source
+    assert '"experiment.save_final=${SAVE_FINAL}"' in smoke_source
     assert "xlnet_content_diagonal" in smoke_source
     assert 'ARCHITECTURE_VARIANT="single_stream_text_ar"' in smoke_source
+    assert "unified-c-on-b-qwen3-0.6b-smoke-ascend16" in smoke_source
+    assert "unified-d-on-b-qwen3-0.6b-smoke-ascend16" in smoke_source
+    assert 'TRAIN_ENTRY="pretrain/train_selfless_flow_dynamic_xt.py"' in smoke_source
+    assert '"model.image_flow_batch_mul=${IMAGE_FLOW_BATCH_MUL}"' in smoke_source
+    assert (
+        '"model.dynamic_xt_t2i_gradient_checkpointing=${DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING}"'
+        in smoke_source
+    )
+    assert '"training.use_gradient_checkpointing=false"' in smoke_source
     assert 'TRAINING_OBJECTIVE="showo_mae_flow"' not in smoke_source
     assert '--ablation "${ABLATION}"' in smoke_source
 
 
-def test_dedicated_c_resume_launcher_is_scoped_to_its_completed_checkpoint():
-    source = RESUME_C_LAUNCHER.read_text(encoding="utf-8")
+def test_dedicated_c_on_b_launcher_forces_fresh_b_based_run():
+    source = C_LAUNCHER.read_text(encoding="utf-8")
     formal_source = LAUNCHER.read_text(encoding="utf-8")
 
     assert 'export ABLATION="c"' in source
-    assert 'export ALLOW_FORMAL_RESUME="true"' in source
-    assert 'checkpoint-${RESUME_STEP}' in source
-    assert 'resume-step-${RESUME_STEP}-${RESUME_ATTEMPT}' in source
+    assert "unified-c-on-b-0p6b" in source
+    assert 'export ALLOW_FORMAL_RESUME="false"' in source
+    assert "retired C-on-A" in source
+    assert "FORMAL_RESUME_FROM" not in source
     assert "pretraining_unified_ablation_100b_ascend64.sh" in source
     assert 'RESUME_FROM="none"' in formal_source
     assert 'FORMAL_RESUME_FROM is required for formal resume' in formal_source
     assert 'checkpoint_complete.json' in formal_source
     assert 'metadata.json' in formal_source
+
+
+def test_dedicated_d_on_b_launcher_forces_fresh_mul4_run():
+    source = D_LAUNCHER.read_text(encoding="utf-8")
+    formal_source = LAUNCHER.read_text(encoding="utf-8")
+
+    assert 'export ABLATION="d"' in source
+    assert "unified-d-on-b-0p6b" in source
+    assert 'export ALLOW_FORMAL_RESUME="false"' in source
+    assert "retired A-based Dynamic-XT" in source
+    assert "FORMAL_RESUME_FROM" not in source
+    assert "pretraining_unified_ablation_100b_ascend64.sh" in source
+    assert 'export IMAGE_FLOW_BATCH_MUL="4"' in source
+    assert 'export DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING="true"' in source
+    assert "ABLATION must be b, c, or d" in formal_source

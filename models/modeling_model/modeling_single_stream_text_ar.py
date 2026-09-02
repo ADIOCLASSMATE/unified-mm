@@ -6,8 +6,8 @@ This model changes only the text prediction contract:
 * the hidden returned at target position ``j`` is the X0 hidden from source
   position ``j - 1`` so existing train/validation/evaluation callers keep their
   target-aligned interface;
-* image-flow training stays unchanged, while image generation uses the same
-  strict-sigma cached single stream as ablation A.
+* image-flow training stays unchanged, while image generation inherits the
+  configured dual-stream attention contract (baseline B for formal training).
 
 The class intentionally adds no parameters.  With the same config payload and
 seed, every parameter shared with the baseline has the same name, shape,
@@ -30,7 +30,7 @@ from .modeling_selfless_flow import (
 
 
 class SingleStreamTextARConfig(Qwen3Config):
-    """Checkpoint identity for text-AR + unchanged image Selfless flow."""
+    """Checkpoint identity for text AR plus configured Selfless image flow."""
 
     model_type = "selfless_flow_single_stream_text_ar"
 
@@ -388,7 +388,7 @@ class SingleStreamTextARQwen3Model(Qwen3Model):
 
 
 class SingleStreamTextARQwen3ForCausalLM(Qwen3ForCausalLM):
-    """Next-token text AR plus ablation-A cached image generation."""
+    """Next-token text AR plus the configured cached image generation path."""
 
     config_class = SingleStreamTextARConfig
     model_type = SingleStreamTextARConfig.model_type
@@ -397,20 +397,9 @@ class SingleStreamTextARQwen3ForCausalLM(Qwen3ForCausalLM):
     text_prediction_offset = 1
     text_hidden_alignment = "target_position_contains_previous_content_hidden"
 
-    def _generation_attention_contract(self) -> str:
-        """C keeps the image stream exactly equal to ablation A."""
-
-        contract = super()._generation_attention_contract()
-        if contract != "selfless_strict":
-            raise ValueError(
-                "single_stream_text_ar image generation must use "
-                f"selfless_strict, got {contract!r}"
-            )
-        return contract
-
     @torch.no_grad()
     def generate_image(self, *args, **kwargs):
-        """Generate images with C's unchanged ablation-A image stream."""
+        """Generate images with the configured baseline attention contract."""
 
         return super().generate_image(*args, **kwargs)
 
@@ -643,7 +632,7 @@ class SingleStreamTextARQwen3ForCausalLM(Qwen3ForCausalLM):
         backbone pass cannot be both physical-causal text AR and bitwise the
         baseline image query stream, so the isolated ablation performs two
         source-specific passes and merges their already weighted losses.  The
-        image pass runs first to preserve baseline-a RNG ordering when this
+        image pass runs first to preserve baseline RNG ordering when this
         cold path is invoked while the module is in training mode.
         """
 
@@ -661,7 +650,7 @@ class SingleStreamTextARQwen3ForCausalLM(Qwen3ForCausalLM):
         labels = kwargs.get("labels", args[5] if len(args) > 5 else None)
         if labels is None and compute_image_loss:
             # With no loss to merge, an image-bearing call is a conditioning
-            # or generation probe.  Keep it on baseline-a's query stream.
+            # or generation probe. Keep it on the configured baseline stream.
             image_kwargs = dict(kwargs)
             image_kwargs["compute_text_loss"] = False
             image_kwargs["compute_image_loss"] = True

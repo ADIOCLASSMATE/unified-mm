@@ -79,7 +79,9 @@ def _comparable_contract(contract: dict[str, Any]) -> dict[str, Any]:
         experiment[key] = "<sweep-arm-identity>"
     model = comparable.setdefault("model", {})
     model.setdefault("training_objective", "selfless_dual_stream")
-    model.setdefault("dual_stream_attention_contract", "selfless_strict")
+    model.setdefault(
+        "dual_stream_attention_contract", "xlnet_content_diagonal"
+    )
     model.setdefault("showo_mask_schedule", "cosine")
     model.setdefault("showo_min_masking_rate", 0.0)
     optimizer = comparable.setdefault("optimizer", {}).setdefault(
@@ -146,11 +148,15 @@ def _read_arm(
     if str(model.get("training_objective", "selfless_dual_stream")) != (
         "selfless_dual_stream"
     ):
-        raise ValueError(f"{checkpoint}: sweep arm is not ablation a")
-    if str(model.get("dual_stream_attention_contract", "selfless_strict")) != (
-        "selfless_strict"
+        raise ValueError(f"{checkpoint}: sweep arm is not baseline b")
+    if str(
+        model.get(
+            "dual_stream_attention_contract", "xlnet_content_diagonal"
+        )
+    ) != (
+        "xlnet_content_diagonal"
     ):
-        raise ValueError(f"{checkpoint}: sweep arm is not ablation a")
+        raise ValueError(f"{checkpoint}: sweep arm is not baseline b")
     expected_backbone_lr = _require_finite_positive(
         arm["backbone_lr"], f"{arm_id}.backbone_lr"
     )

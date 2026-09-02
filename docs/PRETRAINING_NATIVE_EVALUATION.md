@@ -89,7 +89,7 @@ COCO caption perplexity, and incomplete Winoground/SVO-Probes/What'sUp runs.
 ## Canonical launch
 
 ```bash
-RUN_ROOT=output/unified-a-0p6b-100b-imagenet-split-s42-r1
+RUN_ROOT=output/unified-b-0p6b-100b-imagenet-split-s42-r1
 EVAL_PROFILE=formal \
   script/selfless/evaluate_unified_native_full_checkpoint_ascend16.sh \
   "${RUN_ROOT}/hf_model-final-ema" /path/to/evaluation-output

@@ -20,21 +20,21 @@ case "${SOURCE_TASK}" in
   climbmix|text)
     SOURCE_TASK="climbmix"
     DEFAULT_CONFIG="configs/selfless/unified_single_text_0p6b_100b_ascend16.yaml"
-    DEFAULT_RUN_PROJECT="unified-a-0p6b-text-only-100bphys-s42-r1"
+    DEFAULT_RUN_PROJECT="unified-b-0p6b-text-only-100bphys-s42-r1"
     FORMAL_STEPS=95368
     DEFAULT_SAVE_EMA_EVAL_EVERY=12510
     ;;
   i2t|caption)
     SOURCE_TASK="i2t"
     DEFAULT_CONFIG="configs/selfless/unified_single_caption_0p6b_100b_ascend16.yaml"
-    DEFAULT_RUN_PROJECT="unified-a-0p6b-caption-only-100bphys-s42-r1"
+    DEFAULT_RUN_PROJECT="unified-b-0p6b-caption-only-100bphys-s42-r1"
     FORMAL_STEPS=190736
     DEFAULT_SAVE_EMA_EVAL_EVERY=12510
     ;;
   t2i|image)
     SOURCE_TASK="t2i"
     DEFAULT_CONFIG="configs/selfless/unified_single_t2i_0p6b_100b_ascend16.yaml"
-    DEFAULT_RUN_PROJECT="unified-a-0p6b-t2i-only-100bphys-s42-r1"
+    DEFAULT_RUN_PROJECT="unified-b-0p6b-t2i-only-100bphys-s42-r1"
     FORMAL_STEPS=190736
     DEFAULT_SAVE_EMA_EVAL_EVERY=12510
     ;;

@@ -95,7 +95,7 @@ def _source_from_schedule(config: DictConfig) -> tuple[str, tuple[str, ...]]:
 
 
 def _validate_global_protocol(protocol: DictConfig) -> DictConfig:
-    _expect("protocol.schema", protocol.schema, "unified_single_source_0p6b_100b_v1")
+    _expect("protocol.schema", protocol.schema, "unified_single_source_0p6b_100b_v2")
     _expect("protocol.world_size", int(protocol.world_size), EXPECTED_WORLD_SIZE)
     _expect("protocol.nodes", int(protocol.nodes), 1)
     _expect("protocol.npu_per_node", int(protocol.npu_per_node), 16)
@@ -116,7 +116,7 @@ def _validate_global_protocol(protocol: DictConfig) -> DictConfig:
     _expect(
         "protocol.dual_stream_attention_contract",
         protocol.dual_stream_attention_contract,
-        "selfless_strict",
+        "xlnet_content_diagonal",
     )
     _expect("protocol.runtime_hashing_enabled", bool(protocol.runtime_hashing_enabled), False)
     _expect("protocol.wandb_mode", protocol.wandb_mode, "disabled")
@@ -230,8 +230,8 @@ def _validate_shared_model_optimizer(
     *,
     source: str,
 ) -> None:
-    # The architecture, objective, and both task heads remain byte-for-byte
-    # configuration-equivalent to the combined baseline.
+    # The architecture, B attention contract, objective, and both task heads
+    # remain byte-for-byte configuration-equivalent to the combined baseline.
     _expect(f"{source} model contract", config.model, base.model)
     _expect(f"{source} optimizer contract", config.optimizer, base.optimizer)
     _expect(f"{source} model_path", config.model.model_path, EXPECTED_MODEL_PATH)

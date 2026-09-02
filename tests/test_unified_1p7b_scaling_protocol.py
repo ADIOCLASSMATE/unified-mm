@@ -33,6 +33,10 @@ def test_1p7b_preserves_global_data_and_token_budget_on_64_npus():
     sources = config.dataset.params.sources
 
     assert config.model.model_path.endswith("Qwen--Qwen3-1.7B-Base")
+    assert config.model.dual_stream_attention_contract == (
+        "xlnet_content_diagonal"
+    )
+    assert str(config.experiment.project).startswith("unified-b-")
     assert sources.climbmix.tokenizer_path == config.model.model_path
     assert schedule == ["climbmix", "t2i", "climbmix", "i2t"]
     assert int(sources.climbmix.sequence_length) == 2048
@@ -72,6 +76,8 @@ def test_1p7b_lr_grid_is_width_scaled_and_complete():
     config = OmegaConf.load(manifest.base_config)
 
     assert manifest.schema == "unified_lr_sweep_v1"
+    assert str(manifest.sweep_project).startswith("unified-b-")
+    assert str(manifest.formal_output_root).startswith("output/unified-b-")
     assert int(manifest.nodes) == 4
     assert int(manifest.npu_per_node) == 16
     assert int(manifest.world_size) == 64
@@ -141,6 +147,10 @@ def test_1p7b_launchers_freeze_64_card_no_hash_sweep_only():
     assert 'FLOW_LR="${FLOW_LR:-6.0e-5}"' in base
     assert 'SAVE_EMA_EVAL_EVERY="${SAVE_EMA_EVAL_EVERY:-12510}"' in base
     assert '--save-ema-eval-every "${SAVE_EMA_EVAL_EVERY}"' in base
+    assert 'ABLATION="${ABLATION:-b}"' in base
+    assert 'model.dual_stream_attention_contract=xlnet_content_diagonal' in base
+    assert 'export ABLATION="b"' in arm
+    assert 'export ABLATION="b"' in smoke
     assert 'BACKBONE_LR="${BACKBONE_LR:-2.4e-4}"' in smoke
     assert 'FLOW_LR="${FLOW_LR:-6.0e-5}"' in smoke
 

@@ -96,6 +96,51 @@ def test_raw_hf_export_without_ema_provenance_is_rejected(tmp_path):
         resolve_evaluation_model_source(model)
 
 
+def test_dynamic_hf_export_requires_backbone_time_embedder_weights(tmp_path):
+    model = tmp_path / "hf_model-final-ema"
+    model.mkdir()
+    (model / "config.json").write_text(
+        json.dumps(
+            {
+                "architecture_variant": "dynamic_xt",
+                "training_objective": "selfless_dual_stream",
+                "dual_stream_attention_contract": "xlnet_content_diagonal",
+                "image_tokens_per_img": 256,
+                "image_latent_dim": 16,
+                "image_flow_width": 1280,
+                "image_flow_depth": 8,
+                "image_flow_batch_mul": 4,
+            }
+        ),
+        encoding="utf-8",
+    )
+    save_file(
+        {
+            "model.image_token_embedder.weight": torch.zeros(1),
+            "image_flow_condition_proj.weight": torch.zeros(1),
+            "image_flow_head.weight": torch.zeros(1),
+        },
+        model / "model.safetensors",
+    )
+    (model / "tokenizer.json").write_text("{}", encoding="utf-8")
+    (model / "ema_export_metadata.json").write_text(
+        json.dumps(
+            {
+                "schema": "selfless_ema_hf_export_v1",
+                "floating_dtype": "float32",
+                "source_global_step": 95_415,
+                "source_world_size": 64,
+                "state_key_count": 3,
+                "export_kind": "training",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="backbone_flow_time_embedder"):
+        resolve_evaluation_model_source(model)
+
+
 def test_hf_checkpoint_architecture_is_authoritative(tmp_path):
     model = tmp_path / "hf_model-final-ema"
     model.mkdir()

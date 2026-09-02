@@ -29,6 +29,10 @@ def test_frozen_sweep_grid_and_no_hash_contract():
     assert base.training.max_train_steps == 95415
     assert base.lr_scheduler.params.warmup_steps == 596
     assert base.lr_scheduler.params.decay_steps == 23854
+    assert base.model.dual_stream_attention_contract == (
+        "xlnet_content_diagonal"
+    )
+    assert str(sweep.sweep_project).startswith("unified-b-")
 
     arms = list(sweep.arms)
     assert len(arms) == 9
@@ -51,6 +55,7 @@ def test_frozen_sweep_grid_and_no_hash_contract():
     assert "SAVE_EMA_EVAL_EVERY=\"0\"" in launcher
     assert "RESUME_FROM=\"none\"" in launcher
     assert 'WANDB_MODE="disabled"' in launcher
+    assert 'export ABLATION="b"' in launcher
     assert "sha256" not in launcher.lower()
     assert "hashlib" not in launcher.lower()
 
@@ -94,7 +99,7 @@ def _fake_arm_artifacts(
                 },
                 "model": {
                     "training_objective": "selfless_dual_stream",
-                    "dual_stream_attention_contract": "selfless_strict",
+                    "dual_stream_attention_contract": "xlnet_content_diagonal",
                 },
                 "training": {"runtime_hashing_enabled": False},
                 "optimizer": {
@@ -227,7 +232,7 @@ def test_selector_rejects_non_lr_contract_drift(tmp_path):
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     metadata["config_contract"]["model"][
         "dual_stream_attention_contract"
-    ] = "xlnet_content_diagonal"
+    ] = "selfless_strict"
     _write_json(metadata_path, metadata)
 
     manifest = {
@@ -246,7 +251,7 @@ def test_selector_rejects_non_lr_contract_drift(tmp_path):
     }
     manifest_path = tmp_path / "sweep.yaml"
     OmegaConf.save(OmegaConf.create(manifest), manifest_path)
-    with pytest.raises(ValueError, match="not ablation a"):
+    with pytest.raises(ValueError, match="not baseline b"):
         select(manifest_path)
 
 

@@ -23,11 +23,11 @@ esac
 
 export CONFIG="configs/selfless/unified_baseline_1p7b_100b_ascend_64npu.yaml"
 export ACCELERATE_CONFIG="accelerate_configs/64_npus_4nodes_deepspeed_zero2.yaml"
-export RUN_PROJECT="unified-a-1p7b-lr-sweep-1b-s42/${ARM_ID}"
-export RUN_NAME="unified-a-1p7b-${ARM_ID}-1b-s42"
+export RUN_PROJECT="unified-b-1p7b-lr-sweep-1b-s42/${ARM_ID}"
+export RUN_NAME="unified-b-1p7b-${ARM_ID}-1b-s42"
 export RUN_ROOT="output/${RUN_PROJECT}"
 export BACKBONE_LR FLOW_LR
-export ABLATION="a"
+export ABLATION="b"
 export PRESERVE_MODEL_CONTRACT="false"
 export RESUME_FROM="none"
 export STOP_AFTER_STEPS="955"

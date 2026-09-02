@@ -1,4 +1,4 @@
-# Unified baseline-a initialized from Qwen3-1.7B-Base.
+# Unified baseline-b initialized from Qwen3-1.7B-Base.
 #
 # The 64-NPU run preserves the 0.6B global data contract and GA=4:
 #   ClimbMix B4xL2048 -> ImageNet T2I B16xL512 ->
@@ -8,8 +8,8 @@
 # Consequently both the 1B qualification point (955) and 100B horizon
 # (95,415) are identical to the 0.6B run in token space.
 experiment:
-    project: "unified-baseline-qwen3-1.7b-100b"
-    name: "baseline-a-qwen3-1.7b-climbmix-imagenet-t2i-i2t-64x910b"
+    project: "unified-b-qwen3-1.7b-100b-s42-r1"
+    name: "baseline-b-qwen3-1.7b-climbmix-imagenet-t2i-i2t-64x910b"
     wandb_project: "unified-mm"
     output_dir: "output"
     save_every: 2000
@@ -53,7 +53,7 @@ model:
     model_path: "public/models/Qwen--Qwen3-1.7B-Base"
     architecture_variant: "selfless_contextual"
     training_objective: "selfless_dual_stream"
-    dual_stream_attention_contract: "selfless_strict"
+    dual_stream_attention_contract: "xlnet_content_diagonal"
     showo_mask_schedule: "cosine"
     showo_min_masking_rate: 0.0
     use_flex_attention: true
@@ -192,7 +192,7 @@ training:
     save_image_flow_adapter: true
 
 evaluation:
-    checkpoint: "output/unified-a-qwen3-1.7b-100b-s42-r1/hf_model-final-ema"
+    checkpoint: "output/unified-b-qwen3-1.7b-100b-s42-r1/hf_model-final-ema"
     model_dtype: "bf16"
     samples: 50000
     batch_size: 4096

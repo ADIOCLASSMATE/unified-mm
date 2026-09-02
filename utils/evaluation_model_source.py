@@ -120,6 +120,14 @@ def resolve_evaluation_model_source(path: str | Path) -> EvaluationModelSource:
             "image_flow_condition_proj.",
             "image_flow_head.",
         )
+        if str(metadata.get("architecture_variant", "")).strip().lower() == "dynamic_xt":
+            # Export metadata from older checkpoints may not carry the model
+            # contract, so the authoritative HF config is checked below too.
+            required_prefixes += ("model.backbone_flow_time_embedder.",)
+        hf_config = _read_json(source / "config.json")
+        if str(hf_config.get("architecture_variant", "")).strip().lower() == "dynamic_xt":
+            required_prefixes += ("model.backbone_flow_time_embedder.",)
+        required_prefixes = tuple(dict.fromkeys(required_prefixes))
         missing_prefixes = [
             prefix for prefix in required_prefixes if not any(key.startswith(prefix) for key in keys)
         ]

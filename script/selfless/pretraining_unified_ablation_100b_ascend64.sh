@@ -5,26 +5,36 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${REPO_ROOT}"
 
 ABLATION="${ABLATION:-}"
-if [[ ! "${ABLATION}" =~ ^[abc]$ ]]; then
-  echo "ERROR: ABLATION must be one of a, b, c" >&2
+if [[ ! "${ABLATION}" =~ ^[bcd]$ ]]; then
+  echo "ERROR: ABLATION must be b, c, or d" >&2
   exit 2
 fi
 
-# Freeze every formal-training field to the current baseline-a contract.  For
-# ablation b changes only the content attention contract; ablation c changes
-# only architecture_variant to the isolated single-stream text-AR model.  All
-# arms start from Qwen3-0.6B-Base at optimizer step zero; no sweep checkpoint
-# is resumed.  A failed formal run may opt into its own validated checkpoint
-# through the dedicated ALLOW_FORMAL_RESUME contract below.
+# Freeze every formal-training field to the baseline-b contract. Ablation c
+# selects the isolated single-stream text-AR model. Ablation d selects the
+# isolated Dynamic-XT model and keeps B's image_flow_batch_mul=4. Every fresh
+# arm starts from Qwen3-0.6B-Base at optimizer step zero. A failed run may only
+# resume a checkpoint produced by the same B-based run identity.
 export CONFIG="configs/selfless/unified_baseline_100b_ascend_64npu.yaml"
 export ACCELERATE_CONFIG="accelerate_configs/64_npus_4nodes_deepspeed_zero2.yaml"
 export ABLATION
-export RUN_PROJECT="${RUN_PROJECT:-unified-${ABLATION}-0p6b-100b-imagenet-split-s42-r1}"
-export RUN_NAME="${RUN_NAME:-unified-${ABLATION}-qwen3-0.6b-100b-imagenet-split-s42-r1}"
+if [[ "${ABLATION}" == "c" ]]; then
+  DEFAULT_RUN_PROJECT="unified-c-on-b-0p6b-100b-imagenet-split-s42-r1"
+  DEFAULT_RUN_NAME="unified-c-on-b-qwen3-0.6b-100b-imagenet-split-s42-r1"
+elif [[ "${ABLATION}" == "d" ]]; then
+  DEFAULT_RUN_PROJECT="unified-d-on-b-0p6b-100b-imagenet-split-s42-r1"
+  DEFAULT_RUN_NAME="unified-d-on-b-qwen3-0.6b-100b-imagenet-split-s42-r1"
+else
+  DEFAULT_RUN_PROJECT="unified-b-0p6b-100b-imagenet-split-s42-r1"
+  DEFAULT_RUN_NAME="unified-b-qwen3-0.6b-100b-imagenet-split-s42-r1"
+fi
+export RUN_PROJECT="${RUN_PROJECT:-${DEFAULT_RUN_PROJECT}}"
+export RUN_NAME="${RUN_NAME:-${DEFAULT_RUN_NAME}}"
 export RUN_ROOT="${RUN_ROOT:-output/${RUN_PROJECT}}"
 export OUTPUT_DIR_BASE="output"
 export BACKBONE_LR="3.0e-4"
 export FLOW_LR="5.0e-5"
+export IMAGE_FLOW_BATCH_MUL="4"
 export PRESERVE_MODEL_CONTRACT="false"
 export RESUME_FROM="none"
 ALLOW_FORMAL_RESUME="${ALLOW_FORMAL_RESUME:-false}"
@@ -56,7 +66,7 @@ export VALIDATION_IMAGE_EVERY="2000"
 export VALIDATION_I2T_EVERY="2000"
 export VALIDATION_I2T_SAMPLES="2"
 export VALIDATION_I2T_MAX_NEW_TOKENS="64"
-# Match the immutable a/b launches: periodic paired evaluation exports were
+# Match the immutable baseline-b launch: periodic paired evaluation exports were
 # disabled; normal checkpoints, final current/EMA export and evaluation stay
 # unchanged.
 export SAVE_EMA_EVAL_EVERY="0"
