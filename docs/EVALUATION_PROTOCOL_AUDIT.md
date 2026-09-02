@@ -122,12 +122,10 @@ prior 或对称 PMI，但那不是用户指定的 `log P(text|image)-log P(text)
 
 ## 验证状态
 
-本次验证结果：排除两组依赖系统 TBE 的 NPU 专属测试后，完整 CPU suite 为
-`384 passed, 2 skipped`
-（两项是 CUDA FlexAttention 集成测试）；全部修改过的 Python 文件通过
-`py_compile`，全部修改过的 shell launcher 通过 `bash -n`，9 个协议 YAML 可解析，
-`git diff --check` 通过。NPU 专属测试及实际指标尚未运行，因为当前节点缺少可用的
-CANN/`libascend_hal.so`。
+本次完整 CPU suite 为 `384 passed, 2 skipped`（两项是 CUDA FlexAttention
+集成测试）。CPU 控制节点必须设置 `TORCH_DEVICE_BACKEND_AUTOLOAD=0`，因为该节点
+没有 CANN/`libascend_hal.so`；这只影响本地测试收集，不影响 Ascend 正式作业。
+全部正式多模态 likelihood 作业已在 16×Ascend 910B 环境中完成。
 
 数据门禁也已对当前资产实检：ImageNet val 为 50,000 图/1,000 类且每类 50 图；
 固定 CLIP 类名文件与所钉住 notebook 除两项消歧外逐项一致；COCO/Flickr 分别为
@@ -137,9 +135,21 @@ CANN/`libascend_hal.so`。
 分布和 DPG prompt-file/CSV ID 一致性；MJHQ 官方 metadata 实检为 30,000 条、十类
 各 3,000 条。
 
-完整 50K × 1,000 分类、50K 生成、全量检索、multimodal MC64 和 rFID 均需要
-16 张 Ascend 910B，本报告没有用旧结果或局部 smoke test 冒充新协议结果。当前
-asset v2 已重建为 61,036 张图，但新的 16-shard
-`vae_posterior_mar_kl16_v2` 尚需在 NPU 上生成；正式 Job 完成后才能填入新模型数值。
-GenEval Mask2Former、DPG mPLUG、MJHQ 30K clean-fid 也尚未在各自 CUDA 环境实际
-执行，因此本次只交付并验证协议与调用链，不填造这三项分数。
+正式结果均直接来自 A/B 的 step 95,415 `hf_model-final-ema`：ImageNet 50K×1,000
+分类、ImageNet 50K 生成、COCO/Flickr 全量检索、8 项文本任务，以及 FP32、MC=64
+的 SugarCrepe、ARO Relation、ARO Attribution、MMBench 和 SEED 均已完成。后五项
+分别严格覆盖 7,511、23,937、28,748、4,329、14,233 条记录，每项 16 个 rank
+shard；formal 合并器验证 `project_formal_protocol=true`、三张固定 null image、
+`alpha=1`、仅输出去先验分数。A/B 共 157,516 条预测记录中未出现 `NaN` 或
+`Infinity` 字面量，运行时也由 fail-fast 门禁逐 token 检查非有限值。
+
+开发机上还用完全撤回猜测性 attention 补丁后的原始模型代码，对曾失败的 B/ARO
+Relation 前 400 条连续复跑两次；两次预测文件 SHA256 均为
+`6d9314471248a456187a485eb4df0bb3d8bcfee9a0285f1fd4da5037384c83e6`。因此没有把
+“全 mask attention 行”写成未经证实的根因，也没有保留相关模型补丁；正式全量
+复跑同样通过。
+
+官方生成集也已完整出图并校验 ID/目录：每个模型 GenEval 2,212 张、DPG-Bench
+4,260 张样本加 1,065 张官方 2×2 grid、MJHQ-30K 30,000 张。GenEval
+Mask2Former、DPG mPLUG、MJHQ 30K clean-fid 尚未在各自 CUDA 环境执行，所以三项
+分数继续严格留空，不以 0 或替代指标填充。
