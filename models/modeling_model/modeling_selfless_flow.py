@@ -426,9 +426,7 @@ def compiled_flex_attention(query, key, value, attention_mask, scaling, enable_g
         sparse_mode=0,
         scale=scaling,
     )
-    # Multiplication cannot sanitize a NaN returned for an all-masked row:
-    # IEEE arithmetic keeps ``NaN * 0`` as NaN.  Select an exact zero instead.
-    return torch.where(valid_rows, out[0], torch.zeros_like(out[0]))
+    return out[0] * valid_rows.to(dtype=out[0].dtype)
 
 
 class Qwen3Attention(nn.Module):
