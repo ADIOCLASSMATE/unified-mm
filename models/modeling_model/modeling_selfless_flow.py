@@ -414,7 +414,6 @@ def compiled_flex_attention(query, key, value, attention_mask, scaling, enable_g
                 "prepared attention_mask must contain (safe_mask, valid_rows)"
             )
         safe_mask, valid_rows = attention_mask
-        safe_mask = safe_mask.clone()
     else:
         safe_mask, valid_rows = _to_bool_atten_mask(attention_mask)
     out = torch_npu.npu_fusion_attention(
