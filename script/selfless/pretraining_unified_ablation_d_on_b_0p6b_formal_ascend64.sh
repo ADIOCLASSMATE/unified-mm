@@ -5,8 +5,8 @@ set -euo pipefail
 # dedicated Dynamic-XT architecture.  In particular, flow batch multiplication
 # remains four and the retired A-based Dynamic-XT checkpoint is never resumed.
 export ABLATION="d"
-export RUN_PROJECT="unified-d-on-b-0p6b-100b-imagenet-split-s42-r3"
-export RUN_NAME="unified-d-on-b-qwen3-0.6b-100b-imagenet-split-s42-r3"
+export RUN_PROJECT="unified-d-on-b-0p6b-100b-imagenet-split-s42-r4"
+export RUN_NAME="unified-d-on-b-qwen3-0.6b-100b-imagenet-split-s42-r4"
 export ALLOW_FORMAL_RESUME="false"
 export IMAGE_FLOW_BATCH_MUL="4"
 export FLOW_HEAD_ATTENTION_CONTRACT="xlnet_content_diagonal"

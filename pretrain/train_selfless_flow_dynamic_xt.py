@@ -10,11 +10,13 @@ from models.modeling_model.modeling_selfless_flow_dynamic_xt import (
     DYNAMIC_XT_ARCHITECTURE,
     DYNAMIC_XT_ATTENTION_CONTRACT,
     DYNAMIC_XT_FLOW_BATCH_MUL,
+    DYNAMIC_XT_FLOW_CONDITION_CONTRACT,
     DYNAMIC_XT_FLOW_HEAD_ATTENTION_CONTRACT,
     DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING,
 )
 from pretrain.train_selfless_flow import main as run_selfless_training
 from utils.utils import load_model_tokenizer
+
 
 def load_dynamic_xt_model_tokenizer(
     config,
@@ -90,10 +92,11 @@ def load_dynamic_xt_model_tokenizer(
         logger.info(
             "Ablation D contract: model_type=%s, base=B, "
             "image_flow_batch_mul=%s, t2i_only_checkpointing=%s, "
-            "extra_parameters=%s",
+            "flow_condition_contract=%s, extra_parameters=%s",
             model.model_type,
             model.image_flow_batch_mul,
             selective_checkpointing,
+            DYNAMIC_XT_FLOW_CONDITION_CONTRACT,
             f"{model.dynamic_xt_parameter_count():,}",
         )
     return model, tokenizer

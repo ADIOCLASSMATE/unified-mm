@@ -2,7 +2,6 @@ from pathlib import Path
 
 from omegaconf import OmegaConf
 
-
 MANIFEST = Path("configs/protocols/unified_ablation_100b_ascend64.yaml")
 LAUNCHER = Path(
     "script/selfless/pretraining_unified_ablation_100b_ascend64.sh"
@@ -235,7 +234,7 @@ def test_formal_launcher_freezes_current_baseline_contract():
     assert 'DUAL_STREAM_ATTENTION_CONTRACT="selfless_strict"' not in base_source
     assert 'DUAL_STREAM_ATTENTION_CONTRACT="xlnet_content_diagonal"' in base_source
     assert "unified-c-on-b-0p6b-100b-imagenet-split-s42-r1" in base_source
-    assert "unified-d-on-b-0p6b-100b-imagenet-split-s42-r3" in base_source
+    assert "unified-d-on-b-0p6b-100b-imagenet-split-s42-r4" in base_source
     assert "unified-e-on-b-0p6b-100b-imagenet-split-s42-r1" in base_source
     assert "unified-f-on-b-0p6b-100b-imagenet-split-s42-r1" in base_source
     assert (
@@ -318,7 +317,7 @@ def test_dedicated_d_on_b_launcher_forces_fresh_mul4_run():
 
     assert 'export ABLATION="d"' in source
     assert "unified-d-on-b-0p6b" in source
-    assert "s42-r3" in source
+    assert "s42-r4" in source
     assert 'export ALLOW_FORMAL_RESUME="false"' in source
     assert "retired A-based Dynamic-XT" in source
     assert "FORMAL_RESUME_FROM" not in source

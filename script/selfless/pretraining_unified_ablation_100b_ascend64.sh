@@ -21,7 +21,7 @@ export ABLATION
 case "${ABLATION}" in
   b) ARM_NAME="b"; RUN_REVISION="r1" ;;
   c) ARM_NAME="c-on-b"; RUN_REVISION="r1" ;;
-  d) ARM_NAME="d-on-b"; RUN_REVISION="r3" ;;
+  d) ARM_NAME="d-on-b"; RUN_REVISION="r4" ;;
   e) ARM_NAME="e-on-b"; RUN_REVISION="r1" ;;
   f) ARM_NAME="f-on-b"; RUN_REVISION="r1" ;;
 esac

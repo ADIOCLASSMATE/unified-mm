@@ -70,7 +70,7 @@ case "${ABLATION}" in
     ARCHITECTURE_VARIANT="dynamic_xt"
     TRAINING_OBJECTIVE="selfless_dual_stream"
     DUAL_STREAM_ATTENTION_CONTRACT="xlnet_content_diagonal"
-    DEFAULT_RUN_PROJECT="unified-d-on-b-0p6b-100b-imagenet-split-s42-r3"
+    DEFAULT_RUN_PROJECT="unified-d-on-b-0p6b-100b-imagenet-split-s42-r4"
     TRAIN_ENTRY="pretrain/train_selfless_flow_dynamic_xt.py"
     # D's T2I branch carries four dynamic query states. Layer activation
     # checkpointing preserves the B16 logical batch and mul=4 estimator while

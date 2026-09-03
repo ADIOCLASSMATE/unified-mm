@@ -1,10 +1,11 @@
 """Ablation D: Dynamic-``x_t`` queries on top of baseline B.
 
-The B content stream is evaluated once with the XLNet-style content diagonal.
-Four rectified-flow states share that content computation while their XT query
-streams receive ``embed(x_t) + time_embed(t)``.  This preserves B's
-``image_flow_batch_mul=4`` estimator without executing four complete
-backbones.
+The B X0/content stream is evaluated once with the XLNet-style content
+diagonal. Four rectified-flow states share its hidden states as their flow
+content AdaLN conditions, while their XT query streams receive
+``embed(x_t) + time_embed(t)`` and exclusively condition flow query AdaLN.
+This preserves B's ``image_flow_batch_mul=4`` estimator without executing four
+complete backbones or allowing the current X0 token into its velocity query.
 """
 
 from __future__ import annotations
@@ -23,11 +24,11 @@ from transformers.modeling_outputs import (
 )
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
-from .image_flow_loss import TimestepEmbedder
+from .image_flow_loss import FlowLoss, TimestepEmbedder
 from .modeling_selfless_flow import (
+    Qwen3Attention,
     Qwen3ForCausalLM,
     Qwen3Model,
-    Qwen3Attention,
     _debug_require_finite_tensor,
     _normal_init_fp32_,
     _to_bool_atten_mask,
@@ -39,12 +40,80 @@ from .modeling_selfless_flow_dynamic_xt_generation import (
     DynamicXtGenerationMixin,
 )
 
-
 DYNAMIC_XT_ARCHITECTURE = "dynamic_xt"
 DYNAMIC_XT_ATTENTION_CONTRACT = "xlnet_content_diagonal"
 DYNAMIC_XT_FLOW_HEAD_ATTENTION_CONTRACT = "xlnet_content_diagonal"
+DYNAMIC_XT_FLOW_CONDITION_CONTRACT = "backbone_xt_query_backbone_x0_content"
 DYNAMIC_XT_FLOW_BATCH_MUL = 4
 DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING = True
+
+
+class DynamicXtFlowLoss(FlowLoss):
+    """D-only flow loss with distinct XT-query and X0-content conditions.
+
+    ``FlowLoss`` intentionally keeps the historical A/B behavior where an
+    omitted content condition falls back to the query condition. D must not
+    use that fallback: its query AdaLN is conditioned by the Dynamic-XT stream,
+    while its content AdaLN is conditioned by the shared X0 stream. Keeping
+    this override in the D module preserves the public A/B/F flow-head API and
+    their exact execution path.
+    """
+
+    def _training_context(self, *args, **kwargs):
+        context = super()._training_context(*args, **kwargs)
+        context_conditions = self.__dict__.get(
+            "_dynamic_xt_training_context_conditions"
+        )
+        if context_conditions is None:
+            raise RuntimeError(
+                "Dynamic-XT training requires an explicit X0 content condition"
+            )
+        expected = context["context_latents"].shape[:2]
+        if tuple(context_conditions.shape[:2]) != tuple(expected):
+            raise ValueError(
+                "Dynamic-XT X0 content conditions must align with flow content: "
+                f"{tuple(context_conditions.shape[:2])} != {tuple(expected)}"
+            )
+        context["context_conditions"] = context_conditions
+        return context
+
+    def forward(
+        self,
+        target,
+        z,
+        mask=None,
+        sigma=None,
+        image_positions=None,
+        context_latents=None,
+        context_mask=None,
+        content_attention_mask=None,
+        context_conditions=None,
+        record_stats: bool = True,
+        training_state=None,
+    ):
+        if context_conditions is None:
+            raise ValueError(
+                "Dynamic-XT flow training requires X0 context_conditions"
+            )
+        key = "_dynamic_xt_training_context_conditions"
+        if key in self.__dict__:
+            raise RuntimeError("Dynamic-XT flow loss is not reentrant")
+        self.__dict__[key] = context_conditions
+        try:
+            return super().forward(
+                target=target,
+                z=z,
+                mask=mask,
+                sigma=sigma,
+                image_positions=image_positions,
+                context_latents=context_latents,
+                context_mask=context_mask,
+                content_attention_mask=content_attention_mask,
+                record_stats=record_stats,
+                training_state=training_state,
+            )
+        finally:
+            self.__dict__.pop(key, None)
 
 
 class SelflessFlowDynamicXtConfig(Qwen3Config):
@@ -322,6 +391,107 @@ class DynamicXtQwen3Model(Qwen3Model):
             )
             self._reset_backbone_flow_time_embedder_impl()
         self.last_dynamic_xt_checkpointed_layers = 0
+        self._dynamic_xt_generation_x0_captures = {}
+
+    def clear_dynamic_xt_generation_x0_captures(self) -> None:
+        """Drop transient X0 rows retained by D's serialized decoder."""
+
+        self._dynamic_xt_generation_x0_captures.clear()
+
+    def _capture_dynamic_xt_generation_x0(
+        self,
+        output: BaseModelOutputWithPast,
+        *,
+        token_types: torch.Tensor | None,
+        image_latent_mask: torch.Tensor | None,
+        cache_position: torch.Tensor | None,
+        debug_label: str,
+    ) -> None:
+        """Retain the fused forward's generated X0 row for flow-content AdaLN."""
+
+        if debug_label.startswith("conditional_"):
+            branch = "conditional"
+        elif debug_label.startswith("unconditional_"):
+            branch = "unconditional"
+        else:
+            return
+        if token_types is None or image_latent_mask is None:
+            raise RuntimeError(
+                "Dynamic-XT generation capture requires token types and an "
+                "image-latent visibility mask"
+            )
+        hidden = output.last_hidden_state
+        token_types = token_types.to(device=hidden.device)
+        image_latent_mask = image_latent_mask.to(
+            device=hidden.device,
+            dtype=torch.bool,
+        )
+        visible_image = token_types.eq(1) & image_latent_mask
+        batch_size, sequence_length = visible_image.shape
+        if cache_position is None:
+            physical_positions = torch.arange(
+                sequence_length,
+                device=hidden.device,
+                dtype=torch.long,
+            ).unsqueeze(0).expand(batch_size, -1)
+        else:
+            physical_positions = cache_position.to(
+                device=hidden.device,
+                dtype=torch.long,
+            )
+            if physical_positions.ndim == 1:
+                physical_positions = physical_positions.unsqueeze(0).expand(
+                    batch_size,
+                    -1,
+                )
+        if tuple(physical_positions.shape) != (batch_size, sequence_length):
+            raise ValueError(
+                "Dynamic-XT generation cache positions must align with X0 rows: "
+                f"{tuple(physical_positions.shape)} != "
+                f"{(batch_size, sequence_length)}"
+            )
+        self._dynamic_xt_generation_x0_captures[branch] = {
+            "hidden": hidden,
+            "physical_positions": physical_positions,
+            "visible_image": visible_image,
+        }
+
+    def dynamic_xt_generation_x0_hidden(
+        self,
+        branch: str,
+        physical_positions: torch.Tensor,
+    ) -> torch.Tensor:
+        """Select one just-committed X0 content hidden per generation row."""
+
+        capture = self._dynamic_xt_generation_x0_captures.get(str(branch))
+        if capture is None:
+            raise RuntimeError(
+                f"missing Dynamic-XT {branch} X0 generation capture"
+            )
+        requested = physical_positions.to(
+            device=capture["hidden"].device,
+            dtype=torch.long,
+        )
+        matches = capture["physical_positions"].eq(
+            requested.unsqueeze(1)
+        ) & capture["visible_image"]
+        if int(requested.shape[0]) != int(capture["hidden"].shape[0]):
+            raise ValueError(
+                "Dynamic-XT pending X0 positions must match the captured batch"
+            )
+        if getattr(self, "_dynamic_xt_validate_generation_capture", False):
+            match_counts = matches.sum(dim=1)
+            if not bool(match_counts.eq(1).all()):
+                raise RuntimeError(
+                    "Dynamic-XT fused generation forward did not expose exactly "
+                    "one visible X0 row for each pending flow-content token: "
+                    f"match_counts={match_counts.detach().cpu().tolist()}"
+                )
+        indices = matches.to(dtype=torch.long).argmax(dim=1)
+        return capture["hidden"][
+            torch.arange(requested.shape[0], device=requested.device),
+            indices,
+        ]
 
     def reset_backbone_flow_time_embedder(self) -> None:
         with torch.random.fork_rng(devices=[]):
@@ -437,6 +607,7 @@ class DynamicXtQwen3Model(Qwen3Model):
         xt_flow_latents: torch.Tensor | None = None,
         xt_flow_times: torch.Tensor | None = None,
         xt_flow_query_mask: torch.Tensor | None = None,
+        return_x0_hidden_state: bool = False,
         **kwargs,
     ) -> BaseModelOutputWithPast:
         # The ordinary B path (ClimbMix and I2T) must never inherit D's
@@ -449,7 +620,7 @@ class DynamicXtQwen3Model(Qwen3Model):
             xt_flow_query_mask is not None,
         )
         if not any(supplied):
-            return super().forward(
+            output = super().forward(
                 X0_input_ids=X0_input_ids,
                 attention_mask=attention_mask,
                 content_attention_mask=content_attention_mask,
@@ -461,6 +632,14 @@ class DynamicXtQwen3Model(Qwen3Model):
                 calculate_likelihood=calculate_likelihood,
                 **kwargs,
             )
+            self._capture_dynamic_xt_generation_x0(
+                output,
+                token_types=kwargs.get("token_types", None),
+                image_latent_mask=kwargs.get("image_latent_mask", None),
+                cache_position=cache_position,
+                debug_label=str(kwargs.get("debug_backbone_label", "")),
+            )
+            return output
         if not all(supplied):
             raise ValueError(
                 "xt_flow_latents, xt_flow_times, and xt_flow_query_mask must "
@@ -600,10 +779,15 @@ class DynamicXtQwen3Model(Qwen3Model):
                 f"layers.{layer_idx}.dynamic_xt.output_xt",
                 XT_hidden_states,
             )
-        return BaseModelOutputWithPast(
+        output = BaseModelOutputWithPast(
             last_hidden_state=self.norm(XT_hidden_states),
             past_key_values=past_key_values if use_cache else None,
         )
+        # D training consumes both final streams. Keep the standard return
+        # field bound to XT so existing non-D model interfaces remain intact.
+        if return_x0_hidden_state:
+            output["x0_last_hidden_state"] = self.norm(X0_hidden_states)
+        return output
 
 
 class DynamicXtQwen3ForCausalLM(
@@ -616,6 +800,7 @@ class DynamicXtQwen3ForCausalLM(
     model_type = SelflessFlowDynamicXtConfig.model_type
     architecture_variant = DYNAMIC_XT_ARCHITECTURE
     dynamic_xt_attention_contract = DYNAMIC_XT_ATTENTION_CONTRACT
+    dynamic_xt_flow_condition_contract = DYNAMIC_XT_FLOW_CONDITION_CONTRACT
     dynamic_xt_flow_batch_mul = DYNAMIC_XT_FLOW_BATCH_MUL
     backbone_model_class = DynamicXtQwen3Model
 
@@ -644,6 +829,28 @@ class DynamicXtQwen3ForCausalLM(
 
     def __init__(self, config: Qwen3Config):
         super().__init__(config)
+        # This subclass adds no parameters or state-dict keys. It only removes
+        # D's invalid query-condition fallback during image training.
+        self.image_flow_head.__class__ = DynamicXtFlowLoss
+        # Missing metadata is interpreted as the new mandatory D contract so
+        # pretrained Qwen configs can still initialize D directly. There is no
+        # runtime switch back to the retired shared-condition implementation.
+        configured_flow_condition_contract = str(
+            getattr(
+                config,
+                "dynamic_xt_flow_condition_contract",
+                DYNAMIC_XT_FLOW_CONDITION_CONTRACT,
+            )
+        ).strip().lower()
+        if configured_flow_condition_contract != DYNAMIC_XT_FLOW_CONDITION_CONTRACT:
+            raise ValueError(
+                "Dynamic-XT supports only flow query=backbone XT and flow "
+                "content=backbone X0 conditions, got "
+                f"{configured_flow_condition_contract!r}"
+            )
+        config.dynamic_xt_flow_condition_contract = (
+            DYNAMIC_XT_FLOW_CONDITION_CONTRACT
+        )
         architecture = str(
             getattr(config, "architecture_variant", DYNAMIC_XT_ARCHITECTURE)
         ).strip().lower()
@@ -886,7 +1093,7 @@ class DynamicXtQwen3ForCausalLM(
 
         if context_image_latents is not image_latents:
             model_kwargs["image_latents_are_noisy"] = True
-        hidden_states = self.model(
+        backbone_output = self.model(
             X0_input_ids=X0_input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -898,8 +1105,11 @@ class DynamicXtQwen3ForCausalLM(
             xt_flow_latents=aligned_x_t,
             xt_flow_times=aligned_t,
             xt_flow_query_mask=query_mask,
+            return_x0_hidden_state=True,
             **model_kwargs,
-        ).last_hidden_state
+        )
+        hidden_states = backbone_output.last_hidden_state
+        x0_hidden_states = backbone_output["x0_last_hidden_state"]
         if int(hidden_states.shape[0]) != query_batch:
             raise RuntimeError(
                 "Dynamic-XT backbone returned the wrong query batch: "
@@ -914,6 +1124,21 @@ class DynamicXtQwen3ForCausalLM(
         )
         image_hidden = torch.gather(selected_hidden, 1, gather_index)
         image_conditions = self._prepare_image_flow_condition(image_hidden)
+        x0_gather_index = token_indices.unsqueeze(-1).expand(
+            -1,
+            -1,
+            x0_hidden_states.shape[-1],
+        )
+        x0_image_hidden = torch.gather(
+            torch.index_select(x0_hidden_states, 0, rows),
+            1,
+            x0_gather_index,
+        )
+        # X0 is computed once for the B-sized content batch. Its condition is
+        # then repeated in the same repeat-major order as the four RF states.
+        content_conditions = self._prepare_image_flow_condition(
+            x0_image_hidden
+        ).repeat(repeats, 1, 1)
         context_for_loss = (
             image_latents
             if context_image_latents is None
@@ -932,6 +1157,7 @@ class DynamicXtQwen3ForCausalLM(
             sigma=repeated_sigmas,
             image_positions=repeated_positions,
             context_latents=image_context,
+            context_conditions=content_conditions,
             record_stats=record_flow_stats,
             training_state=training_state,
         )
@@ -1005,9 +1231,11 @@ class DynamicXtQwen3ForCausalLM(
 __all__ = [
     "DYNAMIC_XT_ARCHITECTURE",
     "DYNAMIC_XT_ATTENTION_CONTRACT",
-    "DYNAMIC_XT_FLOW_HEAD_ATTENTION_CONTRACT",
     "DYNAMIC_XT_FLOW_BATCH_MUL",
+    "DYNAMIC_XT_FLOW_CONDITION_CONTRACT",
+    "DYNAMIC_XT_FLOW_HEAD_ATTENTION_CONTRACT",
     "DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING",
+    "DynamicXtFlowLoss",
     "DynamicXtQwen3ForCausalLM",
     "DynamicXtQwen3Model",
     "SelflessFlowDynamicXtConfig",

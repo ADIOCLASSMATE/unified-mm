@@ -29,6 +29,7 @@ def main() -> None:
         "configs/selfless/unified_baseline_100b_ascend_64npu.yaml"
     )
     config.model.architecture_variant = "dynamic_xt"
+    config.model.dynamic_xt_t2i_gradient_checkpointing = True
     model, _ = load_dynamic_xt_model_tokenizer(
         config,
         model_dtype=torch.bfloat16,

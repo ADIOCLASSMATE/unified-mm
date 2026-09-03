@@ -23,7 +23,9 @@ from models.modeling_model.modeling_selfless_flow import (
 from models.modeling_model.modeling_selfless_flow_dynamic_xt import (
     DYNAMIC_XT_ATTENTION_CONTRACT,
     DYNAMIC_XT_FLOW_BATCH_MUL,
+    DYNAMIC_XT_FLOW_CONDITION_CONTRACT,
     DYNAMIC_XT_FLOW_HEAD_ATTENTION_CONTRACT,
+    DynamicXtFlowLoss,
     DynamicXtQwen3ForCausalLM,
     DynamicXtQwen3Model,
     SelflessFlowDynamicXtConfig,
@@ -78,6 +80,21 @@ def tiny_config(config_class=SelflessFlowDynamicXtConfig):
     )
     config.use_cache = False
     return config
+
+
+def randomize_flow_output(model):
+    """Make condition/attention-path tests non-trivial despite zero init."""
+
+    torch.manual_seed(20260903)
+    with torch.no_grad():
+        for block in model.image_flow_head.net.blocks:
+            block.adaLN_modulation[-1].weight.normal_(0.0, 0.1)
+            block.adaLN_modulation[-1].bias.normal_(0.0, 0.1)
+        final_layer = model.image_flow_head.net.final_layer
+        final_layer.adaLN_modulation[-1].weight.normal_(0.0, 0.1)
+        final_layer.adaLN_modulation[-1].bias.normal_(0.0, 0.1)
+        final_layer.linear.weight.normal_(0.0, 0.1)
+        final_layer.linear.bias.normal_(0.0, 0.1)
 
 
 def test_shared_rf_helper_preserves_per_token_fp32_math_and_rng_order():
@@ -161,6 +178,10 @@ def test_dynamic_model_has_distinct_type_and_only_time_embedder_capacity():
     assert model.config.model_type == "selfless_flow_dynamic_xt"
     assert model.model_type == "selfless_flow_dynamic_xt"
     assert model.dynamic_xt_parameter_count() == expected
+    assert (
+        model.config.dynamic_xt_flow_condition_contract
+        == DYNAMIC_XT_FLOW_CONDITION_CONTRACT
+    )
     assert not hasattr(Qwen3Model(tiny_config(Qwen3Config)), "backbone_flow_time_embedder")
 
 
@@ -168,7 +189,8 @@ def test_dynamic_training_contract_preserves_four_states_with_shared_content():
     source = inspect.getsource(DynamicXtQwen3ForCausalLM.forward)
     assert "checkpoint(" not in source
     assert "repeated_targets = targets.repeat(repeats, 1, 1)" in source
-    assert source.count("hidden_states = self.model(") == 1
+    assert source.count("backbone_output = self.model(") == 1
+    assert "context_conditions=content_conditions" in source
     assert 'output["per_modality_loss"]' in source
     assert 'output["per_modality_count"]' in source
 
@@ -181,6 +203,24 @@ def test_dynamic_training_contract_preserves_four_states_with_shared_content():
     invalid.flow_head_attention_contract = "selfless_strict"
     with pytest.raises(ValueError, match="flow_head_attention_contract"):
         DynamicXtQwen3ForCausalLM(invalid)
+
+
+def test_dynamic_flow_loss_requires_explicit_x0_content_condition():
+    model = DynamicXtQwen3ForCausalLM(tiny_config())
+    assert isinstance(model.image_flow_head, DynamicXtFlowLoss)
+    assert "context_conditions" not in inspect.signature(FlowLoss.forward).parameters
+    assert (
+        "context_conditions"
+        in inspect.signature(DynamicXtFlowLoss.forward).parameters
+    )
+    with pytest.raises(ValueError, match="requires X0 context_conditions"):
+        model.image_flow_head(
+            target=torch.randn(1, 4, 4),
+            z=torch.randn(1, 4, 32),
+            sigma=torch.arange(4).view(1, 4).float(),
+            image_positions=torch.arange(4).view(1, 4),
+            context_latents=torch.randn(1, 4, 4),
+        )
 
 
 def test_dynamic_xt_is_isolated_from_baseline_model_file():
@@ -241,7 +281,7 @@ def test_dynamic_presampling_keeps_static_x0_then_rf_rng_order():
     source = inspect.getsource(DynamicXtQwen3ForCausalLM.forward)
     input_noise_offset = source.index("self._shared_noisy_image_latents")
     rf_state_offset = source.index("self.image_flow_head.sample_training_state")
-    backbone_offset = source.index("hidden_states = self.model")
+    backbone_offset = source.index("backbone_output = self.model")
     assert input_noise_offset < rf_state_offset < backbone_offset
 
     static_config = tiny_config(Qwen3Config)
@@ -323,6 +363,169 @@ def test_dynamic_training_runs_one_content_batch_and_four_query_batches():
     assert time_gradient is not None
     assert torch.isfinite(time_gradient).all()
     assert all(not layer.gradient_checkpointing for layer in model.model.layers)
+
+
+def test_dynamic_training_routes_xt_and_x0_to_distinct_flow_adaln(monkeypatch):
+    model = DynamicXtQwen3ForCausalLM(tiny_config()).train()
+    input_ids = torch.tensor([[3, 11, 8, 8, 8, 8, 12, 9]])
+    token_types = torch.tensor(
+        [[0, 2, 1, 1, 1, 1, 2, 0]],
+        dtype=torch.uint8,
+    )
+    sigma = torch.tensor([[0.0, 1.0, 4.0, 5.0, 6.0, 7.0, 2.0, 3.0]])
+    image_latents = torch.randn(1, 8, 4)
+    strict_mask = get_selfless_mask(sigma, 8, "cpu")
+    content_mask = get_selfless_mask(
+        sigma,
+        8,
+        "cpu",
+        include_diagonal=True,
+    )
+    backbone_capture = {}
+    flow_capture = {}
+    original_backbone_forward = model.model.forward
+    original_flow_forward = model.image_flow_head.forward
+
+    def capture_backbone(*args, **kwargs):
+        output = original_backbone_forward(*args, **kwargs)
+        if "x0_last_hidden_state" in output:
+            backbone_capture["xt"] = output.last_hidden_state
+            backbone_capture["x0"] = output["x0_last_hidden_state"]
+        return output
+
+    def capture_flow(*args, **kwargs):
+        flow_capture["query"] = kwargs["z"]
+        flow_capture["content"] = kwargs["context_conditions"]
+        return original_flow_forward(*args, **kwargs)
+
+    monkeypatch.setattr(model.model, "forward", capture_backbone)
+    monkeypatch.setattr(model.image_flow_head, "forward", capture_flow)
+    output = model(
+        X0_input_ids=input_ids,
+        labels=input_ids,
+        attention_mask=strict_mask,
+        content_attention_mask=content_mask,
+        token_types=token_types,
+        image_latents=image_latents,
+        image_local_positions=torch.tensor(
+            [[-1, -1, 0, 1, 2, 3, -1, -1]]
+        ),
+        image_span_table=torch.tensor([[0, 0, 2, 6, 0]]),
+        flow_sigma=sigma,
+        compute_text_loss=False,
+        compute_image_loss=True,
+    )
+    assert torch.isfinite(output.loss)
+
+    image_indices = torch.arange(2, 6).view(1, 4)
+    xt_index = image_indices.repeat(4, 1).unsqueeze(-1).expand(-1, -1, 32)
+    expected_query = model._prepare_image_flow_condition(
+        torch.gather(backbone_capture["xt"], 1, xt_index)
+    )
+    x0_index = image_indices.unsqueeze(-1).expand(-1, -1, 32)
+    expected_content = model._prepare_image_flow_condition(
+        torch.gather(backbone_capture["x0"], 1, x0_index)
+    ).repeat(4, 1, 1)
+    torch.testing.assert_close(flow_capture["query"], expected_query)
+    torch.testing.assert_close(flow_capture["content"], expected_content)
+    for repeat_index in range(1, 4):
+        torch.testing.assert_close(
+            flow_capture["content"][:1],
+            flow_capture["content"][repeat_index : repeat_index + 1],
+            rtol=0,
+            atol=0,
+        )
+    assert not torch.equal(flow_capture["query"], flow_capture["content"])
+
+
+def test_dynamic_x0_current_token_has_no_path_to_current_velocity():
+    torch.manual_seed(319)
+    model = DynamicXtQwen3ForCausalLM(tiny_config()).eval()
+    randomize_flow_output(model)
+    input_ids = torch.tensor([[3, 11, 8, 8, 8, 8, 12, 9]])
+    token_types = torch.tensor(
+        [[0, 2, 1, 1, 1, 1, 2, 0]],
+        dtype=torch.uint8,
+    )
+    full_sigma = torch.tensor([[0.0, 1.0, 4.0, 5.0, 6.0, 7.0, 2.0, 3.0]])
+    image_sigma = full_sigma[:, 2:6]
+    strict_backbone = get_selfless_mask(full_sigma, 8, "cpu")
+    content_backbone = get_selfless_mask(
+        full_sigma,
+        8,
+        "cpu",
+        include_diagonal=True,
+    )
+    strict_flow = image_sigma.unsqueeze(1) < image_sigma.unsqueeze(2)
+    content_flow = image_sigma.unsqueeze(1) <= image_sigma.unsqueeze(2)
+    image_positions = torch.arange(4).view(1, 4)
+    x_t = torch.randn(1, 4, 4)
+    t = torch.rand(1, 4)
+    aligned_x_t = torch.zeros(1, 8, 4)
+    aligned_x_t[:, 2:6] = x_t
+    aligned_t = torch.zeros(1, 8)
+    aligned_t[:, 2:6] = t
+    query_mask = token_types.eq(1)
+
+    def velocity(image_latents):
+        backbone = model.model(
+            X0_input_ids=input_ids,
+            attention_mask=strict_backbone,
+            content_attention_mask=content_backbone,
+            token_types=token_types,
+            image_latents=image_latents,
+            calculate_likelihood=True,
+            xt_flow_latents=aligned_x_t,
+            xt_flow_times=aligned_t,
+            xt_flow_query_mask=query_mask,
+            return_x0_hidden_state=True,
+        )
+        query_condition = model._prepare_image_flow_condition(
+            backbone.last_hidden_state[:, 2:6]
+        )
+        content_condition = model._prepare_image_flow_condition(
+            backbone["x0_last_hidden_state"][:, 2:6]
+        )
+        prediction = model.image_flow_head.velocity(
+            x_t,
+            t,
+            query_condition,
+            context_latents=image_latents[:, 2:6],
+            context_mask=strict_flow,
+            content_attention_mask=content_flow,
+            query_positions=image_positions,
+            context_positions=image_positions,
+            context_conditions=content_condition,
+        )
+        return prediction, query_condition, content_condition
+
+    clean = torch.randn(1, 8, 4)
+    changed = clean.clone()
+    current_index = 1
+    changed[:, 2 + current_index] += 25.0
+    base_velocity, base_query, base_content = velocity(clean)
+    changed_velocity, changed_query, changed_content = velocity(changed)
+
+    torch.testing.assert_close(
+        changed_query[:, current_index],
+        base_query[:, current_index],
+        rtol=0,
+        atol=0,
+    )
+    assert not torch.allclose(
+        changed_content[:, current_index],
+        base_content[:, current_index],
+    )
+    torch.testing.assert_close(
+        changed_velocity[:, current_index],
+        base_velocity[:, current_index],
+        rtol=1.0e-6,
+        atol=1.0e-6,
+    )
+    assert not torch.allclose(
+        changed_velocity[:, current_index + 1],
+        base_velocity[:, current_index + 1],
+    )
 
 
 def test_four_query_streams_match_four_independent_dynamic_forwards():
@@ -528,6 +731,146 @@ def test_dynamic_generation_recomputes_condition_in_dedicated_path(use_cache):
     assert trace["dynamic_xt_conditional_velocity_evaluations"] == 2
     assert trace["dynamic_xt_unconditional_velocity_evaluations"] == 0
     assert trace["dynamic_xt_query_cache_policy"] == "read_only_x0_kv"
+    assert trace["dynamic_xt_flow_query_condition"] == "backbone_xt_hidden"
+    assert trace["dynamic_xt_flow_content_condition"] == "backbone_x0_hidden"
+    assert (
+        trace["dynamic_xt_flow_condition_contract"]
+        == DYNAMIC_XT_FLOW_CONDITION_CONTRACT
+    )
+
+
+def test_cached_generation_commits_fused_x0_hidden_as_flow_content_condition(
+    monkeypatch,
+):
+    torch.manual_seed(911)
+    model = DynamicXtQwen3ForCausalLM(tiny_config()).eval()
+    randomize_flow_output(model)
+    selected_conditions = []
+    committed_conditions = []
+    original_select = model.model.dynamic_xt_generation_x0_hidden
+    original_pending = model.image_flow_head.net.forward_with_pending_content
+
+    def capture_select(branch, physical_positions):
+        hidden = original_select(branch, physical_positions)
+        selected_conditions.append(
+            (branch, model._prepare_image_flow_condition(hidden).detach().clone())
+        )
+        return hidden
+
+    def capture_pending(*args, **kwargs):
+        committed_conditions.append(
+            kwargs["context_conditions"].detach().clone()
+        )
+        return original_pending(*args, **kwargs)
+
+    monkeypatch.setattr(
+        model.model,
+        "dynamic_xt_generation_x0_hidden",
+        capture_select,
+    )
+    monkeypatch.setattr(
+        model.image_flow_head.net,
+        "forward_with_pending_content",
+        capture_pending,
+    )
+    _, trace = model.generate(
+        "t2i",
+        input_ids=torch.tensor([[3, 11, 8, 8, 8, 8, 12, 9]]),
+        token_types=torch.tensor(
+            [[0, 2, 1, 1, 1, 1, 2, 0]], dtype=torch.uint8
+        ),
+        sigma=torch.tensor(
+            [[0.0, 1.0, 4.0, 5.0, 6.0, 7.0, 2.0, 3.0]]
+        ),
+        spans=[(0, 2, 6)],
+        image_latent_dim=4,
+        initial_noise_bank=(
+            torch.arange(16, dtype=torch.float32).view(1, 4, 4) / 13.0
+        ),
+        flow_temperature=0.8,
+        flow_cfg=2.0,
+        flow_solver="heun",
+        flow_num_steps=1,
+        parallel_rate=1,
+        order_strategy="sigma",
+        use_cache=True,
+        return_trace=True,
+        _debug_max_generation_steps=2,
+    )
+
+    assert [branch for branch, _ in selected_conditions] == [
+        "conditional",
+        "unconditional",
+    ]
+    assert len(committed_conditions) == 1
+    expected = torch.cat(
+        [condition for _, condition in selected_conditions],
+        dim=0,
+    )
+    torch.testing.assert_close(
+        committed_conditions[0],
+        expected,
+        rtol=0,
+        atol=0,
+    )
+    retired_static_query_condition = torch.cat(
+        [
+            model._prepare_image_flow_condition(
+                trace["debug_conditional_backbone_hidden"][0]
+            ),
+            model._prepare_image_flow_condition(
+                trace["debug_unconditional_backbone_hidden"][0]
+            ),
+        ],
+        dim=0,
+    )
+    assert not torch.allclose(
+        committed_conditions[0],
+        retired_static_query_condition,
+    )
+    assert trace["dynamic_xt_flow_content_condition_commits"] == 1
+    assert trace["flow_content_cache_tokens_committed"] == 1
+
+
+def test_dynamic_cached_generation_matches_full_recompute_token_by_token():
+    torch.manual_seed(12345)
+    model = DynamicXtQwen3ForCausalLM(tiny_config()).eval()
+    randomize_flow_output(model)
+    common = {
+        "input_ids": torch.tensor([[3, 11, 8, 8, 8, 8, 12, 9]]),
+        "token_types": torch.tensor(
+            [[0, 2, 1, 1, 1, 1, 2, 0]], dtype=torch.uint8
+        ),
+        "sigma": torch.tensor(
+            [[0.0, 1.0, 4.0, 5.0, 6.0, 7.0, 2.0, 3.0]]
+        ),
+        "spans": [(0, 2, 6)],
+        "image_latent_dim": 4,
+        "initial_noise_bank": (
+            torch.arange(16, dtype=torch.float32).view(1, 4, 4) / 19.0
+        ),
+        "flow_temperature": 0.7,
+        "flow_cfg": 1.0,
+        "flow_solver": "heun",
+        "flow_num_steps": 2,
+        "parallel_rate": 1,
+        "order_strategy": "sigma",
+        "return_trace": True,
+        "_debug_max_generation_steps": 4,
+    }
+    full, full_trace = model.generate("t2i", **common, use_cache=False)
+    cached, cached_trace = model.generate("t2i", **common, use_cache=True)
+
+    torch.testing.assert_close(cached, full, rtol=2.0e-5, atol=2.0e-5)
+    torch.testing.assert_close(
+        cached_trace["debug_conditional_backbone_hidden"],
+        full_trace["debug_conditional_backbone_hidden"],
+        rtol=1.0e-5,
+        atol=1.0e-5,
+    )
+    assert full_trace["dynamic_xt_flow_content_condition_commits"] == 3
+    assert cached_trace["dynamic_xt_flow_content_condition_commits"] == 3
+    assert cached_trace["flow_content_cache_tokens_committed"] == 3
 
 
 def test_heun_calls_dynamic_condition_for_predictor_and_corrector():

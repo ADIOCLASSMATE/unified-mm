@@ -1,8 +1,9 @@
 """Generation-only implementation for ablation D (Dynamic-``x_t``).
 
-The baseline A/B generation state machine remains unchanged.  This mixin owns
-the D-specific rule: every rectified-flow velocity evaluation rebuilds the XT
-query from the current ``x_t`` and ``t`` while reading a fixed X0 KV cache.
+Every velocity evaluation rebuilds the XT query from the current ``x_t`` and
+``t`` while reading a fixed X0 KV cache. The fused serialized backbone forward
+also exposes the previous generated token's X0 content hidden; D uses that
+hidden exclusively for the flow-content AdaLN cache update.
 """
 
 from __future__ import annotations
@@ -22,6 +23,69 @@ class DynamicXtGenerationMixin:
 
     _supports_paired_backbone_cfg = False
 
+    def sample_image_flow_with_cfg(self, z, *args, **kwargs):
+        """Replace D's retired static-query content condition with fused X0."""
+
+        pending_positions = kwargs.get("pending_context_positions")
+        if pending_positions is not None:
+            span_starts = getattr(
+                self,
+                "_dynamic_xt_generation_span_starts",
+                None,
+            )
+            if span_starts is None:
+                raise RuntimeError(
+                    "Dynamic-XT pending flow content is missing span metadata"
+                )
+            batch_size = int(span_starts.numel())
+            pending_positions = pending_positions.to(
+                device=span_starts.device,
+                dtype=torch.long,
+            ).reshape(-1)
+            paired = bool(kwargs.get("latent_mixer_cache_is_paired", False))
+            expected_rows = batch_size * (2 if paired else 1)
+            if int(pending_positions.numel()) != expected_rows:
+                raise ValueError(
+                    "Dynamic-XT pending flow positions have the wrong batch: "
+                    f"{pending_positions.numel()} != {expected_rows}"
+                )
+            local_positions = pending_positions[:batch_size]
+            if paired and not torch.equal(
+                local_positions,
+                pending_positions[batch_size:],
+            ):
+                raise ValueError(
+                    "Dynamic-XT conditional/unconditional pending positions "
+                    "must be identical"
+                )
+            physical_positions = span_starts + local_positions
+            conditional_hidden = self.model.dynamic_xt_generation_x0_hidden(
+                "conditional",
+                physical_positions,
+            )
+            content_conditions = self._prepare_image_flow_condition(
+                conditional_hidden
+            )
+            if paired:
+                unconditional_hidden = (
+                    self.model.dynamic_xt_generation_x0_hidden(
+                        "unconditional",
+                        physical_positions,
+                    )
+                )
+                content_conditions = torch.cat(
+                    [
+                        content_conditions,
+                        self._prepare_image_flow_condition(
+                            unconditional_hidden
+                        ),
+                    ],
+                    dim=0,
+                )
+            kwargs["pending_context_conditions"] = content_conditions
+            self._dynamic_xt_content_condition_commits += 1
+        return super().sample_image_flow_with_cfg(z, *args, **kwargs)
+
     def _make_backbone_flow_condition_evaluator(self, **state):
         sample_indices = state["sample_indices"]
         seq_positions = state["seq_positions"]
@@ -35,6 +99,7 @@ class DynamicXtGenerationMixin:
         generation_step = int(state["generation_step"])
         batch_size = int(sample_indices.numel())
         device = selected_input_ids.device
+        self._dynamic_xt_generation_span_starts = state["span_starts"]
 
         def cache_mask(image_uncond: bool):
             query_sigma = current_sigma[
@@ -213,7 +278,18 @@ class DynamicXtGenerationMixin:
     @torch.no_grad()
     def generate_image(self, *args, **kwargs):
         self._dynamic_xt_eval_counts = {"conditional": 0, "unconditional": 0}
-        result = super().generate_image(*args, **kwargs)
+        self._dynamic_xt_content_condition_commits = 0
+        self._dynamic_xt_generation_span_starts = None
+        self.model._dynamic_xt_validate_generation_capture = bool(
+            kwargs.get("debug_finite", False)
+        )
+        self.model.clear_dynamic_xt_generation_x0_captures()
+        try:
+            result = super().generate_image(*args, **kwargs)
+        finally:
+            self.model.clear_dynamic_xt_generation_x0_captures()
+            self.model._dynamic_xt_validate_generation_capture = False
+            self._dynamic_xt_generation_span_starts = None
         if not bool(kwargs.get("return_trace", False)) or result is None:
             return result
         generated, trace = result
@@ -233,6 +309,14 @@ class DynamicXtGenerationMixin:
                     self._dynamic_xt_eval_counts["unconditional"]
                 ),
                 "dynamic_xt_query_cache_policy": "read_only_x0_kv",
+                "dynamic_xt_flow_query_condition": "backbone_xt_hidden",
+                "dynamic_xt_flow_content_condition": "backbone_x0_hidden",
+                "dynamic_xt_flow_condition_contract": (
+                    self.dynamic_xt_flow_condition_contract
+                ),
+                "dynamic_xt_flow_content_condition_commits": int(
+                    self._dynamic_xt_content_condition_commits
+                ),
                 "dynamic_xt_parameter_count": self.dynamic_xt_parameter_count(),
             }
         )

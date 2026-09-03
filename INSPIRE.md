@@ -402,6 +402,11 @@ not implicitly mount the official dataset.
   `models/modeling_model/modeling_selfless_flow_dynamic_xt_generation.py`.
   During Heun generation every predictor/corrector evaluation rebuilds the XT
   query while reading fixed X0 K/V without committing XT to the cache.
+  The flow query AdaLN condition is the refreshed backbone XT hidden. The flow
+  content AdaLN condition is instead the backbone X0 hidden: training computes
+  it once at batch B and repeats it for the four RF states, while generation
+  obtains the previous token's X0 hidden from the fused cache-commit/current-
+  query forward. The retired shared/static condition behavior has no switch.
 - The formal D launcher is
   `script/selfless/pretraining_unified_ablation_d_on_b_0p6b_formal_ascend64.sh`;
   the independent evaluation entry is

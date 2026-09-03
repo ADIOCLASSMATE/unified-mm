@@ -108,7 +108,7 @@ comparability:
 run_projects:
     b: unified-b-0p6b-100b-imagenet-split-s42-r1
     c: unified-c-on-b-0p6b-100b-imagenet-split-s42-r1
-    d: unified-d-on-b-0p6b-100b-imagenet-split-s42-r3
+    d: unified-d-on-b-0p6b-100b-imagenet-split-s42-r4
     e: unified-e-on-b-0p6b-100b-imagenet-split-s42-r1
     f: unified-f-on-b-0p6b-100b-imagenet-split-s42-r1
 ablations:
@@ -137,14 +137,21 @@ ablations:
         image_sigma_order: random
         start: qwen_pretrained_step_0
     d:
-        status: ready_r3_after_64npu_startup_guard_validation
+        status: ready_r4_xt_query_x0_content
         architecture_variant: dynamic_xt
         training_objective: selfless_dual_stream
         dual_stream_attention_contract: xlnet_content_diagonal
         flow_head_attention_contract: xlnet_content_diagonal
         query_attention: "sigma_kv < sigma_q"
         content_attention: "sigma_kv <= sigma_q"
-        backbone_condition: "embed(x_t) + time_embed(t)"
+        backbone_query_input: "embed(x_t) + time_embed(t)"
+        flow_query_condition: backbone_xt_hidden
+        flow_content_condition: backbone_x0_hidden
+        flow_condition_contract: backbone_xt_query_backbone_x0_content
+        training_content_condition_batch: B_then_repeat_to_4B
+        generation_content_commit: fused_previous_x0_with_current_query
+        extra_endpoint_forward: false
+        current_x1_to_velocity_leak: false
         condition_refresh: every_ode_velocity_evaluation
         dynamic_query_scope: t2i_only
         content_stream_batch: B

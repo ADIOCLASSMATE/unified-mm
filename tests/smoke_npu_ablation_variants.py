@@ -214,7 +214,9 @@ def run_variant(
         ),
         use_cache=True,
         return_trace=True,
-        _debug_max_generation_steps=(1 if model_label == "dynamic_xt" else None),
+        # D needs two serialized tokens to exercise the fused previous-X0
+        # backbone commit and the corresponding flow-content cache update.
+        _debug_max_generation_steps=(2 if model_label == "dynamic_xt" else None),
     )
     torch.npu.synchronize()
     if tuple(generated.shape) != (1, 4, 2, 2):
@@ -224,12 +226,18 @@ def run_variant(
     if not bool(torch.isfinite(generated).all().item()):
         raise AssertionError(f"{model_label} generation is not finite")
     if model_label == "dynamic_xt":
-        if trace["dynamic_xt_conditional_velocity_evaluations"] != 2:
-            raise AssertionError("Heun must recompute conditional XT twice")
-        if trace["dynamic_xt_unconditional_velocity_evaluations"] != 2:
-            raise AssertionError("Heun must recompute unconditional XT twice")
+        if trace["dynamic_xt_conditional_velocity_evaluations"] != 4:
+            raise AssertionError("Heun must recompute conditional XT twice per token")
+        if trace["dynamic_xt_unconditional_velocity_evaluations"] != 4:
+            raise AssertionError("Heun must recompute unconditional XT twice per token")
         if trace["dynamic_xt_query_cache_policy"] != "read_only_x0_kv":
             raise AssertionError("Dynamic-XT query cache policy changed")
+        if trace["dynamic_xt_flow_query_condition"] != "backbone_xt_hidden":
+            raise AssertionError("Dynamic-XT flow query condition changed")
+        if trace["dynamic_xt_flow_content_condition"] != "backbone_x0_hidden":
+            raise AssertionError("Dynamic-XT flow content condition changed")
+        if trace["dynamic_xt_flow_content_condition_commits"] != 1:
+            raise AssertionError("Dynamic-XT did not commit the fused previous X0")
     return {
         "architecture_variant": model_label,
         "loss": float(output.loss.detach().cpu()),
