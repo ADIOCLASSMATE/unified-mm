@@ -50,7 +50,10 @@ def test_final_hf_ema_source_uses_export_provenance(tmp_path):
                 "floating_dtype": "float32",
                 "source_global_step": 95_415,
                 "source_world_size": 64,
-                "state_key_count": 3,
+                # The source state contains a tied alias while safetensors
+                # stores only one physical tensor for that alias group.
+                "state_key_count": 4,
+                "stored_weight_key_count": 3,
                 "export_kind": "training",
             }
         ),
@@ -81,9 +84,37 @@ def test_final_hf_ema_source_uses_export_provenance(tmp_path):
 
     assert source.kind == "hf_final_ema"
     assert source.global_step == 95_415
+    assert source.report()["state_key_count"] == 4
+    assert source.report()["stored_weight_key_count"] == 3
     assert config.model.model_path == str(model.resolve())
     assert config.training.from_scratch is False
     assert config.training.use_gradient_checkpointing is False
+    assert config.model.flow_head_attention_contract == "selfless_strict"
+
+
+def test_final_hf_ema_source_rejects_stored_key_count_mismatch(tmp_path):
+    model = tmp_path / "hf_model-final-ema"
+    model.mkdir()
+    (model / "config.json").write_text("{}", encoding="utf-8")
+    save_file({"weight": torch.zeros(1)}, model / "model.safetensors")
+    (model / "tokenizer.json").write_text("{}", encoding="utf-8")
+    (model / "ema_export_metadata.json").write_text(
+        json.dumps(
+            {
+                "schema": "selfless_ema_hf_export_v1",
+                "floating_dtype": "float32",
+                "source_global_step": 1,
+                "source_world_size": 1,
+                "state_key_count": 2,
+                "stored_weight_key_count": 2,
+                "export_kind": "training",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="stored key count disagrees"):
+        resolve_evaluation_model_source(model)
 
 
 def test_raw_hf_export_without_ema_provenance_is_rejected(tmp_path):
@@ -246,6 +277,21 @@ def _text_ar_model_contract():
     }
 
 
+def _ordered_evaluation_config():
+    config = _evaluation_config()
+    config.dataset = OmegaConf.create(
+        {
+            "class_name": "UnifiedMixedDataset",
+            "params": {"image": {"image_sigma_order": "random"}},
+        }
+    )
+    config.experiment = OmegaConf.create(
+        {"validation_single_stream_order_strategies": ["spatial_halton"]}
+    )
+    config.evaluation = OmegaConf.create({"strategies": "spatial_halton"})
+    return config
+
+
 def test_sharded_checkpoint_architecture_is_authoritative(tmp_path):
     checkpoint = tmp_path / "checkpoint-10"
     _write_sharded_source(
@@ -282,6 +328,89 @@ def test_checkpoint_attention_contract_is_authoritative(tmp_path):
         config.model.dual_stream_attention_contract
         == "xlnet_content_diagonal"
     )
+    # Missing is deliberately not inferred from the backbone: every legacy
+    # A/B flow head used the shared strict mask.
+    assert config.model.flow_head_attention_contract == "selfless_strict"
+
+
+def test_checkpoint_flow_head_attention_contract_is_authoritative(tmp_path):
+    checkpoint = tmp_path / "checkpoint-10"
+    model_contract = _text_ar_model_contract()
+    model_contract.update(
+        {
+            "architecture_variant": "selfless_contextual",
+            "dual_stream_attention_contract": "xlnet_content_diagonal",
+            "flow_head_attention_contract": "xlnet_content_diagonal",
+        }
+    )
+    _write_sharded_source(checkpoint, model_contract=model_contract)
+    config = _evaluation_config()
+
+    configure_model_source(
+        config,
+        resolve_evaluation_model_source(checkpoint),
+    )
+
+    assert config.model.flow_head_attention_contract == (
+        "xlnet_content_diagonal"
+    )
+
+
+def test_f_checkpoint_owns_parameter_matched_width_and_reference_contract(
+    tmp_path,
+):
+    checkpoint = tmp_path / "checkpoint-10"
+    model_contract = _text_ar_model_contract()
+    model_contract.update(
+        {
+            "architecture_variant": "positionwise_flow_head_on_b",
+            "dual_stream_attention_contract": "xlnet_content_diagonal",
+            "flow_head_attention_contract": "not_applicable",
+            "image_flow_width": 1936,
+            "image_flow_batch_mul": 4,
+            "positionwise_reference_flow_width": 1280,
+            "positionwise_reference_flow_depth": 8,
+            "positionwise_max_parameter_relative_error": 0.005,
+            "training_image_sigma_order": "random",
+        }
+    )
+    _write_sharded_source(checkpoint, model_contract=model_contract)
+    config = _ordered_evaluation_config()
+    config.model.image_flow_batch_mul = 4
+
+    configure_model_source(config, resolve_evaluation_model_source(checkpoint))
+
+    assert config.model.architecture_variant == "positionwise_flow_head_on_b"
+    assert config.model.flow_head_attention_contract == "not_applicable"
+    assert config.model.image_flow_width == 1936
+    assert config.model.positionwise_reference_flow_width == 1280
+    assert config.model.positionwise_reference_flow_depth == 8
+    assert config.model.positionwise_max_parameter_relative_error == 0.005
+
+
+def test_legacy_f_checkpoint_without_attention_field_is_not_applicable(
+    tmp_path,
+):
+    checkpoint = tmp_path / "checkpoint-10"
+    model_contract = _text_ar_model_contract()
+    model_contract.update(
+        {
+            "architecture_variant": "positionwise_flow_head_on_b",
+            "dual_stream_attention_contract": "xlnet_content_diagonal",
+            "image_flow_width": 1936,
+            "image_flow_batch_mul": 4,
+            "positionwise_reference_flow_width": 1280,
+            "positionwise_reference_flow_depth": 8,
+            "positionwise_max_parameter_relative_error": 0.005,
+        }
+    )
+    _write_sharded_source(checkpoint, model_contract=model_contract)
+    config = _ordered_evaluation_config()
+    config.model.image_flow_batch_mul = 4
+
+    configure_model_source(config, resolve_evaluation_model_source(checkpoint))
+
+    assert config.model.flow_head_attention_contract == "not_applicable"
 
 
 def test_checkpoint_image_contract_mismatch_is_rejected(tmp_path):

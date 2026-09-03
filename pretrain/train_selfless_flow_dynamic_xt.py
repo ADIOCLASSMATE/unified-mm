@@ -10,6 +10,7 @@ from models.modeling_model.modeling_selfless_flow_dynamic_xt import (
     DYNAMIC_XT_ARCHITECTURE,
     DYNAMIC_XT_ATTENTION_CONTRACT,
     DYNAMIC_XT_FLOW_BATCH_MUL,
+    DYNAMIC_XT_FLOW_HEAD_ATTENTION_CONTRACT,
     DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING,
 )
 from pretrain.train_selfless_flow import main as run_selfless_training
@@ -42,6 +43,19 @@ def load_dynamic_xt_model_tokenizer(
             "Ablation D is based on B and requires "
             "model.dual_stream_attention_contract="
             f"'{DYNAMIC_XT_ATTENTION_CONTRACT}', got {attention_contract!r}"
+        )
+    flow_head_attention_contract = str(
+        config.model.get("flow_head_attention_contract", "")
+    ).strip().lower()
+    if (
+        flow_head_attention_contract
+        != DYNAMIC_XT_FLOW_HEAD_ATTENTION_CONTRACT
+    ):
+        raise ValueError(
+            "Ablation D is based on corrected B and requires "
+            "model.flow_head_attention_contract="
+            f"'{DYNAMIC_XT_FLOW_HEAD_ATTENTION_CONTRACT}', got "
+            f"{flow_head_attention_contract!r}"
         )
     flow_batch_mul = int(config.model.get("image_flow_batch_mul", -1))
     if flow_batch_mul != DYNAMIC_XT_FLOW_BATCH_MUL:

@@ -36,7 +36,7 @@ def test_positionwise_contract_has_no_context_or_cache():
         "uses_image_position": False,
     }
     assert head.empty_latent_mixer_cache(batch_size=2, capacity=4) is None
-    assert head.append_latent_mixer_cache(None, context_latents=None) is None
+    assert not hasattr(head, "append_latent_mixer_cache")
     assert not any("attn" in name or "cross" in name for name, _ in head.named_parameters())
 
 

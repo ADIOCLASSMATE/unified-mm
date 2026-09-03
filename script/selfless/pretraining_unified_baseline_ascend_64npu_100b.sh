@@ -20,6 +20,7 @@ ACCELERATE_CONFIG="${ACCELERATE_CONFIG:-accelerate_configs/64_npus_4nodes_deepsp
 RESUME_FROM="${RESUME_FROM:-none}"
 STOP_AFTER_STEPS="${STOP_AFTER_STEPS:-95415}"
 SAVE_EVERY="${SAVE_EVERY:-2000}"
+LOG_EVERY="${LOG_EVERY:-10}"
 CHECKPOINTS_TOTAL_LIMIT="${CHECKPOINTS_TOTAL_LIMIT:-3}"
 CHECKPOINT_MILESTONE_EVERY="${CHECKPOINT_MILESTONE_EVERY:-0}"
 VAL_EVERY="${VAL_EVERY:-2000}"
@@ -31,6 +32,8 @@ SAVE_EMA_EVAL_EVERY="${SAVE_EMA_EVAL_EVERY:-12510}"
 SAVE_FINAL="${SAVE_FINAL:-true}"
 SAVE_FINAL_CHECKPOINT="${SAVE_FINAL_CHECKPOINT:-true}"
 WANDB_MODE="${WANDB_MODE:-disabled}"
+DEBUG_LOSS_TRACE_UNTIL_STEP="${DEBUG_LOSS_TRACE_UNTIL_STEP:-0}"
+DEEPSPEED_BF16_OVERFLOW_CHECK_UNTIL_STEP="${DEEPSPEED_BF16_OVERFLOW_CHECK_UNTIL_STEP:-0}"
 BACKBONE_LR="${BACKBONE_LR:-3.0e-4}"
 FLOW_LR="${FLOW_LR:-5.0e-5}"
 IMAGE_FLOW_BATCH_MUL="${IMAGE_FLOW_BATCH_MUL:-4}"
@@ -46,6 +49,10 @@ case "${ABLATION}" in
     DEFAULT_RUN_PROJECT="unified-b-0p6b-100b-imagenet-split-s42-r1"
     TRAIN_ENTRY="pretrain/train_selfless_flow.py"
     DEFAULT_DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING="false"
+    DEFAULT_IMAGE_SIGMA_ORDER="random"
+    DEFAULT_VALIDATION_ORDER_STRATEGY="spatial_halton"
+    DEFAULT_FLOW_HEAD_WIDTH="1280"
+    DEFAULT_FLOW_HEAD_ATTENTION_CONTRACT="xlnet_content_diagonal"
     ;;
   c)
     ARCHITECTURE_VARIANT="single_stream_text_ar"
@@ -54,25 +61,63 @@ case "${ABLATION}" in
     DEFAULT_RUN_PROJECT="unified-c-on-b-0p6b-100b-imagenet-split-s42-r1"
     TRAIN_ENTRY="pretrain/train_selfless_flow.py"
     DEFAULT_DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING="false"
+    DEFAULT_IMAGE_SIGMA_ORDER="random"
+    DEFAULT_VALIDATION_ORDER_STRATEGY="spatial_halton"
+    DEFAULT_FLOW_HEAD_WIDTH="1280"
+    DEFAULT_FLOW_HEAD_ATTENTION_CONTRACT="xlnet_content_diagonal"
     ;;
   d)
     ARCHITECTURE_VARIANT="dynamic_xt"
     TRAINING_OBJECTIVE="selfless_dual_stream"
     DUAL_STREAM_ATTENTION_CONTRACT="xlnet_content_diagonal"
-    DEFAULT_RUN_PROJECT="unified-d-on-b-0p6b-100b-imagenet-split-s42-r1"
+    DEFAULT_RUN_PROJECT="unified-d-on-b-0p6b-100b-imagenet-split-s42-r3"
     TRAIN_ENTRY="pretrain/train_selfless_flow_dynamic_xt.py"
     # D's T2I branch carries four dynamic query states. Layer activation
     # checkpointing preserves the B16 logical batch and mul=4 estimator while
     # keeping the per-rank 910B memory footprint bounded.
     DEFAULT_DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING="true"
+    DEFAULT_IMAGE_SIGMA_ORDER="random"
+    DEFAULT_VALIDATION_ORDER_STRATEGY="spatial_halton"
+    DEFAULT_FLOW_HEAD_WIDTH="1280"
+    DEFAULT_FLOW_HEAD_ATTENTION_CONTRACT="xlnet_content_diagonal"
+    ;;
+  e)
+    ARCHITECTURE_VARIANT="selfless_contextual"
+    TRAINING_OBJECTIVE="selfless_dual_stream"
+    DUAL_STREAM_ATTENTION_CONTRACT="xlnet_content_diagonal"
+    DEFAULT_RUN_PROJECT="unified-e-on-b-0p6b-100b-imagenet-split-s42-r1"
+    TRAIN_ENTRY="pretrain/train_selfless_flow.py"
+    DEFAULT_DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING="false"
+    DEFAULT_IMAGE_SIGMA_ORDER="sequential"
+    DEFAULT_VALIDATION_ORDER_STRATEGY="sequential"
+    DEFAULT_FLOW_HEAD_WIDTH="1280"
+    DEFAULT_FLOW_HEAD_ATTENTION_CONTRACT="xlnet_content_diagonal"
+    ;;
+  f)
+    ARCHITECTURE_VARIANT="positionwise_flow_head_on_b"
+    TRAINING_OBJECTIVE="selfless_dual_stream"
+    DUAL_STREAM_ATTENTION_CONTRACT="xlnet_content_diagonal"
+    DEFAULT_RUN_PROJECT="unified-f-on-b-0p6b-100b-imagenet-split-s42-r1"
+    TRAIN_ENTRY="pretrain/train_selfless_flow.py"
+    DEFAULT_DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING="false"
+    DEFAULT_IMAGE_SIGMA_ORDER="random"
+    DEFAULT_VALIDATION_ORDER_STRATEGY="spatial_halton"
+    # Width 1936 at depth 8 gives 163,828,208 parameters, within 0.149%
+    # of B's 164,072,976-parameter contextual head.
+    DEFAULT_FLOW_HEAD_WIDTH="1936"
+    DEFAULT_FLOW_HEAD_ATTENTION_CONTRACT="not_applicable"
     ;;
   *)
-    echo "ERROR: ABLATION must be b, c, or d; got ${ABLATION}" >&2
+    echo "ERROR: ABLATION must be b, c, d, e, or f; got ${ABLATION}" >&2
     exit 2
     ;;
 esac
 
 DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING="${DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING:-${DEFAULT_DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING}}"
+IMAGE_SIGMA_ORDER="${IMAGE_SIGMA_ORDER:-${DEFAULT_IMAGE_SIGMA_ORDER}}"
+VALIDATION_ORDER_STRATEGY="${VALIDATION_ORDER_STRATEGY:-${DEFAULT_VALIDATION_ORDER_STRATEGY}}"
+FLOW_HEAD_WIDTH="${FLOW_HEAD_WIDTH:-${DEFAULT_FLOW_HEAD_WIDTH}}"
+FLOW_HEAD_ATTENTION_CONTRACT="${FLOW_HEAD_ATTENTION_CONTRACT:-${DEFAULT_FLOW_HEAD_ATTENTION_CONTRACT}}"
 
 RUN_PROJECT="${RUN_PROJECT:-${DEFAULT_RUN_PROJECT}}"
 RUN_NAME="${RUN_NAME:-${RUN_PROJECT//\//-}}"
@@ -81,8 +126,36 @@ if [[ "${PRESERVE_MODEL_CONTRACT}" != "false" && "${PRESERVE_MODEL_CONTRACT}" !=
   echo "ERROR: PRESERVE_MODEL_CONTRACT must be true or false" >&2
   exit 2
 fi
+if [[ ! "${LOG_EVERY}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: LOG_EVERY must be a positive integer" >&2
+  exit 2
+fi
+if [[ ! "${DEBUG_LOSS_TRACE_UNTIL_STEP}" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: DEBUG_LOSS_TRACE_UNTIL_STEP must be a non-negative integer" >&2
+  exit 2
+fi
+if [[ ! "${DEEPSPEED_BF16_OVERFLOW_CHECK_UNTIL_STEP}" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: DEEPSPEED_BF16_OVERFLOW_CHECK_UNTIL_STEP must be a non-negative integer" >&2
+  exit 2
+fi
 if [[ "${IMAGE_FLOW_BATCH_MUL}" != "4" ]]; then
   echo "ERROR: B-based unified ablations require IMAGE_FLOW_BATCH_MUL=4" >&2
+  exit 2
+fi
+if [[ "${IMAGE_SIGMA_ORDER}" != "${DEFAULT_IMAGE_SIGMA_ORDER}" ]]; then
+  echo "ERROR: ablation ${ABLATION} requires IMAGE_SIGMA_ORDER=${DEFAULT_IMAGE_SIGMA_ORDER}" >&2
+  exit 2
+fi
+if [[ "${VALIDATION_ORDER_STRATEGY}" != "${DEFAULT_VALIDATION_ORDER_STRATEGY}" ]]; then
+  echo "ERROR: ablation ${ABLATION} requires VALIDATION_ORDER_STRATEGY=${DEFAULT_VALIDATION_ORDER_STRATEGY}" >&2
+  exit 2
+fi
+if [[ "${FLOW_HEAD_WIDTH}" != "${DEFAULT_FLOW_HEAD_WIDTH}" ]]; then
+  echo "ERROR: ablation ${ABLATION} requires FLOW_HEAD_WIDTH=${DEFAULT_FLOW_HEAD_WIDTH}" >&2
+  exit 2
+fi
+if [[ "${FLOW_HEAD_ATTENTION_CONTRACT}" != "${DEFAULT_FLOW_HEAD_ATTENTION_CONTRACT}" ]]; then
+  echo "ERROR: ablation ${ABLATION} requires FLOW_HEAD_ATTENTION_CONTRACT=${DEFAULT_FLOW_HEAD_ATTENTION_CONTRACT}" >&2
   exit 2
 fi
 if [[ "${DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING}" != "true" && "${DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING}" != "false" ]]; then
@@ -91,6 +164,10 @@ if [[ "${DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING}" != "true" && "${DYNAMIC_XT_T2I_
 fi
 if [[ "${ABLATION}" == "d" && "${DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING}" != "true" ]]; then
   echo "ERROR: ablation D requires T2I activation checkpointing at formal B16" >&2
+  exit 2
+fi
+if [[ "${ABLATION}" != "d" && "${DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING}" != "false" ]]; then
+  echo "ERROR: T2I-only Dynamic-XT checkpointing is valid only for ablation D" >&2
   exit 2
 fi
 if [[ "${PRESERVE_MODEL_CONTRACT}" == "true" && "${ABLATION}" != "b" ]]; then
@@ -171,6 +248,10 @@ PREFLIGHT=(
   --save-ema-eval-every "${SAVE_EMA_EVAL_EVERY}"
   --ablation "${ABLATION}"
   --dynamic-xt-t2i-gradient-checkpointing "${DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING}"
+  --image-sigma-order "${IMAGE_SIGMA_ORDER}"
+  --validation-order-strategy "${VALIDATION_ORDER_STRATEGY}"
+  --flow-head-width "${FLOW_HEAD_WIDTH}"
+  --flow-head-attention-contract "${FLOW_HEAD_ATTENTION_CONTRACT}"
 )
 if [[ "${NODE_RANK}" == "0" ]]; then
   PREFLIGHT+=(--tokenizer-probe)
@@ -194,6 +275,9 @@ COMMAND=(
   "experiment.output_dir=${OUTPUT_DIR_BASE}"
   "experiment.resume_from_checkpoint=${RESUME_FROM}"
   "experiment.save_every=${SAVE_EVERY}"
+  "experiment.log_every=${LOG_EVERY}"
+  "experiment.debug_loss_trace_until_step=${DEBUG_LOSS_TRACE_UNTIL_STEP}"
+  "experiment.deepspeed_bf16_overflow_check_until_step=${DEEPSPEED_BF16_OVERFLOW_CHECK_UNTIL_STEP}"
   "experiment.checkpoints_total_limit=${CHECKPOINTS_TOTAL_LIMIT}"
   "experiment.checkpoint_milestone_every=${CHECKPOINT_MILESTONE_EVERY}"
   "experiment.val_every=${VAL_EVERY}"
@@ -211,6 +295,12 @@ COMMAND=(
   "optimizer.params.flow_learning_rate=${FLOW_LR}"
   "training.use_gradient_checkpointing=false"
   "model.dynamic_xt_t2i_gradient_checkpointing=${DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING}"
+  "model.training_image_sigma_order=${IMAGE_SIGMA_ORDER}"
+  "model.image_flow_width=${FLOW_HEAD_WIDTH}"
+  "model.image_flow_grad_checkpointing=false"
+  "dataset.params.image.image_sigma_order=${IMAGE_SIGMA_ORDER}"
+  "experiment.validation_single_stream_order_strategies=[${VALIDATION_ORDER_STRATEGY}]"
+  "evaluation.strategies=${VALIDATION_ORDER_STRATEGY}"
   "training.stop_after_steps=${STOP_AFTER_STEPS}"
 )
 if [[ "${PRESERVE_MODEL_CONTRACT}" == "false" ]]; then
@@ -218,9 +308,17 @@ if [[ "${PRESERVE_MODEL_CONTRACT}" == "false" ]]; then
     "model.architecture_variant=${ARCHITECTURE_VARIANT}"
     "model.training_objective=${TRAINING_OBJECTIVE}"
     "model.dual_stream_attention_contract=${DUAL_STREAM_ATTENTION_CONTRACT}"
+    "model.flow_head_attention_contract=${FLOW_HEAD_ATTENTION_CONTRACT}"
     "model.image_flow_batch_mul=${IMAGE_FLOW_BATCH_MUL}"
     "model.showo_mask_schedule=cosine"
     "model.showo_min_masking_rate=0.0"
+  )
+fi
+if [[ "${ABLATION}" == "f" ]]; then
+  COMMAND+=(
+    "model.positionwise_reference_flow_width=1280"
+    "model.positionwise_reference_flow_depth=8"
+    "model.positionwise_max_parameter_relative_error=0.005"
   )
 fi
 printf '%q ' "${COMMAND[@]}" >"${AUDIT_DIR}/launch_command.sh"

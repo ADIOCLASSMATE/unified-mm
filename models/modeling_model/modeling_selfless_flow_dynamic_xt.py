@@ -42,6 +42,7 @@ from .modeling_selfless_flow_dynamic_xt_generation import (
 
 DYNAMIC_XT_ARCHITECTURE = "dynamic_xt"
 DYNAMIC_XT_ATTENTION_CONTRACT = "xlnet_content_diagonal"
+DYNAMIC_XT_FLOW_HEAD_ATTENTION_CONTRACT = "xlnet_content_diagonal"
 DYNAMIC_XT_FLOW_BATCH_MUL = 4
 DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING = True
 
@@ -667,6 +668,19 @@ class DynamicXtQwen3ForCausalLM(
                 "dual_stream_attention_contract='xlnet_content_diagonal', got "
                 f"{attention_contract!r}"
             )
+        flow_head_attention_contract = str(
+            getattr(config, "flow_head_attention_contract", "")
+        ).strip().lower()
+        if (
+            flow_head_attention_contract
+            != DYNAMIC_XT_FLOW_HEAD_ATTENTION_CONTRACT
+        ):
+            raise ValueError(
+                "Ablation D is defined on corrected baseline B and requires "
+                "flow_head_attention_contract="
+                f"'{DYNAMIC_XT_FLOW_HEAD_ATTENTION_CONTRACT}', got "
+                f"{flow_head_attention_contract!r}"
+            )
         if self.image_flow_batch_mul != DYNAMIC_XT_FLOW_BATCH_MUL:
             raise ValueError(
                 "Ablation D must preserve baseline B's image_flow_batch_mul=4, "
@@ -991,6 +1005,7 @@ class DynamicXtQwen3ForCausalLM(
 __all__ = [
     "DYNAMIC_XT_ARCHITECTURE",
     "DYNAMIC_XT_ATTENTION_CONTRACT",
+    "DYNAMIC_XT_FLOW_HEAD_ATTENTION_CONTRACT",
     "DYNAMIC_XT_FLOW_BATCH_MUL",
     "DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING",
     "DynamicXtQwen3ForCausalLM",

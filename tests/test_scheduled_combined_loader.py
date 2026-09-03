@@ -16,6 +16,7 @@ from utils.combined_dataloaders import (
 from utils.imagenet_flow_dataloaders import ScheduledPadCollator
 from pretrain.train_selfless_flow import (
     _append_training_metrics_jsonl,
+    _debug_nonfinite_loss_trace_details,
     _gradient_accumulation_plugin,
     _single_source_global_physical_token_budget,
     _source_loss_metric_payload,
@@ -642,6 +643,33 @@ def test_source_task_losses_and_weighted_contributions_are_separate():
     assert logs["train/weighted_contribution_t2i"] == 2.0
     assert logs["train/weighted_contribution_i2t"] == 0.5
     assert sum(value[1] for value in display.values()) == 3.5
+
+
+def test_nonfinite_loss_trace_identifies_rank_step_slot_and_source():
+    trace = torch.ones(2, 8, 3)
+    trace[1, 5] = torch.tensor([float("nan"), 7.0, float("inf")])
+
+    details = _debug_nonfinite_loss_trace_details(
+        trace,
+        ending_global_step=12,
+        gradient_accumulation_steps=4,
+        source_schedule=("climbmix", "t2i", "climbmix", "i2t"),
+    )
+
+    assert len(details) == 1
+    assert "rank=1,step=12,slot=2,source='t2i'" in details[0]
+    assert "'weighted': nan" in details[0]
+    assert "'image_loss': inf" in details[0]
+
+
+def test_nonfinite_loss_trace_rejects_partial_optimizer_step():
+    with pytest.raises(ValueError, match="complete optimizer steps"):
+        _debug_nonfinite_loss_trace_details(
+            torch.ones(2, 5, 3),
+            ending_global_step=2,
+            gradient_accumulation_steps=4,
+            source_schedule=("climbmix", "t2i", "climbmix", "i2t"),
+        )
 
 
 def test_single_source_metrics_require_only_the_active_target():

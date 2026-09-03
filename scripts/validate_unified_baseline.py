@@ -18,6 +18,28 @@ from utils.combined_dataloaders import BASELINE_SOURCE_SCHEDULE
 from utils.selfless_training_runtime import validate_wsd_contract
 
 
+def _contextual_flow_parameter_count(
+    *, latent_dim: int, condition_dim: int, width: int, depth: int
+) -> int:
+    shared = (
+        3 * width * width
+        + width * (condition_dim + 2 * latent_dim + 262)
+        + latent_dim
+    )
+    return int(shared + depth * (12 * width * width + 18 * width))
+
+
+def _positionwise_flow_parameter_count(
+    *, latent_dim: int, condition_dim: int, width: int, depth: int
+) -> int:
+    shared = (
+        3 * width * width
+        + width * (condition_dim + 2 * latent_dim + 262)
+        + latent_dim
+    )
+    return int(shared + depth * (5 * width * width + 7 * width))
+
+
 def _require_file(value: str, label: str) -> Path:
     path = Path(value)
     if not path.is_file():
@@ -131,10 +153,31 @@ def _parse_args():
     parser.add_argument("--backbone-lr", type=float)
     parser.add_argument("--flow-lr", type=float)
     parser.add_argument("--save-ema-eval-every", type=int)
-    parser.add_argument("--ablation", choices=("b", "c", "d"), default="b")
+    parser.add_argument(
+        "--ablation",
+        choices=("b", "c", "d", "e", "f"),
+        default="b",
+    )
     parser.add_argument(
         "--dynamic-xt-t2i-gradient-checkpointing",
         choices=("true", "false"),
+    )
+    parser.add_argument(
+        "--image-sigma-order",
+        choices=("random", "sequential"),
+    )
+    parser.add_argument(
+        "--validation-order-strategy",
+        choices=("spatial_halton", "sequential"),
+    )
+    parser.add_argument("--flow-head-width", type=int)
+    parser.add_argument(
+        "--flow-head-attention-contract",
+        choices=(
+            "selfless_strict",
+            "xlnet_content_diagonal",
+            "not_applicable",
+        ),
     )
     return parser.parse_args()
 
@@ -208,30 +251,108 @@ def main():
         raise ValueError(
             "base config must use baseline b's xlnet_content_diagonal contract"
         )
+    if (
+        str(config.model.flow_head_attention_contract)
+        != "xlnet_content_diagonal"
+    ):
+        raise ValueError(
+            "base config must keep the flow-head content diagonal aligned "
+            "with baseline b's backbone"
+        )
     if int(config.model.image_flow_batch_mul) != 4:
         raise ValueError(
             "unified B-based ablations require model.image_flow_batch_mul=4"
         )
     ablation_contracts = {
-        "b": (
-            "selfless_contextual",
-            "selfless_dual_stream",
-            "xlnet_content_diagonal",
-        ),
-        "c": (
-            "single_stream_text_ar",
-            "selfless_dual_stream",
-            "xlnet_content_diagonal",
-        ),
-        "d": (
-            "dynamic_xt",
-            "selfless_dual_stream",
-            "xlnet_content_diagonal",
-        ),
+        "b": {
+            "architecture": "selfless_contextual",
+            "image_order": "random",
+            "validation_order": "spatial_halton",
+            "flow_width": 1280,
+            "flow_head_attention_contract": "xlnet_content_diagonal",
+        },
+        "c": {
+            "architecture": "single_stream_text_ar",
+            "image_order": "random",
+            "validation_order": "spatial_halton",
+            "flow_width": 1280,
+            "flow_head_attention_contract": "xlnet_content_diagonal",
+        },
+        "d": {
+            "architecture": "dynamic_xt",
+            "image_order": "random",
+            "validation_order": "spatial_halton",
+            "flow_width": 1280,
+            "flow_head_attention_contract": "xlnet_content_diagonal",
+        },
+        "e": {
+            "architecture": "selfless_contextual",
+            "image_order": "sequential",
+            "validation_order": "sequential",
+            "flow_width": 1280,
+            "flow_head_attention_contract": "xlnet_content_diagonal",
+        },
+        "f": {
+            "architecture": "positionwise_flow_head_on_b",
+            "image_order": "random",
+            "validation_order": "spatial_halton",
+            "flow_width": 1936,
+            "flow_head_attention_contract": "not_applicable",
+        },
     }
-    architecture_variant, training_objective, attention_contract = ablation_contracts[
-        args.ablation
-    ]
+    ablation_contract = ablation_contracts[args.ablation]
+    architecture_variant = ablation_contract["architecture"]
+    training_objective = "selfless_dual_stream"
+    attention_contract = "xlnet_content_diagonal"
+    image_sigma_order = str(
+        args.image_sigma_order
+        if args.image_sigma_order is not None
+        else config.model.get(
+            "training_image_sigma_order",
+            image.image_sigma_order,
+        )
+    ).lower()
+    validation_order_strategy = str(
+        args.validation_order_strategy
+        if args.validation_order_strategy is not None
+        else config.experiment.validation_single_stream_order_strategies[0]
+    ).lower()
+    flow_head_width = int(
+        args.flow_head_width
+        if args.flow_head_width is not None
+        else config.model.image_flow_width
+    )
+    flow_head_attention_contract = str(
+        args.flow_head_attention_contract
+        if args.flow_head_attention_contract is not None
+        else config.model.flow_head_attention_contract
+    ).strip().lower()
+    if image_sigma_order != ablation_contract["image_order"]:
+        raise ValueError(
+            f"ablation {args.ablation.upper()} requires image_sigma_order="
+            f"{ablation_contract['image_order']}, got {image_sigma_order}"
+        )
+    if validation_order_strategy != ablation_contract["validation_order"]:
+        raise ValueError(
+            f"ablation {args.ablation.upper()} requires validation order="
+            f"{ablation_contract['validation_order']}, got "
+            f"{validation_order_strategy}"
+        )
+    if flow_head_width != int(ablation_contract["flow_width"]):
+        raise ValueError(
+            f"ablation {args.ablation.upper()} requires image_flow_width="
+            f"{ablation_contract['flow_width']}, got {flow_head_width}"
+        )
+    if (
+        flow_head_attention_contract
+        != ablation_contract["flow_head_attention_contract"]
+    ):
+        raise ValueError(
+            f"ablation {args.ablation.upper()} requires "
+            "flow_head_attention_contract="
+            f"{ablation_contract['flow_head_attention_contract']}, got "
+            f"{flow_head_attention_contract}"
+        )
     dynamic_xt_t2i_gradient_checkpointing = (
         args.dynamic_xt_t2i_gradient_checkpointing == "true"
         if args.dynamic_xt_t2i_gradient_checkpointing is not None
@@ -254,6 +375,10 @@ def main():
     if args.ablation != "d" and dynamic_xt_t2i_gradient_checkpointing:
         raise ValueError(
             "T2I-only Dynamic-XT checkpointing is valid only for ablation D"
+        )
+    if bool(config.model.get("image_flow_grad_checkpointing", False)):
+        raise ValueError(
+            "all formal B-based arms keep flow-head checkpointing off"
         )
     backbone_lr = float(
         args.backbone_lr
@@ -284,6 +409,39 @@ def main():
         raise ValueError(
             "baseline b requires random image reveal order"
         )
+    if str(config.model.get("training_image_sigma_order", "")).lower() != "random":
+        raise ValueError("base config must persist baseline B's random image order")
+
+    flow_head_parameters = None
+    if args.ablation == "f":
+        reference_parameters = _contextual_flow_parameter_count(
+            latent_dim=int(config.model.image_latent_dim),
+            condition_dim=int(source_model_config.hidden_size),
+            width=1280,
+            depth=8,
+        )
+        positionwise_parameters = _positionwise_flow_parameter_count(
+            latent_dim=int(config.model.image_latent_dim),
+            condition_dim=int(source_model_config.hidden_size),
+            width=flow_head_width,
+            depth=8,
+        )
+        relative_error = abs(
+            positionwise_parameters - reference_parameters
+        ) / float(reference_parameters)
+        if relative_error > 0.005:
+            raise ValueError(
+                "ablation F position-wise head is not parameter matched: "
+                f"relative_error={relative_error:.6f}"
+            )
+        flow_head_parameters = {
+            "architecture": "positionwise_adaln_mlp",
+            "parameters": positionwise_parameters,
+            "reference_architecture": "contextual_dual_stream",
+            "reference_parameters": reference_parameters,
+            "relative_error": relative_error,
+            "max_relative_error": 0.005,
+        }
     if str(image.get("expected_split", "")) != "train":
         raise ValueError("training image dataset must set expected_split=train")
     if int(image.get("expected_records", -1)) != 1_281_167:
@@ -453,17 +611,28 @@ def main():
             "architecture_variant": architecture_variant,
             "training_objective": training_objective,
             "dual_stream_attention_contract": attention_contract,
+            "flow_head_attention_contract": flow_head_attention_contract,
             "text_prediction": (
-                "causal_next_token_shift" if args.ablation == "c" else "same_position"
+                "causal_next_token_shift"
+                if args.ablation == "c"
+                else "same_position"
             ),
             "image_path": (
                 "identical_to_b"
                 if args.ablation == "c"
                 else "dynamic_xt_on_b"
                 if args.ablation == "d"
-                else None
+                else "deterministic_ltr_on_b"
+                if args.ablation == "e"
+                else "parameter_matched_positionwise_on_b"
+                if args.ablation == "f"
+                else "baseline_b"
             ),
             "image_flow_batch_mul": int(config.model.image_flow_batch_mul),
+            "image_sigma_order": image_sigma_order,
+            "validation_order_strategy": validation_order_strategy,
+            "flow_head_width": flow_head_width,
+            "flow_head_parameter_match": flow_head_parameters,
             "backbone_condition": (
                 "dynamic_xt_every_ode_evaluation"
                 if args.ablation == "d"
@@ -514,7 +683,7 @@ def main():
             "i2t_micro_batch_size_per_rank": int(
                 sources.i2t.micro_batch_size
             ),
-            "image_sigma_order": str(image.image_sigma_order),
+            "image_sigma_order": image_sigma_order,
             "optimizer_steps_per_epoch": optimizer_steps_per_image_epoch,
         },
         "ema_evaluation_export": {

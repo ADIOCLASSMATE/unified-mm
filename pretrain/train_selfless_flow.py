@@ -38,6 +38,10 @@ from accelerate.utils import (
 from safetensors import SafetensorError, safe_open
 
 from utils.dataset_utils import get_dataloaders
+from utils.flow_head_contract import (
+    flow_head_attention_report,
+    validate_flow_head_attention_contract,
+)
 from utils.wsd_schedule import get_wsd_schedule
 from utils.selfless_flow_optimizer import (
     learning_rate_for_parameter,
@@ -228,6 +232,54 @@ def _source_task_loss_and_count(
     raise ValueError(f"unsupported mixed training source={source_name!r}")
 
 
+def _debug_nonfinite_loss_trace_details(
+    trace: torch.Tensor,
+    *,
+    ending_global_step: int,
+    gradient_accumulation_steps: int,
+    source_schedule: tuple[str, ...],
+) -> list[str]:
+    """Describe non-finite device-cached loss scalars at a log boundary."""
+
+    if trace.ndim != 3 or trace.shape[-1] != 3:
+        raise ValueError(
+            "debug loss trace must have shape [world,microbatches,3], got "
+            f"{tuple(trace.shape)}"
+        )
+    accumulation = int(gradient_accumulation_steps)
+    if accumulation <= 0 or int(trace.shape[1]) % accumulation:
+        raise ValueError(
+            "debug loss trace length must contain complete optimizer steps"
+        )
+    if source_schedule and len(source_schedule) != accumulation:
+        raise ValueError(
+            "debug loss trace source schedule must match gradient accumulation"
+        )
+
+    trace_cpu = trace.detach().float().cpu()
+    finite_by_microbatch = torch.isfinite(trace_cpu).all(dim=-1)
+    bad_indices = (~finite_by_microbatch).nonzero(as_tuple=False).tolist()
+    bad_indices.sort(key=lambda item: (int(item[1]), int(item[0])))
+    first_step = int(ending_global_step) - int(trace.shape[1]) // accumulation + 1
+    field_names = ("weighted", "text_loss", "image_loss")
+    details = []
+    for rank, microbatch_index in bad_indices:
+        slot = int(microbatch_index) % accumulation
+        source = source_schedule[slot] if source_schedule else "unknown"
+        values = {
+            name: float(value)
+            for name, value in zip(
+                field_names,
+                trace_cpu[int(rank), int(microbatch_index)].tolist(),
+            )
+        }
+        details.append(
+            f"rank={int(rank)},step={first_step + int(microbatch_index) // accumulation},"
+            f"slot={slot + 1},source={source!r},values={values}"
+        )
+    return details
+
+
 def _source_loss_metric_payload(
     reduced_source_totals: torch.Tensor,
     *,
@@ -361,6 +413,7 @@ def _training_objective(config) -> str:
             "unsupported model.dual_stream_attention_contract="
             f"{attention_contract!r}"
         )
+    validate_flow_head_attention_contract(config.model)
     if (
         objective == "showo_mae_flow"
         and str(config.model.get("showo_mask_schedule", "cosine")).lower()
@@ -1517,12 +1570,37 @@ def main(*, model_loader=None):
     backbone_gate_stats_every = int(
         config.experiment.get("backbone_gate_stats_every", 0)
     )
+    debug_loss_trace_until_step = int(
+        config.experiment.get("debug_loss_trace_until_step", 0)
+    )
+    deepspeed_bf16_overflow_check_until_step = int(
+        config.experiment.get(
+            "deepspeed_bf16_overflow_check_until_step",
+            0,
+        )
+    )
     if log_every <= 0:
         raise ValueError(f"experiment.log_every must be positive, got {log_every}")
     if log_grad_norm_every <= 0:
         raise ValueError(
             "experiment.log_grad_norm_every must be positive, got "
             f"{log_grad_norm_every}"
+        )
+    if debug_loss_trace_until_step < 0:
+        raise ValueError(
+            "experiment.debug_loss_trace_until_step must be non-negative"
+        )
+    if deepspeed_bf16_overflow_check_until_step < 0:
+        raise ValueError(
+            "experiment.deepspeed_bf16_overflow_check_until_step must be "
+            "non-negative"
+        )
+    if (
+        debug_loss_trace_until_step
+        and debug_loss_trace_until_step % log_every
+    ):
+        raise ValueError(
+            "experiment.debug_loss_trace_until_step must end on a log boundary"
         )
     stop_after_steps = training_stop_step(config)
     mixed_source_training = (
@@ -1688,6 +1766,14 @@ def main(*, model_loader=None):
         accelerator.state.deepspeed_plugin.deepspeed_config.setdefault(
             "data_types", {}
         )["grad_accum_dtype"] = gradient_accumulation_dtype
+        if deepspeed_bf16_overflow_check_until_step:
+            # Accelerate executes DeepSpeedEngine.step() inside backward() on
+            # accumulation boundaries. Enable DeepSpeed's pre-update BF16
+            # overflow scan for the bounded startup guard so a bad gradient
+            # cannot poison the parameters before the trainer can report it.
+            accelerator.state.deepspeed_plugin.deepspeed_config.setdefault(
+                "bf16", {}
+            )["check_grad_overflow"] = True
 
     #####################################
     # SETUP LOGGING, SEED and CONFIG    #
@@ -2305,6 +2391,7 @@ def main(*, model_loader=None):
         0.0, device=accelerator.device
     )
     finite_loss_microbatches_checked = 0
+    debug_loss_trace: list[torch.Tensor] = []
     last_logged_loss = None
     actual_global_physical_tokens_per_step = None
     source_microbatches_window = {
@@ -2546,7 +2633,6 @@ def main(*, model_loader=None):
                 and accelerator.sync_gradients
                 and (global_step + 1) % flow_stats_every == 0
             )
-
             model_output = model(**forward_kwargs)
             loss = model_output.loss
             # Every microbatch loss is accumulated below and the complete
@@ -2565,6 +2651,16 @@ def main(*, model_loader=None):
             if per_modality_loss is None or per_modality_count is None:
                 raise RuntimeError(
                     "joint image-text training requires per-modality loss/count output"
+                )
+            if 0 < global_step + 1 <= debug_loss_trace_until_step:
+                debug_loss_trace.append(
+                    torch.stack(
+                        (
+                            loss.detach().float(),
+                            per_modality_loss["text_loss"].detach().float(),
+                            per_modality_loss["image_loss"].detach().float(),
+                        )
+                    )
                 )
             text_count = per_modality_count["text_tokens"].detach().to(
                 accelerator.device, dtype=torch.float32
@@ -2619,6 +2715,37 @@ def main(*, model_loader=None):
                 acc_backbone_gate_stat_batches += 1
             acc_loss += loss.detach()
 
+            # Resolve the bounded startup trace before the final backward of
+            # an accumulation window.  A non-finite forward value must be
+            # reported before DeepSpeed's gradient-overflow guard can obscure
+            # its source, and every rank must enter the gather together.
+            if accelerator.sync_gradients and debug_loss_trace:
+                local_trace = torch.stack(debug_loss_trace)
+                gathered_trace = accelerator.gather(local_trace).reshape(
+                    accelerator.num_processes,
+                    local_trace.shape[0],
+                    local_trace.shape[1],
+                )
+                trace_details = _debug_nonfinite_loss_trace_details(
+                    gathered_trace,
+                    ending_global_step=global_step + 1,
+                    gradient_accumulation_steps=(
+                        accelerator.gradient_accumulation_steps
+                    ),
+                    source_schedule=(
+                        tuple(train_dataloader.schedule)
+                        if mixed_source_training
+                        else ()
+                    ),
+                )
+                debug_loss_trace.clear()
+                if trace_details:
+                    raise FloatingPointError(
+                        "non-finite training loss trace before backward at "
+                        f"global_step={global_step + 1}: "
+                        + "; ".join(trace_details[:32])
+                    )
+
             accelerator.backward(loss)
 
             if accelerator.sync_gradients:
@@ -2667,6 +2794,40 @@ def main(*, model_loader=None):
                         )
                 
                 optimizer.step()
+                if (
+                    0
+                    < global_step + 1
+                    <= deepspeed_bf16_overflow_check_until_step
+                ):
+                    # Accelerate invokes DeepSpeedEngine.step() inside
+                    # accelerator.backward() at a synchronization boundary;
+                    # its optimizer wrapper's step() above is intentionally a
+                    # no-op. ZeRO has therefore already populated ``overflow``
+                    # here, before scheduler/EMA state advances.
+                    zero_optimizer = getattr(model, "optimizer", None)
+                    if zero_optimizer is None:
+                        raise RuntimeError(
+                            "startup BF16 overflow guard requires the "
+                            "DeepSpeed ZeRO optimizer"
+                        )
+                    if bool(getattr(zero_optimizer, "overflow", False)):
+                        raise FloatingPointError(
+                            "DeepSpeed detected a non-finite BF16 gradient and "
+                            "skipped the optimizer update: "
+                            f"next_global_step={global_step + 1}"
+                        )
+                    if (
+                        global_step + 1
+                        == deepspeed_bf16_overflow_check_until_step
+                        and hasattr(zero_optimizer, "check_grad_overflow")
+                    ):
+                        zero_optimizer.check_grad_overflow = False
+                        if accelerator.is_main_process:
+                            logger.info(
+                                "Startup BF16 overflow-check window passed; "
+                                "disabled its extra scan for subsequent "
+                                "optimizer steps."
+                            )
                 lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 if (
@@ -4426,6 +4587,9 @@ def _validate_multimodal(
                                 == "xlnet_content_diagonal"
                             ),
                         },
+                        "flow_head_attention": flow_head_attention_report(
+                            config.model
+                        ),
                         "training_seed": int(config.training.seed),
                         "validation_seed": int(
                             config.experiment.get(

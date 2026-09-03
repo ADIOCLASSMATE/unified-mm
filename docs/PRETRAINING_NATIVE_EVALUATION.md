@@ -88,6 +88,14 @@ COCO caption perplexity, and incomplete Winoground/SVO-Probes/What'sUp runs.
 
 ## Canonical launch
 
+The previous step-95415 B artifact used a strict, no-diagonal flow-head
+content stream. It has been relabeled as the historical control at
+`output/unified-b-flow-head-no-diagonal-0p6b-100b-imagenet-split-s42-r1`.
+Its explicit `flow_head_attention_contract: selfless_strict` preserves the
+old numerical path. The path below is reserved for the freshly retrained,
+corrected B model, whose flow query is strict and whose flow content stream
+uses the diagonal contract `sigma_kv <= sigma_q`.
+
 ```bash
 RUN_ROOT=output/unified-b-0p6b-100b-imagenet-split-s42-r1
 EVAL_PROFILE=formal \

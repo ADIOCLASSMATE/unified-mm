@@ -57,6 +57,10 @@ from utils.evaluation_model_source import (  # noqa: E402
     load_model_source_weights,
     resolve_evaluation_model_source,
 )
+from utils.flow_head_contract import (  # noqa: E402
+    flow_head_attention_report,
+    validate_flow_head_attention_contract,
+)
 from utils.sharded_ema import load_sharded_ema_checkpoint  # noqa: E402
 from utils.utils import load_model_tokenizer  # noqa: E402
 
@@ -1849,6 +1853,10 @@ def main(*, model_loader=None):
             "unsupported model.dual_stream_attention_contract="
             f"{attention_contract!r}"
         )
+    flow_head_attention_contract = validate_flow_head_attention_contract(
+        config.model,
+        label="evaluation config",
+    )
     unified_dataset = str(config.dataset.class_name) == "UnifiedMixedDataset"
     dataset_params = (
         config.dataset.params.image
@@ -1907,6 +1915,18 @@ def main(*, model_loader=None):
             "loaded model attention contract does not match evaluation config: "
             f"model={loaded_attention_contract!r}, config={attention_contract!r}"
         )
+    loaded_flow_head_attention_contract = validate_flow_head_attention_contract(
+        model.config,
+        label="loaded model",
+    )
+    if loaded_flow_head_attention_contract != flow_head_attention_contract:
+        raise ValueError(
+            "loaded model flow-head attention contract does not match "
+            "evaluation config: "
+            f"model={loaded_flow_head_attention_contract!r}, "
+            f"config={flow_head_attention_contract!r}"
+        )
+    flow_head_attention = flow_head_attention_report(config.model)
     if evaluation_model_source is not None:
         if is_main_process(rank):
             print(
@@ -2649,6 +2669,7 @@ def main(*, model_loader=None):
                 ),
                 "single_stream_current_query_diagonal": False,
             },
+            "flow_head_attention": flow_head_attention,
             "evaluation_resume": {
                 "schema": EVALUATION_RESUME_SCHEMA,
                 "commit_schema": EVALUATION_RESUME_COMMIT_SCHEMA,
@@ -2728,12 +2749,21 @@ def main(*, model_loader=None):
                 else None
             ),
             "flow_head": {
-                "architecture": "dynamic_dual_stream",
+                "architecture": flow_head_attention["architecture"],
+                "attention_contract": flow_head_attention_contract,
                 "depth": int(config.model.get("image_flow_depth", 8)),
                 "width": int(config.model.get("image_flow_width", 1280)),
                 "mlp_ratio": 1.0,
-                "attention_heads": 8,
-                "attention_dropout": 0.0,
+                "attention_heads": (
+                    8
+                    if flow_head_attention["applicable"]
+                    else 0
+                ),
+                "attention_dropout": (
+                    0.0
+                    if flow_head_attention["applicable"]
+                    else None
+                ),
                 "adaln_zero_init": True,
                 "position_contract": (
                     model.image_flow_head.net.position_contract()

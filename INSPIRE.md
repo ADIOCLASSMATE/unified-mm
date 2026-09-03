@@ -63,9 +63,12 @@ not implicitly mount the official dataset.
 - Project: `多模态大模型新架构评测探索与scaling-law`
   (`high-dimensionaldata`).
 - Project override for the unified ClimbMix + ImageNet work: every 1B LR-sweep
-  Job and every formal 100B baseline-b, C-on-B, or D-on-B Job must use
+  Job and every formal 100B baseline-b or C-on-B Job must use
   `随机序语言建模-统一自回归与掩码扩散的随机顺序生成框架`. Never submit those
-  Jobs to `high-dimensionaldata`.
+  Jobs to `high-dimensionaldata`. The explicit exception is the D/E/F-on-B
+  study: submit those three formal Jobs to
+  `多模态大模型新架构评测探索与scaling-law` (`high-dimensionaldata`), with
+  no duplicate D/E/F Jobs in the random-order project.
 - Unified training sets `training.runtime_hashing_enabled: false`. Its data
   loading, checkpoint/resume checks, EMA layout checks, sweep selection, and
   formal continuation must use readable fields and must not calculate hashes.
@@ -77,7 +80,7 @@ not implicitly mount the official dataset.
   `script/selfless/pretraining_unified_baseline_lr_sweep_arm_ascend64.sh` and
   select only after all nine complete with
   `scripts/select_unified_lr_sweep.py`.
-- The formal baseline-b/C-on-B/D-on-B contract is
+- The formal baseline-b/C-on-B/D-on-B/E-on-B/F-on-B contract is
   `configs/protocols/unified_ablation_100b_ascend64.yaml`; launch each selected
   condition with
   `script/selfless/pretraining_unified_ablation_100b_ascend64.sh`. The 0.6B
@@ -89,7 +92,17 @@ not implicitly mount the official dataset.
   identical to baseline b and it must not resume a retired C-on-A checkpoint.
   D-on-B uses the dedicated Dynamic-XT model and generation implementation,
   preserves `image_flow_batch_mul: 4`, and must not resume the retired A-based
-  Dynamic-XT checkpoint.
+  Dynamic-XT checkpoint. Only its T2I Dynamic-XT decoder layers use activation
+  checkpointing. A single DeepSpeed BF16 overflow scan protects D's first
+  optimizer update and is then disabled; ClimbMix/I2T and all steady-state
+  updates keep the normal path. E keeps B's model but uses deterministic serialized
+  image sigma and generation order. F uses the isolated, parameter-matched
+  position-wise flow model/generation files (width 1936, depth 8). F has no
+  cross-token flow-head attention or content stream, so its persisted
+  `flow_head_attention_contract` is `not_applicable`; its backbone still uses
+  B's `xlnet_content_diagonal` contract. E/F retain
+  `image_flow_batch_mul: 4`; global and flow-head gradient checkpointing stay
+  off.
 - Dedicated Workspace: `昇腾卡公共空间`; use it only for Ascend workloads.
 - Compute Group: `910B资源` (`ASCEND 910B (64GB)`).
 - The `high-dimensionaldata` Ascend training allocation ceiling is 256
@@ -129,10 +142,17 @@ not implicitly mount the official dataset.
   custom ImageNet 1K/5K retrieval, ReaL, and the old generated-caption CLIP
   score have been removed. The text-only entry is
   `script/selfless/evaluate_selfless_text_ascend16.sh`.
-- The canonical final-evaluation input for baseline b is
-  `output/unified-b-0p6b-100b-imagenet-split-s42-r1/hf_model-final-ema`.
-  It is loaded directly as the Hugging Face model, without a sharded EMA
-  overlay; `ema_export_metadata.json` records source step 95415. Rank-sharded
+- The completed step-95415 artifact previously named baseline b predates the
+  flow-head content diagonal. It is retained only as the no-diagonal control at
+  `output/unified-b-flow-head-no-diagonal-0p6b-100b-imagenet-split-s42-r1/hf_model-final-ema`.
+  The canonical corrected-b path
+  `output/unified-b-0p6b-100b-imagenet-split-s42-r1` is reserved for a fresh
+  retraining run and must not reuse this historical checkpoint. Corrected B
+  explicitly sets `flow_head_attention_contract: xlnet_content_diagonal`:
+  its flow query remains strict (`sigma_kv < sigma_q`) while the content stream
+  consumes the same latent token as the backbone and uses `sigma_kv <= sigma_q`.
+  Legacy checkpoints with no such
+  field are always interpreted as `selfless_strict`. Rank-sharded
   checkpoint directories remain legacy inputs only for historical trends.
 - The reusable T2I-only entry is
   `script/selfless/evaluate_unified_t2i_fid_is_ascend16.sh`. Project-formal IS uses
@@ -386,6 +406,11 @@ not implicitly mount the official dataset.
   `script/selfless/pretraining_unified_ablation_d_on_b_0p6b_formal_ascend64.sh`;
   the independent evaluation entry is
   `scripts/evaluate_dynamic_xt_single_stream_fid_is.py`.
+- The minimal 64-NPU startup guard was validated for 10 optimizer steps in
+  `umm-d-on-b-startupguard10-v13-64-s42-r1`: the first-boundary guard passed,
+  disabled itself immediately, and step 10 remained finite at loss `0.6762`
+  and `4.1813 s/step`. Fully masked attention rows are a normal shared input
+  pattern across arms and are not treated as the D failure cause.
 - The position-wise-head retained smoke report is
   `public/datasets/imagenet_full/preparation/positionwise_head_smoke_report.json`.
 - The position-wise-head final EMA completed the project-formal 50K

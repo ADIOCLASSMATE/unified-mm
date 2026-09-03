@@ -312,9 +312,14 @@ class PositionwiseFlowLoss(nn.Module):
         sigma: torch.Tensor | None = None,
         image_positions: torch.Tensor | None = None,
         context_latents: torch.Tensor | None = None,
+        context_mask: torch.Tensor | None = None,
         record_stats: bool = True,
     ) -> torch.Tensor:
-        del sigma, image_positions, context_latents
+        # Keep the same call surface as ContextualFlowLoss.  F deliberately
+        # discards every cross-token context input: accepting context_mask here
+        # avoids a model-level compatibility branch while making that omission
+        # explicit in the isolated head implementation.
+        del sigma, image_positions, context_latents, context_mask
         model_device = self.net.input_proj.weight.device
         model_dtype = self.net.input_proj.weight.dtype
         target_float = target.to(device=model_device, dtype=torch.float32)
@@ -356,10 +361,6 @@ class PositionwiseFlowLoss(nn.Module):
 
     def empty_latent_mixer_cache(self, batch_size: int = 1, capacity=None):
         del batch_size, capacity
-        return None
-
-    def append_latent_mixer_cache(self, cache, **_unused_context):
-        del cache
         return None
 
     def stack_latent_mixer_caches(self, caches):

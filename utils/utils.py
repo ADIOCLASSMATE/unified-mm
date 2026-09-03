@@ -10,6 +10,7 @@ from omegaconf import DictConfig, ListConfig, OmegaConf
 from typing import Any, List, Tuple
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 from transformers import AutoConfig, AutoTokenizer
+from utils.flow_head_contract import validate_flow_head_attention_contract
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
@@ -107,6 +108,12 @@ def load_model_tokenizer(
         DynamicXtQwen3ForCausalLM,
         SelflessFlowDynamicXtConfig,
     )
+    # F owns a distinct checkpoint model type. Register it before AutoConfig
+    # reads a final export or resumable checkpoint.
+    from models.modeling_model.modeling_selfless_flow_positionwise_on_b import (
+        PositionwiseFlowOnBQwen3ForCausalLM,
+        SelflessFlowPositionwiseOnBConfig,
+    )
 
     validate_image_data_layout(config)
     if model_dtype not in {torch.bfloat16, torch.float32}:
@@ -151,11 +158,17 @@ def load_model_tokenizer(
         if model_config_class is None:
             model_config_class = SelflessFlowDynamicXtConfig
         implementation_label = "dynamic_xt_on_b"
+    elif architecture_variant == "positionwise_flow_head_on_b":
+        Qwen3ForCausalLM = PositionwiseFlowOnBQwen3ForCausalLM
+        if model_config_class is None:
+            model_config_class = SelflessFlowPositionwiseOnBConfig
+        implementation_label = "positionwise_flow_head_on_b"
     else:
         raise ValueError(
             f"Unknown model.architecture_variant={architecture_variant!r}; "
-            "expected selfless_contextual, positionwise_selfless, or "
-            "single_stream_text_ar, or dynamic_xt."
+            "expected selfless_contextual, positionwise_selfless, "
+            "single_stream_text_ar, dynamic_xt, "
+            "or positionwise_flow_head_on_b."
         )
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -200,6 +213,7 @@ def load_model_tokenizer(
         "architecture_variant",
         "training_objective",
         "dual_stream_attention_contract",
+        "flow_head_attention_contract",
         "showo_mask_schedule",
         "showo_min_masking_rate",
         "boi_token_id",
@@ -213,6 +227,10 @@ def load_model_tokenizer(
         "image_flow_batch_mul",
         "image_flow_grad_checkpointing",
         "dynamic_xt_t2i_gradient_checkpointing",
+        "training_image_sigma_order",
+        "positionwise_reference_flow_width",
+        "positionwise_reference_flow_depth",
+        "positionwise_max_parameter_relative_error",
         "image_flow_time_scale",
         "image_flow_time_sampling",
         "image_flow_logit_mean",
@@ -237,6 +255,18 @@ def load_model_tokenizer(
         model_config.model_type = model_config_class.model_type
         model_config.architectures = [Qwen3ForCausalLM.__name__]
     source_has_image_flow = hasattr(model_config, "image_flow_width")
+    default_source_flow_head_attention_contract = (
+        "not_applicable"
+        if architecture_variant == "positionwise_flow_head_on_b"
+        else "selfless_strict"
+    )
+    source_flow_head_attention_contract = str(
+        getattr(
+            model_config,
+            "flow_head_attention_contract",
+            default_source_flow_head_attention_contract,
+        )
+    ).strip().lower()
     source_attention_gate = str(
         getattr(model_config, "backbone_attention_output_gate", "none")
     )
@@ -244,13 +274,22 @@ def load_model_tokenizer(
     model_config.use_flex_attention = config.model.use_flex_attention
     model_config.eos_token_id = tokenizer.eos_token_id
     for key in multimodal_config_keys:
-        value = (
-            architecture_variant
-            if key == "architecture_variant" and model_class is None
-            else config.model.get(key)
-        )
+        if key == "architecture_variant" and model_class is None:
+            value = architecture_variant
+        elif key == "flow_head_attention_contract" and source_has_image_flow:
+            # A trained checkpoint owns this numerical contract. Legacy A/B
+            # configs lack the field because their contextual head was strict;
+            # legacy F lacks it because its position-wise head has no attention.
+            # Never reinterpret either numerical path through a newer YAML.
+            value = source_flow_head_attention_contract
+        else:
+            value = config.model.get(key)
         if value is not None:
             setattr(model_config, key, value)
+    validate_flow_head_attention_contract(
+        model_config,
+        label="resolved model config",
+    )
 
     if (
         hasattr(tokenizer, "im_end_token_id")

@@ -389,13 +389,14 @@ def clone_prefix_cache(
         destination.keys = source.keys.expand(batch_size, -1, -1, -1).clone()
         destination.values = source.values.expand(batch_size, -1, -1, -1).clone()
         destination.is_initialized = True
-    cached_text_source = getattr(
-        prefix_cache, "_single_stream_text_ar_last_hidden", None
-    )
-    if cached_text_source is not None:
-        cloned._single_stream_text_ar_last_hidden = cached_text_source.expand(
-            batch_size, -1
-        ).clone()
+    for hidden_attr in ("_single_stream_text_ar_last_hidden",):
+        cached_text_source = getattr(prefix_cache, hidden_attr, None)
+        if cached_text_source is not None:
+            setattr(
+                cloned,
+                hidden_attr,
+                cached_text_source.expand(batch_size, -1).clone(),
+            )
     return cloned
 
 

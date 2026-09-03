@@ -11,22 +11,26 @@ import torch
 import torch_npu  # noqa: F401
 from transformers import Qwen3Config
 
-from models.modeling_model.modeling_positionwise_flow import (
-    PositionwiseFlowQwen3ForCausalLM,
+from models.modeling_model.modeling_selfless_flow import (
+    Qwen3ForCausalLM as BaselineQwen3ForCausalLM,
 )
 from models.modeling_model.modeling_selfless_flow_dynamic_xt import (
     DynamicXtQwen3ForCausalLM,
     SelflessFlowDynamicXtConfig,
 )
+from models.modeling_model.modeling_selfless_flow_positionwise_on_b import (
+    PositionwiseFlowOnBQwen3ForCausalLM,
+    SelflessFlowPositionwiseOnBConfig,
+)
 from utils.utils import get_selfless_mask
 
 
 def tiny_config(model_label: str) -> Qwen3Config:
-    config_class = (
-        SelflessFlowDynamicXtConfig
-        if model_label == "dynamic_xt"
-        else Qwen3Config
-    )
+    config_classes = {
+        "dynamic_xt": SelflessFlowDynamicXtConfig,
+        "positionwise_flow_head_on_b": SelflessFlowPositionwiseOnBConfig,
+    }
+    config_class = config_classes.get(model_label, Qwen3Config)
     config = config_class(
         vocab_size=32,
         hidden_size=32,
@@ -40,10 +44,21 @@ def tiny_config(model_label: str) -> Qwen3Config:
         bos_token_id=1,
         eos_token_id=9,
     )
-    if model_label in {"positionwise_selfless", "dynamic_xt"}:
+    if model_label in {
+        "positionwise_selfless",
+        "dynamic_xt",
+        "positionwise_flow_head_on_b",
+    }:
         config.architecture_variant = model_label
+    elif model_label == "deterministic_ltr_on_b":
+        config.architecture_variant = "selfless_contextual"
     config.training_objective = "selfless_dual_stream"
     config.dual_stream_attention_contract = "xlnet_content_diagonal"
+    config.flow_head_attention_contract = (
+        "not_applicable"
+        if model_label == "positionwise_flow_head_on_b"
+        else "xlnet_content_diagonal"
+    )
     config.mask_token_id = 7
     config.image_mask_token_id = 8
     config.boi_token_id = 11
@@ -53,7 +68,7 @@ def tiny_config(model_label: str) -> Qwen3Config:
     config.image_flow_width = 32
     config.image_flow_depth = 2
     config.image_flow_num_sampling_steps = "10"
-    config.image_flow_batch_mul = 4 if model_label == "dynamic_xt" else 1
+    config.image_flow_batch_mul = 4
     config.image_flow_time_scale = 1000.0
     config.image_flow_time_sampling = "uniform"
     config.image_flow_time_eps = 1.0e-4
@@ -61,6 +76,8 @@ def tiny_config(model_label: str) -> Qwen3Config:
     config.image_flow_solver = "euler"
     config.image_input_noise_strength = 1.0e-2
     config.image_uncond_prob = 0.1
+    config.lambda_text = 0.05
+    config.lambda_image = 1.0
     config.backbone_attention_output_gate = "none"
     config.use_flex_attention = True
     config.use_cache = False
@@ -184,16 +201,18 @@ def run_variant(
         spans=[(0, 2, 6)],
         image_latent_dim=4,
         flow_temperature=1.0,
-        flow_cfg=(
-            2.0
-            if model_label in {"positionwise_selfless", "dynamic_xt"}
-            else 1.0
-        ),
+        flow_cfg=2.0,
         flow_solver="heun" if model_label == "dynamic_xt" else "euler",
         flow_num_steps=1,
         parallel_rate=1,
-        order_strategy="sigma",
-        use_cache=model_label == "dynamic_xt",
+        order_strategy=(
+            "sequential"
+            if model_label == "deterministic_ltr_on_b"
+            else "spatial_halton"
+            if model_label == "positionwise_flow_head_on_b"
+            else "sigma"
+        ),
+        use_cache=True,
         return_trace=True,
         _debug_max_generation_steps=(1 if model_label == "dynamic_xt" else None),
     )
@@ -225,8 +244,13 @@ def main() -> None:
     device = torch.device("npu:0")
     reports = [
         run_variant(
-            PositionwiseFlowQwen3ForCausalLM,
-            "positionwise_selfless",
+            BaselineQwen3ForCausalLM,
+            "deterministic_ltr_on_b",
+            device,
+        ),
+        run_variant(
+            PositionwiseFlowOnBQwen3ForCausalLM,
+            "positionwise_flow_head_on_b",
             device,
         ),
         run_variant(

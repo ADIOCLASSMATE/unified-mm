@@ -23,6 +23,7 @@ from models.modeling_model.modeling_selfless_flow import (
 from models.modeling_model.modeling_selfless_flow_dynamic_xt import (
     DYNAMIC_XT_ATTENTION_CONTRACT,
     DYNAMIC_XT_FLOW_BATCH_MUL,
+    DYNAMIC_XT_FLOW_HEAD_ATTENTION_CONTRACT,
     DynamicXtQwen3ForCausalLM,
     DynamicXtQwen3Model,
     SelflessFlowDynamicXtConfig,
@@ -72,6 +73,9 @@ def tiny_config(config_class=SelflessFlowDynamicXtConfig):
     config.architecture_variant = "dynamic_xt"
     config.training_objective = "selfless_dual_stream"
     config.dual_stream_attention_contract = DYNAMIC_XT_ATTENTION_CONTRACT
+    config.flow_head_attention_contract = (
+        DYNAMIC_XT_FLOW_HEAD_ATTENTION_CONTRACT
+    )
     config.use_cache = False
     return config
 
@@ -171,6 +175,11 @@ def test_dynamic_training_contract_preserves_four_states_with_shared_content():
     invalid = tiny_config()
     invalid.image_flow_batch_mul = 1
     with pytest.raises(ValueError, match="image_flow_batch_mul=4"):
+        DynamicXtQwen3ForCausalLM(invalid)
+
+    invalid = tiny_config()
+    invalid.flow_head_attention_contract = "selfless_strict"
+    with pytest.raises(ValueError, match="flow_head_attention_contract"):
         DynamicXtQwen3ForCausalLM(invalid)
 
 

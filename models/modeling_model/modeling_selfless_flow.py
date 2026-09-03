@@ -768,6 +768,12 @@ class Qwen3Attention(nn.Module):
             f"{prefix}.flex_attention_output",
             X0_attn_output,
         )
+        _debug_require_finite_tensor(
+            debug_finite,
+            debug_label,
+            f"{prefix}.flex_attention_output_xt",
+            XT_attn_output,
+        )
 
         X0_attn_output = self._apply_attention_output_gate(
             X0_attn_output,
@@ -1483,6 +1489,12 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 debug_backbone_label,
                 f"layers.{layer_idx}.output_x0",
                 X0_hidden_states,
+            )
+            _debug_require_finite_tensor(
+                debug_finite_backbone,
+                debug_backbone_label,
+                f"layers.{layer_idx}.output_xt",
+                XT_hidden_states,
             )
 
         hidden_states = self._finalize_stream_hidden(

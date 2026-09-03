@@ -67,6 +67,10 @@ class EvaluationModelSource:
                     "loaded_via": "from_pretrained",
                     "floating_dtype": self.metadata.get("floating_dtype"),
                     "state_key_count": self.metadata.get("state_key_count"),
+                    "stored_weight_key_count": self.metadata.get(
+                        "stored_weight_key_count",
+                        self.metadata.get("state_key_count"),
+                    ),
                 }
             )
         else:
@@ -102,6 +106,21 @@ def resolve_evaluation_model_source(path: str | Path) -> EvaluationModelSource:
             raise ValueError("formal final evaluation requires the FP32 EMA export")
         if int(metadata.get("state_key_count", 0)) <= 0:
             raise ValueError("final EMA export has no recorded state keys")
+        # ``state_key_count`` describes the merged PyTorch state dict.  A
+        # safetensors export stores only one member of each tied-weight alias
+        # group (for this model, lm_head.weight is tied to embed_tokens), so
+        # its physical key count can legitimately be smaller.  New exports
+        # record both counts; legacy exports recorded only the physical count.
+        source_state_key_count = int(metadata["state_key_count"])
+        stored_weight_key_count = int(
+            metadata.get("stored_weight_key_count", source_state_key_count)
+        )
+        if stored_weight_key_count <= 0:
+            raise ValueError("final EMA export has no recorded stored weight keys")
+        if stored_weight_key_count > source_state_key_count:
+            raise ValueError(
+                "final EMA stored weight key count exceeds source state key count"
+            )
         if str(metadata.get("export_kind")) != "training":
             raise ValueError("formal final evaluation requires a training EMA export")
         from safetensors import safe_open
@@ -110,8 +129,10 @@ def resolve_evaluation_model_source(path: str | Path) -> EvaluationModelSource:
             str(source / "model.safetensors"), framework="pt", device="cpu"
         ) as handle:
             keys = list(handle.keys())
-            if len(keys) != int(metadata["state_key_count"]):
-                raise ValueError("final EMA safetensors key count disagrees with metadata")
+            if len(keys) != stored_weight_key_count:
+                raise ValueError(
+                    "final EMA safetensors stored key count disagrees with metadata"
+                )
             dtypes = {handle.get_slice(key).get_dtype() for key in keys}
         if dtypes != {"F32"}:
             raise ValueError(f"final EMA safetensors must be FP32; got {sorted(dtypes)}")
@@ -192,6 +213,7 @@ def model_source_from_args(args) -> EvaluationModelSource:
 def _apply_checkpoint_model_contract(config, saved_model, *, label: str) -> None:
     if not isinstance(saved_model, dict):
         raise ValueError(f"{label} lacks config_contract.model")
+    saved_architecture = str(saved_model.get("architecture_variant", ""))
     for field in _REQUIRED_MODEL_CONTRACT_FIELDS:
         if field not in saved_model:
             raise ValueError(f"{label} config lacks required field: {field}")
@@ -201,9 +223,21 @@ def _apply_checkpoint_model_contract(config, saved_model, *, label: str) -> None
             "dual_stream_attention_contract",
         }:
             # One neutral evaluation YAML serves every ablation. The weight
-            # source owns both implementation identity and the sole A/B mask
-            # switch; parameters alone cannot recover either distinction.
+            # source owns both implementation identity and the backbone A/B
+            # mask switch; parameters alone cannot recover either distinction.
+            # The separate flow-head mask contract is restored below.
             config.model[field] = str(saved_value)
+            continue
+        if (
+            field == "image_flow_width"
+            and saved_architecture == "positionwise_flow_head_on_b"
+        ):
+            if int(saved_value) != 1936:
+                raise ValueError(
+                    f"{label} ablation-F image_flow_width must be 1936, "
+                    f"got {saved_value!r}"
+                )
+            config.model[field] = int(saved_value)
             continue
         expected = config.model.get(field)
         if expected is not None and str(saved_value) != str(expected):
@@ -212,6 +246,76 @@ def _apply_checkpoint_model_contract(config, saved_model, *, label: str) -> None
                 f"checkpoint={saved_value!r}, evaluation={expected!r}"
             )
         config.model[field] = saved_value
+
+    # Flow-head query/content masks were split after the first A/B runs. A
+    # missing field means historical shared-strict behavior for contextual
+    # heads. F has no attention at all, so its legacy missing value is N/A.
+    default_flow_head_attention_contract = (
+        "not_applicable"
+        if saved_architecture == "positionwise_flow_head_on_b"
+        else "selfless_strict"
+    )
+    flow_head_attention_contract = str(
+        saved_model.get(
+            "flow_head_attention_contract",
+            default_flow_head_attention_contract,
+        )
+    ).strip().lower()
+    if saved_architecture == "positionwise_flow_head_on_b":
+        valid_flow_head_contract = flow_head_attention_contract == "not_applicable"
+    else:
+        valid_flow_head_contract = flow_head_attention_contract in {
+            "selfless_strict",
+            "xlnet_content_diagonal",
+        }
+    if not valid_flow_head_contract:
+        raise ValueError(
+            f"{label} has invalid flow_head_attention_contract="
+            f"{flow_head_attention_contract!r} for architecture_variant="
+            f"{saved_architecture!r}"
+        )
+    config.model.flow_head_attention_contract = flow_head_attention_contract
+    if saved_architecture == "positionwise_flow_head_on_b":
+        expected_f_fields = {
+            "positionwise_reference_flow_width": 1280,
+            "positionwise_reference_flow_depth": 8,
+            "positionwise_max_parameter_relative_error": 0.005,
+        }
+        for field, expected in expected_f_fields.items():
+            if field not in saved_model:
+                raise ValueError(f"{label} ablation-F config lacks {field}")
+            value = saved_model[field]
+            if float(value) != float(expected):
+                raise ValueError(
+                    f"{label} ablation-F {field}={value!r}, expected {expected!r}"
+                )
+            config.model[field] = value
+    # New order-sensitive ablations persist the training/generation order in
+    # the checkpoint itself.  Keep legacy B/C/D exports compatible by treating
+    # this as optional, but make it authoritative whenever present.
+    if "training_image_sigma_order" in saved_model:
+        order = str(saved_model["training_image_sigma_order"]).lower()
+        if order not in {"random", "sequential"}:
+            raise ValueError(
+                f"{label} has invalid training_image_sigma_order={order!r}"
+            )
+        config.model.training_image_sigma_order = order
+        if config.get("dataset", None) is not None:
+            dataset_params = (
+                config.dataset.params.image
+                if str(config.dataset.class_name) == "UnifiedMixedDataset"
+                else config.dataset.params
+            )
+            dataset_params.image_sigma_order = order
+        generation_order = (
+            "sequential" if order == "sequential" else "spatial_halton"
+        )
+        if config.get("experiment", None) is not None:
+            config.experiment.validation_single_stream_order_strategies = [
+                generation_order
+            ]
+        if config.get("evaluation", None) is not None:
+            config.evaluation.strategies = generation_order
 
 
 def configure_model_source(config, source: EvaluationModelSource) -> None:

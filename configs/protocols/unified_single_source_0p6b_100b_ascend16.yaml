@@ -14,6 +14,7 @@ initialization: qwen3_0p6b_base_step_zero
 architecture_variant: selfless_contextual
 training_objective: selfless_dual_stream
 dual_stream_attention_contract: xlnet_content_diagonal
+flow_head_attention_contract: xlnet_content_diagonal
 # Smallest common optimizer-boundary total at or above 100B.  Text updates
 # contain exactly twice as many physical positions as either image-source
 # update, so image runs use exactly twice the number of optimizer steps.

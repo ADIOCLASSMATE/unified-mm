@@ -34,6 +34,10 @@ from utils.evaluation_model_source import (  # noqa: E402
     model_source_from_args,
     resolve_evaluation_model_source,
 )
+from utils.flow_head_contract import (  # noqa: E402
+    flow_head_attention_report,
+    validate_flow_head_attention_contract,
+)
 from utils.utils import load_model_tokenizer  # noqa: E402
 
 
@@ -92,6 +96,10 @@ def main() -> None:
             "unsupported dual-stream attention contract: "
             f"{attention_contract!r}"
         )
+    flow_head_attention_contract = validate_flow_head_attention_contract(
+        config.model,
+        label="evaluation config",
+    )
     config.experiment.output_dir = str(args.output_dir)
     config.experiment.validation_max_batches = int(args.validation_max_batches)
     config.experiment.validation_image_every = 1
@@ -117,6 +125,17 @@ def main() -> None:
         raise ValueError(
             "loaded model attention contract does not match evaluation config: "
             f"model={loaded_attention_contract!r}, config={attention_contract!r}"
+        )
+    loaded_flow_head_attention_contract = validate_flow_head_attention_contract(
+        model.config,
+        label="loaded model",
+    )
+    if loaded_flow_head_attention_contract != flow_head_attention_contract:
+        raise ValueError(
+            "loaded model flow-head attention contract does not match "
+            "evaluation config: "
+            f"model={loaded_flow_head_attention_contract!r}, "
+            f"config={flow_head_attention_contract!r}"
         )
     weight_report = load_model_source_weights(model, source)
     if int(weight_report["global_step"]) != global_step:
@@ -176,6 +195,7 @@ def main() -> None:
             "model_source": weight_report,
             "global_step": global_step,
             "dual_stream_attention_contract": attention_contract,
+            "flow_head_attention_contract": flow_head_attention_contract,
             "backbone_attention": {
                 "dual_stream_attention_contract": attention_contract,
                 "query_stream_diagonal": False,
@@ -187,6 +207,7 @@ def main() -> None:
                 ),
                 "single_stream_current_query_diagonal": False,
             },
+            "flow_head_attention": flow_head_attention_report(config.model),
             "imagenet_split": "val",
             "world_size": int(accelerator.num_processes),
             "batch_size_per_rank": int(args.batch_size_per_rank),

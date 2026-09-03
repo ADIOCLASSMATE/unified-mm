@@ -1,9 +1,10 @@
-# Formal baseline-b, C-on-B, and D-on-B protocol. The selected 0.6B learning rates are
-# frozen as readable constants; every fresh arm starts from the same Qwen
-# weights at optimizer step zero.
-schema: unified_ablation_100b_v4
+# Formal B-based unified ablation protocol. Every fresh arm starts from the
+# same Qwen3-0.6B-Base weights at optimizer step zero. D/E/F are submitted to
+# the scaling-law platform project requested for this study.
+schema: unified_ablation_100b_v5
 base_config: configs/selfless/unified_baseline_100b_ascend_64npu.yaml
-platform_project: "随机序语言建模-统一自回归与掩码扩散的随机顺序生成框架"
+platform_project: "多模态大模型新架构评测探索与scaling-law"
+historical_platform_project_bc: "随机序语言建模-统一自回归与掩码扩散的随机顺序生成框架"
 world_size: 64
 nodes: 4
 npu_per_node: 16
@@ -52,6 +53,8 @@ shared:
     climbmix_tokenization: online
     text_sequence_length: 2048
     image_flow_batch_mul: 4
+    global_gradient_checkpointing: false
+    image_flow_gradient_checkpointing: false
     selected_lr:
         rerun: false
         backbone_and_special_lr: 3.0e-4
@@ -68,29 +71,57 @@ shared:
         train_validation_overlap_allowed: false
 comparability:
     baseline: b
+    # Singular aliases are retained for downstream reports written against v4.
     b_vs_c_only_allowed_difference: model.architecture_variant
     b_vs_d_only_allowed_difference: model.architecture_variant
+    b_vs_c_only_allowed_differences: [model.architecture_variant]
+    b_vs_d_only_allowed_differences: [model.architecture_variant]
     b_vs_c_query_stream_identical: true
     b_vs_d_query_stream_identical: false
     b_vs_d_static_contract_identical: true
     b_vs_d_image_flow_batch_mul_identical: true
-    initialization_identical: true
-    data_and_schedule_identical: true
+    b_vs_e_only_allowed_differences:
+        - model.training_image_sigma_order
+        - dataset.params.image.image_sigma_order
+        - experiment.validation_single_stream_order_strategies
+        - evaluation.strategies
+    b_vs_f_only_allowed_differences:
+        - model.architecture_variant
+        - model.flow_head_attention_contract
+        - model.image_flow_width
+        - model.positionwise_reference_flow_width
+        - model.positionwise_reference_flow_depth
+        - model.positionwise_max_parameter_relative_error
+    qwen_pretrained_source_identical: true
+    pretrained_backbone_weights_identical: true
+    architecture_specific_modules_initialized_from_training_seed: 42
+    data_assets_and_source_schedule_identical: true
     optimizer_and_lr_identical: true
     token_budget_identical: true
+    validation_samples_steps_and_seeds_identical: true
+    image_flow_batch_mul_identical: true
     systems_only_differences:
-        d: [t2i_dynamic_decoder_activation_checkpointing]
+        d:
+            - t2i_dynamic_decoder_activation_checkpointing
+            - first_update_bf16_overflow_guard
     systems_only_differences_change_objective: false
 run_projects:
     b: unified-b-0p6b-100b-imagenet-split-s42-r1
     c: unified-c-on-b-0p6b-100b-imagenet-split-s42-r1
-    d: unified-d-on-b-0p6b-100b-imagenet-split-s42-r1
+    d: unified-d-on-b-0p6b-100b-imagenet-split-s42-r3
+    e: unified-e-on-b-0p6b-100b-imagenet-split-s42-r1
+    f: unified-f-on-b-0p6b-100b-imagenet-split-s42-r1
 ablations:
     b:
         status: main_baseline
+        architecture_variant: selfless_contextual
         training_objective: selfless_dual_stream
+        image_sigma_order: random
         query_attention: "sigma_kv < sigma_q"
         content_attention: "sigma_kv <= sigma_q"
+        flow_head_attention_contract: xlnet_content_diagonal
+        flow_head_query_attention: "sigma_kv < sigma_q"
+        flow_head_content_attention: "sigma_kv <= sigma_q"
         start: qwen_pretrained_step_0
     c:
         architecture_variant: single_stream_text_ar
@@ -99,14 +130,18 @@ ablations:
         text_attention: physical_position_causal
         text_prediction: "hidden[j-1] -> token[j]"
         dual_stream_attention_contract: xlnet_content_diagonal
+        flow_head_attention_contract: xlnet_content_diagonal
         image_stream: identical_to_b_selfless_dual_stream
         image_attention: "sigma_kv <= sigma_q"
         image_loss_positions: identical_to_b
+        image_sigma_order: random
         start: qwen_pretrained_step_0
     d:
+        status: ready_r3_after_64npu_startup_guard_validation
         architecture_variant: dynamic_xt
         training_objective: selfless_dual_stream
         dual_stream_attention_contract: xlnet_content_diagonal
+        flow_head_attention_contract: xlnet_content_diagonal
         query_attention: "sigma_kv < sigma_q"
         content_attention: "sigma_kv <= sigma_q"
         backbone_condition: "embed(x_t) + time_embed(t)"
@@ -119,8 +154,53 @@ ablations:
         rf_states_per_t2i_microbatch_per_rank: 64
         global_gradient_checkpointing: false
         gradient_checkpointing: t2i_dynamic_decoder_layers_only
+        startup_loss_trace:
+            until_step: 10
+            storage: device_only_until_optimizer_boundary
+            synchronization: one_gather_per_optimizer_boundary
+            changes_training_math: false
+        startup_bf16_overflow_guard:
+            until_step: 1
+            synchronization: deepspeed_pre_update_scan
+            disabled_after_step: 1
+            steady_state_overhead: none
+            changes_training_math: false
+        validated_64npu_startup:
+            job: umm-d-on-b-startupguard10-v13-64-s42-r1
+            steps: 10
+            final_loss: 0.6762
+            seconds_per_step: 4.1813
         time_embedder_optimizer_role: backbone
         content_compute: once_per_layer
+        image_sigma_order: random
         start: qwen_pretrained_step_0
-    g:
-        status: deferred
+    e:
+        status: ready
+        base: b
+        architecture_variant: selfless_contextual
+        model_implementation: identical_to_b
+        flow_head_attention_contract: xlnet_content_diagonal
+        text_sigma_order: identical_to_b_deterministic_physical_left_to_right
+        image_sigma_order: sequential
+        generation_order: sequential
+        start: qwen_pretrained_step_0
+    f:
+        status: ready
+        base: b
+        architecture_variant: positionwise_flow_head_on_b
+        model_file: models/modeling_model/modeling_selfless_flow_positionwise_on_b.py
+        generation_file: models/modeling_model/modeling_selfless_flow_positionwise_on_b_generation.py
+        backbone_and_attention: identical_to_b
+        image_sigma_order: random
+        flow_head_attention_contract: not_applicable
+        flow_head:
+            architecture: shared_positionwise_adaln_mlp
+            cross_token_attention: false
+            content_stream: false
+            depth: 8
+            width: 1936
+            parameters: 163828208
+            reference_b_parameters: 164072976
+            relative_difference: 0.00149184
+            tolerance: 0.005
+        start: qwen_pretrained_step_0

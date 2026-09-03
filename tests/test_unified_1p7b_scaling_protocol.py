@@ -36,6 +36,9 @@ def test_1p7b_preserves_global_data_and_token_budget_on_64_npus():
     assert config.model.dual_stream_attention_contract == (
         "xlnet_content_diagonal"
     )
+    assert config.model.flow_head_attention_contract == (
+        "xlnet_content_diagonal"
+    )
     assert str(config.experiment.project).startswith("unified-b-")
     assert sources.climbmix.tokenizer_path == config.model.model_path
     assert schedule == ["climbmix", "t2i", "climbmix", "i2t"]

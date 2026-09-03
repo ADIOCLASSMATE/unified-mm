@@ -114,6 +114,7 @@ def tiny_config() -> Qwen3Config:
     config.image_flow_time_eps = 1e-4
     config.image_flow_time_uniform_mix = 0.0
     config.image_flow_solver = "heun"
+    config.flow_head_attention_contract = "xlnet_content_diagonal"
     config.image_uncond_prob = 0.0
     config.use_flex_attention = False
     return config

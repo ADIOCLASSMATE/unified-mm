@@ -18,11 +18,17 @@ def test_single_source_protocol_and_configs_use_main_baseline_b():
     assert protocol.dual_stream_attention_contract == (
         "xlnet_content_diagonal"
     )
+    assert protocol.flow_head_attention_contract == (
+        "xlnet_content_diagonal"
+    )
     for source in preflight.SUPPORTED_SOURCES:
         config = OmegaConf.load(protocol.single_source_runs[source].config)
         assert config.model.architecture_variant == "selfless_contextual"
         assert config.model.training_objective == "selfless_dual_stream"
         assert config.model.dual_stream_attention_contract == (
+            "xlnet_content_diagonal"
+        )
+        assert config.model.flow_head_attention_contract == (
             "xlnet_content_diagonal"
         )
         assert str(config.experiment.project).startswith("unified-b-")

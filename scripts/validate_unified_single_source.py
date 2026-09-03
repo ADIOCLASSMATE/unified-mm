@@ -118,6 +118,11 @@ def _validate_global_protocol(protocol: DictConfig) -> DictConfig:
         protocol.dual_stream_attention_contract,
         "xlnet_content_diagonal",
     )
+    _expect(
+        "protocol.flow_head_attention_contract",
+        protocol.flow_head_attention_contract,
+        "xlnet_content_diagonal",
+    )
     _expect("protocol.runtime_hashing_enabled", bool(protocol.runtime_hashing_enabled), False)
     _expect("protocol.wandb_mode", protocol.wandb_mode, "disabled")
 
@@ -249,6 +254,11 @@ def _validate_shared_model_optimizer(
         f"{source} attention contract",
         config.model.dual_stream_attention_contract,
         protocol.dual_stream_attention_contract,
+    )
+    _expect(
+        f"{source} flow-head attention contract",
+        config.model.flow_head_attention_contract,
+        protocol.flow_head_attention_contract,
     )
     _expect(
         f"{source} lambda_text",

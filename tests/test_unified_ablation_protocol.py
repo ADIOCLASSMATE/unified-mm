@@ -18,6 +18,14 @@ D_LAUNCHER = Path(
     "script/selfless/"
     "pretraining_unified_ablation_d_on_b_0p6b_formal_ascend64.sh"
 )
+E_LAUNCHER = Path(
+    "script/selfless/"
+    "pretraining_unified_ablation_e_on_b_0p6b_formal_ascend64.sh"
+)
+F_LAUNCHER = Path(
+    "script/selfless/"
+    "pretraining_unified_ablation_f_on_b_0p6b_formal_ascend64.sh"
+)
 BASE_LAUNCHER = Path(
     "script/selfless/pretraining_unified_baseline_ascend_64npu_100b.sh"
 )
@@ -30,7 +38,10 @@ def test_formal_protocol_is_comparable_complete_and_no_hash():
     protocol = OmegaConf.load(MANIFEST)
     base = OmegaConf.load(protocol.base_config)
 
-    assert protocol.schema == "unified_ablation_100b_v4"
+    assert protocol.schema == "unified_ablation_100b_v5"
+    assert protocol.platform_project == (
+        "多模态大模型新架构评测探索与scaling-law"
+    )
     assert protocol.world_size == 64
     assert protocol.nodes * protocol.npu_per_node == protocol.world_size
     assert protocol.target_text_tokens == 100_000_000_000
@@ -80,18 +91,33 @@ def test_formal_protocol_is_comparable_complete_and_no_hash():
     assert protocol.shared.imagenet.validation.split == "val"
     assert protocol.shared.imagenet.train_validation_overlap_allowed is False
 
-    assert set(protocol.ablations) == {"b", "c", "d", "g"}
-    assert set(protocol.run_projects) == {"b", "c", "d"}
+    assert set(protocol.ablations) == {"b", "c", "d", "e", "f"}
+    assert set(protocol.run_projects) == {"b", "c", "d", "e", "f"}
     assert base.model.dual_stream_attention_contract == (
+        "xlnet_content_diagonal"
+    )
+    assert base.model.flow_head_attention_contract == (
         "xlnet_content_diagonal"
     )
     assert protocol.ablations.b.start == "qwen_pretrained_step_0"
     assert protocol.ablations.b.status == "main_baseline"
     assert protocol.ablations.b.query_attention == "sigma_kv < sigma_q"
     assert protocol.ablations.b.content_attention == "sigma_kv <= sigma_q"
+    assert protocol.ablations.b.flow_head_query_attention == (
+        "sigma_kv < sigma_q"
+    )
+    assert protocol.ablations.b.flow_head_content_attention == (
+        "sigma_kv <= sigma_q"
+    )
     assert protocol.comparability.baseline == "b"
     assert protocol.comparability.b_vs_c_query_stream_identical is True
     assert protocol.comparability.b_vs_d_query_stream_identical is False
+    assert protocol.comparability.qwen_pretrained_source_identical is True
+    assert protocol.comparability.pretrained_backbone_weights_identical is True
+    assert (
+        protocol.comparability.architecture_specific_modules_initialized_from_training_seed
+        == 42
+    )
     assert protocol.comparability.b_vs_d_static_contract_identical is True
     assert protocol.comparability.b_vs_d_image_flow_batch_mul_identical is True
     assert protocol.ablations.c.start == "qwen_pretrained_step_0"
@@ -103,6 +129,9 @@ def test_formal_protocol_is_comparable_complete_and_no_hash():
     assert protocol.ablations.c.text_stream == "single_x0"
     assert protocol.ablations.c.text_attention == "physical_position_causal"
     assert protocol.ablations.c.dual_stream_attention_contract == (
+        "xlnet_content_diagonal"
+    )
+    assert protocol.ablations.c.flow_head_attention_contract == (
         "xlnet_content_diagonal"
     )
     assert protocol.ablations.c.image_stream == (
@@ -117,6 +146,9 @@ def test_formal_protocol_is_comparable_complete_and_no_hash():
     assert protocol.ablations.d.architecture_variant == "dynamic_xt"
     assert protocol.ablations.d.training_objective == "selfless_dual_stream"
     assert protocol.ablations.d.dual_stream_attention_contract == (
+        "xlnet_content_diagonal"
+    )
+    assert protocol.ablations.d.flow_head_attention_contract == (
         "xlnet_content_diagonal"
     )
     assert protocol.ablations.d.query_attention == "sigma_kv < sigma_q"
@@ -134,8 +166,23 @@ def test_formal_protocol_is_comparable_complete_and_no_hash():
     assert protocol.ablations.d.gradient_checkpointing == (
         "t2i_dynamic_decoder_layers_only"
     )
+    assert protocol.ablations.d.startup_loss_trace.until_step == 10
+    assert protocol.ablations.d.startup_loss_trace.synchronization == (
+        "one_gather_per_optimizer_boundary"
+    )
+    assert protocol.ablations.d.startup_loss_trace.changes_training_math is False
+    assert protocol.ablations.d.startup_bf16_overflow_guard.until_step == 1
+    assert (
+        protocol.ablations.d.startup_bf16_overflow_guard.disabled_after_step
+        == 1
+    )
+    assert (
+        protocol.ablations.d.startup_bf16_overflow_guard.steady_state_overhead
+        == "none"
+    )
     assert protocol.comparability.systems_only_differences.d == [
-        "t2i_dynamic_decoder_activation_checkpointing"
+        "t2i_dynamic_decoder_activation_checkpointing",
+        "first_update_bf16_overflow_guard",
     ]
     assert (
         protocol.comparability.systems_only_differences_change_objective
@@ -143,7 +190,23 @@ def test_formal_protocol_is_comparable_complete_and_no_hash():
     )
     assert protocol.ablations.d.time_embedder_optimizer_role == "backbone"
     assert protocol.ablations.d.content_compute == "once_per_layer"
-    assert protocol.ablations.g.status == "deferred"
+    assert protocol.ablations.e.status == "ready"
+    assert protocol.ablations.e.base == "b"
+    assert protocol.ablations.e.architecture_variant == "selfless_contextual"
+    assert protocol.ablations.e.image_sigma_order == "sequential"
+    assert protocol.ablations.e.generation_order == "sequential"
+    assert protocol.ablations.f.status == "ready"
+    assert protocol.ablations.f.architecture_variant == (
+        "positionwise_flow_head_on_b"
+    )
+    assert protocol.ablations.f.flow_head_attention_contract == (
+        "not_applicable"
+    )
+    assert protocol.ablations.f.flow_head.content_stream is False
+    assert protocol.ablations.f.flow_head.width == 1936
+    assert protocol.ablations.f.flow_head.parameters == 163_828_208
+    assert protocol.ablations.f.flow_head.reference_b_parameters == 164_072_976
+    assert float(protocol.ablations.f.flow_head.relative_difference) < 0.005
 
 
 def test_formal_launcher_freezes_current_baseline_contract():
@@ -172,13 +235,16 @@ def test_formal_launcher_freezes_current_baseline_contract():
     assert 'DUAL_STREAM_ATTENTION_CONTRACT="selfless_strict"' not in base_source
     assert 'DUAL_STREAM_ATTENTION_CONTRACT="xlnet_content_diagonal"' in base_source
     assert "unified-c-on-b-0p6b-100b-imagenet-split-s42-r1" in base_source
-    assert "unified-d-on-b-0p6b-100b-imagenet-split-s42-r1" in base_source
+    assert "unified-d-on-b-0p6b-100b-imagenet-split-s42-r3" in base_source
+    assert "unified-e-on-b-0p6b-100b-imagenet-split-s42-r1" in base_source
+    assert "unified-f-on-b-0p6b-100b-imagenet-split-s42-r1" in base_source
     assert (
         '"model.dual_stream_attention_contract=${DUAL_STREAM_ATTENTION_CONTRACT}"'
         in base_source
     )
     assert 'ARCHITECTURE_VARIANT="single_stream_text_ar"' in base_source
     assert 'ARCHITECTURE_VARIANT="dynamic_xt"' in base_source
+    assert 'ARCHITECTURE_VARIANT="positionwise_flow_head_on_b"' in base_source
     assert 'TRAIN_ENTRY="pretrain/train_selfless_flow_dynamic_xt.py"' in base_source
     assert '"model.image_flow_batch_mul=${IMAGE_FLOW_BATCH_MUL}"' in base_source
     assert (
@@ -189,6 +255,15 @@ def test_formal_launcher_freezes_current_baseline_contract():
     assert (
         '"model.architecture_variant=${ARCHITECTURE_VARIANT}"' in base_source
     )
+    assert '"model.training_image_sigma_order=${IMAGE_SIGMA_ORDER}"' in base_source
+    assert '"dataset.params.image.image_sigma_order=${IMAGE_SIGMA_ORDER}"' in base_source
+    assert '"model.image_flow_width=${FLOW_HEAD_WIDTH}"' in base_source
+    assert (
+        '"model.flow_head_attention_contract=${FLOW_HEAD_ATTENTION_CONTRACT}"'
+        in base_source
+    )
+    assert 'DEFAULT_FLOW_HEAD_ATTENTION_CONTRACT="not_applicable"' in base_source
+    assert '"model.image_flow_grad_checkpointing=false"' in base_source
 
 
 def test_dedicated_b_launcher_selects_only_xlnet_content_diagonal_arm():
@@ -243,10 +318,40 @@ def test_dedicated_d_on_b_launcher_forces_fresh_mul4_run():
 
     assert 'export ABLATION="d"' in source
     assert "unified-d-on-b-0p6b" in source
+    assert "s42-r3" in source
     assert 'export ALLOW_FORMAL_RESUME="false"' in source
     assert "retired A-based Dynamic-XT" in source
     assert "FORMAL_RESUME_FROM" not in source
     assert "pretraining_unified_ablation_100b_ascend64.sh" in source
     assert 'export IMAGE_FLOW_BATCH_MUL="4"' in source
     assert 'export DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING="true"' in source
-    assert "ABLATION must be b, c, or d" in formal_source
+    assert (
+        'export FLOW_HEAD_ATTENTION_CONTRACT="xlnet_content_diagonal"'
+        in source
+    )
+    assert 'export DEEPSPEED_BF16_OVERFLOW_CHECK_UNTIL_STEP="1"' in source
+    assert 'export DEBUG_LOSS_TRACE_UNTIL_STEP="10"' in source
+    assert "synchronizing individual microbatches" in source
+    assert "ABLATION must be b, c, d, e, or f" in formal_source
+
+
+def test_dedicated_e_f_launchers_are_fresh_b_based_and_isolated():
+    e_source = E_LAUNCHER.read_text(encoding="utf-8")
+    f_source = F_LAUNCHER.read_text(encoding="utf-8")
+    formal_source = LAUNCHER.read_text(encoding="utf-8")
+
+    for arm, source in (("e", e_source), ("f", f_source)):
+        assert f'export ABLATION="{arm}"' in source
+        assert f"unified-{arm}-on-b-0p6b" in source
+        assert 'export ALLOW_FORMAL_RESUME="false"' in source
+        assert 'export IMAGE_FLOW_BATCH_MUL="4"' in source
+        assert "pretraining_unified_ablation_100b_ascend64.sh" in source
+    assert "deterministic serialized left-to-right" in e_source
+    assert "dedicated parameter-" in f_source
+    assert (
+        'export FLOW_HEAD_ATTENTION_CONTRACT="xlnet_content_diagonal"'
+        in e_source
+    )
+    assert 'export FLOW_HEAD_ATTENTION_CONTRACT="not_applicable"' in f_source
+    assert 'e) ARM_NAME="e-on-b"' in formal_source
+    assert 'f) ARM_NAME="f-on-b"' in formal_source
