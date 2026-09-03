@@ -1003,7 +1003,7 @@ class ContextualFlowTransformerHead(nn.Module):
             "cache_contract": self.cache_contract(),
         }
 
-    def append_latent_mixer_cache(
+    def _append_content_cache_sequential(
         self,
         cache,
         *,
@@ -1011,6 +1011,14 @@ class ContextualFlowTransformerHead(nn.Module):
         context_conditions,
         context_positions,
     ):
+        """Sequential compatibility path for historical strict checkpoints.
+
+        The corrected content-diagonal implementation uses
+        :meth:`forward_with_pending_content` in production.  Keeping this
+        implementation private preserves the exact operation order needed by
+        old A/B checkpoints and provides a numerical reference for tests.
+        """
+
         model_device = self.input_proj.weight.device
         model_dtype = self.input_proj.weight.dtype
         context_latents = context_latents.to(
@@ -1025,7 +1033,7 @@ class ContextualFlowTransformerHead(nn.Module):
             context_conditions = context_conditions.unsqueeze(1)
         if context_latents.dim() != 3 or context_latents.shape[1] != 1:
             raise ValueError(
-                "append_latent_mixer_cache accepts exactly one new content token "
+                "content-cache update accepts exactly one new content token "
                 f"per row, got {tuple(context_latents.shape)}."
             )
         if context_conditions.shape[:2] != context_latents.shape[:2]:
@@ -1174,6 +1182,273 @@ class ContextualFlowTransformerHead(nn.Module):
             "position_contract": cache["position_contract"],
             "cache_contract": cache["cache_contract"],
         }
+
+    def forward_with_pending_content(
+        self,
+        x,
+        t,
+        c,
+        *,
+        latent_mixer_cache,
+        context_latents,
+        context_conditions,
+        context_positions,
+        condition_embedding=None,
+        time_embedding=None,
+        query_positions=None,
+        query_rope=None,
+    ):
+        """Commit one content token while evaluating one strict query.
+
+        Corrected contextual heads execute the content and query rows together
+        in every block.  The pending content K/V is installed before the
+        combined attention call, so the content row receives its diagonal and
+        the later query row immediately sees the newly committed token.  Only
+        the content row contributes K/V to the cache.
+
+        Historical strict heads intentionally retain the sequential operation
+        order until their exact numerical compatibility contract is retired.
+        """
+
+        if latent_mixer_cache is None:
+            raise ValueError(
+                "pending flow content requires an initialized content cache"
+            )
+        if not self.content_self_diagonal:
+            updated_cache = self._append_content_cache_sequential(
+                latent_mixer_cache,
+                context_latents=context_latents,
+                context_conditions=context_conditions,
+                context_positions=context_positions,
+            )
+            latent_mixer_cache.clear()
+            latent_mixer_cache.update(updated_cache)
+            return self(
+                x,
+                t,
+                c,
+                condition_embedding=condition_embedding,
+                time_embedding=time_embedding,
+                query_positions=query_positions,
+                query_rope=query_rope,
+                latent_mixer_cache=latent_mixer_cache,
+            )
+
+        model_device = self.input_proj.weight.device
+        model_dtype = self.input_proj.weight.dtype
+        x = x.to(device=model_device, dtype=model_dtype)
+        c = c.to(device=model_device, dtype=model_dtype)
+        context_latents = context_latents.to(
+            device=model_device,
+            dtype=model_dtype,
+        )
+        context_conditions = context_conditions.to(
+            device=model_device,
+            dtype=model_dtype,
+        )
+        if context_latents.dim() == 2:
+            context_latents = context_latents.unsqueeze(1)
+        if context_conditions.dim() == 2:
+            context_conditions = context_conditions.unsqueeze(1)
+        if context_latents.dim() != 3 or context_latents.shape[1] != 1:
+            raise ValueError(
+                "fused flow cache update requires one pending content token "
+                f"per row, got {tuple(context_latents.shape)}."
+            )
+        if context_conditions.shape[:2] != context_latents.shape[:2]:
+            raise ValueError(
+                "pending context_conditions must match context_latents."
+            )
+
+        batch_shape = x.shape[:-1]
+        x, query_positions, squeeze = self._ensure_sequence(
+            x,
+            query_positions,
+        )
+        if x.shape[1] != 1:
+            raise ValueError(
+                "fused flow cache update requires exactly one query token."
+            )
+        batch_size = x.shape[0]
+        if context_latents.shape[0] != batch_size:
+            raise ValueError(
+                "pending content and query batch sizes must match."
+            )
+        self._validate_latent_mixer_cache(latent_mixer_cache)
+        if latent_mixer_cache["layers"][0]["k"].shape[0] != batch_size:
+            raise ValueError(
+                "flow cache and fused content/query batch sizes must match."
+            )
+
+        context_positions = self._positions(
+            context_positions,
+            batch_size,
+            1,
+            model_device,
+        )
+        context_rope = self._build_rope(context_positions, model_dtype)
+        if query_rope is None:
+            query_rope = self._build_rope(query_positions, model_dtype)
+        combined_positions = torch.cat(
+            [context_positions, query_positions],
+            dim=1,
+        )
+        combined_rope = tuple(
+            torch.cat([content_part, query_part], dim=1)
+            for content_part, query_part in zip(context_rope, query_rope)
+        )
+
+        content_hidden = self._initial_content_hidden(
+            context_latents,
+            context_positions,
+        )
+        query_hidden = self.input_proj(x)
+        content_y = self._content_condition(context_conditions)
+        query_time = (
+            self._shape_time(t, batch_shape)
+            if time_embedding is None
+            else time_embedding
+        )
+        query_condition = (
+            self.cond_embed(c)
+            if condition_embedding is None
+            else condition_embedding
+        )
+        query_y = query_time + query_condition
+        if query_y.dim() == 2:
+            query_y = query_y.unsqueeze(1)
+        combined_y = torch.cat([content_y, query_y], dim=1)
+
+        previous_len = int(
+            latent_mixer_cache.get(
+                "active_length",
+                latent_mixer_cache["layers"][0]["k"].shape[2],
+            )
+        )
+        cache_capacity = latent_mixer_cache.get("capacity")
+        if cache_capacity is not None and previous_len >= int(cache_capacity):
+            raise ValueError(
+                "latent mixer cache capacity exceeded: "
+                f"active_length={previous_len}, capacity={cache_capacity}"
+            )
+
+        previous_mask = latent_mixer_cache["context_mask"]
+        if cache_capacity is None:
+            mask_storage = None
+            position_storage = None
+            positions = torch.cat(
+                [
+                    latent_mixer_cache["context_positions"],
+                    context_positions,
+                ],
+                dim=1,
+            )
+            context_mask = torch.cat(
+                [
+                    previous_mask,
+                    torch.ones(
+                        batch_size,
+                        1,
+                        1,
+                        device=model_device,
+                        dtype=torch.bool,
+                    ),
+                ],
+                dim=-1,
+            )
+        else:
+            mask_storage = latent_mixer_cache["context_mask_storage"]
+            position_storage = latent_mixer_cache[
+                "context_positions_storage"
+            ]
+            mask_storage[:, :, previous_len] = True
+            position_storage[:, previous_len : previous_len + 1].copy_(
+                context_positions
+            )
+            context_mask = mask_storage
+            positions = position_storage
+
+        context_length = context_mask.shape[-1]
+        combined_mask = context_mask.expand(
+            batch_size,
+            2,
+            context_length,
+        )
+        prepared_combined_mask = self.blocks[0].prepare_context_mask(
+            combined_mask,
+            batch_size,
+            2,
+            context_length,
+            model_device,
+        )
+
+        updated_layers = []
+        for layer_idx, block in enumerate(self.blocks):
+            previous_layer = latent_mixer_cache["layers"][layer_idx]
+            new_layer = block.prepare_cross_cache(
+                content_hidden,
+                context_positions=context_positions,
+                context_rope=context_rope,
+            )
+            if cache_capacity is None:
+                updated_layer = {
+                    "k": torch.cat(
+                        [previous_layer["k"], new_layer["k"]],
+                        dim=2,
+                    ),
+                    "v": torch.cat(
+                        [previous_layer["v"], new_layer["v"]],
+                        dim=2,
+                    ),
+                    "context_positions": positions,
+                    "input_layout": "BNSD",
+                }
+            else:
+                k_storage = previous_layer["k_storage"]
+                v_storage = previous_layer["v_storage"]
+                k_storage[:, :, previous_len : previous_len + 1].copy_(
+                    new_layer["k"]
+                )
+                v_storage[:, :, previous_len : previous_len + 1].copy_(
+                    new_layer["v"]
+                )
+                updated_layer = {
+                    "k": k_storage,
+                    "v": v_storage,
+                    "k_storage": k_storage,
+                    "v_storage": v_storage,
+                    "context_positions": positions,
+                    "input_layout": "BNSD",
+                }
+
+            combined_hidden = torch.cat(
+                [content_hidden, query_hidden],
+                dim=1,
+            )
+            combined_hidden = block(
+                combined_hidden,
+                combined_y,
+                layer_cache=updated_layer,
+                context_mask=prepared_combined_mask,
+                query_positions=combined_positions,
+                query_rope=combined_rope,
+                include_mlp=True,
+            )
+            content_hidden, query_hidden = combined_hidden.split(1, dim=1)
+            updated_layers.append(updated_layer)
+
+        latent_mixer_cache["layers"] = updated_layers
+        latent_mixer_cache["context_mask"] = context_mask
+        latent_mixer_cache["context_positions"] = positions
+        latent_mixer_cache["capacity"] = cache_capacity
+        latent_mixer_cache["active_length"] = previous_len + 1
+        latent_mixer_cache["context_mask_storage"] = mask_storage
+        latent_mixer_cache["context_positions_storage"] = position_storage
+        latent_mixer_cache.pop("_prepared_context_mask", None)
+
+        self._clear_stream_stats()
+        out = self.final_layer(query_hidden, query_y)
+        return out.squeeze(1) if squeeze else out
 
     def stack_latent_mixer_caches(self, caches):
         if not caches:
@@ -1686,7 +1961,11 @@ class FlowLoss(nn.Module):
                 return [_convert(item, key) for item in value]
             if isinstance(value, tuple):
                 return tuple(_convert(item, key) for item in value)
-            if key in {"context_mask", "context_mask_storage"}:
+            if key in {
+                "context_mask",
+                "context_mask_storage",
+                "_prepared_context_mask",
+            }:
                 return value.to(device=device, dtype=torch.bool)
             if key is not None and key.endswith("positions"):
                 return value.to(device=device)
@@ -1735,9 +2014,6 @@ class FlowLoss(nn.Module):
             batch_size=batch_size,
             capacity=capacity,
         )
-
-    def append_latent_mixer_cache(self, cache, **kwargs):
-        return self.net.append_latent_mixer_cache(cache, **kwargs)
 
     def stack_latent_mixer_caches(self, caches):
         return self.net.stack_latent_mixer_caches(caches)
@@ -2130,8 +2406,39 @@ class FlowLoss(nn.Module):
         ode_step: int | None = None,
         debug_phase: str = "",
         context_prepared: bool = False,
+        pending_context: dict | None = None,
     ) -> torch.Tensor:
-        def _velocity(current_x, current_t, current_z, current_context):
+        def _velocity(
+            current_x,
+            current_t,
+            current_z,
+            current_context,
+            current_pending,
+        ):
+            if current_pending is not None:
+                if not context_prepared:
+                    raise ValueError(
+                        "fused pending content requires prepared flow context"
+                    )
+                return self.net.forward_with_pending_content(
+                    current_x,
+                    self._scale_time(current_t),
+                    current_z,
+                    latent_mixer_cache=current_context.get(
+                        "latent_mixer_cache"
+                    ),
+                    context_latents=current_pending["context_latents"],
+                    context_conditions=current_pending[
+                        "context_conditions"
+                    ],
+                    context_positions=current_pending["context_positions"],
+                    condition_embedding=current_context.get(
+                        "condition_embedding"
+                    ),
+                    time_embedding=current_context.get("time_embedding"),
+                    query_positions=current_context.get("query_positions"),
+                    query_rope=current_context.get("query_rope"),
+                )
             if context_prepared:
                 return self._velocity_prepared(
                     current_x,
@@ -2153,7 +2460,13 @@ class FlowLoss(nn.Module):
 
         z_is_paired = z.shape[0] == x.shape[0] * 2
         if cfg == 1.0 and not z_is_paired:
-            velocity = _velocity(x, t, z, context_kwargs)
+            velocity = _velocity(
+                x,
+                t,
+                z,
+                context_kwargs,
+                pending_context,
+            )
             if debug_check is not None:
                 debug_check(
                     f"{debug_phase}velocity",
@@ -2165,7 +2478,18 @@ class FlowLoss(nn.Module):
         x_pair = torch.cat([x, x], dim=0)
         t_pair = torch.cat([t, t], dim=0)
         paired_context_kwargs = context_kwargs if context_is_paired else self._duplicate_context(context_kwargs)
-        v_pair = _velocity(x_pair, t_pair, z, paired_context_kwargs)
+        paired_pending_context = (
+            pending_context
+            if context_is_paired or pending_context is None
+            else self._duplicate_context(pending_context)
+        )
+        v_pair = _velocity(
+            x_pair,
+            t_pair,
+            z,
+            paired_context_kwargs,
+            paired_pending_context,
+        )
         v_cond, v_uncond = torch.chunk(v_pair, 2, dim=0)
         velocity_delta = v_cond - v_uncond
         if self.collect_guidance_diagnostics:
@@ -2334,6 +2658,9 @@ class FlowLoss(nn.Module):
         context_conditions: torch.Tensor | None = None,
         latent_mixer_cache: dict | None = None,
         latent_mixer_cache_is_paired: bool = False,
+        pending_context_latents: torch.Tensor | None = None,
+        pending_context_conditions: torch.Tensor | None = None,
+        pending_context_positions: torch.Tensor | None = None,
         context_prepared: bool = False,
         initial_noise: torch.Tensor | None = None,
         initial_noise_prevalidated: bool = False,
@@ -2471,6 +2798,34 @@ class FlowLoss(nn.Module):
                 "query_positions": raw_context_kwargs.get("query_positions"),
                 "latent_mixer_cache": latent_mixer_cache,
             }
+        pending_values = (
+            pending_context_latents,
+            pending_context_conditions,
+            pending_context_positions,
+        )
+        if any(value is not None for value in pending_values) and not all(
+            value is not None for value in pending_values
+        ):
+            raise ValueError(
+                "pending flow content requires latents, conditions, and "
+                "positions together"
+            )
+        pending_context = None
+        if pending_context_latents is not None:
+            pending_context = {
+                "context_latents": pending_context_latents.to(
+                    device=model_device,
+                    dtype=model_dtype,
+                ),
+                "context_conditions": pending_context_conditions.to(
+                    device=model_device,
+                    dtype=model_dtype,
+                ),
+                "context_positions": pending_context_positions.to(
+                    device=model_device,
+                    dtype=torch.long,
+                ),
+            }
         context_is_paired = bool(latent_mixer_cache_is_paired)
         if cfg != 1.0:
             if context_is_paired:
@@ -2482,6 +2837,10 @@ class FlowLoss(nn.Module):
                         )
             else:
                 context_kwargs = self._duplicate_context(context_kwargs)
+                if pending_context is not None:
+                    pending_context = self._duplicate_context(
+                        pending_context
+                    )
                 context_is_paired = True
         if context_kwargs.get("query_positions") is not None:
             query_length = z.shape[1] if z.ndim > 2 else 1
@@ -2542,6 +2901,7 @@ class FlowLoss(nn.Module):
                 ode_step=idx,
                 debug_phase="predictor_",
                 context_prepared=True,
+                pending_context=(pending_context if idx == 0 else None),
             ).float()
             _debug_check(
                 "guided_velocity", v, idx, {"state": x, "condition": current_z}

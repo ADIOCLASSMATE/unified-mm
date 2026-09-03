@@ -62,6 +62,7 @@ def _tiny_model(
     config.use_flex_attention = False
     config.training_objective = "selfless_dual_stream"
     config.dual_stream_attention_contract = attention_contract
+    config.flow_head_attention_contract = attention_contract
     return Qwen3ForCausalLM(config).eval()
 
 
@@ -236,6 +237,113 @@ def test_backbone_static_kv_cache_matches_full_recompute_with_cfg(
             "flow_cfg_content_cache_divergence_by_layer"
         ]
     )
+
+
+@torch.no_grad()
+@pytest.mark.parametrize(
+    "attention_contract",
+    ["selfless_strict", "xlnet_content_diagonal"],
+)
+def test_generation_pending_content_fusion_matches_sequential_reference(
+    monkeypatch,
+    attention_contract,
+):
+    monkeypatch.setattr(
+        selfless_flow,
+        "compiled_flex_attention",
+        _eager_flex_attention,
+    )
+    torch.manual_seed(73)
+    model = _tiny_model(attention_contract)
+    torch.manual_seed(79)
+    with torch.no_grad():
+        for block in model.image_flow_head.net.blocks:
+            block.adaLN_modulation[-1].weight.normal_(0.0, 0.1)
+            block.adaLN_modulation[-1].bias.normal_(0.0, 0.1)
+        final_layer = model.image_flow_head.net.final_layer
+        final_layer.adaLN_modulation[-1].weight.normal_(0.0, 0.1)
+        final_layer.adaLN_modulation[-1].bias.normal_(0.0, 0.1)
+        final_layer.linear.weight.normal_(0.0, 0.1)
+        final_layer.linear.bias.normal_(0.0, 0.1)
+
+    net = model.image_flow_head.net
+    fused_forward = net.forward_with_pending_content
+
+    def sequential_reference(
+        x,
+        t,
+        c,
+        *,
+        latent_mixer_cache,
+        context_latents,
+        context_conditions,
+        context_positions,
+        condition_embedding=None,
+        time_embedding=None,
+        query_positions=None,
+        query_rope=None,
+    ):
+        updated_cache = net._append_content_cache_sequential(
+            latent_mixer_cache,
+            context_latents=context_latents,
+            context_conditions=context_conditions,
+            context_positions=context_positions,
+        )
+        latent_mixer_cache.clear()
+        latent_mixer_cache.update(updated_cache)
+        return net(
+            x,
+            t,
+            c,
+            condition_embedding=condition_embedding,
+            time_embedding=time_embedding,
+            query_positions=query_positions,
+            query_rope=query_rope,
+            latent_mixer_cache=latent_mixer_cache,
+        )
+
+    kwargs = {
+        "input_ids": torch.tensor([[3, 11, 8, 8, 8, 8, 12, 9]]),
+        "token_types": torch.tensor(
+            [[0, 2, 1, 1, 1, 1, 2, 0]],
+            dtype=torch.uint8,
+        ),
+        "sigma": torch.tensor(
+            [[0.0, 1.0, 4.0, 5.0, 6.0, 7.0, 2.0, 3.0]]
+        ),
+        "spans": [(0, 2, 6)],
+        "initial_noise_bank": (
+            torch.arange(16, dtype=torch.float32).view(1, 4, 4) / 17.0
+        ),
+        "flow_temperature": 0.7,
+        "flow_cfg": 2.5,
+        "flow_cfg_schedule": "constant",
+        "flow_solver": "heun",
+        "flow_num_steps": 3,
+        "parallel_rate": 1,
+        "order_strategy": "spatial_halton",
+        "use_cache": True,
+        "return_trace": True,
+        "_debug_max_generation_steps": 4,
+    }
+    monkeypatch.setattr(
+        net,
+        "forward_with_pending_content",
+        sequential_reference,
+    )
+    sequential, sequential_trace = model.generate("t2i", **kwargs)
+    monkeypatch.setattr(net, "forward_with_pending_content", fused_forward)
+    fused, fused_trace = model.generate("t2i", **kwargs)
+
+    tolerance = 0.0 if attention_contract == "selfless_strict" else 1e-6
+    torch.testing.assert_close(
+        fused,
+        sequential,
+        rtol=tolerance,
+        atol=tolerance,
+    )
+    assert sequential_trace["flow_content_cache_tokens_committed"] == 3
+    assert fused_trace["flow_content_cache_tokens_committed"] == 3
 
 
 @torch.no_grad()

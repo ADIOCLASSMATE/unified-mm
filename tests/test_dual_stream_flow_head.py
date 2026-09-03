@@ -46,6 +46,30 @@ def _inputs():
     return content, query, condition, time, positions, sigma, strict_mask
 
 
+def _pending_step(
+    flow,
+    cache,
+    *,
+    content,
+    content_condition,
+    content_position,
+    query,
+    query_time,
+    query_condition,
+    query_position,
+):
+    return flow.net.forward_with_pending_content(
+        query,
+        flow._scale_time(query_time),
+        query_condition,
+        latent_mixer_cache=cache,
+        context_latents=content,
+        context_conditions=content_condition,
+        context_positions=content_position,
+        query_positions=query_position,
+    )
+
+
 def _legacy_strict_velocity(
     flow,
     query,
@@ -133,6 +157,9 @@ def test_flow_loss_exposes_no_architecture_ablation_arguments():
         "rope_axis_dims",
     ):
         assert retired not in parameters
+    flow = _flow()
+    assert not hasattr(flow, "append_latent_mixer_cache")
+    assert not hasattr(flow.net, "append_latent_mixer_cache")
 
 
 def test_position_and_cache_contracts_are_fixed():
@@ -331,11 +358,16 @@ def test_incremental_cache_matches_full_sequence_last_query(attention_contract):
 
     cache = flow.empty_latent_mixer_cache()
     for token_index in range(3):
-        cache = flow.append_latent_mixer_cache(
+        _pending_step(
+            flow,
             cache,
-            context_latents=content[:, token_index],
-            context_conditions=condition[:, token_index],
-            context_positions=positions[:, token_index],
+            content=content[:, token_index],
+            content_condition=condition[:, token_index],
+            content_position=positions[:, token_index],
+            query=query[:, token_index + 1],
+            query_time=time[:, token_index + 1],
+            query_condition=condition[:, token_index + 1],
+            query_position=positions[:, token_index + 1],
         )
     incremental = flow.velocity(
         query[:, -1],
@@ -352,6 +384,121 @@ def test_incremental_cache_matches_full_sequence_last_query(attention_contract):
     )
 
 
+@pytest.mark.parametrize(
+    "attention_contract",
+    ["selfless_strict", "xlnet_content_diagonal"],
+)
+@pytest.mark.parametrize("capacity", [None, 4])
+def test_pending_content_fusion_matches_sequential_reference(
+    attention_contract,
+    capacity,
+):
+    flow = _flow(attention_contract=attention_contract).eval()
+    content, query, condition, time, positions, _, _ = _inputs()
+    sequential_cache = flow.empty_latent_mixer_cache(capacity=capacity)
+    fused_cache = flow.empty_latent_mixer_cache(capacity=capacity)
+
+    for token_index in range(3):
+        sequential_cache = flow.net._append_content_cache_sequential(
+            sequential_cache,
+            context_latents=content[:, token_index],
+            context_conditions=condition[:, token_index],
+            context_positions=positions[:, token_index],
+        )
+        sequential = flow.velocity(
+            query[:, token_index + 1],
+            time[:, token_index + 1],
+            condition[:, token_index + 1],
+            query_positions=positions[:, token_index + 1],
+            latent_mixer_cache=sequential_cache,
+        )
+        fused = _pending_step(
+            flow,
+            fused_cache,
+            content=content[:, token_index],
+            content_condition=condition[:, token_index],
+            content_position=positions[:, token_index],
+            query=query[:, token_index + 1],
+            query_time=time[:, token_index + 1],
+            query_condition=condition[:, token_index + 1],
+            query_position=positions[:, token_index + 1],
+        )
+
+        tolerance = 0.0 if attention_contract == "selfless_strict" else 1e-6
+        torch.testing.assert_close(
+            fused,
+            sequential,
+            rtol=tolerance,
+            atol=tolerance,
+        )
+        for fused_layer, sequential_layer in zip(
+            fused_cache["layers"],
+            sequential_cache["layers"],
+        ):
+            active_length = token_index + 1
+            for name in ("k", "v"):
+                torch.testing.assert_close(
+                    fused_layer[name][:, :, :active_length],
+                    sequential_layer[name][:, :, :active_length],
+                    rtol=tolerance,
+                    atol=tolerance,
+                )
+
+
+def test_corrected_pending_step_uses_one_two_row_block_call(monkeypatch):
+    flow = _flow(attention_contract="xlnet_content_diagonal").eval()
+    content, query, condition, time, positions, _, _ = _inputs()
+    query_lengths = []
+
+    for block in flow.net.blocks:
+        original_forward = block.forward
+
+        def counted_forward(*args, _original=original_forward, **kwargs):
+            query_lengths.append(args[0].shape[1])
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(block, "forward", counted_forward)
+
+    _pending_step(
+        flow,
+        flow.empty_latent_mixer_cache(capacity=4),
+        content=content[:, 0],
+        content_condition=condition[:, 0],
+        content_position=positions[:, 0],
+        query=query[:, 1],
+        query_time=time[:, 1],
+        query_condition=condition[:, 1],
+        query_position=positions[:, 1],
+    )
+
+    assert query_lengths == [2] * len(flow.net.blocks)
+
+
+def test_cfg_sampling_duplicates_unpaired_pending_content():
+    flow = _flow(attention_contract="xlnet_content_diagonal").eval()
+    content, query, condition, _, positions, _, _ = _inputs()
+    paired_condition = torch.cat(
+        [condition[:, 1], torch.zeros_like(condition[:, 1])],
+        dim=0,
+    )
+
+    sample = flow.sample(
+        paired_condition,
+        cfg=2.5,
+        solver="euler",
+        num_steps=1,
+        query_positions=positions[:, 1],
+        latent_mixer_cache=flow.empty_latent_mixer_cache(),
+        pending_context_latents=content[:, 0],
+        pending_context_conditions=condition[:, 0],
+        pending_context_positions=positions[:, 0],
+        initial_noise=query[:, 1],
+    )
+
+    assert sample.shape == query[:, 1].shape
+    assert torch.isfinite(sample).all()
+
+
 def test_empty_and_single_content_cache_are_finite():
     flow = _flow()
     content, query, condition, time, positions, _, _ = _inputs()
@@ -363,18 +510,16 @@ def test_empty_and_single_content_cache_are_finite():
         query_positions=positions[:, 0],
         latent_mixer_cache=cache,
     )
-    cache = flow.append_latent_mixer_cache(
+    single = _pending_step(
+        flow,
         cache,
-        context_latents=content[:, 0],
-        context_conditions=condition[:, 0],
-        context_positions=positions[:, 0],
-    )
-    single = flow.velocity(
-        query[:, 1],
-        time[:, 1],
-        condition[:, 1],
-        query_positions=positions[:, 1],
-        latent_mixer_cache=cache,
+        content=content[:, 0],
+        content_condition=condition[:, 0],
+        content_position=positions[:, 0],
+        query=query[:, 1],
+        query_time=time[:, 1],
+        query_condition=condition[:, 1],
+        query_position=positions[:, 1],
     )
     assert torch.isfinite(empty).all()
     assert torch.isfinite(single).all()
@@ -392,12 +537,16 @@ def test_fixed_capacity_content_cache_matches_growing_cache():
 
     for token_index in range(3):
         kwargs = {
-            "context_latents": content[:, token_index],
-            "context_conditions": condition[:, token_index],
-            "context_positions": positions[:, token_index],
+            "content": content[:, token_index],
+            "content_condition": condition[:, token_index],
+            "content_position": positions[:, token_index],
+            "query": query[:, token_index + 1],
+            "query_time": time[:, token_index + 1],
+            "query_condition": condition[:, token_index + 1],
+            "query_position": positions[:, token_index + 1],
         }
-        growing = flow.append_latent_mixer_cache(growing, **kwargs)
-        fixed = flow.append_latent_mixer_cache(fixed, **kwargs)
+        _pending_step(flow, growing, **kwargs)
+        _pending_step(flow, fixed, **kwargs)
 
         assert fixed["active_length"] == token_index + 1
         assert fixed["capacity"] == 3
@@ -451,17 +600,29 @@ def test_fixed_capacity_content_cache_matches_growing_cache():
 def test_stacked_cfg_cache_matches_separate_branches():
     flow = _flow()
     content, query, condition, time, positions, _, _ = _inputs()
-    conditional = flow.append_latent_mixer_cache(
-        flow.empty_latent_mixer_cache(),
-        context_latents=content[:, 0],
-        context_conditions=condition[:, 0],
-        context_positions=positions[:, 0],
+    conditional = flow.empty_latent_mixer_cache()
+    _pending_step(
+        flow,
+        conditional,
+        content=content[:, 0],
+        content_condition=condition[:, 0],
+        content_position=positions[:, 0],
+        query=query[:, 1],
+        query_time=time[:, 1],
+        query_condition=condition[:, 1],
+        query_position=positions[:, 1],
     )
-    unconditional = flow.append_latent_mixer_cache(
-        flow.empty_latent_mixer_cache(),
-        context_latents=content[:, 0],
-        context_conditions=torch.zeros_like(condition[:, 0]),
-        context_positions=positions[:, 0],
+    unconditional = flow.empty_latent_mixer_cache()
+    _pending_step(
+        flow,
+        unconditional,
+        content=content[:, 0],
+        content_condition=torch.zeros_like(condition[:, 0]),
+        content_position=positions[:, 0],
+        query=query[:, 1],
+        query_time=time[:, 1],
+        query_condition=torch.zeros_like(condition[:, 1]),
+        query_position=positions[:, 1],
     )
     stacked = flow.stack_latent_mixer_caches(
         [conditional, unconditional]

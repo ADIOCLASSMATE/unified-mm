@@ -957,6 +957,9 @@ class SelflessGenerationMixin:
             )
 
         pending_local_positions: torch.Tensor | None = None
+        pending_flow_latents: torch.Tensor | None = None
+        pending_flow_conditions: torch.Tensor | None = None
+        pending_flow_positions: torch.Tensor | None = None
         debug_conditional_hidden: list[torch.Tensor] = []
         debug_unconditional_hidden: list[torch.Tensor] = []
         completed_steps = 0
@@ -1268,6 +1271,14 @@ class SelflessGenerationMixin:
                 "context_prepared": True,
                 "initial_noise_prevalidated": True,
             }
+            if pending_flow_latents is not None:
+                flow_context.update(
+                    {
+                        "pending_context_latents": pending_flow_latents,
+                        "pending_context_conditions": pending_flow_conditions,
+                        "pending_context_positions": pending_flow_positions,
+                    }
+                )
             condition_evaluator = self._make_backbone_flow_condition_evaluator(
                 selected_input_ids=selected_input_ids,
                 selected_token_types=selected_token_types,
@@ -1364,12 +1375,9 @@ class SelflessGenerationMixin:
                     [cached_positions, cached_positions],
                     dim=0,
                 )
-            flow_cache = self.image_flow_head.append_latent_mixer_cache(
-                flow_cache,
-                context_latents=cached_latents,
-                context_conditions=cached_conditions,
-                context_positions=cached_positions,
-            )
+            pending_flow_latents = cached_latents
+            pending_flow_conditions = cached_conditions
+            pending_flow_positions = cached_positions
             pending_local_positions = current_local_positions
 
         generated = generated.view(
@@ -1387,8 +1395,12 @@ class SelflessGenerationMixin:
             return generated
 
         flow_cache_peak_bytes = 0
+        flow_cache_tokens_committed = 0
         cfg_cache_divergence = None
         if isinstance(flow_cache, dict) and "layers" in flow_cache:
+            flow_cache_tokens_committed = int(
+                flow_cache.get("active_length", 0)
+            )
             flow_cache_peak_bytes = (
                 sum(
                     layer[name].numel() * layer[name].element_size()
@@ -1449,6 +1461,9 @@ class SelflessGenerationMixin:
             "backbone_kv_cache_peak_bytes": int(backbone_cache_peak_bytes),
             "flow_content_cache_peak_bytes_per_sample": int(
                 flow_cache_peak_bytes
+            ),
+            "flow_content_cache_tokens_committed": (
+                flow_cache_tokens_committed
             ),
             "flow_cfg_content_cache_divergence_by_layer": (
                 cfg_cache_divergence
