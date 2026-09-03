@@ -93,11 +93,13 @@ content stream. It has been relabeled as the historical control at
 `output/unified-b-flow-head-no-diagonal-0p6b-100b-imagenet-split-s42-r1`.
 Its explicit `flow_head_attention_contract: selfless_strict` preserves the
 old numerical path. The path below is reserved for the freshly retrained,
-corrected B model, whose flow query is strict and whose flow content stream
-uses the diagonal contract `sigma_kv <= sigma_q`.
+flow-diagonal-only B model, whose flow query is strict and whose flow content
+stream uses the diagonal contract `sigma_kv <= sigma_q`. The new canonical B
+also takes flow-content AdaLN conditions from backbone X0 hidden and writes to
+a distinct output path.
 
 ```bash
-RUN_ROOT=output/unified-b-0p6b-100b-imagenet-split-s42-r1
+RUN_ROOT=output/unified-b-x0content-0p6b-100b-imagenet-split-s42-r1
 EVAL_PROFILE=formal \
   script/selfless/evaluate_unified_native_full_checkpoint_ascend16.sh \
   "${RUN_ROOT}/hf_model-final-ema" /path/to/evaluation-output

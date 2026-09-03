@@ -214,6 +214,7 @@ def load_model_tokenizer(
         "training_objective",
         "dual_stream_attention_contract",
         "flow_head_attention_contract",
+        "flow_condition_contract",
         "showo_mask_schedule",
         "showo_min_masking_rate",
         "boi_token_id",
@@ -267,6 +268,18 @@ def load_model_tokenizer(
             default_source_flow_head_attention_contract,
         )
     ).strip().lower()
+    default_source_flow_condition_contract = (
+        "not_applicable"
+        if architecture_variant == "positionwise_flow_head_on_b"
+        else "backbone_xt_shared_query_content"
+    )
+    source_flow_condition_contract = str(
+        getattr(
+            model_config,
+            "flow_condition_contract",
+            default_source_flow_condition_contract,
+        )
+    ).strip().lower()
     source_attention_gate = str(
         getattr(model_config, "backbone_attention_output_gate", "none")
     )
@@ -282,6 +295,11 @@ def load_model_tokenizer(
             # legacy F lacks it because its position-wise head has no attention.
             # Never reinterpret either numerical path through a newer YAML.
             value = source_flow_head_attention_contract
+        elif key == "flow_condition_contract" and source_has_image_flow:
+            # Missing on historical A/B checkpoints means their original
+            # shared query/content AdaLN condition. A newer YAML must not
+            # silently reinterpret already-trained weights as X0-conditioned.
+            value = source_flow_condition_contract
         else:
             value = config.model.get(key)
         if value is not None:

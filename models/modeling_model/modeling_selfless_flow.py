@@ -78,6 +78,85 @@ from .modeling_selfless_generation import (
     SelflessStaticCache,
 )
 
+
+LEGACY_FLOW_CONDITION_CONTRACT = "backbone_xt_shared_query_content"
+X0_CONTENT_FLOW_CONDITION_CONTRACT = (
+    "backbone_xt_query_backbone_x0_content"
+)
+_FLOW_CONDITION_CONTRACTS = {
+    LEGACY_FLOW_CONDITION_CONTRACT,
+    X0_CONTENT_FLOW_CONDITION_CONTRACT,
+}
+
+
+class X0ContentFlowLoss(FlowLoss):
+    """Contextual flow loss with an explicit backbone-X0 content condition.
+
+    Historical A/B checkpoints omit ``flow_condition_contract`` and retain
+    ``FlowLoss`` itself, including its query-condition fallback.  New A/B
+    checkpoints use this parameter-free subclass so their query AdaLN receives
+    backbone XT hidden states while content AdaLN receives backbone X0 hidden
+    states.  Keeping the legacy class and call path untouched is important for
+    bitwise-compatible loading of existing weights.
+    """
+
+    _CONTEXT_KEY = "_x0_content_training_context_conditions"
+
+    def _training_context(self, *args, **kwargs):
+        context = super()._training_context(*args, **kwargs)
+        context_conditions = self.__dict__.get(self._CONTEXT_KEY)
+        if context_conditions is None:
+            raise RuntimeError(
+                "X0-content flow training requires an explicit backbone-X0 "
+                "content condition"
+            )
+        expected = context["context_latents"].shape[:2]
+        if tuple(context_conditions.shape[:2]) != tuple(expected):
+            raise ValueError(
+                "backbone-X0 content conditions must align with flow content: "
+                f"{tuple(context_conditions.shape[:2])} != {tuple(expected)}"
+            )
+        context["context_conditions"] = context_conditions
+        return context
+
+    def forward(
+        self,
+        target,
+        z,
+        mask=None,
+        sigma=None,
+        image_positions=None,
+        context_latents=None,
+        context_mask=None,
+        content_attention_mask=None,
+        context_conditions=None,
+        record_stats: bool = True,
+        training_state=None,
+    ):
+        if context_conditions is None:
+            raise ValueError(
+                "X0-content flow training requires backbone-X0 "
+                "context_conditions"
+            )
+        if self._CONTEXT_KEY in self.__dict__:
+            raise RuntimeError("X0-content flow loss is not reentrant")
+        self.__dict__[self._CONTEXT_KEY] = context_conditions
+        try:
+            return super().forward(
+                target=target,
+                z=z,
+                mask=mask,
+                sigma=sigma,
+                image_positions=image_positions,
+                context_latents=context_latents,
+                context_mask=context_mask,
+                content_attention_mask=content_attention_mask,
+                record_stats=record_stats,
+                training_state=training_state,
+            )
+        finally:
+            self.__dict__.pop(self._CONTEXT_KEY, None)
+
 def auto_docstring(obj=None, **_kwargs):
     def decorator(target):
         return target
@@ -1332,6 +1411,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
         use_cache: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         calculate_likelihood: Optional[bool] = None,
+        return_x0_hidden_state: bool = False,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
         r"""
@@ -1506,10 +1586,13 @@ class Qwen3Model(Qwen3PreTrainedModel):
             past_key_values=past_key_values,
             cache_position=cache_position,
         )
-        return BaseModelOutputWithPast(
+        output = BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values if use_cache else None,
         )
+        if return_x0_hidden_state:
+            output["x0_last_hidden_state"] = self.norm(X0_hidden_states)
+        return output
 
 
 @auto_docstring
@@ -1525,6 +1608,24 @@ class Qwen3ForCausalLM(
 
     def __init__(self, config):
         super().__init__(config)
+        flow_condition_contract = str(
+            getattr(
+                config,
+                "flow_condition_contract",
+                LEGACY_FLOW_CONDITION_CONTRACT,
+            )
+        ).strip().lower()
+        if flow_condition_contract not in _FLOW_CONDITION_CONTRACTS:
+            raise ValueError(
+                "unsupported flow_condition_contract="
+                f"{flow_condition_contract!r}; expected one of "
+                f"{sorted(_FLOW_CONDITION_CONTRACTS)}"
+            )
+        # Missing metadata identifies historical A/B weights. Persist the
+        # resolved legacy contract when they are saved again without changing
+        # the instantiated modules or numerical path.
+        config.flow_condition_contract = flow_condition_contract
+        self.flow_condition_contract = flow_condition_contract
         self.model = self.backbone_model_class(config)
         self.vocab_size = config.vocab_size
         self.image_latent_dim = getattr(config, "image_latent_dim", 4)
@@ -1571,6 +1672,10 @@ class Qwen3ForCausalLM(
                 "selfless_strict",
             ),
         )
+        if flow_condition_contract == X0_CONTENT_FLOW_CONDITION_CONTRACT:
+            # No parameters or buffers are added; therefore initialization RNG,
+            # state-dict keys, and checkpoint loading remain identical.
+            self.image_flow_head.__class__ = X0ContentFlowLoss
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1610,6 +1715,11 @@ class Qwen3ForCausalLM(
             dtype=self.image_flow_condition_proj.weight.dtype,
         )
         return self.image_flow_condition_proj(z)
+
+    def _uses_backbone_x0_flow_content_condition(self) -> bool:
+        """Whether the contextual head uses split XT/X0 AdaLN conditions."""
+
+        return type(self.image_flow_head) is X0ContentFlowLoss
 
     def _zero_image_module_loss(
         self,
@@ -1811,6 +1921,13 @@ class Qwen3ForCausalLM(
             compute_text_loss=compute_text_loss,
             compute_image_loss=compute_image_loss,
         )
+        use_x0_content_condition = bool(
+            labels is not None
+            and compute_image_loss
+            and self._uses_backbone_x0_flow_content_condition()
+        )
+        if use_x0_content_condition:
+            model_kwargs["return_x0_hidden_state"] = True
         outputs: BaseModelOutputWithPast = self.model(
             X0_input_ids=X0_input_ids,
             attention_mask=attention_mask,
@@ -1929,6 +2046,34 @@ class Qwen3ForCausalLM(
                     image_conditions = self._prepare_image_flow_condition(
                         image_hidden_states
                     )
+                    image_content_conditions = None
+                    if use_x0_content_condition:
+                        x0_hidden_states = outputs.get(
+                            "x0_last_hidden_state", None
+                        )
+                        if x0_hidden_states is None:
+                            raise RuntimeError(
+                                "X0-content flow contract requested but the "
+                                "backbone did not return X0 hidden states"
+                            )
+                        selected_x0_hidden_states = torch.index_select(
+                            x0_hidden_states,
+                            0,
+                            rows,
+                        )
+                        x0_hidden_gather_indices = token_indices.unsqueeze(
+                            -1
+                        ).expand(-1, -1, x0_hidden_states.shape[-1])
+                        image_x0_hidden_states = torch.gather(
+                            selected_x0_hidden_states,
+                            dim=1,
+                            index=x0_hidden_gather_indices,
+                        )
+                        image_content_conditions = (
+                            self._prepare_image_flow_condition(
+                                image_x0_hidden_states
+                            )
+                        )
                     flow_sigma = model_kwargs.get("flow_sigma", None)
                     if flow_sigma is None:
                         image_sigmas = offsets.expand(span_table.shape[0], -1).float()
@@ -1985,6 +2130,10 @@ class Qwen3ForCausalLM(
                             repeats, 1, 1
                         )
                         image_conditions = image_conditions.repeat(repeats, 1, 1)
+                        if image_content_conditions is not None:
+                            image_content_conditions = (
+                                image_content_conditions.repeat(repeats, 1, 1)
+                            )
                         if image_sigmas is not None:
                             image_sigmas = image_sigmas.repeat(repeats, 1)
                         image_positions_for_flow = image_positions_for_flow.repeat(
@@ -1996,7 +2145,7 @@ class Qwen3ForCausalLM(
                             image_flow_context_mask = image_flow_context_mask.repeat(
                                 repeats, 1, 1
                             )
-                    image_loss = self.image_flow_head(
+                    image_flow_kwargs = dict(
                         target=image_targets,
                         z=image_conditions,
                         mask=image_loss_mask,
@@ -2006,6 +2155,11 @@ class Qwen3ForCausalLM(
                         context_mask=image_flow_context_mask,
                         record_stats=record_flow_stats,
                     )
+                    if image_content_conditions is not None:
+                        image_flow_kwargs["context_conditions"] = (
+                            image_content_conditions
+                        )
+                    image_loss = self.image_flow_head(**image_flow_kwargs)
                     image_token_count = (
                         image_loss_mask.sum()
                         if image_loss_mask is not None
@@ -2092,10 +2246,13 @@ class Qwen3ForQuestionAnswering(GenericForQuestionAnswering, Qwen3PreTrainedMode
 
 
 __all__ = [
+    "LEGACY_FLOW_CONDITION_CONTRACT",
     "Qwen3ForCausalLM",
     "Qwen3ForQuestionAnswering",
     "Qwen3PreTrainedModel",
     "Qwen3Model",
     "Qwen3ForSequenceClassification",
     "Qwen3ForTokenClassification",
+    "X0_CONTENT_FLOW_CONDITION_CONTRACT",
+    "X0ContentFlowLoss",
 ]

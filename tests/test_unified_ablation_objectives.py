@@ -1,5 +1,6 @@
 import math
 
+import pytest
 import torch
 import torch.nn.functional as F
 from transformers import Qwen3Config
@@ -103,11 +104,18 @@ def test_xlnet_b_hybrid_generation_mask_only_adds_content_self_edges():
     assert not _allowed(hybrid, 2, 1)
 
 
-def test_xlnet_b_hybrid_single_stream_matches_dual_stream_query():
+@pytest.mark.parametrize(
+    "attention_contract",
+    ["selfless_strict", "xlnet_content_diagonal"],
+)
+def test_ab_hybrid_single_stream_matches_dual_stream_query(
+    attention_contract,
+):
     torch.manual_seed(17)
     model = _tiny_model(
         "selfless_dual_stream", num_hidden_layers=2
     ).eval()
+    model.config.dual_stream_attention_contract = attention_contract
     input_ids = torch.tensor([[3, 11, 8, 8, 8, 8, 12, 0]])
     token_types = torch.tensor(
         [[0, 2, 1, 1, 1, 1, 2, 3]], dtype=torch.uint8
@@ -125,13 +133,17 @@ def test_xlnet_b_hybrid_single_stream_matches_dual_stream_query():
         sigma,
         8,
         "cpu",
-        include_diagonal=True,
+        include_diagonal=attention_contract == "xlnet_content_diagonal",
     )
     hybrid_mask = get_selfless_mask(
         sigma,
         8,
         "cpu",
-        diagonal_query_mask=content_queries,
+        diagonal_query_mask=(
+            content_queries
+            if attention_contract == "xlnet_content_diagonal"
+            else None
+        ),
     )
 
     dual_layers = []

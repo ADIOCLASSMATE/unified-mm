@@ -44,17 +44,31 @@ FORMAL_WORLD_SIZE="${FORMAL_WORLD_SIZE:-64}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-16}"
 
 case "${ABLATION}" in
+  a)
+    ARCHITECTURE_VARIANT="selfless_contextual"
+    TRAINING_OBJECTIVE="selfless_dual_stream"
+    DUAL_STREAM_ATTENTION_CONTRACT="selfless_strict"
+    DEFAULT_RUN_PROJECT="unified-a-x0content-qwen3-0.6b-smoke-ascend16"
+    TRAIN_ENTRY="pretrain/train_selfless_flow.py"
+    DEFAULT_DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING="false"
+    DEFAULT_IMAGE_SIGMA_ORDER="random"
+    DEFAULT_VALIDATION_ORDER_STRATEGY="spatial_halton"
+    DEFAULT_FLOW_HEAD_WIDTH="1280"
+    DEFAULT_FLOW_HEAD_ATTENTION_CONTRACT="selfless_strict"
+    DEFAULT_FLOW_CONDITION_CONTRACT="backbone_xt_query_backbone_x0_content"
+    ;;
   b)
     ARCHITECTURE_VARIANT="selfless_contextual"
     TRAINING_OBJECTIVE="selfless_dual_stream"
     DUAL_STREAM_ATTENTION_CONTRACT="xlnet_content_diagonal"
-    DEFAULT_RUN_PROJECT="unified-b-qwen3-0.6b-smoke-ascend16"
+    DEFAULT_RUN_PROJECT="unified-b-x0content-qwen3-0.6b-smoke-ascend16"
     TRAIN_ENTRY="pretrain/train_selfless_flow.py"
     DEFAULT_DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING="false"
     DEFAULT_IMAGE_SIGMA_ORDER="random"
     DEFAULT_VALIDATION_ORDER_STRATEGY="spatial_halton"
     DEFAULT_FLOW_HEAD_WIDTH="1280"
     DEFAULT_FLOW_HEAD_ATTENTION_CONTRACT="xlnet_content_diagonal"
+    DEFAULT_FLOW_CONDITION_CONTRACT="backbone_xt_query_backbone_x0_content"
     ;;
   c)
     ARCHITECTURE_VARIANT="single_stream_text_ar"
@@ -67,6 +81,7 @@ case "${ABLATION}" in
     DEFAULT_VALIDATION_ORDER_STRATEGY="spatial_halton"
     DEFAULT_FLOW_HEAD_WIDTH="1280"
     DEFAULT_FLOW_HEAD_ATTENTION_CONTRACT="xlnet_content_diagonal"
+    DEFAULT_FLOW_CONDITION_CONTRACT="backbone_xt_query_backbone_x0_content"
     ;;
   d)
     ARCHITECTURE_VARIANT="dynamic_xt"
@@ -81,18 +96,20 @@ case "${ABLATION}" in
     DEFAULT_VALIDATION_ORDER_STRATEGY="spatial_halton"
     DEFAULT_FLOW_HEAD_WIDTH="1280"
     DEFAULT_FLOW_HEAD_ATTENTION_CONTRACT="xlnet_content_diagonal"
+    DEFAULT_FLOW_CONDITION_CONTRACT="backbone_xt_query_backbone_x0_content"
     ;;
   e)
     ARCHITECTURE_VARIANT="selfless_contextual"
     TRAINING_OBJECTIVE="selfless_dual_stream"
     DUAL_STREAM_ATTENTION_CONTRACT="xlnet_content_diagonal"
-    DEFAULT_RUN_PROJECT="unified-e-on-b-qwen3-0.6b-smoke-ascend16"
+    DEFAULT_RUN_PROJECT="unified-e-on-b-x0content-qwen3-0.6b-smoke-ascend16"
     TRAIN_ENTRY="pretrain/train_selfless_flow.py"
     DEFAULT_DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING="false"
     DEFAULT_IMAGE_SIGMA_ORDER="sequential"
     DEFAULT_VALIDATION_ORDER_STRATEGY="sequential"
     DEFAULT_FLOW_HEAD_WIDTH="1280"
     DEFAULT_FLOW_HEAD_ATTENTION_CONTRACT="xlnet_content_diagonal"
+    DEFAULT_FLOW_CONDITION_CONTRACT="backbone_xt_query_backbone_x0_content"
     ;;
   f)
     ARCHITECTURE_VARIANT="positionwise_flow_head_on_b"
@@ -105,9 +122,10 @@ case "${ABLATION}" in
     DEFAULT_VALIDATION_ORDER_STRATEGY="spatial_halton"
     DEFAULT_FLOW_HEAD_WIDTH="1936"
     DEFAULT_FLOW_HEAD_ATTENTION_CONTRACT="not_applicable"
+    DEFAULT_FLOW_CONDITION_CONTRACT="not_applicable"
     ;;
   *)
-    echo "ERROR: ABLATION must be b, c, d, e, or f; got ${ABLATION}" >&2
+    echo "ERROR: ABLATION must be a, b, c, d, e, or f; got ${ABLATION}" >&2
     exit 2
     ;;
 esac
@@ -117,6 +135,7 @@ IMAGE_SIGMA_ORDER="${IMAGE_SIGMA_ORDER:-${DEFAULT_IMAGE_SIGMA_ORDER}}"
 VALIDATION_ORDER_STRATEGY="${VALIDATION_ORDER_STRATEGY:-${DEFAULT_VALIDATION_ORDER_STRATEGY}}"
 FLOW_HEAD_WIDTH="${FLOW_HEAD_WIDTH:-${DEFAULT_FLOW_HEAD_WIDTH}}"
 FLOW_HEAD_ATTENTION_CONTRACT="${FLOW_HEAD_ATTENTION_CONTRACT:-${DEFAULT_FLOW_HEAD_ATTENTION_CONTRACT}}"
+FLOW_CONDITION_CONTRACT="${FLOW_CONDITION_CONTRACT:-${DEFAULT_FLOW_CONDITION_CONTRACT}}"
 
 export HCCL_INTRA_ROCE_ENABLE="${HCCL_INTRA_ROCE_ENABLE:-1}"
 export HCCL_CONNECT_TIMEOUT="${HCCL_CONNECT_TIMEOUT:-600}"
@@ -161,6 +180,10 @@ if [[ "${FLOW_HEAD_WIDTH}" != "${DEFAULT_FLOW_HEAD_WIDTH}" ]]; then
 fi
 if [[ "${FLOW_HEAD_ATTENTION_CONTRACT}" != "${DEFAULT_FLOW_HEAD_ATTENTION_CONTRACT}" ]]; then
   echo "ERROR: ablation ${ABLATION} requires FLOW_HEAD_ATTENTION_CONTRACT=${DEFAULT_FLOW_HEAD_ATTENTION_CONTRACT}" >&2
+  exit 2
+fi
+if [[ "${FLOW_CONDITION_CONTRACT}" != "${DEFAULT_FLOW_CONDITION_CONTRACT}" ]]; then
+  echo "ERROR: ablation ${ABLATION} requires FLOW_CONDITION_CONTRACT=${DEFAULT_FLOW_CONDITION_CONTRACT}" >&2
   exit 2
 fi
 if [[ "${DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING}" != "true" && "${DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING}" != "false" ]]; then
@@ -215,6 +238,7 @@ python scripts/validate_unified_baseline.py \
   --validation-order-strategy "${VALIDATION_ORDER_STRATEGY}" \
   --flow-head-width "${FLOW_HEAD_WIDTH}" \
   --flow-head-attention-contract "${FLOW_HEAD_ATTENTION_CONTRACT}" \
+  --flow-condition-contract "${FLOW_CONDITION_CONTRACT}" \
   >"${AUDIT_DIR}/asset_preflight.json"
 
 COMMAND=(
@@ -254,6 +278,7 @@ COMMAND=(
   "model.training_objective=${TRAINING_OBJECTIVE}"
   "model.dual_stream_attention_contract=${DUAL_STREAM_ATTENTION_CONTRACT}"
   "model.flow_head_attention_contract=${FLOW_HEAD_ATTENTION_CONTRACT}"
+  "model.flow_condition_contract=${FLOW_CONDITION_CONTRACT}"
   "model.image_flow_batch_mul=${IMAGE_FLOW_BATCH_MUL}"
   "training.use_gradient_checkpointing=false"
   "model.dynamic_xt_t2i_gradient_checkpointing=${DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING}"

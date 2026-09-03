@@ -123,6 +123,11 @@ def _validate_global_protocol(protocol: DictConfig) -> DictConfig:
         protocol.flow_head_attention_contract,
         "xlnet_content_diagonal",
     )
+    _expect(
+        "protocol.flow_condition_contract",
+        protocol.flow_condition_contract,
+        "backbone_xt_shared_query_content",
+    )
     _expect("protocol.runtime_hashing_enabled", bool(protocol.runtime_hashing_enabled), False)
     _expect("protocol.wandb_mode", protocol.wandb_mode, "disabled")
 
@@ -235,9 +240,17 @@ def _validate_shared_model_optimizer(
     *,
     source: str,
 ) -> None:
-    # The architecture, B attention contract, objective, and both task heads
-    # remain byte-for-byte configuration-equivalent to the combined baseline.
-    _expect(f"{source} model contract", config.model, base.model)
+    # The historical single-source controls remain configuration-equivalent to
+    # their original B baseline. The combined baseline now opts into split
+    # XT/X0 conditioning, so override only that newly versioned field before
+    # comparing the otherwise identical model contracts.
+    expected_model = OmegaConf.create(
+        OmegaConf.to_container(base.model, resolve=True)
+    )
+    expected_model.flow_condition_contract = (
+        protocol.flow_condition_contract
+    )
+    _expect(f"{source} model contract", config.model, expected_model)
     _expect(f"{source} optimizer contract", config.optimizer, base.optimizer)
     _expect(f"{source} model_path", config.model.model_path, EXPECTED_MODEL_PATH)
     _expect(
@@ -259,6 +272,11 @@ def _validate_shared_model_optimizer(
         f"{source} flow-head attention contract",
         config.model.flow_head_attention_contract,
         protocol.flow_head_attention_contract,
+    )
+    _expect(
+        f"{source} flow condition contract",
+        config.model.flow_condition_contract,
+        protocol.flow_condition_contract,
     )
     _expect(
         f"{source} lambda_text",

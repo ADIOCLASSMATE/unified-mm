@@ -42,17 +42,31 @@ PRESERVE_MODEL_CONTRACT="${PRESERVE_MODEL_CONTRACT:-false}"
 OUTPUT_DIR_BASE="${OUTPUT_DIR_BASE:-output}"
 
 case "${ABLATION}" in
+  a)
+    ARCHITECTURE_VARIANT="selfless_contextual"
+    TRAINING_OBJECTIVE="selfless_dual_stream"
+    DUAL_STREAM_ATTENTION_CONTRACT="selfless_strict"
+    DEFAULT_RUN_PROJECT="unified-a-x0content-0p6b-100b-imagenet-split-s42-r1"
+    TRAIN_ENTRY="pretrain/train_selfless_flow.py"
+    DEFAULT_DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING="false"
+    DEFAULT_IMAGE_SIGMA_ORDER="random"
+    DEFAULT_VALIDATION_ORDER_STRATEGY="spatial_halton"
+    DEFAULT_FLOW_HEAD_WIDTH="1280"
+    DEFAULT_FLOW_HEAD_ATTENTION_CONTRACT="selfless_strict"
+    DEFAULT_FLOW_CONDITION_CONTRACT="backbone_xt_query_backbone_x0_content"
+    ;;
   b)
     ARCHITECTURE_VARIANT="selfless_contextual"
     TRAINING_OBJECTIVE="selfless_dual_stream"
     DUAL_STREAM_ATTENTION_CONTRACT="xlnet_content_diagonal"
-    DEFAULT_RUN_PROJECT="unified-b-0p6b-100b-imagenet-split-s42-r1"
+    DEFAULT_RUN_PROJECT="unified-b-x0content-0p6b-100b-imagenet-split-s42-r1"
     TRAIN_ENTRY="pretrain/train_selfless_flow.py"
     DEFAULT_DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING="false"
     DEFAULT_IMAGE_SIGMA_ORDER="random"
     DEFAULT_VALIDATION_ORDER_STRATEGY="spatial_halton"
     DEFAULT_FLOW_HEAD_WIDTH="1280"
     DEFAULT_FLOW_HEAD_ATTENTION_CONTRACT="xlnet_content_diagonal"
+    DEFAULT_FLOW_CONDITION_CONTRACT="backbone_xt_query_backbone_x0_content"
     ;;
   c)
     ARCHITECTURE_VARIANT="single_stream_text_ar"
@@ -65,6 +79,7 @@ case "${ABLATION}" in
     DEFAULT_VALIDATION_ORDER_STRATEGY="spatial_halton"
     DEFAULT_FLOW_HEAD_WIDTH="1280"
     DEFAULT_FLOW_HEAD_ATTENTION_CONTRACT="xlnet_content_diagonal"
+    DEFAULT_FLOW_CONDITION_CONTRACT="backbone_xt_query_backbone_x0_content"
     ;;
   d)
     ARCHITECTURE_VARIANT="dynamic_xt"
@@ -80,18 +95,20 @@ case "${ABLATION}" in
     DEFAULT_VALIDATION_ORDER_STRATEGY="spatial_halton"
     DEFAULT_FLOW_HEAD_WIDTH="1280"
     DEFAULT_FLOW_HEAD_ATTENTION_CONTRACT="xlnet_content_diagonal"
+    DEFAULT_FLOW_CONDITION_CONTRACT="backbone_xt_query_backbone_x0_content"
     ;;
   e)
     ARCHITECTURE_VARIANT="selfless_contextual"
     TRAINING_OBJECTIVE="selfless_dual_stream"
     DUAL_STREAM_ATTENTION_CONTRACT="xlnet_content_diagonal"
-    DEFAULT_RUN_PROJECT="unified-e-on-b-0p6b-100b-imagenet-split-s42-r1"
+    DEFAULT_RUN_PROJECT="unified-e-on-b-x0content-0p6b-100b-imagenet-split-s42-r1"
     TRAIN_ENTRY="pretrain/train_selfless_flow.py"
     DEFAULT_DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING="false"
     DEFAULT_IMAGE_SIGMA_ORDER="sequential"
     DEFAULT_VALIDATION_ORDER_STRATEGY="sequential"
     DEFAULT_FLOW_HEAD_WIDTH="1280"
     DEFAULT_FLOW_HEAD_ATTENTION_CONTRACT="xlnet_content_diagonal"
+    DEFAULT_FLOW_CONDITION_CONTRACT="backbone_xt_query_backbone_x0_content"
     ;;
   f)
     ARCHITECTURE_VARIANT="positionwise_flow_head_on_b"
@@ -106,9 +123,10 @@ case "${ABLATION}" in
     # of B's 164,072,976-parameter contextual head.
     DEFAULT_FLOW_HEAD_WIDTH="1936"
     DEFAULT_FLOW_HEAD_ATTENTION_CONTRACT="not_applicable"
+    DEFAULT_FLOW_CONDITION_CONTRACT="not_applicable"
     ;;
   *)
-    echo "ERROR: ABLATION must be b, c, d, e, or f; got ${ABLATION}" >&2
+    echo "ERROR: ABLATION must be a, b, c, d, e, or f; got ${ABLATION}" >&2
     exit 2
     ;;
 esac
@@ -118,6 +136,7 @@ IMAGE_SIGMA_ORDER="${IMAGE_SIGMA_ORDER:-${DEFAULT_IMAGE_SIGMA_ORDER}}"
 VALIDATION_ORDER_STRATEGY="${VALIDATION_ORDER_STRATEGY:-${DEFAULT_VALIDATION_ORDER_STRATEGY}}"
 FLOW_HEAD_WIDTH="${FLOW_HEAD_WIDTH:-${DEFAULT_FLOW_HEAD_WIDTH}}"
 FLOW_HEAD_ATTENTION_CONTRACT="${FLOW_HEAD_ATTENTION_CONTRACT:-${DEFAULT_FLOW_HEAD_ATTENTION_CONTRACT}}"
+FLOW_CONDITION_CONTRACT="${FLOW_CONDITION_CONTRACT:-${DEFAULT_FLOW_CONDITION_CONTRACT}}"
 
 RUN_PROJECT="${RUN_PROJECT:-${DEFAULT_RUN_PROJECT}}"
 RUN_NAME="${RUN_NAME:-${RUN_PROJECT//\//-}}"
@@ -156,6 +175,10 @@ if [[ "${FLOW_HEAD_WIDTH}" != "${DEFAULT_FLOW_HEAD_WIDTH}" ]]; then
 fi
 if [[ "${FLOW_HEAD_ATTENTION_CONTRACT}" != "${DEFAULT_FLOW_HEAD_ATTENTION_CONTRACT}" ]]; then
   echo "ERROR: ablation ${ABLATION} requires FLOW_HEAD_ATTENTION_CONTRACT=${DEFAULT_FLOW_HEAD_ATTENTION_CONTRACT}" >&2
+  exit 2
+fi
+if [[ "${FLOW_CONDITION_CONTRACT}" != "${DEFAULT_FLOW_CONDITION_CONTRACT}" ]]; then
+  echo "ERROR: ablation ${ABLATION} requires FLOW_CONDITION_CONTRACT=${DEFAULT_FLOW_CONDITION_CONTRACT}" >&2
   exit 2
 fi
 if [[ "${DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING}" != "true" && "${DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING}" != "false" ]]; then
@@ -252,6 +275,7 @@ PREFLIGHT=(
   --validation-order-strategy "${VALIDATION_ORDER_STRATEGY}"
   --flow-head-width "${FLOW_HEAD_WIDTH}"
   --flow-head-attention-contract "${FLOW_HEAD_ATTENTION_CONTRACT}"
+  --flow-condition-contract "${FLOW_CONDITION_CONTRACT}"
 )
 if [[ "${NODE_RANK}" == "0" ]]; then
   PREFLIGHT+=(--tokenizer-probe)
@@ -309,6 +333,7 @@ if [[ "${PRESERVE_MODEL_CONTRACT}" == "false" ]]; then
     "model.training_objective=${TRAINING_OBJECTIVE}"
     "model.dual_stream_attention_contract=${DUAL_STREAM_ATTENTION_CONTRACT}"
     "model.flow_head_attention_contract=${FLOW_HEAD_ATTENTION_CONTRACT}"
+    "model.flow_condition_contract=${FLOW_CONDITION_CONTRACT}"
     "model.image_flow_batch_mul=${IMAGE_FLOW_BATCH_MUL}"
     "model.showo_mask_schedule=cosine"
     "model.showo_min_masking_rate=0.0"

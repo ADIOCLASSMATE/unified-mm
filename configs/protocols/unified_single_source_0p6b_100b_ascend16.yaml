@@ -15,6 +15,10 @@ architecture_variant: selfless_contextual
 training_objective: selfless_dual_stream
 dual_stream_attention_contract: xlnet_content_diagonal
 flow_head_attention_contract: xlnet_content_diagonal
+# These controls were defined against the historical B implementation. Keep
+# their AdaLN condition contract frozen even though the new combined A/B/E
+# runs use backbone X0 hidden states for the flow content stream.
+flow_condition_contract: backbone_xt_shared_query_content
 # Smallest common optimizer-boundary total at or above 100B.  Text updates
 # contain exactly twice as many physical positions as either image-source
 # update, so image runs use exactly twice the number of optimizer steps.

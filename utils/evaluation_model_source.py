@@ -275,6 +275,36 @@ def _apply_checkpoint_model_contract(config, saved_model, *, label: str) -> None
             f"{saved_architecture!r}"
         )
     config.model.flow_head_attention_contract = flow_head_attention_contract
+    # AdaLN query/content conditions were split after the original A/B runs.
+    # As with the attention contract above, missing checkpoint metadata is an
+    # explicit legacy numerical contract rather than permission for the
+    # evaluation YAML to select newer behavior.
+    default_flow_condition_contract = (
+        "not_applicable"
+        if saved_architecture == "positionwise_flow_head_on_b"
+        else "backbone_xt_shared_query_content"
+    )
+    flow_condition_contract = str(
+        saved_model.get(
+            "flow_condition_contract",
+            default_flow_condition_contract,
+        )
+    ).strip().lower()
+    valid_flow_condition_contracts = (
+        {"not_applicable"}
+        if saved_architecture == "positionwise_flow_head_on_b"
+        else {
+            "backbone_xt_shared_query_content",
+            "backbone_xt_query_backbone_x0_content",
+        }
+    )
+    if flow_condition_contract not in valid_flow_condition_contracts:
+        raise ValueError(
+            f"{label} has invalid flow_condition_contract="
+            f"{flow_condition_contract!r} for architecture_variant="
+            f"{saved_architecture!r}"
+        )
+    config.model.flow_condition_contract = flow_condition_contract
     if saved_architecture == "positionwise_flow_head_on_b":
         expected_f_fields = {
             "positionwise_reference_flow_width": 1280,

@@ -90,6 +90,9 @@ def test_final_hf_ema_source_uses_export_provenance(tmp_path):
     assert config.training.from_scratch is False
     assert config.training.use_gradient_checkpointing is False
     assert config.model.flow_head_attention_contract == "selfless_strict"
+    assert config.model.flow_condition_contract == (
+        "backbone_xt_shared_query_content"
+    )
 
 
 def test_final_hf_ema_source_rejects_stored_key_count_mismatch(tmp_path):
@@ -232,6 +235,9 @@ def _evaluation_config():
                 "image_flow_width": 1280,
                 "image_flow_depth": 8,
                 "image_flow_batch_mul": 1,
+                "flow_condition_contract": (
+                    "backbone_xt_query_backbone_x0_content"
+                ),
             },
             "training": {
                 "from_scratch": True,
@@ -331,6 +337,9 @@ def test_checkpoint_attention_contract_is_authoritative(tmp_path):
     # Missing is deliberately not inferred from the backbone: every legacy
     # A/B flow head used the shared strict mask.
     assert config.model.flow_head_attention_contract == "selfless_strict"
+    assert config.model.flow_condition_contract == (
+        "backbone_xt_shared_query_content"
+    )
 
 
 def test_checkpoint_flow_head_attention_contract_is_authoritative(tmp_path):
@@ -353,6 +362,32 @@ def test_checkpoint_flow_head_attention_contract_is_authoritative(tmp_path):
 
     assert config.model.flow_head_attention_contract == (
         "xlnet_content_diagonal"
+    )
+
+
+def test_checkpoint_flow_condition_contract_is_authoritative(tmp_path):
+    checkpoint = tmp_path / "checkpoint-10"
+    model_contract = _text_ar_model_contract()
+    model_contract.update(
+        {
+            "architecture_variant": "selfless_contextual",
+            "dual_stream_attention_contract": "xlnet_content_diagonal",
+            "flow_head_attention_contract": "xlnet_content_diagonal",
+            "flow_condition_contract": (
+                "backbone_xt_query_backbone_x0_content"
+            ),
+        }
+    )
+    _write_sharded_source(checkpoint, model_contract=model_contract)
+    config = _evaluation_config()
+
+    configure_model_source(
+        config,
+        resolve_evaluation_model_source(checkpoint),
+    )
+
+    assert config.model.flow_condition_contract == (
+        "backbone_xt_query_backbone_x0_content"
     )
 
 
@@ -382,6 +417,7 @@ def test_f_checkpoint_owns_parameter_matched_width_and_reference_contract(
 
     assert config.model.architecture_variant == "positionwise_flow_head_on_b"
     assert config.model.flow_head_attention_contract == "not_applicable"
+    assert config.model.flow_condition_contract == "not_applicable"
     assert config.model.image_flow_width == 1936
     assert config.model.positionwise_reference_flow_width == 1280
     assert config.model.positionwise_reference_flow_depth == 8
@@ -411,6 +447,7 @@ def test_legacy_f_checkpoint_without_attention_field_is_not_applicable(
     configure_model_source(config, resolve_evaluation_model_source(checkpoint))
 
     assert config.model.flow_head_attention_contract == "not_applicable"
+    assert config.model.flow_condition_contract == "not_applicable"
 
 
 def test_checkpoint_image_contract_mismatch_is_rejected(tmp_path):

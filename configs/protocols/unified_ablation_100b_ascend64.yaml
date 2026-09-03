@@ -1,7 +1,8 @@
-# Formal B-based unified ablation protocol. Every fresh arm starts from the
-# same Qwen3-0.6B-Base weights at optimizer step zero. D/E/F are submitted to
+# Formal unified ablation protocol. Every fresh arm starts from the same
+# Qwen3-0.6B-Base weights at optimizer step zero. A/B/E use split backbone
+# XT-query and X0-content flow AdaLN conditions. D/E/F are submitted to
 # the scaling-law platform project requested for this study.
-schema: unified_ablation_100b_v5
+schema: unified_ablation_100b_v6
 base_config: configs/selfless/unified_baseline_100b_ascend_64npu.yaml
 platform_project: "多模态大模型新架构评测探索与scaling-law"
 historical_platform_project_bc: "随机序语言建模-统一自回归与掩码扩散的随机顺序生成框架"
@@ -53,6 +54,7 @@ shared:
     climbmix_tokenization: online
     text_sequence_length: 2048
     image_flow_batch_mul: 4
+    contextual_flow_condition_contract: backbone_xt_query_backbone_x0_content
     global_gradient_checkpointing: false
     image_flow_gradient_checkpointing: false
     selected_lr:
@@ -71,6 +73,9 @@ shared:
         train_validation_overlap_allowed: false
 comparability:
     baseline: b
+    a_vs_b_only_allowed_differences:
+        - model.dual_stream_attention_contract
+        - model.flow_head_attention_contract
     # Singular aliases are retained for downstream reports written against v4.
     b_vs_c_only_allowed_difference: model.architecture_variant
     b_vs_d_only_allowed_difference: model.architecture_variant
@@ -106,14 +111,31 @@ comparability:
             - first_update_bf16_overflow_guard
     systems_only_differences_change_objective: false
 run_projects:
-    b: unified-b-0p6b-100b-imagenet-split-s42-r1
+    a: unified-a-x0content-0p6b-100b-imagenet-split-s42-r1
+    b: unified-b-x0content-0p6b-100b-imagenet-split-s42-r1
     c: unified-c-on-b-0p6b-100b-imagenet-split-s42-r1
     d: unified-d-on-b-0p6b-100b-imagenet-split-s42-r4
-    e: unified-e-on-b-0p6b-100b-imagenet-split-s42-r1
+    e: unified-e-on-b-x0content-0p6b-100b-imagenet-split-s42-r1
     f: unified-f-on-b-0p6b-100b-imagenet-split-s42-r1
 ablations:
+    a:
+        status: ready_x0_content
+        architecture_variant: selfless_contextual
+        training_objective: selfless_dual_stream
+        image_sigma_order: random
+        query_attention: "sigma_kv < sigma_q"
+        content_attention: "sigma_kv < sigma_q"
+        flow_head_attention_contract: selfless_strict
+        flow_head_query_attention: "sigma_kv < sigma_q"
+        flow_head_content_attention: "sigma_kv < sigma_q"
+        flow_query_condition: backbone_xt_hidden
+        flow_content_condition: backbone_x0_hidden
+        flow_condition_contract: backbone_xt_query_backbone_x0_content
+        generation_content_commit: fused_previous_x0_with_current_query
+        current_x1_to_velocity_leak: false
+        start: qwen_pretrained_step_0
     b:
-        status: main_baseline
+        status: main_baseline_x0_content
         architecture_variant: selfless_contextual
         training_objective: selfless_dual_stream
         image_sigma_order: random
@@ -122,6 +144,11 @@ ablations:
         flow_head_attention_contract: xlnet_content_diagonal
         flow_head_query_attention: "sigma_kv < sigma_q"
         flow_head_content_attention: "sigma_kv <= sigma_q"
+        flow_query_condition: backbone_xt_hidden
+        flow_content_condition: backbone_x0_hidden
+        flow_condition_contract: backbone_xt_query_backbone_x0_content
+        generation_content_commit: fused_previous_x0_with_current_query
+        current_x1_to_velocity_leak: false
         start: qwen_pretrained_step_0
     c:
         architecture_variant: single_stream_text_ar
@@ -131,6 +158,7 @@ ablations:
         text_prediction: "hidden[j-1] -> token[j]"
         dual_stream_attention_contract: xlnet_content_diagonal
         flow_head_attention_contract: xlnet_content_diagonal
+        flow_condition_contract: backbone_xt_query_backbone_x0_content
         image_stream: identical_to_b_selfless_dual_stream
         image_attention: "sigma_kv <= sigma_q"
         image_loss_positions: identical_to_b
@@ -182,11 +210,16 @@ ablations:
         image_sigma_order: random
         start: qwen_pretrained_step_0
     e:
-        status: ready
+        status: ready_x0_content
         base: b
         architecture_variant: selfless_contextual
         model_implementation: identical_to_b
         flow_head_attention_contract: xlnet_content_diagonal
+        flow_query_condition: backbone_xt_hidden
+        flow_content_condition: backbone_x0_hidden
+        flow_condition_contract: backbone_xt_query_backbone_x0_content
+        generation_content_commit: fused_previous_x0_with_current_query
+        current_x1_to_velocity_leak: false
         text_sigma_order: identical_to_b_deterministic_physical_left_to_right
         image_sigma_order: sequential
         generation_order: sequential
@@ -200,6 +233,7 @@ ablations:
         backbone_and_attention: identical_to_b
         image_sigma_order: random
         flow_head_attention_contract: not_applicable
+        flow_condition_contract: not_applicable
         flow_head:
             architecture: shared_positionwise_adaln_mlp
             cross_token_attention: false

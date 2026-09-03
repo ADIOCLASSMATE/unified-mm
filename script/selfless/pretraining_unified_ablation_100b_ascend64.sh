@@ -5,8 +5,8 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${REPO_ROOT}"
 
 ABLATION="${ABLATION:-}"
-if [[ ! "${ABLATION}" =~ ^[bcdef]$ ]]; then
-  echo "ERROR: ABLATION must be b, c, d, e, or f" >&2
+if [[ ! "${ABLATION}" =~ ^[abcdef]$ ]]; then
+  echo "ERROR: ABLATION must be a, b, c, d, e, or f" >&2
   exit 2
 fi
 
@@ -19,10 +19,11 @@ export CONFIG="configs/selfless/unified_baseline_100b_ascend_64npu.yaml"
 export ACCELERATE_CONFIG="accelerate_configs/64_npus_4nodes_deepspeed_zero2.yaml"
 export ABLATION
 case "${ABLATION}" in
-  b) ARM_NAME="b"; RUN_REVISION="r1" ;;
+  a) ARM_NAME="a-x0content"; RUN_REVISION="r1" ;;
+  b) ARM_NAME="b-x0content"; RUN_REVISION="r1" ;;
   c) ARM_NAME="c-on-b"; RUN_REVISION="r1" ;;
   d) ARM_NAME="d-on-b"; RUN_REVISION="r4" ;;
-  e) ARM_NAME="e-on-b"; RUN_REVISION="r1" ;;
+  e) ARM_NAME="e-on-b-x0content"; RUN_REVISION="r1" ;;
   f) ARM_NAME="f-on-b"; RUN_REVISION="r1" ;;
 esac
 DEFAULT_RUN_PROJECT="unified-${ARM_NAME}-0p6b-100b-imagenet-split-s42-${RUN_REVISION}"

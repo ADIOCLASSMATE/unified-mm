@@ -520,6 +520,9 @@ class SelflessGenerationMixin:
         content_self_diagonal = (
             attention_contract == "xlnet_content_diagonal"
         )
+        use_x0_content_condition = bool(
+            self._uses_backbone_x0_flow_content_condition()
+        )
         batch_size, sequence_length = input_ids.shape
         image_latent_dim = int(image_latent_dim or self.image_latent_dim)
         image_tokens_per_img = int(
@@ -981,7 +984,7 @@ class SelflessGenerationMixin:
             cache: SelflessStaticCache,
             image_uncond_rows: torch.Tensor | None,
             label: str,
-        ) -> torch.Tensor:
+        ) -> tuple[torch.Tensor, torch.Tensor | None]:
             current_positions = span_starts + current_local_positions
             current_indices = current_positions.unsqueeze(1)
             current_query_sigma = current_sigma[
@@ -1102,7 +1105,13 @@ class SelflessGenerationMixin:
                 debug_finite_backbone=debug_finite,
                 debug_backbone_label=label,
             ).last_hidden_state
-            return hidden[:, -1]
+            pending_x0_hidden = (
+                hidden[:, 0]
+                if use_x0_content_condition
+                and pending_local_positions is not None
+                else None
+            )
+            return hidden[:, -1], pending_x0_hidden
 
         for step_index in range(image_tokens_per_img):
             if (
@@ -1115,6 +1124,8 @@ class SelflessGenerationMixin:
             current_positions = span_starts + current_local_positions
             attention_mask = None
             uncond_attention_mask = None
+            conditional_pending_x0_hidden = None
+            unconditional_pending_x0_hidden = None
 
             if use_cache:
                 if pending_local_positions is not None:
@@ -1139,7 +1150,7 @@ class SelflessGenerationMixin:
                         torch.ones_like(pending_indices, dtype=torch.bool),
                     )
                 if pair_backbone_cfg:
-                    paired_hidden = cached_query(
+                    paired_hidden, paired_pending_x0_hidden = cached_query(
                         current_local_positions,
                         cache=conditional_cache,
                         image_uncond_rows=paired_cfg_rows,
@@ -1148,14 +1159,25 @@ class SelflessGenerationMixin:
                     conditional_hidden, unconditional_hidden = (
                         paired_hidden.split(selected_batch, dim=0)
                     )
+                    if paired_pending_x0_hidden is not None:
+                        (
+                            conditional_pending_x0_hidden,
+                            unconditional_pending_x0_hidden,
+                        ) = paired_pending_x0_hidden.split(
+                            selected_batch,
+                            dim=0,
+                        )
                 else:
-                    conditional_hidden = cached_query(
+                    (
+                        conditional_hidden,
+                        conditional_pending_x0_hidden,
+                    ) = cached_query(
                         current_local_positions,
                         cache=conditional_cache,
                         image_uncond_rows=None,
                         label=f"conditional_cache_step={step_index + 1}",
                     )
-                    unconditional_hidden = (
+                    unconditional_result = (
                         cached_query(
                             current_local_positions,
                             cache=unconditional_cache,
@@ -1165,6 +1187,13 @@ class SelflessGenerationMixin:
                         if use_flow_cfg
                         else None
                     )
+                    if unconditional_result is None:
+                        unconditional_hidden = None
+                    else:
+                        (
+                            unconditional_hidden,
+                            unconditional_pending_x0_hidden,
+                        ) = unconditional_result
             else:
                 image_latent_mask = base_image_latent_mask.clone()
                 image_latent_mask[
@@ -1203,6 +1232,12 @@ class SelflessGenerationMixin:
                     batch_indices,
                     current_positions,
                 ]
+                if use_x0_content_condition and pending_local_positions is not None:
+                    pending_positions = span_starts + pending_local_positions
+                    conditional_pending_x0_hidden = full_hidden[
+                        batch_indices,
+                        pending_positions,
+                    ]
                 unconditional_hidden = None
                 if use_flow_cfg:
                     uncond_attention_mask = (
@@ -1233,6 +1268,14 @@ class SelflessGenerationMixin:
                         batch_indices,
                         current_positions,
                     ]
+                    if (
+                        use_x0_content_condition
+                        and pending_local_positions is not None
+                    ):
+                        unconditional_pending_x0_hidden = uncond_full_hidden[
+                            batch_indices,
+                            pending_positions,
+                        ]
 
             self._generation_debug_check(
                 debug_finite,
@@ -1264,6 +1307,30 @@ class SelflessGenerationMixin:
                 if unconditional_hidden is not None
                 else None
             )
+            if use_x0_content_condition and pending_flow_latents is not None:
+                if conditional_pending_x0_hidden is None:
+                    raise RuntimeError(
+                        "X0-content generation failed to capture the previous "
+                        "backbone content hidden in the fused forward"
+                    )
+                pending_flow_conditions = self._prepare_image_flow_condition(
+                    conditional_pending_x0_hidden
+                )
+                if use_flow_cfg:
+                    if unconditional_pending_x0_hidden is None:
+                        raise RuntimeError(
+                            "X0-content CFG generation failed to capture the "
+                            "unconditional previous content hidden"
+                        )
+                    pending_flow_conditions = torch.cat(
+                        [
+                            pending_flow_conditions,
+                            self._prepare_image_flow_condition(
+                                unconditional_pending_x0_hidden
+                            ),
+                        ],
+                        dim=0,
+                    )
             flow_context = {
                 "query_positions": current_local_positions,
                 "latent_mixer_cache": flow_cache,
@@ -1360,17 +1427,20 @@ class SelflessGenerationMixin:
                 ] = completed_steps
 
             cached_latents = prediction
-            cached_conditions = condition
+            cached_conditions = (
+                None if use_x0_content_condition else condition
+            )
             cached_positions = current_local_positions
             if use_flow_cfg:
                 cached_latents = torch.cat(
                     [cached_latents, cached_latents],
                     dim=0,
                 )
-                cached_conditions = torch.cat(
-                    [cached_conditions, unconditional_condition],
-                    dim=0,
-                )
+                if cached_conditions is not None:
+                    cached_conditions = torch.cat(
+                        [cached_conditions, unconditional_condition],
+                        dim=0,
+                    )
                 cached_positions = torch.cat(
                     [cached_positions, cached_positions],
                     dim=0,
@@ -1451,6 +1521,24 @@ class SelflessGenerationMixin:
             "flow_cfg": float(flow_cfg),
             "flow_cfg_schedule": str(flow_cfg_schedule),
             "flow_head_architecture": "dynamic_dual_stream_pure_2d",
+            "flow_condition_contract": str(
+                getattr(
+                    self.config,
+                    "flow_condition_contract",
+                    "backbone_xt_shared_query_content",
+                )
+            ),
+            "flow_query_condition": "backbone_xt_hidden",
+            "flow_content_condition": (
+                "backbone_x0_hidden"
+                if use_x0_content_condition
+                else "backbone_xt_query_hidden"
+            ),
+            "flow_content_condition_commit": (
+                "fused_previous_x0_with_current_query"
+                if use_x0_content_condition
+                else "previous_static_query_condition"
+            ),
             "segment_isolation_enabled": True,
             "backbone_kv_cache_enabled": bool(use_cache),
             "backbone_cfg_batched": pair_backbone_cfg,

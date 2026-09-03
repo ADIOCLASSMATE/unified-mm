@@ -145,14 +145,19 @@ not implicitly mount the official dataset.
 - The completed step-95415 artifact previously named baseline b predates the
   flow-head content diagonal. It is retained only as the no-diagonal control at
   `output/unified-b-flow-head-no-diagonal-0p6b-100b-imagenet-split-s42-r1/hf_model-final-ema`.
-  The canonical corrected-b path
-  `output/unified-b-0p6b-100b-imagenet-split-s42-r1` is reserved for a fresh
-  retraining run and must not reuse this historical checkpoint. Corrected B
+  The flow-diagonal-only B path
+  `output/unified-b-0p6b-100b-imagenet-split-s42-r1` retains the historical
+  shared-query AdaLN condition and remains an intermediate control. The new
+  canonical B path
+  `output/unified-b-x0content-0p6b-100b-imagenet-split-s42-r1` is reserved for
+  a fresh retraining run and must not reuse either historical checkpoint. New B
   explicitly sets `flow_head_attention_contract: xlnet_content_diagonal`:
   its flow query remains strict (`sigma_kv < sigma_q`) while the content stream
-  consumes the same latent token as the backbone and uses `sigma_kv <= sigma_q`.
-  Legacy checkpoints with no such
-  field are always interpreted as `selfless_strict`. Rank-sharded
+  consumes the same latent token as the backbone, uses `sigma_kv <= sigma_q`,
+  and conditions its content AdaLN with backbone X0 hidden while query AdaLN
+  stays conditioned by XT hidden. Legacy checkpoints with no attention field
+  are interpreted as `selfless_strict`; checkpoints with no
+  `flow_condition_contract` retain the shared-query condition. Rank-sharded
   checkpoint directories remain legacy inputs only for historical trends.
 - The reusable T2I-only entry is
   `script/selfless/evaluate_unified_t2i_fid_is_ascend16.sh`. Project-formal IS uses

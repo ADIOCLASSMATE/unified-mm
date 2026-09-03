@@ -10,8 +10,8 @@
 # runs the complete 100B nominal text-target horizon. Its historical LR winner
 # is frozen here; no new 0.6B sweep or sweep-checkpoint resume is permitted.
 experiment:
-    project: "unified-b-0p6b-100b-imagenet-split-s42-r1"
-    name: "unified-b-qwen3-0.6b-100b-imagenet-split-s42-r1"
+    project: "unified-b-x0content-0p6b-100b-imagenet-split-s42-r1"
+    name: "unified-b-x0content-qwen3-0.6b-100b-imagenet-split-s42-r1"
     wandb_project: "unified-mm"
     output_dir: "output"
     save_every: 2000
@@ -61,6 +61,10 @@ model:
     training_objective: "selfless_dual_stream"
     dual_stream_attention_contract: "xlnet_content_diagonal"
     flow_head_attention_contract: "xlnet_content_diagonal"
+    # Query AdaLN follows the strict XT/query stream. Content AdaLN follows
+    # the backbone X0/content stream; old checkpoints without this field keep
+    # their historical shared-query condition when loaded.
+    flow_condition_contract: "backbone_xt_query_backbone_x0_content"
     # Persist the training order into every checkpoint. E overrides this to
     # sequential so evaluation cannot silently fall back to B's random order.
     training_image_sigma_order: "random"
@@ -206,7 +210,7 @@ training:
     save_image_flow_adapter: true
 
 evaluation:
-    checkpoint: "output/unified-b-0p6b-100b-imagenet-split-s42-r1/hf_model-final-ema"
+    checkpoint: "output/unified-b-x0content-0p6b-100b-imagenet-split-s42-r1/hf_model-final-ema"
     model_dtype: "bf16"
     samples: 50000
     batch_size: 4096

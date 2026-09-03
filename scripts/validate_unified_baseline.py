@@ -155,7 +155,7 @@ def _parse_args():
     parser.add_argument("--save-ema-eval-every", type=int)
     parser.add_argument(
         "--ablation",
-        choices=("b", "c", "d", "e", "f"),
+        choices=("a", "b", "c", "d", "e", "f"),
         default="b",
     )
     parser.add_argument(
@@ -176,6 +176,14 @@ def _parse_args():
         choices=(
             "selfless_strict",
             "xlnet_content_diagonal",
+            "not_applicable",
+        ),
+    )
+    parser.add_argument(
+        "--flow-condition-contract",
+        choices=(
+            "backbone_xt_shared_query_content",
+            "backbone_xt_query_backbone_x0_content",
             "not_applicable",
         ),
     )
@@ -259,51 +267,88 @@ def main():
             "base config must keep the flow-head content diagonal aligned "
             "with baseline b's backbone"
         )
+    if (
+        str(config.model.flow_condition_contract)
+        != "backbone_xt_query_backbone_x0_content"
+    ):
+        raise ValueError(
+            "base config must use split backbone XT-query/X0-content flow "
+            "conditions"
+        )
     if int(config.model.image_flow_batch_mul) != 4:
         raise ValueError(
             "unified B-based ablations require model.image_flow_batch_mul=4"
         )
     ablation_contracts = {
+        "a": {
+            "architecture": "selfless_contextual",
+            "attention_contract": "selfless_strict",
+            "image_order": "random",
+            "validation_order": "spatial_halton",
+            "flow_width": 1280,
+            "flow_head_attention_contract": "selfless_strict",
+            "flow_condition_contract": (
+                "backbone_xt_query_backbone_x0_content"
+            ),
+        },
         "b": {
             "architecture": "selfless_contextual",
+            "attention_contract": "xlnet_content_diagonal",
             "image_order": "random",
             "validation_order": "spatial_halton",
             "flow_width": 1280,
             "flow_head_attention_contract": "xlnet_content_diagonal",
+            "flow_condition_contract": (
+                "backbone_xt_query_backbone_x0_content"
+            ),
         },
         "c": {
             "architecture": "single_stream_text_ar",
+            "attention_contract": "xlnet_content_diagonal",
             "image_order": "random",
             "validation_order": "spatial_halton",
             "flow_width": 1280,
             "flow_head_attention_contract": "xlnet_content_diagonal",
+            "flow_condition_contract": (
+                "backbone_xt_query_backbone_x0_content"
+            ),
         },
         "d": {
             "architecture": "dynamic_xt",
+            "attention_contract": "xlnet_content_diagonal",
             "image_order": "random",
             "validation_order": "spatial_halton",
             "flow_width": 1280,
             "flow_head_attention_contract": "xlnet_content_diagonal",
+            "flow_condition_contract": (
+                "backbone_xt_query_backbone_x0_content"
+            ),
         },
         "e": {
             "architecture": "selfless_contextual",
+            "attention_contract": "xlnet_content_diagonal",
             "image_order": "sequential",
             "validation_order": "sequential",
             "flow_width": 1280,
             "flow_head_attention_contract": "xlnet_content_diagonal",
+            "flow_condition_contract": (
+                "backbone_xt_query_backbone_x0_content"
+            ),
         },
         "f": {
             "architecture": "positionwise_flow_head_on_b",
+            "attention_contract": "xlnet_content_diagonal",
             "image_order": "random",
             "validation_order": "spatial_halton",
             "flow_width": 1936,
             "flow_head_attention_contract": "not_applicable",
+            "flow_condition_contract": "not_applicable",
         },
     }
     ablation_contract = ablation_contracts[args.ablation]
     architecture_variant = ablation_contract["architecture"]
     training_objective = "selfless_dual_stream"
-    attention_contract = "xlnet_content_diagonal"
+    attention_contract = ablation_contract["attention_contract"]
     image_sigma_order = str(
         args.image_sigma_order
         if args.image_sigma_order is not None
@@ -326,6 +371,11 @@ def main():
         args.flow_head_attention_contract
         if args.flow_head_attention_contract is not None
         else config.model.flow_head_attention_contract
+    ).strip().lower()
+    flow_condition_contract = str(
+        args.flow_condition_contract
+        if args.flow_condition_contract is not None
+        else config.model.flow_condition_contract
     ).strip().lower()
     if image_sigma_order != ablation_contract["image_order"]:
         raise ValueError(
@@ -352,6 +402,13 @@ def main():
             "flow_head_attention_contract="
             f"{ablation_contract['flow_head_attention_contract']}, got "
             f"{flow_head_attention_contract}"
+        )
+    if flow_condition_contract != ablation_contract["flow_condition_contract"]:
+        raise ValueError(
+            f"ablation {args.ablation.upper()} requires "
+            "flow_condition_contract="
+            f"{ablation_contract['flow_condition_contract']}, got "
+            f"{flow_condition_contract}"
         )
     dynamic_xt_t2i_gradient_checkpointing = (
         args.dynamic_xt_t2i_gradient_checkpointing == "true"
@@ -612,6 +669,7 @@ def main():
             "training_objective": training_objective,
             "dual_stream_attention_contract": attention_contract,
             "flow_head_attention_contract": flow_head_attention_contract,
+            "flow_condition_contract": flow_condition_contract,
             "text_prediction": (
                 "causal_next_token_shift"
                 if args.ablation == "c"
