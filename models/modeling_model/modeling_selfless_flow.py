@@ -1550,6 +1550,14 @@ class Qwen3ForCausalLM(
             uniform_mix=getattr(config, "image_flow_time_uniform_mix", 0.1),
             solver=getattr(config, "image_flow_solver", "heun"),
             image_tokens_per_img=getattr(config, "image_tokens_per_img", 256),
+            # Missing means a checkpoint predates the split flow-head mask
+            # contract. Those historical A/B weights were trained with one
+            # shared strict mask and must retain their original numerics.
+            flow_head_attention_contract=getattr(
+                config,
+                "flow_head_attention_contract",
+                "selfless_strict",
+            ),
         )
 
         # Initialize weights and apply final processing
@@ -1627,6 +1635,7 @@ class Qwen3ForCausalLM(
         num_steps: int | None = None,
         context_latents: torch.Tensor | None = None,
         context_mask: torch.Tensor | None = None,
+        content_attention_mask: torch.Tensor | None = None,
         query_positions: torch.Tensor | None = None,
         context_positions: torch.Tensor | None = None,
         context_conditions: torch.Tensor | None = None,
@@ -1659,6 +1668,7 @@ class Qwen3ForCausalLM(
             num_steps=num_steps,
             context_latents=context_latents,
             context_mask=context_mask,
+            content_attention_mask=content_attention_mask,
             query_positions=query_positions,
             context_positions=context_positions,
             context_conditions=context_conditions,

@@ -83,6 +83,24 @@ def test_flow_head_uses_selected_capacity_contract():
     assert torch.isfinite(output).all()
 
 
+def test_legacy_model_config_defaults_to_strict_flow_head_only():
+    legacy_config = _tiny_config()
+    assert not hasattr(legacy_config, "flow_head_attention_contract")
+    legacy_model = Qwen3ForCausalLM(legacy_config)
+    assert (
+        legacy_model.image_flow_head.net.flow_head_attention_contract
+        == "selfless_strict"
+    )
+
+    corrected_config = _tiny_config()
+    corrected_config.flow_head_attention_contract = "xlnet_content_diagonal"
+    corrected_model = Qwen3ForCausalLM(corrected_config)
+    assert (
+        corrected_model.image_flow_head.net.flow_head_attention_contract
+        == "xlnet_content_diagonal"
+    )
+
+
 def test_image_input_noise_is_train_only():
     config = _tiny_config()
     config.image_input_noise_strength = 1.0

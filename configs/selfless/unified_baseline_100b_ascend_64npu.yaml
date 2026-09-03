@@ -17,6 +17,8 @@ experiment:
     save_every: 2000
     log_every: 10
     log_grad_norm_every: 50
+    debug_loss_trace_until_step: 0
+    deepspeed_bf16_overflow_check_until_step: 0
     flow_stats_every: 50
     checkpoints_total_limit: 3
     # Formal runs keep exactly the latest three complete checkpoints.
@@ -58,6 +60,10 @@ model:
     architecture_variant: "selfless_contextual"
     training_objective: "selfless_dual_stream"
     dual_stream_attention_contract: "xlnet_content_diagonal"
+    flow_head_attention_contract: "xlnet_content_diagonal"
+    # Persist the training order into every checkpoint. E overrides this to
+    # sequential so evaluation cannot silently fall back to B's random order.
+    training_image_sigma_order: "random"
     showo_mask_schedule: "cosine"
     showo_min_masking_rate: 0.0
     use_flex_attention: true
@@ -68,7 +74,7 @@ model:
     image_flow_width: 1280
     image_flow_num_sampling_steps: "10"
     image_flow_batch_mul: 4
-    # Globally off for B/C and overridden only by D's dedicated launcher.
+    # Globally off for every arm and overridden only by D's dedicated launcher.
     # D applies it inside the T2I Dynamic-XT branch, never to ClimbMix/I2T.
     dynamic_xt_t2i_gradient_checkpointing: false
     image_flow_time_scale: 1000.0
@@ -128,8 +134,8 @@ dataset:
             model_context_length: 32768
             image_tokens_per_img: 256
             image_latent_dim: 16
-            # Ablations a/c share the same random image reveal order; c only
-            # changes the text prediction contract in its isolated model.
+            # B/C/D/F share random image reveal order. E overrides this to
+            # deterministic serialized left-to-right order at launch time.
             image_sigma_order: "random"
             max_seq_length: 512
             pad_to_length: 512

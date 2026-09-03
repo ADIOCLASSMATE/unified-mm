@@ -1,12 +1,17 @@
 import inspect
 import types
 
+import pytest
 import torch
 
 from models.modeling_model.image_flow_loss import FlowLoss
 
 
-def _flow(*, grad_checkpointing: bool = False) -> FlowLoss:
+def _flow(
+    *,
+    grad_checkpointing: bool = False,
+    attention_contract: str = "xlnet_content_diagonal",
+) -> FlowLoss:
     torch.manual_seed(314159)
     flow = FlowLoss(
         target_channels=4,
@@ -16,6 +21,7 @@ def _flow(*, grad_checkpointing: bool = False) -> FlowLoss:
         num_sampling_steps=10,
         grad_checkpointing=grad_checkpointing,
         image_tokens_per_img=4,
+        flow_head_attention_contract=attention_contract,
     )
     with torch.no_grad():
         for block in flow.net.blocks:
@@ -38,6 +44,81 @@ def _inputs():
     sigma = torch.arange(4, dtype=torch.float32).view(1, 4)
     strict_mask = sigma.unsqueeze(1) < sigma.unsqueeze(2)
     return content, query, condition, time, positions, sigma, strict_mask
+
+
+def _legacy_strict_velocity(
+    flow,
+    query,
+    time,
+    condition,
+    content,
+    strict_mask,
+    positions,
+):
+    """Reference the pre-split flow-head forward used by old A/B weights."""
+
+    net = flow.net
+    model_dtype = net.input_proj.weight.dtype
+    model_device = net.input_proj.weight.device
+    query = query.to(device=model_device, dtype=model_dtype)
+    condition = condition.to(device=model_device, dtype=model_dtype)
+    content = content.to(device=model_device, dtype=model_dtype)
+    time = time.to(device=model_device)
+    strict_mask = strict_mask.to(device=model_device, dtype=torch.bool)
+    positions = positions.to(device=model_device)
+
+    batch_shape = query.shape[:-1]
+    query, query_positions, squeeze = net._ensure_sequence(query, positions)
+    query_rope = net._build_rope(query_positions, model_dtype)
+    query = net.input_proj(query)
+    time_embedding = net._shape_time(flow._scale_time(time), batch_shape)
+    condition_embedding = net.cond_embed(condition)
+    modulation = time_embedding + condition_embedding
+    if modulation.dim() == 2:
+        modulation = modulation.unsqueeze(1)
+
+    batch_size, sequence_length, _ = content.shape
+    context_positions = net._positions(
+        positions,
+        batch_size,
+        sequence_length,
+        model_device,
+    )
+    context_rope = net._build_rope(context_positions, model_dtype)
+    content_hidden = net._initial_content_hidden(content, context_positions)
+    content_modulation = net._content_condition(condition)
+    prepared_strict_mask = net.blocks[0].prepare_context_mask(
+        strict_mask,
+        batch_size,
+        sequence_length,
+        sequence_length,
+        model_device,
+    )
+    for block in net.blocks:
+        layer_cache = block.prepare_cross_cache(
+            content_hidden,
+            context_positions=context_positions,
+            context_rope=context_rope,
+        )
+        content_hidden = block(
+            content_hidden,
+            content_modulation,
+            layer_cache=layer_cache,
+            context_mask=prepared_strict_mask,
+            query_positions=context_positions,
+            query_rope=context_rope,
+            include_mlp=True,
+        )
+        query = block(
+            query,
+            modulation,
+            layer_cache=layer_cache,
+            context_mask=prepared_strict_mask,
+            query_positions=query_positions,
+            query_rope=query_rope,
+        )
+    output = net.final_layer(query, modulation)
+    return output.squeeze(1) if squeeze else output
 
 
 def test_flow_loss_exposes_no_architecture_ablation_arguments():
@@ -65,15 +146,17 @@ def test_position_and_cache_contracts_are_fixed():
         "rotate_value": False,
     }
     assert flow.net.cache_contract() == {
-        "schema": "selfless_flow_head_content_cache_v1",
+        "schema": "selfless_flow_head_content_cache_v2",
         "content_update": "shared_attention_mlp",
-        "strict_context": True,
+        "query_context": "strict_sigma_causal",
+        "flow_head_attention_contract": "xlnet_content_diagonal",
+        "content_self_diagonal": True,
         "query_writes_cache": False,
         "position_contract": flow.net.position_contract(),
     }
 
 
-def test_dynamic_content_stream_is_strictly_causal():
+def test_dynamic_query_stream_stays_strict_with_content_diagonal():
     flow = _flow()
     content, query, condition, time, positions, sigma, strict_mask = _inputs()
     content = content.requires_grad_(True)
@@ -114,8 +197,127 @@ def test_dynamic_content_stream_is_strictly_causal():
     assert torch.count_nonzero(content.grad[0, ~future]) > 0
 
 
-def test_incremental_cache_matches_full_sequence_last_query():
+def test_direct_forward_routes_distinct_content_and_query_masks(monkeypatch):
     flow = _flow()
+    content, query, condition, time, positions, sigma, strict_mask = _inputs()
+    observed_masks = []
+    block = flow.net.blocks[0]
+    original_forward = block.forward
+
+    def capture_forward(*args, **kwargs):
+        mask = kwargs["context_mask"]
+        observed_masks.append(mask[0].detach().clone() if isinstance(mask, tuple) else mask.detach().clone())
+        return original_forward(*args, **kwargs)
+
+    monkeypatch.setattr(block, "forward", capture_forward)
+    flow.velocity(
+        query,
+        time,
+        condition,
+        context_latents=content,
+        context_mask=strict_mask,
+        query_positions=positions,
+        context_positions=positions,
+        context_conditions=condition,
+    )
+
+    assert len(observed_masks) == 2
+    torch.testing.assert_close(
+        observed_masks[0],
+        sigma.unsqueeze(1) <= sigma.unsqueeze(2),
+    )
+    torch.testing.assert_close(observed_masks[1], strict_mask)
+
+
+def test_training_context_uses_sigma_leq_for_tied_content_ranks():
+    flow = _flow()
+    content, _, condition, _, positions, _, _ = _inputs()
+    sigma = torch.tensor([[0.0, 1.0, 1.0, 2.0]])
+
+    context = flow._training_context(content, sigma, positions)
+
+    torch.testing.assert_close(
+        context["context_mask"],
+        sigma.unsqueeze(1) < sigma.unsqueeze(2),
+    )
+    torch.testing.assert_close(
+        context["content_attention_mask"],
+        sigma.unsqueeze(1) <= sigma.unsqueeze(2),
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_legacy_strict_forward_and_gradients_are_numerically_identical(dtype):
+    legacy = _flow(attention_contract="selfless_strict").to(dtype=dtype)
+    current = _flow(attention_contract="selfless_strict").to(dtype=dtype)
+    current.load_state_dict(legacy.state_dict(), strict=True)
+    content, query, condition, time, positions, _, strict_mask = _inputs()
+    legacy_content = content.clone().requires_grad_(True)
+    legacy_query = query.clone().requires_grad_(True)
+    current_content = content.clone().requires_grad_(True)
+    current_query = query.clone().requires_grad_(True)
+
+    legacy_output = _legacy_strict_velocity(
+        legacy,
+        legacy_query,
+        time,
+        condition,
+        legacy_content,
+        strict_mask,
+        positions,
+    )
+    current_output = current.velocity(
+        current_query,
+        time,
+        condition,
+        context_latents=current_content,
+        context_mask=strict_mask,
+        content_attention_mask=strict_mask,
+        query_positions=positions,
+        context_positions=positions,
+        context_conditions=condition,
+    )
+    torch.testing.assert_close(current_output, legacy_output, rtol=0.0, atol=0.0)
+
+    probe = torch.linspace(0.1, 1.0, legacy_output.numel()).reshape_as(
+        legacy_output
+    )
+    (legacy_output * probe).sum().backward()
+    (current_output * probe).sum().backward()
+    torch.testing.assert_close(
+        current_content.grad,
+        legacy_content.grad,
+        rtol=0.0,
+        atol=0.0,
+    )
+    torch.testing.assert_close(
+        current_query.grad,
+        legacy_query.grad,
+        rtol=0.0,
+        atol=0.0,
+    )
+    for (legacy_name, legacy_parameter), (
+        current_name,
+        current_parameter,
+    ) in zip(legacy.named_parameters(), current.named_parameters()):
+        assert current_name == legacy_name
+        if legacy_parameter.grad is None:
+            assert current_parameter.grad is None
+        else:
+            torch.testing.assert_close(
+                current_parameter.grad,
+                legacy_parameter.grad,
+                rtol=0.0,
+                atol=0.0,
+            )
+
+
+@pytest.mark.parametrize(
+    "attention_contract",
+    ["selfless_strict", "xlnet_content_diagonal"],
+)
+def test_incremental_cache_matches_full_sequence_last_query(attention_contract):
+    flow = _flow(attention_contract=attention_contract)
     content, query, condition, time, positions, _, strict_mask = _inputs()
     full = flow.velocity(
         query,

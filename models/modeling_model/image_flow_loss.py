@@ -507,6 +507,7 @@ class ContextualFlowTransformerHead(nn.Module):
         grad_checkpointing=False,
         image_tokens_per_img=256,
         endpoint_time=1000.0,
+        flow_head_attention_contract="selfless_strict",
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -520,6 +521,21 @@ class ContextualFlowTransformerHead(nn.Module):
         self.zero_init_gate = True
         self.image_tokens_per_img = int(image_tokens_per_img)
         self.endpoint_time = float(endpoint_time)
+        self.flow_head_attention_contract = str(
+            flow_head_attention_contract
+        ).strip().lower()
+        if self.flow_head_attention_contract not in {
+            "selfless_strict",
+            "xlnet_content_diagonal",
+        }:
+            raise ValueError(
+                "flow_head_attention_contract must be selfless_strict or "
+                "xlnet_content_diagonal, got "
+                f"{flow_head_attention_contract!r}"
+            )
+        self.content_self_diagonal = (
+            self.flow_head_attention_contract == "xlnet_content_diagonal"
+        )
 
         self.time_embed = TimestepEmbedder(model_channels)
         self.cond_embed = nn.Linear(z_channels, model_channels)
@@ -651,9 +667,11 @@ class ContextualFlowTransformerHead(nn.Module):
 
     def cache_contract(self):
         return {
-            "schema": "selfless_flow_head_content_cache_v1",
+            "schema": "selfless_flow_head_content_cache_v2",
             "content_update": "shared_attention_mlp",
-            "strict_context": True,
+            "query_context": "strict_sigma_causal",
+            "flow_head_attention_contract": self.flow_head_attention_contract,
+            "content_self_diagonal": self.content_self_diagonal,
             "query_writes_cache": False,
             "position_contract": self.position_contract(),
         }
@@ -784,10 +802,52 @@ class ContextualFlowTransformerHead(nn.Module):
             )
         return context_mask
 
+    def _resolve_content_attention_mask(
+        self,
+        query_context_mask,
+        content_attention_mask,
+        *,
+        batch_size,
+        sequence_length,
+        device,
+    ):
+        """Keep query visibility strict while optionally adding content self edges."""
+
+        query_context_mask = self._format_context_mask(
+            query_context_mask,
+            batch_size,
+            sequence_length,
+            sequence_length,
+            device,
+        )
+        if query_context_mask is None:
+            raise ValueError(
+                "contextual flow requires an explicit query context mask."
+            )
+        content_attention_mask = self._format_context_mask(
+            content_attention_mask,
+            batch_size,
+            sequence_length,
+            sequence_length,
+            device,
+        )
+        if content_attention_mask is not None:
+            return query_context_mask, content_attention_mask
+        if not self.content_self_diagonal:
+            return query_context_mask, query_context_mask
+
+        diagonal = torch.eye(
+            sequence_length,
+            device=device,
+            dtype=torch.bool,
+        ).unsqueeze(0)
+        return query_context_mask, query_context_mask | diagonal
+
     def prepare_latent_mixer_cache(
         self,
         context_latents=None,
         context_mask=None,
+        content_attention_mask=None,
         context_positions=None,
         context_conditions=None,
     ):
@@ -808,6 +868,11 @@ class ContextualFlowTransformerHead(nn.Module):
         )
         if context_mask is not None:
             context_mask = context_mask.to(device=model_device, dtype=torch.bool)
+        if content_attention_mask is not None:
+            content_attention_mask = content_attention_mask.to(
+                device=model_device,
+                dtype=torch.bool,
+            )
         if context_conditions is None:
             raise ValueError(
                 "contextual flow cache construction requires "
@@ -823,20 +888,17 @@ class ContextualFlowTransformerHead(nn.Module):
                 f"{tuple(context_conditions.shape[:2])}."
             )
         content_y = self._content_condition(context_conditions)
-        content_mask = self._format_context_mask(
-            context_mask,
-            batch_size,
-            context_len,
-            context_len,
-            model_device,
-        )
-        if content_mask is None:
-            raise ValueError(
-                "contextual flow cache construction requires an explicit "
-                "strict content mask."
+        context_mask, content_attention_mask = (
+            self._resolve_content_attention_mask(
+                context_mask,
+                content_attention_mask,
+                batch_size=batch_size,
+                sequence_length=context_len,
+                device=model_device,
             )
-        content_mask = self._format_context_mask(
-            content_mask,
+        )
+        prepared_content_mask = self.blocks[0].prepare_context_mask(
+            content_attention_mask,
             batch_size,
             context_len,
             context_len,
@@ -854,7 +916,7 @@ class ContextualFlowTransformerHead(nn.Module):
                 context_hidden,
                 content_y,
                 layer_cache=layer_cache,
-                context_mask=content_mask,
+                context_mask=prepared_content_mask,
                 query_positions=context_positions,
                 query_rope=context_rope,
                 include_mlp=True,
@@ -996,76 +1058,36 @@ class ContextualFlowTransformerHead(nn.Module):
                 f"active_length={previous_len}, capacity={cache_capacity}"
             )
         previous_mask = cache["context_mask"]
-        updated_layers = []
-        for layer_idx, block in enumerate(self.blocks):
-            previous_layer = cache["layers"][layer_idx]
-            new_layer = block.prepare_cross_cache(
-                hidden,
-                context_positions=context_positions,
-                context_rope=context_rope,
-            )
-            hidden = block(
-                hidden,
-                content_y,
-                layer_cache=previous_layer if previous_len else None,
-                context_mask=previous_mask,
-                query_positions=context_positions,
-                query_rope=context_rope,
-                include_mlp=True,
-            )
-            if cache_capacity is None:
-                updated_layers.append(
-                    {
-                        "k": torch.cat(
-                            [previous_layer["k"], new_layer["k"]], dim=2
-                        ),
-                        "v": torch.cat(
-                            [previous_layer["v"], new_layer["v"]], dim=2
-                        ),
-                        "context_positions": torch.cat(
-                            [
-                                previous_layer["context_positions"],
-                                context_positions,
-                            ],
-                            dim=1,
-                        ),
-                    }
-                )
-                continue
-            k_storage = previous_layer["k_storage"]
-            v_storage = previous_layer["v_storage"]
-            k_storage[:, :, previous_len : previous_len + 1].copy_(
-                new_layer["k"]
-            )
-            v_storage[:, :, previous_len : previous_len + 1].copy_(
-                new_layer["v"]
-            )
-            updated_layers.append(
-                {
-                    # Expose the full fixed-capacity storage so every flow
-                    # attention call has one static shape. Inactive columns
-                    # are excluded by ``context_mask`` below.
-                    "k": k_storage,
-                    "v": v_storage,
-                    "k_storage": k_storage,
-                    "v_storage": v_storage,
-                    "context_positions": None,
-                }
-            )
         if cache_capacity is None:
+            position_storage = None
+            mask_storage = None
             positions = torch.cat(
                 [cache["context_positions"], context_positions], dim=1
             )
-            context_mask = torch.ones(
-                batch_size,
-                1,
-                previous_len + 1,
-                device=model_device,
-                dtype=torch.bool,
+            context_mask = torch.cat(
+                [
+                    previous_mask,
+                    torch.ones(
+                        batch_size,
+                        1,
+                        1,
+                        device=model_device,
+                        dtype=torch.bool,
+                    ),
+                ],
+                dim=-1,
             )
-            mask_storage = None
-            position_storage = None
+            content_update_mask = (
+                context_mask
+                if self.content_self_diagonal
+                else previous_mask
+            )
         else:
+            # Preserve the pre-append visibility for the historical strict
+            # contract before exposing the new cache slot to future queries.
+            content_update_mask = (
+                None if self.content_self_diagonal else previous_mask.clone()
+            )
             mask_storage = cache["context_mask_storage"]
             position_storage = cache["context_positions_storage"]
             mask_storage[:, :, previous_len] = True
@@ -1074,8 +1096,73 @@ class ContextualFlowTransformerHead(nn.Module):
             )
             context_mask = mask_storage
             positions = position_storage
-            for layer_cache in updated_layers:
-                layer_cache["context_positions"] = positions
+            if self.content_self_diagonal:
+                content_update_mask = context_mask
+
+        updated_layers = []
+        for layer_idx, block in enumerate(self.blocks):
+            previous_layer = cache["layers"][layer_idx]
+            new_layer = block.prepare_cross_cache(
+                hidden,
+                context_positions=context_positions,
+                context_rope=context_rope,
+            )
+            if cache_capacity is None:
+                updated_layer = {
+                    "k": torch.cat(
+                        [previous_layer["k"], new_layer["k"]], dim=2
+                    ),
+                    "v": torch.cat(
+                        [previous_layer["v"], new_layer["v"]], dim=2
+                    ),
+                    "context_positions": positions,
+                    "input_layout": "BNSD",
+                }
+            else:
+                k_storage = previous_layer["k_storage"]
+                v_storage = previous_layer["v_storage"]
+                if self.content_self_diagonal:
+                    # The current content query must see its own K/V at every
+                    # layer, exactly like a standard causal decoder cache.
+                    k_storage[:, :, previous_len : previous_len + 1].copy_(
+                        new_layer["k"]
+                    )
+                    v_storage[:, :, previous_len : previous_len + 1].copy_(
+                        new_layer["v"]
+                    )
+                updated_layer = {
+                    # Expose the full fixed-capacity storage so every flow
+                    # attention call has one static shape. Inactive columns
+                    # are excluded by ``context_mask`` below.
+                    "k": k_storage,
+                    "v": v_storage,
+                    "k_storage": k_storage,
+                    "v_storage": v_storage,
+                    "context_positions": positions,
+                    "input_layout": "BNSD",
+                }
+
+            hidden = block(
+                hidden,
+                content_y,
+                layer_cache=(
+                    updated_layer
+                    if self.content_self_diagonal
+                    else previous_layer if previous_len else None
+                ),
+                context_mask=content_update_mask,
+                query_positions=context_positions,
+                query_rope=context_rope,
+                include_mlp=True,
+            )
+            if cache_capacity is not None and not self.content_self_diagonal:
+                k_storage[:, :, previous_len : previous_len + 1].copy_(
+                    new_layer["k"]
+                )
+                v_storage[:, :, previous_len : previous_len + 1].copy_(
+                    new_layer["v"]
+                )
+            updated_layers.append(updated_layer)
         return {
             "layers": updated_layers,
             "context_mask": context_mask,
@@ -1165,6 +1252,7 @@ class ContextualFlowTransformerHead(nn.Module):
         time_embedding=None,
         context_latents=None,
         context_mask=None,
+        content_attention_mask=None,
         query_positions=None,
         query_rope=None,
         context_positions=None,
@@ -1231,20 +1319,24 @@ class ContextualFlowTransformerHead(nn.Module):
             )
             initial_content = content if record_stats else None
             content_y = self._content_condition(context_conditions)
-            content_mask = self._format_context_mask(
+            context_mask, content_attention_mask = (
+                self._resolve_content_attention_mask(
+                    context_mask,
+                    content_attention_mask,
+                    batch_size=batch_size,
+                    sequence_length=context_len,
+                    device=x.device,
+                )
+            )
+            prepared_query_mask = self.blocks[0].prepare_context_mask(
                 context_mask,
                 batch_size,
                 context_len,
                 context_len,
                 x.device,
             )
-            if content_mask is None:
-                raise ValueError(
-                    "Dynamic dual-stream training requires an explicit "
-                    "strict sigma-causal mask."
-                )
             prepared_content_mask = self.blocks[0].prepare_context_mask(
-                content_mask,
+                content_attention_mask,
                 batch_size,
                 context_len,
                 context_len,
@@ -1278,7 +1370,7 @@ class ContextualFlowTransformerHead(nn.Module):
                             query_hidden,
                             y,
                             layer_cache=layer_cache,
-                            context_mask=prepared_content_mask,
+                            context_mask=prepared_query_mask,
                             query_positions=query_positions,
                             query_rope=query_rope,
                             record_stats=record_stats,
@@ -1314,7 +1406,7 @@ class ContextualFlowTransformerHead(nn.Module):
                         x,
                         y,
                         layer_cache=layer_cache,
-                        context_mask=prepared_content_mask,
+                        context_mask=prepared_query_mask,
                         query_positions=query_positions,
                         query_rope=query_rope,
                         record_stats=record_stats,
@@ -1493,6 +1585,7 @@ class FlowLoss(nn.Module):
         uniform_mix=0.1,
         solver="heun",
         image_tokens_per_img=256,
+        flow_head_attention_contract="selfless_strict",
     ):
         super().__init__()
         self.in_channels = int(target_channels)
@@ -1523,6 +1616,7 @@ class FlowLoss(nn.Module):
             grad_checkpointing=grad_checkpointing,
             image_tokens_per_img=image_tokens_per_img,
             endpoint_time=self.time_scale,
+            flow_head_attention_contract=flow_head_attention_contract,
         )
         self.last_forward_stats = {}
         self._inference_time_grids = {}
@@ -1574,7 +1668,7 @@ class FlowLoss(nn.Module):
                 out[key] = None
             elif key.endswith("positions"):
                 out[key] = value.to(device=device)
-            elif key == "context_mask":
+            elif key in {"context_mask", "content_attention_mask"}:
                 out[key] = value.to(device=device, dtype=torch.bool)
             else:
                 out[key] = value.to(device=device, dtype=dtype)
@@ -1592,7 +1686,7 @@ class FlowLoss(nn.Module):
                 return [_convert(item, key) for item in value]
             if isinstance(value, tuple):
                 return tuple(_convert(item, key) for item in value)
-            if key == "context_mask":
+            if key in {"context_mask", "context_mask_storage"}:
                 return value.to(device=device, dtype=torch.bool)
             if key is not None and key.endswith("positions"):
                 return value.to(device=device)
@@ -1606,6 +1700,7 @@ class FlowLoss(nn.Module):
         self,
         context_latents: torch.Tensor | None = None,
         context_mask: torch.Tensor | None = None,
+        content_attention_mask: torch.Tensor | None = None,
         context_positions: torch.Tensor | None = None,
         context_conditions: torch.Tensor | None = None,
     ):
@@ -1616,6 +1711,11 @@ class FlowLoss(nn.Module):
         context_latents = context_latents.to(device=model_device, dtype=model_dtype)
         if context_mask is not None:
             context_mask = context_mask.to(device=model_device, dtype=torch.bool)
+        if content_attention_mask is not None:
+            content_attention_mask = content_attention_mask.to(
+                device=model_device,
+                dtype=torch.bool,
+            )
         if context_positions is not None:
             context_positions = context_positions.to(device=model_device)
         if context_conditions is not None:
@@ -1625,6 +1725,7 @@ class FlowLoss(nn.Module):
         return self.net.prepare_latent_mixer_cache(
             context_latents=context_latents,
             context_mask=context_mask,
+            content_attention_mask=content_attention_mask,
             context_positions=context_positions,
             context_conditions=context_conditions,
         )
@@ -1649,6 +1750,7 @@ class FlowLoss(nn.Module):
         *,
         context_latents: torch.Tensor | None = None,
         context_mask: torch.Tensor | None = None,
+        content_attention_mask: torch.Tensor | None = None,
         query_positions: torch.Tensor | None = None,
         context_positions: torch.Tensor | None = None,
         context_conditions: torch.Tensor | None = None,
@@ -1665,6 +1767,7 @@ class FlowLoss(nn.Module):
             {
                 "context_latents": context_latents,
                 "context_mask": context_mask,
+                "content_attention_mask": content_attention_mask,
                 "query_positions": query_positions,
                 "context_positions": context_positions,
                 "context_conditions": context_conditions,
@@ -1712,6 +1815,7 @@ class FlowLoss(nn.Module):
         image_positions,
         context_latents=None,
         context_mask=None,
+        content_attention_mask=None,
     ):
         if target.dim() != 3:
             return {}
@@ -1720,7 +1824,8 @@ class FlowLoss(nn.Module):
         else:
             context_latents = context_latents.to(device=target.device, dtype=target.dtype)
         batch_size, seq_len, _ = target.shape
-        if context_mask is None:
+        generated_sigma_mask = context_mask is None
+        if generated_sigma_mask:
             if sigma is None:
                 order = torch.arange(
                     seq_len, device=target.device, dtype=torch.float32
@@ -1742,11 +1847,44 @@ class FlowLoss(nn.Module):
                     f"{(batch_size, seq_len, seq_len)}, got "
                     f"{tuple(context_mask.shape)}"
                 )
+        if content_attention_mask is None:
+            if not self.net.content_self_diagonal:
+                content_attention_mask = context_mask
+            elif generated_sigma_mask:
+                # [B,Q,K]: the content query at sigma_q sees sigma_k <= sigma_q.
+                content_attention_mask = (
+                    sigma.unsqueeze(1) <= sigma.unsqueeze(2)
+                )
+            else:
+                # Custom visibility masks (for example Show-o) do not carry a
+                # sigma relation. Add only the aligned physical self edge.
+                diagonal = torch.eye(
+                    seq_len,
+                    device=target.device,
+                    dtype=torch.bool,
+                ).unsqueeze(0)
+                content_attention_mask = context_mask | diagonal
+        else:
+            content_attention_mask = content_attention_mask.to(
+                device=target.device,
+                dtype=torch.bool,
+            )
+            if tuple(content_attention_mask.shape) != (
+                batch_size,
+                seq_len,
+                seq_len,
+            ):
+                raise ValueError(
+                    "flow content_attention_mask must have shape "
+                    f"{(batch_size, seq_len, seq_len)}, got "
+                    f"{tuple(content_attention_mask.shape)}"
+                )
         if image_positions is None:
             image_positions = torch.arange(seq_len, device=target.device, dtype=torch.long).unsqueeze(0).expand(batch_size, seq_len)
         return {
             "context_latents": context_latents,
             "context_mask": context_mask,
+            "content_attention_mask": content_attention_mask,
             "query_positions": image_positions,
             "context_positions": image_positions,
             "context_conditions": None,
@@ -1761,6 +1899,7 @@ class FlowLoss(nn.Module):
         image_positions=None,
         context_latents=None,
         context_mask=None,
+        content_attention_mask=None,
         record_stats: bool = True,
         training_state: RectifiedFlowTrainingState | None = None,
     ):
@@ -1779,6 +1918,11 @@ class FlowLoss(nn.Module):
             context_latents = context_latents.to(device=model_device, dtype=model_dtype)
         if context_mask is not None:
             context_mask = context_mask.to(device=model_device, dtype=torch.bool)
+        if content_attention_mask is not None:
+            content_attention_mask = content_attention_mask.to(
+                device=model_device,
+                dtype=torch.bool,
+            )
 
         if training_state is None:
             training_state = self.sample_training_state(target_float)
@@ -1802,6 +1946,7 @@ class FlowLoss(nn.Module):
             image_positions,
             context_latents=context_latents,
             context_mask=context_mask,
+            content_attention_mask=content_attention_mask,
         )
         v_pred = self.velocity(
             x_t,
@@ -2183,6 +2328,7 @@ class FlowLoss(nn.Module):
         *,
         context_latents: torch.Tensor | None = None,
         context_mask: torch.Tensor | None = None,
+        content_attention_mask: torch.Tensor | None = None,
         query_positions: torch.Tensor | None = None,
         context_positions: torch.Tensor | None = None,
         context_conditions: torch.Tensor | None = None,
@@ -2302,6 +2448,7 @@ class FlowLoss(nn.Module):
                 {
                     "context_latents": context_latents,
                     "context_mask": context_mask,
+                    "content_attention_mask": content_attention_mask,
                     "query_positions": query_positions,
                     "context_positions": context_positions,
                     "context_conditions": context_conditions,
@@ -2312,6 +2459,9 @@ class FlowLoss(nn.Module):
             latent_mixer_cache = self.prepare_latent_mixer_cache(
                 context_latents=raw_context_kwargs.get("context_latents"),
                 context_mask=raw_context_kwargs.get("context_mask"),
+                content_attention_mask=raw_context_kwargs.get(
+                    "content_attention_mask"
+                ),
                 context_positions=raw_context_kwargs.get("context_positions"),
                 context_conditions=raw_context_kwargs.get(
                     "context_conditions"
