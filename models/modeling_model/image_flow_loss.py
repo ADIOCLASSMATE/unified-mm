@@ -1902,6 +1902,10 @@ class FlowLoss(nn.Module):
         self._inference_time_embedding_cache = None
         return super()._apply(fn, recurse=recurse)
 
+    def train(self, mode: bool = True):
+        self._inference_time_embedding_cache = None
+        return super().train(mode)
+
     @staticmethod
     def _rms_stat(x):
         return x.detach().float().pow(2).mean().sqrt()

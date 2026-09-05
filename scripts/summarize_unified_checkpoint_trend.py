@@ -39,7 +39,7 @@ def read_summary(root: Path) -> dict[str, Any]:
         raise TypeError(f"expected JSON object: {path}")
     if payload.get("complete") is not True or payload.get("profile") != "formal":
         raise ValueError(f"trend inputs must be complete formal evaluations: {path}")
-    if payload.get("schema") != "unified_full_checkpoint_evaluation_summary_v3":
+    if payload.get("schema") != "unified_full_checkpoint_evaluation_summary_v4":
         raise ValueError(f"trend input uses an obsolete protocol: {path}")
     if payload.get("runtime_hashing_enabled", True) is not False:
         raise ValueError(f"trend input violates the no-hash contract: {path}")

@@ -243,7 +243,7 @@ def main() -> None:
 
     if core.get("complete") is not True or native.get("complete") is not True:
         raise ValueError("core or pretraining-native evaluation is incomplete")
-    if core.get("schema") != "unified_full_checkpoint_evaluation_summary_v3":
+    if core.get("schema") != "unified_full_checkpoint_evaluation_summary_v4":
         raise ValueError("core evaluation uses an obsolete text protocol")
     if native.get("schema") != "pretraining_native_understanding_summary_v5":
         raise ValueError("native evaluation uses an obsolete metric protocol")

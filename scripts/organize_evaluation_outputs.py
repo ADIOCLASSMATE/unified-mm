@@ -235,8 +235,12 @@ def validate_text_summary_for_archive(summary: dict[str, Any]) -> None:
     ) != set(TEXT_TASK_CONTRACTS):
         raise ValueError("pure-text task coverage is incomplete")
     protocol = summary.get("protocol") or {}
-    if protocol.get("protocol_schema") != "selfless_text_benchmark_v2":
+    if protocol.get("protocol_schema") != "selfless_text_benchmark_v3":
         raise ValueError("pure-text task protocol is obsolete")
+    if protocol.get("normalization") != "original_choice_characters" or (
+        protocol.get("winogrande_scoring") != "shared_suffix_given_prefix_and_option"
+    ):
+        raise ValueError("pure-text scoring protocol is obsolete")
     if (protocol.get("lm_eval_reference") or {}).get("commit") != (
         LM_EVAL_REFERENCE_COMMIT
     ):
@@ -245,8 +249,12 @@ def validate_text_summary_for_archive(summary: dict[str, Any]) -> None:
     primary_values = []
     for task, (samples, metric_name) in TEXT_TASK_CONTRACTS.items():
         metrics = summary["tasks"][task]
-        if metrics.get("schema") != "selfless_text_multiple_choice_metrics_v1":
+        if metrics.get("schema") != "selfless_text_multiple_choice_metrics_v2":
             raise ValueError(f"pure-text task schema is invalid: {task}")
+        if metrics.get("protocol_schema") != "selfless_text_benchmark_v3" or (
+            metrics.get("normalization") != "original_choice_characters"
+        ):
+            raise ValueError(f"pure-text task scoring protocol is obsolete: {task}")
         if metrics.get("complete") is not True or metrics.get(
             "runtime_hashing_enabled", True
         ) is not False:
@@ -619,7 +627,7 @@ def package_step(
 
     text_summary = read_json(core / "text" / "summary.json")
     validate_no_hash(text_summary, f"step {step} text")
-    if text_summary.get("schema") != "selfless_text_benchmark_summary_v3":
+    if text_summary.get("schema") != "selfless_text_benchmark_summary_v4":
         raise ValueError(f"step {step} text suite uses an obsolete protocol")
     if text_summary.get("complete") is not True:
         raise ValueError(f"step {step} text suite is incomplete")

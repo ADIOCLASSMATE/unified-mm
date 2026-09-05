@@ -60,7 +60,9 @@ DEFAULT_TASKS = (
 MC_TASKS = DEFAULT_TASKS
 CHOICE_LETTERS = ("A", "B", "C", "D")
 TEXT_SCORING_CONTRACT = "selfless_same_position_dual_stream_v2"
-TEXT_PROTOCOL_SCHEMA = "selfless_text_benchmark_v2"
+TEXT_PROTOCOL_SCHEMA = "selfless_text_benchmark_v3"
+TEXT_NORMALIZATION = "original_choice_characters"
+WINOGRANDE_SCORING = "shared_suffix_given_prefix_and_option"
 TEXT_ASSET_SCHEMA = "selfless_text_benchmark_assets_v2"
 LM_EVAL_REFERENCE = {
     "repository": "https://github.com/EleutherAI/lm-evaluation-harness",
@@ -101,6 +103,8 @@ class MultipleChoiceExample:
     choices: tuple[str, ...]
     label: int
     category: str | None = None
+    # Multiple-input tasks (WinoGrande): choices are contexts, target is shared.
+    shared_target: str | None = None
 
 
 @dataclass(frozen=True)
@@ -111,6 +115,11 @@ class ChoiceRequest:
     target_start: int
     boundary_adjusted: bool
     truncated_context_tokens: int
+    normalization_char_count: int
+
+    def __post_init__(self):
+        if self.normalization_char_count <= 0:
+            raise ValueError("normalization character count must be positive")
 
 
 @dataclass(frozen=True)
@@ -348,11 +357,12 @@ def load_winogrande(root: Path) -> list[MultipleChoiceExample]:
                 item_index=index,
                 item_id=f"winogrande:{index}",
                 task="winogrande",
-                context=prefix,
+                context="",
                 choices=(
-                    str(row["option1"]) + suffix,
-                    str(row["option2"]) + suffix,
+                    prefix + str(row["option1"]),
+                    prefix + str(row["option2"]),
                 ),
+                shared_target=suffix.strip(),
                 label=int(str(row["answer"]).strip()) - 1,
             )
         )
@@ -484,8 +494,16 @@ def encode_choice(
     choice_index: int,
     max_length: int,
 ) -> ChoiceRequest:
-    context = str(example.context)
-    continuation = str(example.choices[choice_index])
+    choice = str(example.choices[choice_index])
+    # lm-eval acc_norm uses len(original choice), before adding a delimiter or
+    # tokenizing. For WinoGrande the choice is a candidate-specific context.
+    normalization_char_count = len(choice)
+    if normalization_char_count == 0:
+        raise ValueError("cannot normalize an empty choice")
+    context = str(example.context) if example.shared_target is None else choice
+    continuation = choice if example.shared_target is None else example.shared_target
+    if not continuation:
+        raise ValueError("choice has an empty scoring target")
     trailing_count = len(context) - len(context.rstrip())
     if trailing_count:
         continuation = context[-trailing_count:] + continuation
@@ -527,6 +545,7 @@ def encode_choice(
         target_start=len(context_prefix),
         boundary_adjusted=boundary_adjusted,
         truncated_context_tokens=truncated,
+        normalization_char_count=normalization_char_count,
     )
 
 
@@ -643,7 +662,7 @@ def score_choice_requests(
             total = float(row_logprobs.sum().item())
             scores[original_index] = ChoiceScore(
                 loglikelihood=total,
-                normalized_loglikelihood=total / count,
+                normalized_loglikelihood=total / request.normalization_char_count,
                 token_count=count,
                 greedy=bool(row_greedy.all().item()),
             )
@@ -688,7 +707,7 @@ def completed_rank_shard(
         return False
     marker = json.loads(marker_path.read_text(encoding="utf-8"))
     expected = {
-        "schema": "selfless_text_benchmark_rank_complete_v3",
+        "schema": "selfless_text_benchmark_rank_complete_v4",
         "complete": True,
         "protocol_schema": TEXT_PROTOCOL_SCHEMA,
         "task_protocol": TASK_PROTOCOLS[task],
@@ -728,7 +747,7 @@ def write_rank_shard(
     shard_path, marker_path = rank_shard_paths(output_dir, task, rank, world_size)
     atomic_write_text(shard_path, jsonl_text(rows))
     marker = {
-        "schema": "selfless_text_benchmark_rank_complete_v3",
+        "schema": "selfless_text_benchmark_rank_complete_v4",
         "complete": True,
         "protocol_schema": TEXT_PROTOCOL_SCHEMA,
         "task_protocol": TASK_PROTOCOLS[task],
@@ -833,7 +852,9 @@ def evaluate_multiple_choice_task(
             example_requests = requests[start:stop]
             rows.append(
                 {
-                    "schema": "selfless_text_multiple_choice_sample_v1",
+                    "schema": "selfless_text_multiple_choice_sample_v2",
+                    "protocol_schema": TEXT_PROTOCOL_SCHEMA,
+                    "normalization": TEXT_NORMALIZATION,
                     "task": task,
                     "item_index": int(example.item_index),
                     "item_id": example.item_id,
@@ -846,6 +867,9 @@ def evaluate_multiple_choice_task(
                     "choice_loglikelihoods": raw,
                     "choice_normalized_loglikelihoods": normalized,
                     "choice_token_counts": [score.token_count for score in scores],
+                    "choice_char_counts": [
+                        request.normalization_char_count for request in example_requests
+                    ],
                     "choice_greedy": [score.greedy for score in scores],
                     "boundary_adjusted": any(
                         request.boundary_adjusted for request in example_requests
@@ -901,14 +925,34 @@ def aggregate_mc_task(
             for line in shard_path.read_text(encoding="utf-8").splitlines()
             if line.strip()
         )
+    return aggregate_mc_rows(output_dir, task, rows, expected_records)
+
+
+def aggregate_mc_rows(
+    output_dir: Path,
+    task: str,
+    rows: list[dict[str, Any]],
+    expected_records: int,
+) -> dict[str, Any]:
+    """Reduce either freshly inferred or explicitly migrated sample scores."""
     rows.sort(key=lambda row: int(row["item_index"]))
     observed = [int(row["item_index"]) for row in rows]
     if observed != list(range(expected_records)):
         raise ValueError(f"{task} distributed coverage is incomplete or duplicated")
+    if any(
+        row.get("schema") != "selfless_text_multiple_choice_sample_v2"
+        or row.get("protocol_schema") != TEXT_PROTOCOL_SCHEMA
+        or row.get("normalization") != TEXT_NORMALIZATION
+        or row.get("task") != task
+        for row in rows
+    ):
+        raise ValueError(f"{task} shards use an obsolete or mixed text protocol")
     correct = [bool(row["correct"]) for row in rows]
     correct_normalized = [bool(row["correct_normalized"]) for row in rows]
     metrics: dict[str, Any] = {
-        "schema": "selfless_text_multiple_choice_metrics_v1",
+        "schema": "selfless_text_multiple_choice_metrics_v2",
+        "protocol_schema": TEXT_PROTOCOL_SCHEMA,
+        "normalization": TEXT_NORMALIZATION,
         "complete": True,
         "runtime_hashing_enabled": False,
         "task": task,
@@ -1020,7 +1064,7 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     if rank == 0:
         run = {
-            "schema": "selfless_text_benchmark_run_v3",
+            "schema": "selfless_text_benchmark_run_v4",
             "complete": False,
             "runtime_hashing_enabled": False,
             "checkpoint": str(source.path),
@@ -1082,7 +1126,7 @@ def main() -> None:
             for task, metrics in task_metrics.items()
         }
         summary = {
-            "schema": "selfless_text_benchmark_summary_v3",
+            "schema": "selfless_text_benchmark_summary_v4",
             "complete": True,
             "runtime_hashing_enabled": False,
             "checkpoint": str(source.path),
@@ -1095,6 +1139,8 @@ def main() -> None:
             "macro_average_primary": sum(primary.values()) / len(primary),
             "macro_average_role": "internal_cross_task_summary_only",
             "protocol": {
+                "normalization": TEXT_NORMALIZATION,
+                "winogrande_scoring": WINOGRANDE_SCORING,
                 "scoring_contract": TEXT_SCORING_CONTRACT,
                 "protocol_schema": TEXT_PROTOCOL_SCHEMA,
                 "selfless_query_stream_same_position_scoring": True,

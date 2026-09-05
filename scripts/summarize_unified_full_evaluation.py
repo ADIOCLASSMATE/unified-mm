@@ -90,11 +90,15 @@ def forbidden_audit_fields(value: Any, prefix: str = "") -> list[str]:
 
 
 def validate_text_summary(text: dict[str, Any], *, formal: bool) -> None:
-    if text.get("schema") != "selfless_text_benchmark_summary_v3":
+    if text.get("schema") != "selfless_text_benchmark_summary_v4":
         raise ValueError("pure-text evaluation uses an obsolete task protocol")
     protocol = text.get("protocol", {})
-    if protocol.get("protocol_schema") != "selfless_text_benchmark_v2":
+    if protocol.get("protocol_schema") != "selfless_text_benchmark_v3":
         raise ValueError("pure-text protocol schema is invalid")
+    if protocol.get("normalization") != "original_choice_characters":
+        raise ValueError("pure-text normalization must use original choice characters")
+    if protocol.get("winogrande_scoring") != "shared_suffix_given_prefix_and_option":
+        raise ValueError("WinoGrande must score the shared suffix given each option")
     reference = protocol.get("lm_eval_reference", {})
     if reference.get("commit") != LM_EVAL_REFERENCE_COMMIT:
         raise ValueError("pure-text lm-eval reference is not frozen")
@@ -107,8 +111,12 @@ def validate_text_summary(text: dict[str, Any], *, formal: bool) -> None:
     primary_values: list[float] = []
     for task, (records, metric) in TEXT_TASK_PROTOCOLS.items():
         task_metrics = text["tasks"][task]
-        if task_metrics.get("schema") != "selfless_text_multiple_choice_metrics_v1":
+        if task_metrics.get("schema") != "selfless_text_multiple_choice_metrics_v2":
             raise ValueError(f"pure-text task schema is invalid: {task}")
+        if task_metrics.get("protocol_schema") != "selfless_text_benchmark_v3" or (
+            task_metrics.get("normalization") != "original_choice_characters"
+        ):
+            raise ValueError(f"pure-text task scoring protocol is obsolete: {task}")
         if task_metrics.get("complete") is not True:
             raise ValueError(f"pure-text task is incomplete: {task}")
         if task_metrics.get("runtime_hashing_enabled", True) is not False:
@@ -249,7 +257,7 @@ def main() -> None:
     if dataset_contract.get("evaluation_split") != "imagenet_val":
         raise ValueError("image evaluation split is not ImageNet val")
     report = {
-        "schema": "unified_full_checkpoint_evaluation_summary_v3",
+        "schema": "unified_full_checkpoint_evaluation_summary_v4",
         "complete": True,
         "profile": args.profile,
         "runtime_hashing_enabled": False,

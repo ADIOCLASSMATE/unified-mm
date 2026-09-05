@@ -46,7 +46,7 @@ summary = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
 profile = sys.argv[3]
 if summary.get("complete") is not True or summary.get("profile") != profile:
     raise RuntimeError("reused core evaluation is not complete for this profile")
-if summary.get("schema") != "unified_full_checkpoint_evaluation_summary_v3":
+if summary.get("schema") != "unified_full_checkpoint_evaluation_summary_v4":
     raise RuntimeError("reused core evaluation uses an obsolete protocol")
 if Path(summary["checkpoint"]).resolve() != checkpoint:
     raise RuntimeError("reused core evaluation belongs to another checkpoint")

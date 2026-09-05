@@ -1,4 +1,4 @@
-schema: unified_full_evaluation_protocol_v9
+schema: unified_full_evaluation_protocol_v10
 launcher: script/selfless/evaluate_unified_native_full_checkpoint_ascend16.sh
 weights: hf_final_ema
 runtime_hashing_enabled: false
@@ -134,7 +134,9 @@ components:
     secondary_diagnostic: metrics.mean.rfid
     checkpoint_dependent: false
   pure_text:
-    protocol: selfless_text_benchmark_v2
+    protocol: selfless_text_benchmark_v3
+    normalization: original_choice_characters
+    winogrande_scoring: shared_suffix_given_prefix_and_option
     lm_eval_reference_commit: b954108c9baaaa934b4ad842033b31a97ee30816
     adapter_note: same_position_selfless_scoring_required_not_generic_causal_lm
     # MMLU 5-shot reaches 3,097 tokenizer tokens.  Evaluation uses 4,096 so

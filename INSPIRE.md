@@ -119,6 +119,9 @@ not implicitly mount the official dataset.
   GPU smoke in the local Agent environment. Stop it after the smoke when no
   immediate follow-up debugging needs it, but do not delete this permanent
   Notebook.
+- The permanent development Notebook currently uses image
+  `dev-wjx-ascend:v-1.4` and belongs to `公共科研项目`. This Notebook-specific
+  placement does not change the training Job project/image contracts above.
 - Base image:
   `docker-t.sii.shaipower.online/inspire-studio/dev-wjx-ascend:v-1.3`
   (platform image name `dev-wjx-ascend:v-1.3`).
@@ -170,6 +173,13 @@ not implicitly mount the official dataset.
   likelihood contract rather than a stock next-token lm-eval adapter. MMLU is
   5-shot; the evaluation-only maximum context is 4096 and does not change the
   2048-token training contract.
+- Text protocol v3 (full evaluation configuration v10) normalizes choice
+  likelihoods by original-choice Unicode character counts, not token counts.
+  WinoGrande scores only the shared suffix given each prefix-plus-option
+  context. Legacy v2 text scores cannot satisfy the current formal gate;
+  migrate retained likelihoods with `scripts/repair_text_benchmark_results.py`
+  and rerun WinoGrande before publishing an eight-task macro. Migration keeps
+  a `legacy-before-p1/` backup inside the affected text result directory.
 - Historical checkpoint evaluation output is under
   `output/evaluation/unified-a-0p6b/checkpoints/step-{56000,58000,60000}`;
   the compact trend is `output/evaluation/unified-a-0p6b/trend/trend.md`.

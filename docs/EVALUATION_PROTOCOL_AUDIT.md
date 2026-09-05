@@ -120,7 +120,26 @@ prior 或对称 PMI，但那不是用户指定的 `log P(text|image)-log P(text)
 - [MJHQ-30K official dataset](https://huggingface.co/datasets/playgroundai/MJHQ-30K)
 - [clean-fid official repository](https://github.com/GaParmar/clean-fid)
 
-## 验证状态
+## 2026-09-05：文本 P1 修正（v3）
+
+此前“length-normalized accuracy 已对齐”的结论不完整：实现错误地除以
+token 数。现在改为固定 lm-eval 版本的 `len(original_choice)`，即原始选项的
+Unicode 字符数；不包含编码时新增的分隔空格，也不是 UTF-8 字节数。
+ARC-Easy/Challenge、HellaSwag、PIQA、OpenBookQA 的主指标受此修正影响。
+
+WinoGrande 改为 `log P(shared_suffix | prefix + option)`，仅对共享后缀打分，
+不再把候选 option 自身的似然混进目标。它的主指标仍为未归一化 accuracy。
+同位置 Selfless query-stream 打分和 A/B 的 attention contract 保持不变。
+
+文本协议升至 v3，sample/metrics 升至 v2，summary/run/rank-complete 升至 v4；
+完整评测协议升至 v10。旧分片、旧 summary 和旧 core 结果不能被正式续跑、归档、
+趋势汇总当作新协议复用。旧推理 LL 可由
+`scripts/repair_text_benchmark_results.py --text_dir <已有文本结果目录>` 原地重算，
+原始结果保留在该目录的 `legacy-before-p1/`。WinoGrande 旧 LL 无法恢复共享后缀
+分数，必须重新推理；在传入 `--winogrande_text_dir <新协议重评目录>` 合并之前，
+其结果与八任务 macro 均不可作为有效当前指标，summary 标记为 incomplete。
+
+## 历史验证状态（2026-09-02，文本结论由上面的 P1 修正覆盖）
 
 本次完整 CPU suite 为 `384 passed, 2 skipped`（两项是 CUDA FlexAttention
 集成测试）。CPU 控制节点必须设置 `TORCH_DEVICE_BACKEND_AUTOLOAD=0`，因为该节点

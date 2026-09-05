@@ -202,7 +202,7 @@ def test_selected_native_full_summary_and_trend(tmp_path, monkeypatch):
     (core / "full_evaluation_summary.json").write_text(
         json.dumps(
             {
-                "schema": "unified_full_checkpoint_evaluation_summary_v3",
+                "schema": "unified_full_checkpoint_evaluation_summary_v4",
                 "complete": True,
                 "profile": "formal",
                 "runtime_hashing_enabled": False,

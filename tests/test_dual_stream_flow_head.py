@@ -776,6 +776,64 @@ def test_sampling_reuses_timestep_embeddings(monkeypatch):
     assert time_embedding_calls == 4
 
 
+@pytest.mark.parametrize("resume_training", [True, False])
+@torch.no_grad()
+def test_sampling_refreshes_time_embeddings_after_unversioned_updates(
+    resume_training,
+):
+    flow = _flow()
+    model = torch.nn.ModuleList([flow]).eval()
+    _, _, condition, _, positions, _, _ = _inputs()
+    sample_kwargs = {
+        "num_steps": 3,
+        "solver": "heun",
+        "cfg": 1.0,
+        "query_positions": positions,
+        "initial_noise": torch.zeros(1, 4, 4),
+    }
+    previous = flow.sample(condition, **sample_kwargs)
+    versions = tuple(
+        parameter._version for parameter in flow.net.time_embed.parameters()
+    )
+    if resume_training:
+        assert model.train() is model
+    flow.net.time_embed.mlp[2].bias.data.add_(1.0)
+    assert versions == tuple(
+        parameter._version for parameter in flow.net.time_embed.parameters()
+    )
+    assert model.eval() is model
+
+    actual = flow.sample(condition, **sample_kwargs)
+    reloaded = _flow().eval()
+    reloaded.load_state_dict(flow.state_dict(), strict=True)
+    expected = reloaded.sample(condition, **sample_kwargs)
+
+    assert not torch.allclose(previous, expected)
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+
+
+def test_training_loss_does_not_use_cached_inference_time_embeddings():
+    flow = _flow().train()
+    content, _, condition, _, positions, sigma, _ = _inputs()
+    times, _ = flow._inference_time_grid(3, content.device)
+    with torch.no_grad():
+        flow._inference_time_embeddings(times, tuple(condition.shape[:-1]))
+        flow.net.time_embed.mlp[2].bias.data.add_(1.0)
+    forward_kwargs = {
+        "context_latents": content,
+        "sigma": sigma,
+        "image_positions": positions,
+    }
+
+    torch.manual_seed(424242)
+    with_stale_cache = flow(content, condition, **forward_kwargs)
+    flow._inference_time_embedding_cache = None
+    torch.manual_seed(424242)
+    without_cache = flow(content, condition, **forward_kwargs)
+
+    torch.testing.assert_close(with_stale_cache, without_cache, rtol=0.0, atol=0.0)
+
+
 def test_training_uses_float32_flow_objective_and_bfloat16_network(monkeypatch):
     flow = _flow().to(dtype=torch.bfloat16)
     content, _, condition, _, positions, sigma, _ = _inputs()
