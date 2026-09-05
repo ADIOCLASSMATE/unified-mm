@@ -74,7 +74,7 @@ case "${ABLATION}" in
     ARCHITECTURE_VARIANT="single_stream_text_ar"
     TRAINING_OBJECTIVE="selfless_dual_stream"
     DUAL_STREAM_ATTENTION_CONTRACT="xlnet_content_diagonal"
-    DEFAULT_RUN_PROJECT="unified-c-on-b-qwen3-0.6b-smoke-ascend16"
+    DEFAULT_RUN_PROJECT="unified-c-on-b-x0content-qwen3-0.6b-smoke-ascend16"
     TRAIN_ENTRY="pretrain/train_selfless_flow.py"
     DEFAULT_DYNAMIC_XT_T2I_GRADIENT_CHECKPOINTING="false"
     DEFAULT_IMAGE_SIGMA_ORDER="random"

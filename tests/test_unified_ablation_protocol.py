@@ -143,6 +143,16 @@ def test_formal_protocol_is_comparable_complete_and_no_hash():
     assert protocol.comparability.b_vs_d_static_contract_identical is True
     assert protocol.comparability.b_vs_d_image_flow_batch_mul_identical is True
     assert protocol.ablations.c.start == "qwen_pretrained_step_0"
+    assert protocol.ablations.c.status == "ready_x0_content"
+    assert protocol.ablations.c.platform_project == (
+        "随机序语言建模-统一自回归与掩码扩散的随机顺序生成框架"
+    )
+    assert protocol.run_projects.c == (
+        "unified-c-on-b-x0content-0p6b-100b-imagenet-split-s42-r1"
+    )
+    assert protocol.ablations.c.flow_condition_contract == (
+        protocol.ablations.b.flow_condition_contract
+    )
     assert protocol.comparability.b_vs_c_only_allowed_difference == (
         "model.architecture_variant"
     )
@@ -258,7 +268,7 @@ def test_formal_launcher_freezes_current_baseline_contract():
     assert 'ABLATION="${ABLATION:-b}"' in base_source
     assert 'DUAL_STREAM_ATTENTION_CONTRACT="selfless_strict"' in base_source
     assert 'DUAL_STREAM_ATTENTION_CONTRACT="xlnet_content_diagonal"' in base_source
-    assert "unified-c-on-b-0p6b-100b-imagenet-split-s42-r1" in base_source
+    assert "unified-c-on-b-x0content-0p6b-100b-imagenet-split-s42-r1" in base_source
     assert "unified-d-on-b-0p6b-100b-imagenet-split-s42-r4" in base_source
     assert "unified-a-x0content-0p6b-100b-imagenet-split-s42-r1" in base_source
     assert "unified-b-x0content-0p6b-100b-imagenet-split-s42-r1" in base_source
@@ -324,7 +334,7 @@ def test_dedicated_a_b_launchers_select_new_x0_content_arms():
     assert "xlnet_content_diagonal" in smoke_source
     assert "unified-a-x0content-qwen3-0.6b-smoke-ascend16" in smoke_source
     assert 'ARCHITECTURE_VARIANT="single_stream_text_ar"' in smoke_source
-    assert "unified-c-on-b-qwen3-0.6b-smoke-ascend16" in smoke_source
+    assert "unified-c-on-b-x0content-qwen3-0.6b-smoke-ascend16" in smoke_source
     assert "unified-d-on-b-qwen3-0.6b-smoke-ascend16" in smoke_source
     assert 'TRAIN_ENTRY="pretrain/train_selfless_flow_dynamic_xt.py"' in smoke_source
     assert '"model.image_flow_batch_mul=${IMAGE_FLOW_BATCH_MUL}"' in smoke_source
@@ -343,7 +353,12 @@ def test_dedicated_c_on_b_launcher_forces_fresh_b_based_run():
     formal_source = LAUNCHER.read_text(encoding="utf-8")
 
     assert 'export ABLATION="c"' in source
-    assert "unified-c-on-b-0p6b" in source
+    assert "unified-c-on-b-x0content-0p6b" in source
+    assert 'c) ARM_NAME="c-on-b-x0content"' in formal_source
+    assert (
+        'export FLOW_CONDITION_CONTRACT="backbone_xt_query_backbone_x0_content"'
+        in source
+    )
     assert 'export ALLOW_FORMAL_RESUME="false"' in source
     assert "retired C-on-A" in source
     assert "FORMAL_RESUME_FROM" not in source

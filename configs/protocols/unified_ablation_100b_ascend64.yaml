@@ -1,5 +1,5 @@
 # Formal unified ablation protocol. Every fresh arm starts from the same
-# Qwen3-0.6B-Base weights at optimizer step zero. A/B/E use split backbone
+# Qwen3-0.6B-Base weights at optimizer step zero. A/B/C/E use split backbone
 # XT-query and X0-content flow AdaLN conditions. D/E/F are submitted to
 # the scaling-law platform project requested for this study.
 schema: unified_ablation_100b_v6
@@ -114,7 +114,7 @@ comparability:
 run_projects:
     a: unified-a-x0content-0p6b-100b-imagenet-split-s42-r1
     b: unified-b-x0content-0p6b-100b-imagenet-split-s42-r1
-    c: unified-c-on-b-0p6b-100b-imagenet-split-s42-r1
+    c: unified-c-on-b-x0content-0p6b-100b-imagenet-split-s42-r1
     d: unified-d-on-b-0p6b-100b-imagenet-split-s42-r4
     e: unified-e-on-b-x0content-0p6b-100b-imagenet-split-s42-r1
     f: unified-f-on-b-0p6b-100b-imagenet-split-s42-r1
@@ -152,6 +152,8 @@ ablations:
         current_x1_to_velocity_leak: false
         start: qwen_pretrained_step_0
     c:
+        status: ready_x0_content
+        platform_project: "随机序语言建模-统一自回归与掩码扩散的随机顺序生成框架"
         architecture_variant: single_stream_text_ar
         training_objective: selfless_dual_stream
         text_stream: single_x0

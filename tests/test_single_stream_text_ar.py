@@ -33,6 +33,8 @@ def _tiny_config(config_class=SingleStreamTextARConfig):
         ),
         "training_objective": "selfless_dual_stream",
         "dual_stream_attention_contract": "xlnet_content_diagonal",
+        "flow_head_attention_contract": "xlnet_content_diagonal",
+        "flow_condition_contract": "backbone_xt_query_backbone_x0_content",
         "mask_token_id": 7,
         "image_mask_token_id": 8,
         "boi_token_id": 11,
@@ -42,7 +44,7 @@ def _tiny_config(config_class=SingleStreamTextARConfig):
         "image_flow_width": 32,
         "image_flow_depth": 1,
         "image_flow_num_sampling_steps": "10",
-        "image_flow_batch_mul": 1,
+        "image_flow_batch_mul": 4,
         "image_flow_time_sampling": "uniform",
         "image_input_noise_strength": 0.0,
         "lambda_text": 0.05,
@@ -54,11 +56,25 @@ def _tiny_config(config_class=SingleStreamTextARConfig):
     return config
 
 
-def _paired_models():
+def _paired_models(*, nonzero_flow_output=False):
     torch.manual_seed(17)
     baseline = Qwen3ForCausalLM(_tiny_config(Qwen3Config))
     torch.manual_seed(17)
     text_ar = SingleStreamTextARQwen3ForCausalLM(_tiny_config())
+    if nonzero_flow_output:
+        # Exercise both flow conditions and backbone gradients; the default
+        # zero-initialized output head would hide conditioning regressions.
+        torch.manual_seed(314159)
+        with torch.no_grad():
+            for block in baseline.image_flow_head.net.blocks:
+                block.adaLN_modulation[-1].weight.normal_(0.0, 0.1)
+                block.adaLN_modulation[-1].bias.normal_(0.0, 0.1)
+            final = baseline.image_flow_head.net.final_layer
+            final.adaLN_modulation[-1].weight.normal_(0.0, 0.1)
+            final.adaLN_modulation[-1].bias.normal_(0.0, 0.1)
+            final.linear.weight.normal_(0.0, 0.1)
+            final.linear.bias.normal_(0.0, 0.1)
+        text_ar.load_state_dict(baseline.state_dict(), strict=True)
     return baseline, text_ar
 
 
@@ -201,8 +217,8 @@ def test_i2t_first_caption_target_is_conditioned_on_physical_image_prefix():
     )
 
 
-def test_t2i_hidden_loss_and_gradients_are_exactly_baseline_a():
-    baseline, text_ar = _paired_models()
+def test_t2i_hidden_loss_and_gradients_are_exactly_baseline_b_x0_content():
+    baseline, text_ar = _paired_models(nonzero_flow_output=True)
     baseline.train()
     text_ar.train()
     input_ids = torch.tensor([[3, 11, 8, 8, 8, 8, 12]])
@@ -215,6 +231,9 @@ def test_t2i_hidden_loss_and_gradients_are_exactly_baseline_a():
         "X0_input_ids": input_ids,
         "labels": input_ids.clone(),
         "attention_mask": attention_mask,
+        "content_attention_mask": get_selfless_mask(
+            sigma, input_ids.shape[1], "cpu", include_diagonal=True
+        ),
         "token_types": token_types,
         "image_latents": image_latents,
         "image_span_table": torch.tensor([[0, 0, 2, 6, 0]]),
@@ -245,12 +264,17 @@ def test_t2i_hidden_loss_and_gradients_are_exactly_baseline_a():
     baseline_output.loss.backward()
     text_ar_output.loss.backward()
     text_ar_parameters = dict(text_ar.named_parameters())
+    nonzero_gradients = []
     for name, parameter in baseline.named_parameters():
         other = text_ar_parameters[name]
         if parameter.grad is None or other.grad is None:
             assert parameter.grad is None and other.grad is None
         else:
             torch.testing.assert_close(parameter.grad, other.grad, rtol=0, atol=0)
+            if torch.count_nonzero(parameter.grad):
+                nonzero_gradients.append(name)
+    assert any(name.startswith("model.layers.") for name in nonzero_gradients)
+    assert any(name.startswith("image_flow_head.") for name in nonzero_gradients)
 
 
 def test_physical_causal_text_mask_ignores_image_conditioning_dropout_edges():
@@ -284,7 +308,7 @@ def test_physical_causal_text_mask_ignores_image_conditioning_dropout_edges():
     torch.testing.assert_close(allowed, expected, rtol=0, atol=0)
 
 
-def test_image_conditioning_without_labels_is_exactly_baseline_a():
+def test_image_conditioning_without_labels_is_exactly_baseline_b_x0_content():
     baseline, text_ar = _paired_models()
     baseline.eval()
     text_ar.eval()
@@ -295,6 +319,9 @@ def test_image_conditioning_without_labels_is_exactly_baseline_a():
         "X0_input_ids": input_ids,
         "attention_mask": get_selfless_mask(
             sigma, input_ids.shape[1], "cpu"
+        ),
+        "content_attention_mask": get_selfless_mask(
+            sigma, input_ids.shape[1], "cpu", include_diagonal=True
         ),
         "token_types": token_types,
         "image_latents": torch.randn(1, input_ids.shape[1], 4),
@@ -332,6 +359,9 @@ def test_joint_validation_merges_source_specific_text_and_image_passes():
         "labels": labels,
         "attention_mask": get_selfless_mask(
             sigma, input_ids.shape[1], "cpu"
+        ),
+        "content_attention_mask": get_selfless_mask(
+            sigma, input_ids.shape[1], "cpu", include_diagonal=True
         ),
         "token_types": token_types,
         "image_latents": image_latents,
@@ -386,7 +416,8 @@ def test_joint_validation_merges_source_specific_text_and_image_passes():
         atol=0,
     )
     assert joint.per_modality_count["text_tokens"].item() == 2
-    assert joint.per_modality_count["image_tokens"].item() == 4
+    # Four image tokens each receive four independent RF states.
+    assert joint.per_modality_count["image_tokens"].item() == 16
     assert joint.flow_debug_stats.keys() == image_only.flow_debug_stats.keys()
     for key, value in joint.flow_debug_stats.items():
         torch.testing.assert_close(
@@ -452,8 +483,9 @@ def test_c_image_generation_inherits_configured_baseline_b_attention():
 
 
 @torch.no_grad()
-def test_c_on_b_image_cache_matches_its_full_reference():
-    _, model = _paired_models()
+def test_c_image_generation_matches_current_b_cached_and_full_reference():
+    baseline, model = _paired_models(nonzero_flow_output=True)
+    baseline.eval()
     model.eval()
     common = {
         "input_ids": torch.tensor([[3, 11, 8, 8, 8, 8, 12]]),
@@ -468,7 +500,7 @@ def test_c_on_b_image_cache_matches_its_full_reference():
         ),
         "flow_cfg": 1.0,
         "flow_solver": "euler",
-        "flow_num_steps": 1,
+        "flow_num_steps": 2,
         "order_strategy": "spatial_halton",
         "return_trace": True,
     }
@@ -482,7 +514,10 @@ def test_c_on_b_image_cache_matches_its_full_reference():
         use_cache=False,
     )
 
-    torch.testing.assert_close(cached, full, rtol=0, atol=0)
+    for use_cache, actual in ((True, cached), (False, full)):
+        expected, _ = baseline.generate_image(**common, use_cache=use_cache)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(cached, full, rtol=0, atol=1.0e-6)
     assert cached_trace["attention_contract"] == "xlnet_content_diagonal"
     assert cached_trace["backbone_kv_cache_enabled"] is True
     assert full_trace["backbone_kv_cache_enabled"] is False
@@ -496,6 +531,9 @@ def test_text_ar_checkpoint_roundtrip_keeps_distinct_model_identity(tmp_path):
     assert isinstance(config, SingleStreamTextARConfig)
     assert config.model_type == "selfless_flow_single_stream_text_ar"
     assert config.architecture_variant == "single_stream_text_ar"
+    assert config.dual_stream_attention_contract == "xlnet_content_diagonal"
+    assert config.flow_head_attention_contract == "xlnet_content_diagonal"
+    assert config.flow_condition_contract == "backbone_xt_query_backbone_x0_content"
     loaded = SingleStreamTextARQwen3ForCausalLM.from_pretrained(tmp_path)
     expected = model.state_dict()
     for name, value in loaded.state_dict().items():

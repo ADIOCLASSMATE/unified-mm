@@ -89,7 +89,10 @@ not implicitly mount the official dataset.
   optimizer step zero and never resumes a sweep checkpoint. Baseline b uses
   the XLNet-style content-stream diagonal. C-on-B differs only by switching
   the text path to single-stream next-token AR; its image path remains
-  identical to baseline b and it must not resume a retired C-on-A checkpoint.
+  identical to baseline b, including separate backbone XT-query/X0-content
+  flow conditions. Its current output identity is
+  `unified-c-on-b-x0content-0p6b-100b-imagenet-split-s42-r1`; it must not
+  resume retired C-on-A or legacy shared-condition C-on-B checkpoints.
   D-on-B uses the dedicated Dynamic-XT model and generation implementation,
   preserves `image_flow_batch_mul: 4`, and must not resume the retired A-based
   Dynamic-XT checkpoint. Only its T2I Dynamic-XT decoder layers use activation
