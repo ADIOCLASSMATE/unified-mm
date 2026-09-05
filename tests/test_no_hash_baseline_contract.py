@@ -24,9 +24,9 @@ def test_baseline_configuration_freezes_no_hash_training_contract(monkeypatch):
     assert config.model.backbone_attention_output_gate == "none"
     assert int(config.experiment.save_every) == 2_000
     assert int(config.experiment.checkpoints_total_limit) == 3
-    assert int(config.experiment.checkpoint_milestone_every) == 0
+    assert int(config.experiment.checkpoint_milestone_every) == 125_100
     assert bool(config.experiment.save_final_checkpoint)
-    assert int(config.experiment.save_ema_eval_every) == 12_510
+    assert int(config.experiment.save_ema_eval_every) == 25_020
     assert bool(config.experiment.save_model_with_ema_eval)
     assert str(config.experiment.ema_eval_dtype) == "bf16"
     assert int(config.experiment.validation_image_every) == 2_000

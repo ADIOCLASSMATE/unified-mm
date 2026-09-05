@@ -387,6 +387,27 @@ def log_grad_norm(model, accelerator, global_step):
             accelerator.log({"grad_norm/" + name: grad_norm}, step=global_step)
 
 
+def checkpoint_save_due(
+    global_step: int,
+    *,
+    save_every: int,
+    milestone_every_steps: int = 0,
+) -> bool:
+    """Save milestones even when they fall between ordinary checkpoint saves."""
+
+    if save_every <= 0:
+        raise ValueError("save_every must be positive")
+    if milestone_every_steps < 0:
+        raise ValueError("milestone_every_steps must be non-negative")
+    return global_step > 0 and (
+        global_step % save_every == 0
+        or (
+            milestone_every_steps > 0
+            and global_step % milestone_every_steps == 0
+        )
+    )
+
+
 def rotate_checkpoints_for_save(
     output_dir: str | Path,
     checkpoints_total_limit: int,

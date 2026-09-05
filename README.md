@@ -53,6 +53,27 @@ Caption manifest 必须完整覆盖 latent manifest；loader 不静默回退到 
 也不截断超出配置上下文长度的 caption。训练集可使用确定性 segment packing，
 validation 保持一条样本一行。
 
+### Checkpoint 与评测模型的默认约定
+
+一般训练实验统一保留最近 **3 个普通续训 checkpoint**，并额外永久保留每
+**100 个图像 epoch** 的完整 checkpoint（含优化器、调度器、随机状态及 EMA
+状态）。里程碑独立触发保存，不占普通 checkpoint 的 3 个滚动名额。
+
+每 **20 个图像 epoch** 永久导出一对完整 BF16 Hugging Face 评测模型：
+`hf_model-<step>-eval/`（raw）和 `hf_model-<step>-ema-eval/`（EMA），并写入
+`hf_model-<step>-eval-pair.json` 完成标记。这些导出不参与续训 checkpoint 轮换。
+
+| 配置族 | 每图像 epoch 步数 | 100 epoch 里程碑 | 20 epoch raw + EMA 导出 |
+| --- | ---: | ---: | ---: |
+| unified、ImageNet class | 1,251 | 125,100 | 25,020 |
+| ImageNet T2I、caption-joint | 1,202 | 120,200 | 24,040 |
+
+纯文本单源实验使用 unified 的参考步数对齐。配置字段
+`checkpoints_total_limit`、`checkpoint_milestone_every`、`save_ema_eval_every`
+和 `save_model_with_ema_eval` 分别控制上述策略；步数从训练起点累计，调整数据量或
+全局 batch 后应重新换算。普通续训保存频率由 `save_every` 单独控制。
+新实验默认遵守此约定；短程 smoke、LR sweep 等可通过显式覆盖调整保存策略。
+
 ## 评测
 
 当前 ImageNet-1K 生成评测配方是 50K samples、BF16、CFG 3.5、10-step

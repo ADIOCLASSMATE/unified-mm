@@ -26,6 +26,20 @@
 - Evaluator batch size is global before sharding: default 4096, or 256/rank.
 - Use a real-stat cache matched to the evaluation prompt/data distribution.
 
+## Training artifact defaults
+
+- Keep the latest 3 ordinary resumable checkpoints plus every 100-image-epoch
+  milestone permanently. Milestones trigger saves independently of `save_every`
+  and do not consume rolling retention slots.
+- Every 20 image epochs, permanently export both complete raw and EMA models
+  in BF16 with their tokenizer/config and a completed pair manifest.
+- Use these defaults for new experiments and keep YAML, launchers, protocols,
+  preflight validators, and tests aligned. Explicit smoke/LR-sweep overrides
+  may use a different cadence.
+- Convert epoch intervals to optimizer steps using the experiment's image
+  epoch budget; pure-text controls use the unified reference (1,251 steps).
+  Current step intervals and artifact names are documented in README.md.
+
 ## Runtime invariants
 
 - The repository root `.venv` is the only supported environment and is managed

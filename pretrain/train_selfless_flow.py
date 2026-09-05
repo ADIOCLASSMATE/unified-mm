@@ -73,6 +73,7 @@ from utils.sharded_ema import (
 )
 from models.logging import set_verbosity_info, set_verbosity_error
 from utils.utils import (
+    checkpoint_save_due,
     flatten_omega_conf,
     get_config,
     get_showo_mae_mask,
@@ -1564,6 +1565,10 @@ def main(*, model_loader=None):
     config = get_config()
     validate_wsd_contract(config)
 
+    save_every = int(config.experiment.save_every)
+    checkpoint_milestone_every = int(
+        config.experiment.get("checkpoint_milestone_every", 0)
+    )
     log_every = int(config.experiment.log_every)
     log_grad_norm_every = int(config.experiment.log_grad_norm_every)
     flow_stats_every = int(config.experiment.get("flow_stats_every", 0))
@@ -3167,7 +3172,11 @@ def main(*, model_loader=None):
             post_step_maintenance_started = time.perf_counter()
 
             # Checkpointing
-            if global_step % config.experiment.save_every == 0:
+            if checkpoint_save_due(
+                global_step,
+                save_every=save_every,
+                milestone_every_steps=checkpoint_milestone_every,
+            ):
                 _save_resumable_training_checkpoint(
                     model=model,
                     config=config,
@@ -3296,11 +3305,14 @@ def main(*, model_loader=None):
                 break
 
     training_runtime_elapsed = time.time() - training_runtime_started_at
-    save_every = int(config.experiment.save_every)
     if (
         bool(config.experiment.get("save_final_checkpoint", False))
         and global_step > 0
-        and global_step % save_every
+        and not checkpoint_save_due(
+            global_step,
+            save_every=save_every,
+            milestone_every_steps=checkpoint_milestone_every,
+        )
     ):
         _save_resumable_training_checkpoint(
             model=model,

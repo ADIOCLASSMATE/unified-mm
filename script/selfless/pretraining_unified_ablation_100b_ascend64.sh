@@ -60,16 +60,14 @@ export RESUME_FROM
 export STOP_AFTER_STEPS="95415"
 export SAVE_EVERY="2000"
 export CHECKPOINTS_TOTAL_LIMIT="3"
-export CHECKPOINT_MILESTONE_EVERY="0"
+export CHECKPOINT_MILESTONE_EVERY="125100"
 export VAL_EVERY="2000"
 export VALIDATION_IMAGE_EVERY="2000"
 export VALIDATION_I2T_EVERY="2000"
 export VALIDATION_I2T_SAMPLES="2"
 export VALIDATION_I2T_MAX_NEW_TOKENS="64"
-# Match the immutable baseline-b launch: periodic paired evaluation exports were
-# disabled; normal checkpoints, final current/EMA export and evaluation stay
-# unchanged.
-export SAVE_EMA_EVAL_EVERY="0"
+# Project default: permanent full raw/EMA exports every 20 image epochs.
+export SAVE_EMA_EVAL_EVERY="25020"
 export SAVE_FINAL="true"
 export SAVE_FINAL_CHECKPOINT="true"
 export WANDB_MODE="disabled"

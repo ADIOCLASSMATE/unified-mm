@@ -85,6 +85,9 @@ formal_continuation:
     restart_from_step_zero: false
     save_every: 2000
     checkpoints_total_limit: 3
+    checkpoint_milestone_every: 125100
+    save_ema_eval_every: 25020
+    save_model_with_ema_eval: true
     validation_image_every: 2000
     validation_i2t_every: 2000
 arms:

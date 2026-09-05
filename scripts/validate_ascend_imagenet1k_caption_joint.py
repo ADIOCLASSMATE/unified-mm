@@ -113,6 +113,19 @@ def validate_config(config, *, world_size: int) -> dict[str, object]:
         "warmup_steps": (int(config.lr_scheduler.params.warmup_steps), 1_202),
         "decay_steps": (int(config.lr_scheduler.params.decay_steps), 3_606),
         "save_every": (int(config.experiment.save_every), 2_404),
+        "checkpoints_total_limit": (int(config.experiment.checkpoints_total_limit), 3),
+        "checkpoint_milestone_every": (
+            int(config.experiment.checkpoint_milestone_every),
+            100 * STEPS_PER_EPOCH,
+        ),
+        "save_ema_eval_every": (
+            int(config.experiment.save_ema_eval_every),
+            20 * STEPS_PER_EPOCH,
+        ),
+        "save_model_with_ema_eval": (
+            bool(config.experiment.save_model_with_ema_eval),
+            True,
+        ),
         "val_every": (int(config.experiment.val_every), 2_404),
         "log_every": (int(config.experiment.log_every), 50),
         "log_grad_norm_every": (

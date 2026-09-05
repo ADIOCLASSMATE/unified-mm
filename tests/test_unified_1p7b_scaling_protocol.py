@@ -62,8 +62,8 @@ def test_1p7b_preserves_global_data_and_token_budget_on_64_npus():
     assert config.model.image_flow_grad_checkpointing is True
     assert config.training.use_gradient_checkpointing is False
     assert int(config.experiment.checkpoints_total_limit) == 3
-    assert int(config.experiment.checkpoint_milestone_every) == 0
-    assert int(config.experiment.save_ema_eval_every) == 12_510
+    assert int(config.experiment.checkpoint_milestone_every) == 125_100
+    assert int(config.experiment.save_ema_eval_every) == 25_020
     assert bool(config.experiment.save_model_with_ema_eval)
     assert str(config.experiment.ema_eval_dtype) == "bf16"
     assert float(config.optimizer.params.learning_rate) == 2.4e-4
@@ -148,7 +148,7 @@ def test_1p7b_launchers_freeze_64_card_no_hash_sweep_only():
     assert 'WANDB_MODE="disabled"' in arm
     assert 'BACKBONE_LR="${BACKBONE_LR:-2.4e-4}"' in base
     assert 'FLOW_LR="${FLOW_LR:-6.0e-5}"' in base
-    assert 'SAVE_EMA_EVAL_EVERY="${SAVE_EMA_EVAL_EVERY:-12510}"' in base
+    assert 'SAVE_EMA_EVAL_EVERY="${SAVE_EMA_EVAL_EVERY:-25020}"' in base
     assert '--save-ema-eval-every "${SAVE_EMA_EVAL_EVERY}"' in base
     assert 'ABLATION="${ABLATION:-b}"' in base
     assert 'model.dual_stream_attention_contract=xlnet_content_diagonal' in base

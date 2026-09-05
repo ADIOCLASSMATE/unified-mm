@@ -49,10 +49,10 @@ def test_formal_protocol_is_comparable_complete_and_no_hash():
     assert protocol.target_text_tokens == 100_000_000_000
     assert protocol.max_train_steps == 95_415
     assert protocol.save_every == 2_000
-    assert protocol.save_ema_eval_every == 0
+    assert protocol.save_ema_eval_every == 25_020
     assert protocol.validation_every == protocol.save_every
     assert protocol.checkpoints_total_limit == 3
-    assert protocol.checkpoint_milestone_every == 0
+    assert protocol.checkpoint_milestone_every == 125_100
     assert protocol.save_final_resumable_checkpoint is True
     assert protocol.qualitative_outputs.generated_images is True
     assert protocol.qualitative_outputs.image_to_text_captions is True
@@ -240,10 +240,10 @@ def test_formal_launcher_freezes_current_baseline_contract():
     assert 'RESUME_FROM="none"' in source
     assert 'SAVE_EVERY="2000"' in source
     assert 'CHECKPOINTS_TOTAL_LIMIT="3"' in source
-    assert 'CHECKPOINT_MILESTONE_EVERY="0"' in source
+    assert 'CHECKPOINT_MILESTONE_EVERY="125100"' in source
     assert 'VALIDATION_IMAGE_EVERY="2000"' in source
     assert 'VALIDATION_I2T_EVERY="2000"' in source
-    assert 'SAVE_EMA_EVAL_EVERY="0"' in source
+    assert 'SAVE_EMA_EVAL_EVERY="25020"' in source
     assert 'SAVE_FINAL_CHECKPOINT="true"' in source
     assert 'PRESERVE_MODEL_CONTRACT="false"' in source
     assert 'WANDB_MODE="disabled"' in source
@@ -253,7 +253,7 @@ def test_formal_launcher_freezes_current_baseline_contract():
     assert "sha256" not in source.lower()
 
     base_source = BASE_LAUNCHER.read_text(encoding="utf-8")
-    assert 'SAVE_EMA_EVAL_EVERY="${SAVE_EMA_EVAL_EVERY:-12510}"' in base_source
+    assert 'SAVE_EMA_EVAL_EVERY="${SAVE_EMA_EVAL_EVERY:-25020}"' in base_source
     assert '--save-ema-eval-every "${SAVE_EMA_EVAL_EVERY}"' in base_source
     assert 'ABLATION="${ABLATION:-b}"' in base_source
     assert 'DUAL_STREAM_ATTENTION_CONTRACT="selfless_strict"' in base_source

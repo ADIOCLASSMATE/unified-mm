@@ -67,8 +67,9 @@ decay would make the formal decay less than two epochs.
 - retain the latest 3 ordinary checkpoints, including their sharded EMA state;
 - permanently retain every 100-epoch checkpoint (125,100 steps); these
   milestones do not participate in or consume slots from the rolling limit;
-- export and permanently retain a complete BF16 EMA HF evaluation model every
-  10 epochs as `hf_model-<step>-ema-eval`;
+- export and permanently retain complete BF16 raw and EMA HF evaluation models
+  every 20 epochs (25,020 steps) as `hf_model-<step>-eval` and
+  `hf_model-<step>-ema-eval`, with a completed `hf_model-<step>-eval-pair.json`;
 - do not save intermediate image-flow adapters; export only
   `image_flow_adapter-final.pt` at the end of training;
 - run validation loss and validation-image probes every 10 epochs;
@@ -165,11 +166,12 @@ moments. Sampling settings may change in later experiments and must be reported
 with the result. This is a same-configuration project metric, not an ADM/DiT
 leaderboard-comparable FID:
 
-The permanently retained 10-epoch EMA evaluation exports are complete model
-weights, not partial flow adapters. Evaluate one by passing its directory, for
-example `hf_model-12510-ema-eval`, through `--model_path_override`. The rolling
-DeepSpeed checkpoints remain the source for exact training recovery, while the
-smaller BF16 EMA exports are the source for historical FID/IS curves.
+The permanently retained 20-epoch raw/EMA evaluation pairs contain complete
+model weights. Evaluate either model by passing its directory, for example
+`hf_model-25020-ema-eval` or `hf_model-25020-eval`, through
+`--model_path_override`. The rolling and 100-epoch milestone DeepSpeed
+checkpoints support exact training recovery; the BF16 exports support
+historical FID/IS curves for both raw and EMA models.
 
 ```bash
 torchrun --standalone --nproc_per_node=16 \

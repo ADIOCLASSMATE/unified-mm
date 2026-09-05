@@ -8,7 +8,7 @@ from safetensors.torch import save_file
 
 import pretrain.train_selfless_flow as training
 from pretrain.train_selfless_flow import _image_flow_adapter_save_enabled
-from utils.utils import rotate_checkpoints_for_save
+from utils.utils import checkpoint_save_due, rotate_checkpoints_for_save
 
 
 def _mkdirs(root: Path, *names: str) -> None:
@@ -29,6 +29,77 @@ def _write_test_safetensors(path: Path, state_dict: dict[str, torch.Tensor]) -> 
         stored[name] = tensor
     save_file(stored, str(path))
     return len(stored)
+
+
+@pytest.mark.parametrize(
+    "config_path",
+    sorted((Path(__file__).resolve().parents[1] / "configs/selfless").glob("*.yaml")),
+    ids=lambda path: path.stem,
+)
+def test_training_configs_follow_project_artifact_defaults(config_path):
+    config = OmegaConf.load(config_path)
+    # Unified image tasks and pure-text controls share this reference cadence.
+    steps_per_epoch = int(config.training.get("optimizer_steps_per_epoch", 1_251))
+    experiment = config.experiment
+
+    assert int(experiment.checkpoints_total_limit) == 3
+    assert int(experiment.checkpoint_milestone_every) == 100 * steps_per_epoch
+    assert int(experiment.save_ema_eval_every) == 20 * steps_per_epoch
+    assert experiment.save_model_with_ema_eval is True
+    assert experiment.ema_eval_dtype == "bf16"
+    assert config.training.use_ema is True
+    assert config.training.ema_save_hf_model is True
+
+
+def test_off_cadence_milestones_are_saved_and_survive_rolling_checkpoints(tmp_path):
+    saved_steps = []
+
+    class Accelerator:
+        is_main_process = True
+
+        @staticmethod
+        def wait_for_everyone():
+            pass
+
+        @staticmethod
+        def save_state(directory):
+            directory.mkdir()
+            (directory / "training-state.pt").write_bytes(b"state")
+            saved_steps.append(int(directory.name.removeprefix("checkpoint-")))
+
+    config = OmegaConf.create(
+        {
+            "experiment": {
+                "output_dir": str(tmp_path),
+                "save_every": 2_000,
+                "checkpoints_total_limit": 3,
+                "checkpoint_milestone_every": 125_100,
+            },
+            "model": {},
+        }
+    )
+    for step in range(260_001):
+        if checkpoint_save_due(
+            step,
+            save_every=config.experiment.save_every,
+            milestone_every_steps=config.experiment.checkpoint_milestone_every,
+        ):
+            training.save_checkpoint(None, config, Accelerator(), step)
+
+    assert 0 not in saved_steps
+    assert saved_steps.count(125_100) == 1
+    assert saved_steps.count(250_200) == 1
+    assert sorted(path.name for path in tmp_path.glob("checkpoint-*")) == [
+        "checkpoint-125100",
+        "checkpoint-250200",
+        "checkpoint-256000",
+        "checkpoint-258000",
+        "checkpoint-260000",
+    ]
+    for path in tmp_path.glob("checkpoint-*"):
+        assert (path / "training-state.pt").is_file()
+        metadata = json.loads((path / "metadata.json").read_text())
+        assert metadata["global_step"] == int(path.name.removeprefix("checkpoint-"))
 
 
 def test_rotation_excludes_destination_created_early_by_non_main_rank(tmp_path: Path):

@@ -14,7 +14,8 @@ experiment:
     log_grad_norm_every: 1251
     checkpoints_total_limit: 3
     checkpoint_milestone_every: 125100
-    save_ema_eval_every: 12510
+    save_ema_eval_every: 25020
+    save_model_with_ema_eval: true
     ema_eval_dtype: "bf16"
     save_image_flow_adapter: false
     save_final_image_flow_adapter: true

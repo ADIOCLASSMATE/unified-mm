@@ -109,7 +109,7 @@ def test_all_three_configs_have_exact_source_matched_token_contracts():
     for source in preflight.SUPPORTED_SOURCES:
         assert runs[source]["ema_evaluation_export"] == {
             "enabled": True,
-            "every_optimizer_steps": 12_510,
+            "every_optimizer_steps": 25_020,
             "dtype": "bf16",
             "artifacts": ["current_model", "ema_model", "pair_manifest"],
         }
@@ -129,7 +129,7 @@ def test_rejects_nonfixed_paired_model_export_cadence(
     source,
 ):
     def mutate(_protocol, configs):
-        configs[source].experiment.save_ema_eval_every = 12_511
+        configs[source].experiment.save_ema_eval_every = 25_021
 
     protocol_path, paths = _materialize_protocol(tmp_path, mutate)
     with pytest.raises(

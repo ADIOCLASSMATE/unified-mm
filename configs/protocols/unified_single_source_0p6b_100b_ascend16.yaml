@@ -184,4 +184,7 @@ shared_checkpointing:
     save_every: 2000
     validation_every: 2000
     checkpoints_total_limit: 3
+    checkpoint_milestone_every: 125100
+    save_ema_eval_every: 25020
+    save_model_with_ema_eval: true
     save_final_resumable_checkpoint: true

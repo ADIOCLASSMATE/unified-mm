@@ -13,10 +13,11 @@ seed: 42
 target_text_tokens: 100000000000
 max_train_steps: 95415
 save_every: 2000
-save_ema_eval_every: 0
+save_ema_eval_every: 25020
+save_model_with_ema_eval: true
 validation_every: 2000
 checkpoints_total_limit: 3
-checkpoint_milestone_every: 0
+checkpoint_milestone_every: 125100
 save_final_resumable_checkpoint: true
 qualitative_outputs:
     generated_images: true

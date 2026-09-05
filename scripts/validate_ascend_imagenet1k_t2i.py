@@ -187,6 +187,19 @@ def validate_config(
             epoch_contract["decay"] * STEPS_PER_EPOCH,
         ),
         "save_every": (int(config.experiment.save_every), 10 * STEPS_PER_EPOCH),
+        "checkpoints_total_limit": (int(config.experiment.checkpoints_total_limit), 3),
+        "checkpoint_milestone_every": (
+            int(config.experiment.checkpoint_milestone_every),
+            100 * STEPS_PER_EPOCH,
+        ),
+        "save_ema_eval_every": (
+            int(config.experiment.save_ema_eval_every),
+            20 * STEPS_PER_EPOCH,
+        ),
+        "save_model_with_ema_eval": (
+            bool(config.experiment.save_model_with_ema_eval),
+            True,
+        ),
         "val_every": (int(config.experiment.val_every), 10 * STEPS_PER_EPOCH),
         "log_every": (int(config.experiment.log_every), 50),
         "log_grad_norm_every": (

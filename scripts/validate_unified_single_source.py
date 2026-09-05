@@ -221,6 +221,9 @@ def _validate_global_protocol(protocol: DictConfig) -> DictConfig:
     _expect("shared save cadence", int(checkpointing.save_every), 2000)
     _expect("shared validation cadence", int(checkpointing.validation_every), 2000)
     _expect("shared checkpoint retention", int(checkpointing.checkpoints_total_limit), 3)
+    _expect("shared checkpoint milestones", int(checkpointing.checkpoint_milestone_every), 125_100)
+    _expect("shared paired-model evaluation export cadence", int(checkpointing.save_ema_eval_every), 25_020)
+    _expect("shared paired-model evaluation export enabled", bool(checkpointing.save_model_with_ema_eval), True)
     _expect(
         "shared final resumable checkpoint",
         bool(checkpointing.save_final_resumable_checkpoint),
@@ -344,7 +347,7 @@ def _validate_training_runtime_contract(
     _expect(
         f"{source} paired-model evaluation export cadence",
         int(experiment.save_ema_eval_every),
-        12_510,
+        int(checkpointing.save_ema_eval_every),
     )
     _expect(
         f"{source} paired-model evaluation export enabled",
@@ -362,7 +365,7 @@ def _validate_training_runtime_contract(
     _expect(f"{source} save cadence", int(experiment.save_every), int(checkpointing.save_every))
     _expect(f"{source} validation cadence", int(experiment.val_every), int(checkpointing.validation_every))
     _expect(f"{source} checkpoint retention", int(experiment.checkpoints_total_limit), int(checkpointing.checkpoints_total_limit))
-    _expect(f"{source} checkpoint milestones", int(experiment.checkpoint_milestone_every), 0)
+    _expect(f"{source} checkpoint milestones", int(experiment.checkpoint_milestone_every), int(checkpointing.checkpoint_milestone_every))
     _expect(f"{source} save_final", bool(experiment.save_final), True)
     _expect(f"{source} save final checkpoint", bool(experiment.save_final_checkpoint), True)
 

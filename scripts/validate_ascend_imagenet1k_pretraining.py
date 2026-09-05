@@ -89,7 +89,11 @@ def validate_config(config, *, world_size: int) -> dict[str, object]:
         "save_every": (int(config.experiment.save_every), 12_510),
         "save_ema_eval_every": (
             int(config.experiment.save_ema_eval_every),
-            12_510,
+            20 * STEPS_PER_EPOCH,
+        ),
+        "save_model_with_ema_eval": (
+            bool(config.experiment.save_model_with_ema_eval),
+            True,
         ),
         "val_every": (int(config.experiment.val_every), 12_510),
         "validation_image_every": (int(config.experiment.validation_image_every), 12_510),

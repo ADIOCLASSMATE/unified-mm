@@ -528,7 +528,15 @@ def main():
     optimizer_steps_per_image_epoch = next(
         iter(image_steps_per_epoch.values())
     )
-    expected_ema_eval_every = 12_510
+    if int(config.experiment.checkpoints_total_limit) != 3:
+        raise ValueError("config must retain the latest three ordinary checkpoints")
+    expected_milestone_every = 100 * optimizer_steps_per_image_epoch
+    if int(config.experiment.checkpoint_milestone_every) != expected_milestone_every:
+        raise ValueError(
+            "config must permanently retain every 100-image-epoch checkpoint: "
+            f"expected checkpoint_milestone_every={expected_milestone_every}"
+        )
+    expected_ema_eval_every = 20 * optimizer_steps_per_image_epoch
     if int(config.experiment.save_ema_eval_every) != expected_ema_eval_every:
         raise ValueError(
             "config must use the fixed paired-model evaluation export cadence: "

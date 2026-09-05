@@ -21,11 +21,11 @@ experiment:
     deepspeed_bf16_overflow_check_until_step: 0
     flow_stats_every: 50
     checkpoints_total_limit: 3
-    # Formal runs keep exactly the latest three complete checkpoints.
-    checkpoint_milestone_every: 0
+    # Keep three rolling checkpoints plus permanent 100-image-epoch milestones.
+    checkpoint_milestone_every: 125100
     # Permanently export directly loadable current-model and EMA-model pairs
-    # at the fixed unified evaluation interval.
-    save_ema_eval_every: 12510
+    # every 20 image epochs (pure-text controls use the same step interval).
+    save_ema_eval_every: 25020
     save_model_with_ema_eval: true
     ema_eval_dtype: "bf16"
     save_image_flow_adapter: false
