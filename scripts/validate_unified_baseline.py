@@ -360,7 +360,7 @@ def main():
     validation_order_strategy = str(
         args.validation_order_strategy
         if args.validation_order_strategy is not None
-        else config.experiment.validation_single_stream_order_strategies[0]
+        else str(config.evaluation.strategies).split(",")[0]
     ).lower()
     flow_head_width = int(
         args.flow_head_width

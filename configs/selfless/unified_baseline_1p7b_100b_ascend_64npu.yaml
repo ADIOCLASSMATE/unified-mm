@@ -27,26 +27,15 @@ experiment:
     save_hfmodel_every: 1000000000
     save_final: false
     save_final_checkpoint: true
-    val_every: 2000
-    validation_max_batches: 4
-    validation_image_every: 2000
-    validation_i2t_every: 2000
-    validation_i2t_samples: 2
-    validation_i2t_max_new_tokens: 64
-    validation_i2t_temperature: 0.0
-    validation_seed: 424242
-    validation_image_samples: 2
-    validation_flow_temperature: 1.0
-    validation_flow_cfg: 3.5
-    validation_flow_cfg_schedule: "constant"
-    validation_flow_solver: "heun"
-    validation_vae_dtype: "fp32"
-    validation_single_stream_images: true
-    validation_single_stream_parallel_rate: 1
-    validation_single_stream_order_strategies: ["spatial_halton"]
-    validation_vae_module_root: "public/code/mar"
-    validation_vae_path: "public/vae/mar-kl16/kl16.ckpt"
-    validation_vae_scaling_factor: 0.2325
+    # Fixed global downstream probes; all training ranks participate.
+    val_every: 10000
+    downstream_validation:
+        seed: 424242
+        imagenet_per_class: 2
+        grounding_samples: 512
+        mc_samples: 16
+        work_seconds: 540
+        max_seconds: 600
     resume_from_checkpoint: none
 
 model:
@@ -187,7 +176,7 @@ training:
     ema_decay: 0.9999
     ema_update_after_step: 0
     ema_shard_chunk_numel: 4194304
-    ema_validate: false
+    ema_validate: true
     ema_save_adapter: true
     ema_save_hf_model: true
     save_image_flow_adapter: true

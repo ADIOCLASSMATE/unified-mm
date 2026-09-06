@@ -182,7 +182,7 @@ shared_optimizer:
     max_grad_norm: 1.0
 shared_checkpointing:
     save_every: 2000
-    validation_every: 2000
+    validation_every: 10000
     checkpoints_total_limit: 3
     checkpoint_milestone_every: 125100
     save_ema_eval_every: 25020

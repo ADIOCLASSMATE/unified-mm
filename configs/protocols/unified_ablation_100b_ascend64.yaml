@@ -15,15 +15,19 @@ max_train_steps: 95415
 save_every: 2000
 save_ema_eval_every: 25020
 save_model_with_ema_eval: true
-validation_every: 2000
+validation_every: 10000
 checkpoints_total_limit: 3
 checkpoint_milestone_every: 125100
 save_final_resumable_checkpoint: true
+training_validation:
+    profile: training_downstream_v1
+    weights: ema
+    devices: all_training_ranks
+    timing_acceptance_world_size: 16
+    max_seconds: 600
 qualitative_outputs:
-    generated_images: true
-    image_to_text_captions: true
-    every_steps: 2000
-    samples: 2
+    generated_images: false
+    image_to_text_captions: false
 runtime_hashing_enabled: false
 task_loss_logging:
     normalization:
@@ -89,7 +93,6 @@ comparability:
     b_vs_e_only_allowed_differences:
         - model.training_image_sigma_order
         - dataset.params.image.image_sigma_order
-        - experiment.validation_single_stream_order_strategies
         - evaluation.strategies
     b_vs_f_only_allowed_differences:
         - model.architecture_variant

@@ -1863,7 +1863,7 @@ def main(*, model_loader=None):
     if ema_update_after_step < 0:
         raise ValueError(f"ema_update_after_step must be >= 0, got {ema_update_after_step}")
     if _ema_enabled(config):
-        if bool(config.training.get("ema_validate", False)):
+        if not mixed_source_training and bool(config.training.get("ema_validate", False)):
             raise ValueError(
                 "training.ema_validate=true is unsupported with rank-sharded EMA: "
                 "the EMA exists as distributed FP32 tensor chunks and is not an "
@@ -2013,32 +2013,9 @@ def main(*, model_loader=None):
                 f"runtime={train_dataloader.active_sources}, "
                 f"expected={active_mixed_sources}"
             )
-        validation_sources = tuple(
-            source
-            for source in active_mixed_sources
-            if source in {"t2i", "i2t"}
-        )
-        if validation_sources:
-            if val_dataloader is None:
-                raise RuntimeError(
-                    "active image sources require a validation DataLoader"
-                )
-            expected_validation_workers = int(
-                config.dataset.params.sources[
-                    validation_sources[0]
-                ].dataloader_workers
-            )
-            if int(val_dataloader.num_workers) != expected_validation_workers:
-                raise RuntimeError(
-                    "mixed validation DataLoader worker mismatch: "
-                    f"configured={expected_validation_workers}, "
-                    f"runtime={val_dataloader.num_workers}"
-                )
-        elif val_dataloader is not None:
-            raise RuntimeError(
-                "pure ClimbMix training must not construct an inactive image "
-                "validation DataLoader"
-            )
+        # Training validation uses fixed downstream manifests on all ranks.
+        # The paired image loader remains available to standalone full evaluation.
+        val_dataloader = None
         logger.info("Mixed DataLoader runtime: %s", description)
     else:
         configured_workers = int(config.training.dataloader_workers)
@@ -3252,8 +3229,34 @@ def main(*, model_loader=None):
                 )
                 
             # Validation
-            if global_step % config.experiment.val_every == 0:
-                if val_dataloader is not None:
+            if int(config.experiment.val_every) > 0 and global_step % int(config.experiment.val_every) == 0:
+                if mixed_source_training:
+                    validation_started = time.monotonic()
+                    from utils.training_downstream_validation import (
+                        ValidationProfile, run_downstream_validation,
+                    )
+
+                    validation = run_downstream_validation(
+                        accelerator.unwrap_model(model), tokenizer,
+                        device=accelerator.device,
+                        output_dir=Path(config.experiment.output_dir) / "downstream_validation" / f"step-{global_step}",
+                        step=global_step, ema=ema,
+                        profile=ValidationProfile.from_config(config),
+                        started=validation_started,
+                    )
+                    validation_logs = {
+                        "val/downstream_complete": int(validation["complete"]),
+                        "val/downstream_seconds": validation["wall_seconds"],
+                        "val/downstream_within_budget": int(validation["within_time_budget"]),
+                    }
+                    validation_logs.update({
+                        f"val/downstream/{task}": result["primary"]
+                        for task, result in validation["tasks"].items() if result["complete"]
+                    })
+                    if "text_mean" in validation:
+                        validation_logs["val/downstream/text_mean"] = validation["text_mean"]
+                    accelerator.log(validation_logs, step=global_step)
+                elif val_dataloader is not None:
                     validate(
                         model,
                         val_dataloader,
@@ -3262,14 +3265,6 @@ def main(*, model_loader=None):
                         config,
                         tokenizer,
                     )
-                elif accelerator.is_main_process:
-                    logger.info(
-                        "Skipping in-training validation at step %d because "
-                        "the active ClimbMix-only schedule has no image "
-                        "validation source.",
-                        global_step,
-                    )
-
                 model.train()
 
             # Exclude checkpointing and validation from the next training

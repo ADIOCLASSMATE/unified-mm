@@ -219,7 +219,7 @@ def _validate_global_protocol(protocol: DictConfig) -> DictConfig:
 
     checkpointing = protocol.shared_checkpointing
     _expect("shared save cadence", int(checkpointing.save_every), 2000)
-    _expect("shared validation cadence", int(checkpointing.validation_every), 2000)
+    _expect("shared validation cadence", int(checkpointing.validation_every), 10000)
     _expect("shared checkpoint retention", int(checkpointing.checkpoints_total_limit), 3)
     _expect("shared checkpoint milestones", int(checkpointing.checkpoint_milestone_every), 125_100)
     _expect("shared paired-model evaluation export cadence", int(checkpointing.save_ema_eval_every), 25_020)
@@ -341,7 +341,7 @@ def _validate_training_runtime_contract(
     _expect(f"{source} EMA enabled", bool(training.use_ema), True)
     _expect(f"{source} EMA decay", float(training.ema_decay), 0.9999)
     _expect(f"{source} EMA start", int(training.ema_update_after_step), 0)
-    _expect(f"{source} EMA validation", bool(training.ema_validate), False)
+    _expect(f"{source} EMA validation", bool(training.ema_validate), True)
     _expect(f"{source} EMA adapter save", bool(training.ema_save_adapter), True)
     _expect(f"{source} EMA HF save", bool(training.ema_save_hf_model), True)
     _expect(

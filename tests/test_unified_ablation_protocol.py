@@ -50,12 +50,14 @@ def test_formal_protocol_is_comparable_complete_and_no_hash():
     assert protocol.max_train_steps == 95_415
     assert protocol.save_every == 2_000
     assert protocol.save_ema_eval_every == 25_020
-    assert protocol.validation_every == protocol.save_every
+    assert protocol.validation_every == base.experiment.val_every == 10000
     assert protocol.checkpoints_total_limit == 3
     assert protocol.checkpoint_milestone_every == 125_100
     assert protocol.save_final_resumable_checkpoint is True
-    assert protocol.qualitative_outputs.generated_images is True
-    assert protocol.qualitative_outputs.image_to_text_captions is True
+    assert protocol.qualitative_outputs.generated_images is False
+    assert protocol.qualitative_outputs.image_to_text_captions is False
+    assert protocol.training_validation.devices == "all_training_ranks"
+    assert protocol.training_validation.timing_acceptance_world_size == 16
     assert protocol.runtime_hashing_enabled is False
     assert list(protocol.task_loss_logging.raw_normalized) == [
         "train/loss_climbmix",
@@ -251,8 +253,7 @@ def test_formal_launcher_freezes_current_baseline_contract():
     assert 'SAVE_EVERY="2000"' in source
     assert 'CHECKPOINTS_TOTAL_LIMIT="3"' in source
     assert 'CHECKPOINT_MILESTONE_EVERY="125100"' in source
-    assert 'VALIDATION_IMAGE_EVERY="2000"' in source
-    assert 'VALIDATION_I2T_EVERY="2000"' in source
+    assert 'VAL_EVERY="10000"' in source
     assert 'SAVE_EMA_EVAL_EVERY="25020"' in source
     assert 'SAVE_FINAL_CHECKPOINT="true"' in source
     assert 'PRESERVE_MODEL_CONTRACT="false"' in source

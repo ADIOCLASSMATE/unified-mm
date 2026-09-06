@@ -9,6 +9,7 @@ the whole tied token embedding on a single rank.
 from __future__ import annotations
 
 import heapq
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -380,6 +381,51 @@ class RankShardedEMA:
             self.started = True
         self.global_step = next_step
         return self.started
+
+    @contextmanager
+    @torch.no_grad()
+    def applied_to(self, model: torch.nn.Module):
+        """Temporarily install the distributed EMA in a replicated ZeRO-2 model.
+
+        CPU backups preserve live parameters, buffers and tied storage exactly.
+        Broadcast buffers never alias the FP32 EMA. Optimizer/master parameters
+        and EMA updates are untouched; callers must invoke this on every rank.
+        """
+        import torch.distributed as dist
+
+        distributed = dist.is_available() and dist.is_initialized()
+        if self.world_size != (dist.get_world_size() if distributed else 1):
+            raise RuntimeError("EMA evaluation requires the complete training process group")
+        if self.rank != (dist.get_rank() if distributed else 0):
+            raise RuntimeError("EMA shard owner does not match the training rank")
+        if set(self.shards) != set(self.local_chunk_ids):
+            raise RuntimeError("EMA evaluation requires initialized local shards")
+        state = validate_sharded_ema_layout_for_model(self.layout, model)
+        backups = {
+            name: state[name].detach().to("cpu", copy=True)
+            for name in self.layout["tensors"]
+        }
+        try:
+            with torch.no_grad():
+                for chunk_id, chunk in self.layout["chunks"].items():
+                    target = state[chunk["tensor"]]
+                    value = torch.empty(
+                        int(chunk["numel"]), device=target.device, dtype=target.dtype
+                    )
+                    if self.rank == int(chunk["owner"]):
+                        value.copy_(self.shards[chunk_id])
+                    if distributed:
+                        dist.broadcast(value, src=int(chunk["owner"]))
+                    # reshape may copy noncontiguous buffers: copy back explicitly.
+                    flat = target.reshape(-1)
+                    flat.narrow(0, int(chunk["offset"]), int(chunk["numel"])).copy_(value)
+                    if not target.is_contiguous():
+                        target.copy_(flat.reshape(target.shape))
+                yield model
+        finally:
+            with torch.no_grad():
+                for name, backup in backups.items():
+                    state[name].copy_(backup)
 
     def save_checkpoint(self, directory: str | Path, accelerator, *, global_step: int) -> Path:
         directory = Path(directory)
