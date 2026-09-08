@@ -15,7 +15,7 @@
 - 平台 Job 为 `umm-b-x0content-0p6b-100b-64-s42-r1`。通过 `inspire job command` 查询，其启动命令在当前共享仓库执行，并检查提交 `f1b5d14c9c26167b120ff06729fdc7cc4df75013`；不是另一个 runtime 目录。
 - 本次修复前，`git diff f1b5d14 -- models pretrain utils` 为空。没有发现训练核心代码与工作区发生版本漂移的证据。
 - 配置为 raw-model 验证（`ema_validate: false`）、seed 424242、CFG 3.5、10-step Heun、`spatial_halton`，每 2000 step 生成两张图。
-- 已有 step-22000 回放报告加载全部 487 个 state keys，missing/unexpected 均为空；target PNG 完全一致，生成图与记录图的像素 MSE 为 0.04445769265294075。报告位于 `output/unified-b-x0content-0p6b-100b-imagenet-split-s42-r1/generation-diagnostic/step-00022000-correct-vs-recorded/report.json`。这是此前保存的证据，不是本次重新执行的 NPU 回放。
+- 已有 step-22000 回放报告加载全部 487 个 state keys，missing/unexpected 均为空；target PNG 完全一致，生成图与记录图的像素 MSE 为 0.04445769265294075。报告位于 `output/evaluation/diagnostics/unified-b-x0content-0p6b-100b-imagenet-split-s42-r1/generation-diagnostic/step-00022000-correct-vs-recorded/report.json`。这是此前保存的证据，不是本次重新执行的 NPU 回放。
 - 已有 step-30000 loss 审计中，记录的加权 loss 为 0.7814149856567383，回放为 0.7814070241445245，差 7.9615e-6；image-flow loss 差 4.1127e-6。见 `output/running-validation-compat-audit-20260904/b-x0-step-30000/audit.json`。
 
 ## 根因机制

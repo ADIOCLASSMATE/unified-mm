@@ -1,12 +1,13 @@
 # Unified-MM Project Context
 
-## Architecture invariants
+## Base architecture invariants
 
 - Selfless-Flow image tokens are 256 KL16 tokens of width 16.
 - Image attention uses row/column pure 2D RoPE in both the Qwen backbone and
   dynamic dual-stream contextual flow head.
-- Do not add additive image positions or architecture-selection switches.
-- `backbone_attention_output_gate` is the only retained architecture option:
+- Do not add additive image positions. Retained A/B/C/D/E/F ablations have
+  explicit model and checkpoint contracts; preserve those distinctions.
+- `backbone_attention_output_gate` remains a supported option:
   `none` by default, or `per_head_identity_sigmoid` for compatible research
   checkpoints.
 - Preserve same-position labels and strict `sigma[kv] < sigma[q]` visibility.
@@ -50,4 +51,13 @@
 - Preserve the CANN paths when setting `PYTHONPATH`; append the repository root
   instead of replacing `PYTHONPATH` with `.`.
 
-The only retained research summary is `docs/ABLATION_CONCLUSIONS.md`.
+All evaluation artifacts belong under `output/evaluation/`; its `index.html`
+combines selected benchmark scores and complete qualitative comparisons.
+Training validation is separate from checkpoints at
+`output/evaluation/training-validation/<run>/`. Update the homepage with
+`python3 scripts/build_evaluation_report.py`; never fill missing results with
+invalidated or mismatched checkpoints. See `docs/EVALUATION_STRUCTURE.md`.
+
+Current and historical research documents are indexed in `docs/README.md`.
+`docs/ABLATION_CONCLUSIONS.md` records the earlier ImageNet architecture study;
+its original hardware, sample counts and sampling steps are historical.

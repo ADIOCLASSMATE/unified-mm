@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 
 import pytest
 from omegaconf import OmegaConf
@@ -7,9 +8,64 @@ import torch
 
 from scripts.summarize_unified_evaluation import validate_t2i_model_source
 from utils.evaluation_model_source import (
+    EvaluationModelSource,
     configure_model_source,
+    load_model_source_weights,
     resolve_evaluation_model_source,
 )
+
+
+def _dynamic_post_load_fixture(tmp_path, dtype):
+    (tmp_path / "config.json").write_text(
+        json.dumps({"architecture_variant": "dynamic_xt"}), encoding="utf-8"
+    )
+    stored = {
+        f"model.backbone_flow_time_embedder.mlp.{layer}.{kind}":
+        (torch.arange(4).reshape(2, 2).float() + 0.123 + layer)
+        if kind == "weight" else torch.tensor([0.123, 0.456])
+        for layer in (0, 2) for kind in ("weight", "bias")
+    }
+    save_file(stored, tmp_path / "model.safetensors")
+    loaded = {name: value.to(dtype).clone() for name, value in stored.items()}
+    model = SimpleNamespace(
+        config=SimpleNamespace(architecture_variant="dynamic_xt"),
+        get_parameter=lambda name: loaded[name],
+    )
+    source = EvaluationModelSource(tmp_path, "hf_final_ema", 95415, 64, {})
+    return model, source, loaded, stored
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_dynamic_post_load_guard_checks_values_without_overwriting(tmp_path, dtype):
+    model, source, loaded, _ = _dynamic_post_load_fixture(tmp_path, dtype)
+    expected = {name: value.clone() for name, value in loaded.items()}
+    report = load_model_source_weights(model, source)
+    validation = report["post_load_validation"]
+    assert validation["complete"] is True
+    assert validation["comparison"] == "exact_after_model_dtype_cast"
+    assert validation["runtime_hashing_enabled"] is False
+    assert set(validation["checked_parameters"]) == set(loaded)
+    for name in loaded:
+        torch.testing.assert_close(loaded[name], expected[name], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("failure", ["changed", "missing_model", "missing_export", "nonfinite", "wrong_architecture"])
+def test_dynamic_post_load_guard_fails_closed(tmp_path, failure):
+    model, source, loaded, stored = _dynamic_post_load_fixture(tmp_path, torch.bfloat16)
+    name = "model.backbone_flow_time_embedder.mlp.0.weight"
+    if failure == "changed":
+        loaded[name].add_(1)
+    elif failure == "missing_model":
+        loaded.pop(name)
+    elif failure == "missing_export":
+        stored.pop(name)
+        save_file(stored, tmp_path / "model.safetensors")
+    elif failure == "nonfinite":
+        loaded[name].fill_(float("nan"))
+    else:
+        model.config.architecture_variant = "selfless_contextual"
+    with pytest.raises(RuntimeError, match="Dynamic-XT"):
+        load_model_source_weights(model, source)
 
 
 def test_final_hf_ema_source_uses_export_provenance(tmp_path):

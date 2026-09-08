@@ -29,9 +29,14 @@ def test_baseline_configuration_freezes_no_hash_training_contract(monkeypatch):
     assert int(config.experiment.save_ema_eval_every) == 25_020
     assert bool(config.experiment.save_model_with_ema_eval)
     assert str(config.experiment.ema_eval_dtype) == "bf16"
-    assert int(config.experiment.validation_image_every) == 2_000
-    assert int(config.experiment.validation_i2t_every) == 2_000
-    assert int(config.experiment.validation_single_stream_parallel_rate) == 1
+    assert int(config.experiment.val_every) == 10_000
+    assert int(config.experiment.downstream_validation.seed) == 424_242
+    assert int(config.experiment.downstream_validation.mc_samples) == 16
+    assert not {
+        "validation_image_every",
+        "validation_i2t_every",
+        "validation_single_stream_parallel_rate",
+    }.intersection(config.experiment)
 
     contract = runtime.build_resume_contract(
         config,

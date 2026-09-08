@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Unified-MM · 评测总览</title>
+<style>
+:root{--ink:#172c35;--muted:#61747c;--line:#dce5e6;--accent:#12655f;--pale:#e8f3ef;--paper:#fff;--bg:#f4f7f6}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif}
+button,input,select{font:inherit}button,select{border:1px solid var(--line);background:#fff;border-radius:8px;padding:7px 12px;color:var(--ink)}button{cursor:pointer}button:hover{border-color:var(--accent);color:var(--accent)}button.active{background:var(--accent);color:#fff;border-color:var(--accent)}a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
+header{background:var(--paper);border-bottom:1px solid var(--line)}.wrap{max-width:1640px;margin:auto;padding:26px 38px}.eyebrow{font-size:12px;letter-spacing:.16em;color:var(--accent);font-weight:700}h1{font-size:34px;letter-spacing:-.025em;line-height:1.25;margin:10px 0}h2{font-size:22px;margin:0 0 8px}h3{font-size:17px;margin:0 0 10px}p{margin:8px 0}small,.muted{color:var(--muted)}.header-line{display:flex;align-items:flex-start;justify-content:space-between;gap:20px}.header-links{display:flex;gap:15px;white-space:nowrap;padding-top:18px}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-top:24px}.stat{border-left:3px solid #b9d9d0;padding:0 16px}.stat strong{display:block;font-size:29px;line-height:1.2}.stat span{font-size:13px;color:var(--muted)}
+nav{position:sticky;top:0;background:rgba(255,255,255,.97);border-bottom:1px solid var(--line);z-index:6}.tabs{display:flex;gap:5px;padding:10px 38px;max-width:1640px;margin:auto;overflow:auto}.tabs button{border:0;white-space:nowrap}.tabs button.active{background:var(--pale);color:var(--accent);font-weight:700}.panel[hidden]{display:none}.panel{padding-bottom:35px}.box{background:#fff;border:1px solid var(--line);border-radius:12px;padding:22px;margin:18px 0}.conclusion{background:#eaf3ef;border-color:#c5ded2}.conclusion p{max-width:1100px}.toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin:15px 0}.toolbar .spacer{flex:1}.scroll{overflow:auto;background:white;border:1px solid var(--line);border-radius:10px}.metrics-scroll{max-height:70vh}table{border-collapse:separate;border-spacing:0;min-width:100%;font-variant-numeric:tabular-nums}th,td{padding:13px 16px;border-right:1px solid #edf1f1;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}th{background:#eef4f2;color:#39535a;font-weight:600;font-size:13px;white-space:nowrap;position:sticky;top:0;z-index:2}tr:last-child td{border-bottom:0}.metric{white-space:nowrap;text-align:right}.metric a{color:var(--ink)}.metric a:hover{color:var(--accent)}.best{font-weight:750;background:#edf7f0}.model-name{min-width:220px;max-width:285px;position:sticky;left:0;background:#fff;z-index:1}.focus-row .model-name{border-left:3px solid var(--accent)}th.model-name{background:#eef4f2;z-index:3}.status{display:block;font-size:11px;margin-top:5px;color:var(--muted)}.missing{color:#9aabad}.badge{display:inline-block;background:#edf3f3;color:#486168;border-radius:5px;padding:1px 6px;font-size:11px}.note{font-size:13px;line-height:1.7;color:var(--muted)}.selectors{display:flex;flex-wrap:wrap;gap:7px}.chip{display:flex;align-items:center;gap:6px;background:#fff;border:1px solid var(--line);border-radius:6px;padding:5px 9px;font-size:13px;cursor:pointer}.chip:has(input:checked){background:var(--pale);border-color:#8abca9}input[type=checkbox]{accent-color:var(--accent)}input[type=search]{min-width:260px;flex:1;border:1px solid var(--line);border-radius:7px;padding:8px 11px}.gallery td{min-width:280px;width:280px;padding:14px}.gallery .prompt-cell{position:sticky;left:0;background:#f0f5f3;z-index:1;min-width:260px;max-width:320px;width:280px}.gallery th:first-child{left:0;z-index:3}.gallery img{width:256px;height:256px;object-fit:contain;border-radius:6px;background:#f4f4f1}.gallery p{margin:7px 0}.generated-text{white-space:pre-wrap;overflow-wrap:anywhere;max-height:530px;overflow:auto;line-height:1.7}.prompt-text{white-space:pre-wrap;font-size:13px;overflow-wrap:anywhere}.task-note{display:block;font-size:11px;font-weight:400;color:#816439;white-space:normal;max-width:260px}details{margin:10px 0}summary{cursor:pointer;color:var(--accent)}.gallery-scroll{max-height:76vh}.pagination{display:flex;align-items:center;justify-content:center;gap:15px;margin:15px 0}.pagination button:disabled{opacity:.35;cursor:default}.empty{padding:45px;text-align:center;color:var(--muted)}.links-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:12px}.artifact{display:block;border:1px solid var(--line);border-radius:9px;padding:16px;background:#fff}.artifact small{display:block;overflow-wrap:anywhere}.source-list{overflow-wrap:anywhere}.source-list code{font-size:12px}footer{color:var(--muted);font-size:12px;border-top:1px solid var(--line);padding:22px 0}#error{background:#fff0ec;color:#983e23;padding:20px}noscript{display:block;padding:30px}
+@media(max-width:780px){.wrap{padding:20px 16px}.tabs{padding:8px 12px}.header-line{display:block}.header-links{padding-top:8px}.stats{grid-template-columns:repeat(2,1fr);gap:20px}h1{font-size:28px}.box{padding:16px}.gallery .prompt-cell{position:static;min-width:230px}.model-name{min-width:185px}.toolbar input[type=search]{min-width:180px}.stat strong{font-size:25px}}
+</style>
+</head>
+<body>
+<header><div class="wrap">
+  <div class="header-line"><div><div class="eyebrow">UNIFIED-MM / EVALUATION</div><h1>所有模型，一处对照。</h1><p class="muted">正式指标、图像生成、图像描述与文本续写。</p></div>
+    <div class="header-links"><a href="summary.json">结果摘要</a><a href="README.md">目录说明</a><button id="reload">刷新页面</button></div></div>
+  <div class="stats" id="stats"></div><p class="note" id="updated"></p>
+</div></header>
+<nav aria-label="评测视图"><div class="tabs">
+  <button class="active" data-tab="overview">指标与结论</button><button data-tab="t2i">图像生成</button><button data-tab="i2t">图像描述</button><button data-tab="text">文本续写</button><button data-tab="sources">全部文件与协议</button>
+</div></nav>
+<main class="wrap">
+<div id="error" hidden></div>
+<section class="panel" id="overview">
+  <div class="box conclusion"><h3>当前结论</h3><div id="conclusion"></div></div>
+  <div class="toolbar"><h2>模型指标</h2><span class="spacer"></span><label>指标组 <select id="metric-group"><option value="overview">关键指标</option><option value="text">文本八任务</option><option value="understanding">图像理解</option><option value="coco">COCO 检索</option><option value="flickr">Flickr30K 检索</option><option value="diagnostics">验证诊断</option></select></label></div>
+  <p class="note">点击分数查看原始结果。绿色为已收录模型中的数值最优；不表示统计显著。缺失项显示「—」，不会用旧协议或未完成分片补齐。</p>
+  <div class="scroll metrics-scroll" id="metrics"></div>
+  <div class="box note"><strong>比较范围</strong><p>FID 使用 ImageNet-val 50K，10-step Heun、CFG 3.5、seed 42；用于项目内同协议比较。IS 的 ± 是十个按类别分层 split 的标准差。E 按自身训练约定使用 sequential，其余使用 spatial_halton。</p><p>文本八项均分是内部跨任务摘要；MMBench circular 与 SEED 是内部消融指标。图文组合任务：随机顺序模型 MC64，E 为确定性 MC1。GenEval、DPG-Bench、MJHQ 官方评分独立保留，尚无有效分数的项目不进入本表。</p></div>
+</section>
+<section class="panel" id="qualitative" hidden>
+  <h2 id="gallery-title"></h2><p class="note" id="gallery-note"></p>
+  <div class="toolbar"><button data-preset="bd">只看 B_x0 / D</button><button data-preset="main">主要消融</button><button data-preset="all">全部模型</button><span class="note" id="selected-count"></span></div>
+  <div class="selectors" id="model-selectors"></div>
+  <div class="toolbar"><input type="search" id="sample-search" placeholder="搜索提示词、样本 ID 或类别" aria-label="搜索样本"><select id="sample-group" aria-label="样本组"></select><select id="sample-mode" aria-label="采样方式"></select><label>每页 <select id="page-size"><option>8</option><option>16</option><option>32</option><option value="10000">全部</option></select></label></div>
+  <div class="scroll gallery-scroll" id="gallery"></div>
+  <div class="pagination"><button id="previous">上一页</button><span id="page-label"></span><button id="next">下一页</button></div>
+</section>
+<section class="panel" id="sources" hidden>
+  <h2>报告与核验</h2><p class="note">所有评测产物均在本目录；权重与续训状态保留在训练目录。</p><div class="links-grid" id="artifact-links"></div>
+  <div class="box"><h3>每个模型的来源</h3><div class="source-list" id="model-sources"></div></div>
+  <div class="box"><h3>全部评测目录</h3><p class="note">包含历史 checkpoint、训练验证、定性报告、研究分析、评测审计和迁移记录。当前指标表的选取依据见 <a href="selection.json">selection.json</a>。</p><div class="links-grid" id="folder-links"></div></div>
+  <div class="box note"><h3>定性协议</h3><p id="qualitative-protocol"></p><p>网页展示与正式 FID 的样本范围、噪声种子和 batch 大小不同，数值排名与目视偏好应分别判断。I2T 展示模型输入 latent 的 VAE 重建，参考 caption 仅供人工对照，没有进入模型输入。文本使用基座续写，分别提供 greedy 和温度 0.8。单模态模型未训练的任务明确标记。</p></div>
+</section>
+<footer>本页由已保存的原始结果生成。新增结果后运行 <code>python3 scripts/build_evaluation_report.py</code> 更新。所有图像和文本均保留在原始逐样本记录中。</footer>
+</main>
+<noscript>请启用 JavaScript，或直接打开 <a href="summary.json">结果摘要</a>。</noscript>
+<script type="application/json" id="report-data">__REPORT_DATA__</script>
+<script>
+'use strict';
+const D=JSON.parse(document.getElementById('report-data').textContent);
+const $=id=>document.getElementById(id);
+const esc=value=>String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const state={tab:'overview',task:'t2i',selected:new Set(['b_x0','d_on_b']),page:0};
+const lookup=new Map(D.records.map(r=>[[r.model,r.task,r.sample_id,r.task==='t2i'?r.seed:r.task==='text'?r.decoding:''].join('|'),r]));
+const metricGroups={overview:['fid','is','top1','text_macro','mmlu','mmbench_dev_en'],text:['arc_easy','arc_challenge','hellaswag','piqa','winogrande','boolq','openbookqa','mmlu','text_macro'],understanding:['top1','top5','sugarcrepe','aro_vg_relation','aro_vg_attribution','mmbench_dev_en','seed_bench_image'],diagnostics:['t2i_loss','i2t_loss','i2t_ppl']};
+for(const dataset of ['coco','flickr'])metricGroups[dataset]=['i2t','t2i'].flatMap(dir=>[1,5,10].map(k=>`${dataset}_${dir}_r${k}`));
+const fmt=metric=>metric?(metric.percent?(metric.value*100).toFixed(2)+'%':metric.value.toFixed(3))+(metric.std===undefined?'':` ± ${metric.std.toFixed(2)}`):'—';
+function renderMetrics(){
+ const keys=metricGroups[$('metric-group').value];
+ const best={};for(const k of keys){const values=D.models.map(m=>m.metrics[k]?.value).filter(v=>v!==undefined);best[k]=(k==='fid'||k.endsWith('loss')||k.endsWith('ppl')?Math.min:Math.max)(...values)}
+ $('metrics').innerHTML='<table><thead><tr><th class="model-name">模型 / 完成情况</th>'+keys.map(k=>`<th class="metric">${esc(D.labels[k])}</th>`).join('')+'</tr></thead><tbody>'+D.models.map(m=>`<tr class="${['b_x0','d_on_b'].includes(m.id)?'focus-row':''}"><td class="model-name">${esc(m.label)}<span class="status">${esc(m.status)}</span></td>`+keys.map(k=>{const x=m.metrics[k];return `<td class="metric ${x&&x.value===best[k]?'best':''}">${x?`<a href="${esc(x.source)}" title="查看原始结果">${fmt(x)}</a>`:'<span class="missing">—</span>'}</td>`}).join('')+'</tr>').join('')+'</tbody></table>';
+}
+function renderConclusion(){
+ const b=D.models.find(m=>m.id==='b_x0'),d=D.models.find(m=>m.id==='d_on_b');
+ const fids=D.models.filter(m=>m.metrics.fid).sort((a,b)=>a.metrics.fid.value-b.metrics.fid.value);
+ let text=fids.length?`<p><strong>${esc(fids[0].label)} 的 FID 最低：${fmt(fids[0].metrics.fid)}。</strong>这是当前已完成、已收录的 ${fids.length} 个模型之间的比较。</p>`:'';
+ if(b?.metrics.fid&&d?.metrics.fid)text+=`<p>B_x0 / D：FID <strong>${fmt(b.metrics.fid)} / ${fmt(d.metrics.fid)}</strong>；文本均分 ${fmt(b.metrics.text_macro)} / ${fmt(d.metrics.text_macro)}；ImageNet Top-1 ${fmt(b.metrics.top1)} / ${fmt(d.metrics.top1)}。</p>`;
+ text+='<p class="note">FID 描述整批图像的特征分布。形体、构图和提示词遵循请结合成对样本判断；D 的目视优势可以与 B_x0 更低的 FID 同时成立。</p>';
+ const pending=D.models.filter(m=>m.selected_root&&!m.complete);if(pending.length)text+=`<p class="note">尚有 ${pending.length} 个模型的项目套件未齐；已完成部分照常展示，缺失项保持空白。</p>`;
+ $('conclusion').innerHTML=text;
+}
+function showTab(tab){
+ state.tab=tab;const isGallery=['t2i','i2t','text'].includes(tab);
+ $('overview').hidden=tab!=='overview';$('sources').hidden=tab!=='sources';$('qualitative').hidden=!isGallery;
+ document.querySelectorAll('[data-tab]').forEach(b=>b.classList.toggle('active',b.dataset.tab===tab));
+ if(isGallery){state.task=tab;state.page=0;setupTask();renderGallery()}
+}
+function setupTask(){
+ const task=state.task;
+ const titles={t2i:'图像生成 · 同提示、同噪声种子',i2t:'图像描述 · 同一图像输入',text:'文本续写 · 同一前缀'};
+ const notes={t2i:'每模型 64 个提示 × 2 个 seed；可按 ImageNet、简单主体或组合提示筛选。点击图片查看原图。',i2t:'每模型 64 个输入。左列为实际输入 latent 的 VAE 重建；参考描述未输入模型。',text:'每模型 32 个前缀 × 2 种解码。展示全部续写，包含中文与域外诊断。'};
+ $('gallery-title').textContent=titles[task];$('gallery-note').textContent=notes[task];
+ $('sample-search').value='';const groups=[...new Set(D.samples[task].map(r=>r.group))];
+ $('sample-group').innerHTML='<option value="">全部样本组</option>'+groups.map(g=>`<option>${esc(g)}</option>`).join('');
+ const modes=task==='t2i'?[[42,'Seed 42'],[43,'Seed 43']]:task==='text'?[['greedy','Greedy'],['sample','Temperature 0.8']]:[];
+ $('sample-mode').hidden=!modes.length;$('sample-mode').innerHTML='<option value="">全部方式</option>'+modes.map(([v,t])=>`<option value="${v}">${t}</option>`).join('');
+}
+function renderSelectors(){
+ $('model-selectors').innerHTML=D.models.map(m=>`<label class="chip"><input type="checkbox" value="${esc(m.id)}" ${state.selected.has(m.id)?'checked':''}>${esc(m.label)}</label>`).join('');
+ $('model-selectors').querySelectorAll('input').forEach(el=>el.addEventListener('change',()=>{el.checked?state.selected.add(el.value):state.selected.delete(el.value);renderGallery()}));
+}
+function renderGallery(){
+ const task=state.task,models=D.models.filter(m=>state.selected.has(m.id));$('selected-count').textContent=`当前对照 ${models.length} / ${D.models.length} 个模型`;
+ const search=$('sample-search').value.toLowerCase(),group=$('sample-group').value,mode=$('sample-mode').value;
+ let rows=D.samples[task].filter(r=>(!group||r.group===group)&&(!search||[r.id,r.group,r.prompt,r.reference].join(' ').toLowerCase().includes(search)));
+ rows=rows.flatMap(r=>(task==='t2i'?[42,43]:task==='text'?['greedy','sample']:['']).filter(m=>!mode||String(m)===mode).map(m=>({row:r,mode:m})));
+ const size=Number($('page-size').value),pages=Math.max(1,Math.ceil(rows.length/size));state.page=Math.min(state.page,pages-1);
+ const selected=rows.slice(state.page*size,(state.page+1)*size);
+ $('previous').disabled=state.page===0;$('next').disabled=state.page>=pages-1;$('page-label').textContent=`第 ${state.page+1} / ${pages} 页 · 共 ${rows.length} 组样本`;
+ if(!models.length||!selected.length){$('gallery').innerHTML='<div class="empty">请选择模型，或调整样本筛选条件。</div>';return}
+ let content='<table class="gallery"><thead><tr><th>样本 / 输入</th>'+models.map(m=>`<th>${esc(m.label)}<span class="task-note">${esc(m.task_training[task])}</span></th>`).join('')+'</tr></thead><tbody>';
+ for(const {row,mode:sampleMode} of selected){
+  content+=`<tr><td class="prompt-cell"><small>${esc(row.id)} · ${esc(row.group)}${sampleMode!==''?' · '+esc(sampleMode):''}</small>`;
+  if(task==='i2t')content+=`<p><a href="${esc(row.input_image)}"><img loading="lazy" src="${esc(row.input_image)}" alt="模型输入 VAE 重建"></a></p><details><summary>参考描述（未输入模型）</summary><p class="prompt-text">${esc(row.reference)}</p></details>`;
+  else content+=`<p class="prompt-text">${esc(row.prompt)}</p>`;
+  const ref=task==='i2t'?row.original_image:row.reference_image;
+  if(ref)content+=`<details><summary>${task==='i2t'?'原始图像':'提示来源图像'}</summary><a href="${esc(ref)}"><img loading="lazy" src="${esc(ref)}" alt="参考图像"></a></details>`;
+  content+='</td>';
+  for(const m of models){const r=lookup.get([m.id,task,row.id,sampleMode].join('|'));content+='<td>';
+   if(!r)content+='<span class="missing">缺失</span>';
+   else if(task==='t2i')content+=`<a href="${esc(r.image)}"><img loading="lazy" src="${esc(r.image)}" alt="${esc(row.prompt)}"></a>`;
+   else content+=`<div class="generated-text">${esc(r.text)}</div><small>${esc(r.generated_tokens)} tokens · ${esc(r.stop_reason)}</small>`;
+   content+='</td>'}
+  content+='</tr>';
+ }
+ $('gallery').innerHTML=content+'</tbody></table>';$('gallery').scrollTop=0;
+}
+function initialize(){
+ $('stats').innerHTML=[[D.qualitative_models,'模型 final EMA'],[D.formal_models,'已有正式指标'],[D.qualitative_records.toLocaleString(),'条定性输出'],[D.formal_complete_models,'已完成项目套件']].map(([n,t])=>`<div class="stat"><strong>${n}</strong><span>${t}</span></div>`).join('');
+ $('updated').textContent=`指标快照：${D.updated_at.replace('T',' ').replace('+00:00',' UTC')} · 未完成结果保留空白。`;
+ $('qualitative-protocol').textContent=`${D.qualitative_models} 个 final EMA；每模型 ${D.samples.t2i.length*2} 张 T2I、${D.samples.i2t.length} 个 I2T、${D.samples.text.length*2} 条文本续写。固定样本与成对噪声，全部输出保留。`;
+ $('artifact-links').innerHTML=D.artifacts.map(a=>`<a class="artifact" href="${esc(a.path)}">${esc(a.label)}<small>${esc(a.path)}</small></a>`).join('');
+ $('folder-links').innerHTML=D.folders.map(a=>`<a class="artifact" href="${esc(a.path)}">${esc(a.label)}</a>`).join('');
+ $('model-sources').innerHTML=D.models.map(m=>`<details><summary>${esc(m.label)} · step ${m.source.global_step} · ${esc(m.status)}</summary><p><code>${esc(m.checkpoint)}</code></p><p class="note">${esc(m.architecture)} · backbone ${esc(m.backbone_attention)} · flow ${esc(m.flow_attention)} · ${esc(m.flow_condition)}</p>${m.notes.map(n=>`<p class="note">${esc(n)}</p>`).join('')}${m.selected_root?`<p><a href="${esc(m.selected_root)}/">原始评测目录</a></p>`:''}<p><a href="${esc(D.qualitative_root)}/models/${esc(m.id)}/">定性输出与权重载入校验</a></p></details>`).join('');
+ document.querySelectorAll('[data-tab]').forEach(b=>b.addEventListener('click',()=>showTab(b.dataset.tab)));
+ document.querySelectorAll('[data-preset]').forEach(b=>b.addEventListener('click',()=>{const ids=b.dataset.preset==='bd'?['b_x0','d_on_b']:b.dataset.preset==='main'?['b_x0','a_x0','c_on_b','d_on_b','e_on_b','f_on_b']:D.models.map(m=>m.id);state.selected=new Set(ids);renderSelectors();renderGallery()}));
+ $('metric-group').addEventListener('change',renderMetrics);$('reload').addEventListener('click',()=>location.reload());
+ for(const id of ['sample-search','sample-group','sample-mode','page-size'])$(id).addEventListener(id==='sample-search'?'input':'change',()=>{state.page=0;renderGallery()});
+ $('previous').addEventListener('click',()=>{state.page--;renderGallery()});$('next').addEventListener('click',()=>{state.page++;renderGallery()});
+ renderMetrics();renderConclusion();renderSelectors();
+}
+try{initialize()}catch(error){$('error').hidden=false;$('error').textContent='报告显示失败：'+error.message;throw error}
+</script>
+</body>
+</html>

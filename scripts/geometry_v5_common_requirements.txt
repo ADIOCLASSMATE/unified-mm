@@ -1,0 +1,2 @@
+# Isolated public/models/_dependencies/geometry-v5-common; downloaded without proxies.
+sentencepiece==0.2.1

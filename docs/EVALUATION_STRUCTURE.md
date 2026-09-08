@@ -1,5 +1,35 @@
 # 评测结构
 
+统一入口是 [`output/evaluation/index.html`](../output/evaluation/index.html)。
+所有模型的正式分数、定性输出、训练验证与表征分析都在 `output/evaluation/`；
+权重、优化器、随机状态、续训 checkpoint 和训练日志保留在训练目录。
+
+```text
+output/evaluation/
+├── index.html                         # 指标与结论、T2I、I2T、文本对照
+├── summary.json / selection.json      # 可读汇总与明确的结果选择
+├── unified-*/                         # 各模型正式评测与历史 checkpoint 结果
+├── qualitative/<run>/                 # 全模型逐样本输出、原报告及 ZIP
+├── training-validation/<training-run>/ # 训练阶段验证，含历史 sweep
+├── research/                          # 表征、语义与 geometry 研究
+├── comparisons/                       # 比较报告与 FID 复核
+├── diagnostics/ / audits/             # 诊断与评测审计
+└── migrations/                        # 迁移映射、核验和原始 metadata
+```
+
+运行 `python3 scripts/build_evaluation_report.py` 更新总览，不启动设备或重新评分。
+选取依据在 `configs/protocols/evaluation_report.json`；脚本直接读取原始完成结果，
+校验模型身份、checkpoint step、协议和样本覆盖。未完成项保持空白，失效结果拒绝纳入。
+旧 B 的路径重命名使用单独的控制组身份记录，D 只选修复后的 r2。
+报告是生成时刻的快照；C/D 完成后可用同一命令更新。
+
+训练入口自动设置 `experiment.validation_output_dir`；独立评测与回放显式覆盖该字段，
+因此已有训练配置中的路径不会把评测写回训练目录。旧的执行日志与代码快照保留历史
+路径，迁移映射见 `output/evaluation/migrations/20260908-consolidation/`。
+
+`output/evaluation-checkpoints/` 仅含历史评测输入权重，属于 checkpoint 资产，
+不存放评测结果。
+
 当前 final 协议直接加载训练结束导出的 FP32 EMA Hugging Face 目录
 `hf_model-final-ema`。协议不做下游微调、指令微调或线性探针，运行时不计算
 内容哈希。模型来源 metadata 决定 architecture variant、attention contract 和

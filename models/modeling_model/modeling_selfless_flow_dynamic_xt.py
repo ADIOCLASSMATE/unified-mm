@@ -370,9 +370,13 @@ class DynamicXtQwen3Model(Qwen3Model):
         if time_embedder is not None and any(
             module is child for child in time_embedder.modules()
         ):
-            if module is time_embedder:
+            if module is time_embedder and not getattr(
+                module, "_is_hf_initialized", False
+            ):
                 with torch.random.fork_rng(devices=[]):
-                    self._reset_backbone_flow_time_embedder_impl()
+                    self._reset_backbone_flow_time_embedder_impl(
+                        only_uninitialized=True
+                    )
                 for child in time_embedder.modules():
                     child._is_hf_initialized = True
             return
@@ -497,12 +501,24 @@ class DynamicXtQwen3Model(Qwen3Model):
         with torch.random.fork_rng(devices=[]):
             self._reset_backbone_flow_time_embedder_impl()
 
-    def _reset_backbone_flow_time_embedder_impl(self) -> None:
+    def _reset_backbone_flow_time_embedder_impl(
+        self, *, only_uninitialized: bool = False
+    ) -> None:
         std = float(getattr(self.config, "initializer_range", 0.02))
         for module in self.backbone_flow_time_embedder.mlp:
             if isinstance(module, nn.Linear):
-                _normal_init_fp32_(module.weight, mean=0.0, std=std)
-                nn.init.zeros_(module.bias)
+                # HF marks loaded parameters, including partially loaded
+                # modules. The FP32 temporary + copy_ helper bypasses HF's
+                # guarded nn.init calls, so check the destination explicitly.
+                if not only_uninitialized or not getattr(
+                    module.weight, "_is_hf_initialized", False
+                ):
+                    _normal_init_fp32_(module.weight, mean=0.0, std=std)
+                if module.bias is not None and (
+                    not only_uninitialized
+                    or not getattr(module.bias, "_is_hf_initialized", False)
+                ):
+                    nn.init.zeros_(module.bias)
 
     def dynamic_xt_parameter_count(self) -> int:
         return sum(
@@ -820,10 +836,7 @@ class DynamicXtQwen3ForCausalLM(
         if time_embedder is not None and any(
             module is child for child in time_embedder.modules()
         ):
-            if module is time_embedder:
-                dynamic_model.reset_backbone_flow_time_embedder()
-                for child in time_embedder.modules():
-                    child._is_hf_initialized = True
+            dynamic_model._initialize_weights(module, is_remote_code)
             return
         super()._initialize_weights(module, is_remote_code)
 

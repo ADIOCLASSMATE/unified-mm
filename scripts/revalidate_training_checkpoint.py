@@ -377,6 +377,7 @@ def main() -> None:
         )
         wave_dir = output_dir / f"wave-{wave_index:02d}"
         config.experiment.output_dir = str(wave_dir)
+        config.experiment.validation_output_dir = str(wave_dir)
         base_loader = build_unified_image_validation_dataloader(
             config,
             tokenizer,

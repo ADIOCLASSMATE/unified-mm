@@ -1,7 +1,8 @@
 # Unified-MM
 
-Unified-MM 当前以华为昇腾 Ascend NPU 为唯一生产后端，维护最终选定的
-Selfless-Flow 图像生成架构：
+Unified-MM 以华为昇腾 Ascend NPU 为生产后端，研究 ClimbMix 文本与 ImageNet
+图文联合训练。当前主对照是 B X0-content，并保留 A/C/D/E/F 与单源控制组。
+基础架构约定：
 
 - Qwen two-stream backbone 与 dynamic dual-stream contextual flow head；
 - backbone 和 flow head 都固定使用 row/column pure 2D RoPE；
@@ -9,10 +10,12 @@ Selfless-Flow 图像生成架构：
 - attention output gate 保留单一接口，但默认关闭；
 - ImageNet latent dataloader 只支持 `class` 与 `caption` 两种条件模式。
 
-完整的架构选择依据压缩在 [消融结论](docs/ABLATION_CONCLUSIONS.md)，最终训练
-超参数见 [ImageNet-100 超参数结论](docs/IMAGENET100_HYPERPARAMETER_CONCLUSION.md)，
-正式预训练合同见 [ImageNet-1K 800-epoch 配置](docs/IMAGENET1K_800EP_PRETRAINING.md)。
-实验矩阵、旧配置和兼容入口不属于运行时仓库。
+消融模型使用各自 checkpoint 声明的 attention、flow condition 和生成顺序。
+当前协议、研究结果与早期 ImageNet 实验分别列在 [文档索引](docs/README.md)。
+
+所有模型的评测统一放在 [`output/evaluation/`](output/evaluation/)，
+打开 [评测总览](output/evaluation/index.html) 查看指标与 T2I/I2T/文本逐样本对照。
+训练权重、优化器和续训状态保留在各自训练目录。
 
 ## NPU 环境
 
@@ -38,16 +41,18 @@ uv run --frozen python -c \
 
 ## 训练
 
-正式 ImageNet-1K 预训练使用 64×Ascend 910B、global batch 1024、800 epochs、
-HCCL 和 DeepSpeed ZeRO-2。唯一训练入口是：
+Unified 0.6B 的正式消融使用 64×Ascend 910B、HCCL 和 DeepSpeed ZeRO-2。
+各训练臂由 [100B 消融协议](configs/protocols/unified_ablation_100b_ascend64.yaml)
+固定。B 与 D 的入口例如：
 
 ```bash
-bash script/selfless/pretraining_imagenet1k_class_ascend_64npu_bs1024_800ep.sh
+bash script/selfless/pretraining_unified_ablation_b_0p6b_formal_ascend64.sh
+bash script/selfless/pretraining_unified_ablation_d_on_b_0p6b_formal_ascend64.sh
 ```
 
-配置固定 Backbone/Special-token LR `30e-5`、Flow-head/Projector LR `4e-5`，
-EMA decay 为 `0.9999`。训练前必须通过完整数据缓存、模型哈希和官方 ImageNet-val
-FID real-stat 前检；准备方法及恢复训练命令见正式预训练合同。
+Unified 的运行时 hashing 与 W&B 保持关闭；启动前校验数据、模型来源、评测缓存和
+实验合同。训练中快评见 [训练中下游验证](docs/TRAINING_DOWNSTREAM_VALIDATION.md)。
+早期 class-only 800-epoch 配方见 [历史训练合同](docs/IMAGENET1K_800EP_PRETRAINING.md)。
 
 Caption manifest 必须完整覆盖 latent manifest；loader 不静默回退到 class，
 也不截断超出配置上下文长度的 caption。训练集可使用确定性 segment packing，
@@ -83,6 +88,15 @@ Heun、`spatial_halton`；除 50K 指标覆盖外，采样参数可按后续实�
 rank 切分，再进入 dataset collation。
 
 正式 FID 必须传入与目标数据分布匹配的 real-stat cache。
+
+完整项目评测使用 `script/selfless/evaluate_unified_native_full_checkpoint_ascend16.sh`，
+输出目录放在 `output/evaluation/` 下。已有结果的汇总页在 CPU 上更新：
+
+```bash
+python3 scripts/build_evaluation_report.py
+```
+
+目录约定与结果身份见 [评测结构](docs/EVALUATION_STRUCTURE.md)。
 
 最终 checkpoint 另外全量报告官方 GenEval、DPG-Bench 和 MJHQ-30K clean-fid；
 生成在 Ascend 上执行，三套官方评分器使用各自独立 CUDA 环境。固定版本、命令和

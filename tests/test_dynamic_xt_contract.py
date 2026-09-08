@@ -615,20 +615,78 @@ def test_non_t2i_microbatch_keeps_dynamic_parameters_in_backward_graph():
         assert torch.isfinite(parameter.grad).all()
 
 
-def test_dynamic_checkpoint_roundtrip_keeps_distinct_model_identity(tmp_path):
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("load_seed", [42, 43])
+def test_dynamic_checkpoint_roundtrip_keeps_distinct_model_identity(
+    tmp_path, dtype, load_seed
+):
     model = DynamicXtQwen3ForCausalLM(tiny_config())
+    # An untouched initialization can accidentally reproduce the reset RNG.
+    # Emulate learned weights, including nonzero biases, before saving.
+    with torch.no_grad():
+        for index, parameter in enumerate(
+            model.model.backbone_flow_time_embedder.parameters()
+        ):
+            parameter.add_(0.07 * (index + 1))
     expected = {
         name: value.detach().clone()
-        for name, value in model.model.backbone_flow_time_embedder.state_dict().items()
+        for name, value in model.state_dict().items()
     }
     model.save_pretrained(tmp_path)
 
     loaded_config = AutoConfig.from_pretrained(tmp_path)
     assert isinstance(loaded_config, SelflessFlowDynamicXtConfig)
     assert loaded_config.model_type == "selfless_flow_dynamic_xt"
-    loaded = DynamicXtQwen3ForCausalLM.from_pretrained(tmp_path)
-    for name, value in loaded.model.backbone_flow_time_embedder.state_dict().items():
-        torch.testing.assert_close(value, expected[name], rtol=0, atol=0)
+    torch.manual_seed(load_seed)
+    loaded = DynamicXtQwen3ForCausalLM.from_pretrained(tmp_path, dtype=dtype)
+    for name, value in loaded.state_dict().items():
+        torch.testing.assert_close(value, expected[name].to(dtype), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("missing_suffix", ["mlp.0.weight", "mlp.0.bias", "mlp.2.weight", "mlp.2.bias"])
+def test_dynamic_partial_reload_initializes_only_missing_time_parameters(
+    tmp_path, dtype, missing_suffix
+):
+    model = DynamicXtQwen3ForCausalLM(tiny_config())
+    with torch.no_grad():
+        for index, parameter in enumerate(
+            model.model.backbone_flow_time_embedder.parameters()
+        ):
+            parameter.add_(0.07 * (index + 1))
+    expected = {name: value.detach().clone() for name, value in model.state_dict().items()}
+    missing_name = f"model.backbone_flow_time_embedder.{missing_suffix}"
+    partial = {name: value for name, value in expected.items() if name != missing_name}
+    model.save_pretrained(tmp_path, state_dict=partial)
+    loaded, loading_info = DynamicXtQwen3ForCausalLM.from_pretrained(
+        tmp_path, dtype=dtype, output_loading_info=True
+    )
+    assert set(loading_info["missing_keys"]) == {missing_name}
+    for name, value in loaded.state_dict().items():
+        if name != missing_name:
+            torch.testing.assert_close(value, expected[name].to(dtype), rtol=0, atol=0)
+        else:
+            assert torch.isfinite(value).all()
+            if name.endswith(".bias"):
+                torch.testing.assert_close(value, torch.zeros_like(value), rtol=0, atol=0)
+            else:
+                assert 0.01 < float(value.float().std()) < 0.03
+
+
+def test_dynamic_initialization_preserves_loaded_flags_in_both_entrypoints():
+    model = DynamicXtQwen3ForCausalLM(tiny_config())
+    time = model.model.backbone_flow_time_embedder
+    with torch.no_grad():
+        for index, parameter in enumerate(time.parameters()):
+            parameter.fill_(0.1 * (index + 1))
+            parameter._is_hf_initialized = True
+    expected = {name: value.detach().clone() for name, value in time.state_dict().items()}
+    for owner in (model.model, model):
+        for module in time.modules():
+            module._is_hf_initialized = False
+        owner._initialize_weights(time)
+        for name, value in time.state_dict().items():
+            torch.testing.assert_close(value, expected[name], rtol=0, atol=0)
 
 
 def test_dynamic_pretrained_init_preserves_common_missing_parameters(tmp_path):

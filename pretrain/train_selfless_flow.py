@@ -72,6 +72,7 @@ from utils.sharded_ema import (
     read_sharded_ema_rows,
 )
 from models.logging import set_verbosity_info, set_verbosity_error
+from utils.evaluation_paths import training_validation_root, validation_output_dir
 from utils.utils import (
     checkpoint_save_due,
     flatten_omega_conf,
@@ -1674,6 +1675,7 @@ def main(*, model_loader=None):
         )
     
     config.experiment.output_dir = os.path.join(config.experiment.output_dir, config.experiment.project)
+    config.experiment.validation_output_dir = str(training_validation_root(config.experiment.output_dir))
 
     #########################
     # SETUP Accelerator     #
@@ -3239,7 +3241,7 @@ def main(*, model_loader=None):
                     validation = run_downstream_validation(
                         accelerator.unwrap_model(model), tokenizer,
                         device=accelerator.device,
-                        output_dir=Path(config.experiment.output_dir) / "downstream_validation" / f"step-{global_step}",
+                        output_dir=validation_output_dir(config) / "downstream_validation" / f"step-{global_step}",
                         step=global_step, ema=ema,
                         profile=ValidationProfile.from_config(config),
                         started=validation_started,
@@ -3839,7 +3841,7 @@ def _save_validation_i2t_captions(
 
     if accelerator.is_main_process:
         output_directory = (
-            Path(config.experiment.output_dir)
+            validation_output_dir(config)
             / "validation_i2t_captions"
             / f"step-{int(global_step):08d}"
         )
@@ -4176,7 +4178,7 @@ def _save_validation_flow_images(
     vae = None
     if write_images:
         image_dir = (
-            Path(config.experiment.output_dir) / "validation_flow_images"
+            validation_output_dir(config) / "validation_flow_images"
         )
         image_dir.mkdir(parents=True, exist_ok=True)
         _empty_validation_device_cache(accelerator)
@@ -4275,7 +4277,7 @@ def _save_validation_flow_images(
             "metrics": global_logs,
         }
         report_path = (
-            Path(config.experiment.output_dir)
+            validation_output_dir(config)
             / f"validation_generation_step_{global_step}.json"
         )
         report_path.write_text(
@@ -4561,7 +4563,7 @@ def _validate_multimodal(
         accelerator.log(logs, step=global_step)
         if config is not None:
             metrics_path = (
-                Path(config.experiment.output_dir)
+                validation_output_dir(config)
                 / f"validation_metrics_step_{int(global_step)}.json"
             )
             metrics_path.parent.mkdir(parents=True, exist_ok=True)

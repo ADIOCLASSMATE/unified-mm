@@ -47,7 +47,7 @@ FID/IS、检索与其余图文任务留在独立的完整评测流程中。快�
 
 每个验证点写入：
 
-- `output/<run>/downstream_validation/step-<N>/subset.json`：全局样本 ID 与配置。
+- `output/evaluation/training-validation/<run>/downstream_validation/step-<N>/subset.json`：全局样本 ID 与配置。
 - 同目录 `summary.json`：模型契约、EMA 来源、各任务完成情况、得分与时间。
 - Tracker 的 `val/downstream/<task>`、`val/downstream/text_mean` 与耗时/完成标记。
 
@@ -68,7 +68,7 @@ ARO 18.95 秒，SugarCrepe 19.92 秒。
 其余为模型加载、EMA 操作、数据准备与汇总。最大 NPU 已分配显存约
 2.95 GiB（独立计时程序，不含训练优化器）。
 ImageNet Top-1 为 45.15%，与从已有全量分数矩阵重算同一 2,000 张子集的结果一致。
-产物：`output/validation-timing-16npu-20260906-f-r3/`。
+产物：`output/evaluation/diagnostics/validation-timing-16npu-20260906-f-r3/`。
 
 这次计时证明当前 0.6B 配置在 16 卡上的预算；没有对 64/256 卡做额外计时。
 1.7B 复用同一实现与截止时间，尚无其 16 卡完整通过的时间结论。

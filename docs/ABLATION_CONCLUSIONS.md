@@ -1,7 +1,8 @@
-# Selfless-Flow 消融结论
+# 早期 ImageNet Selfless-Flow 消融结论（历史）
 
-本文件是仓库中唯一保留的消融记录。历史实验矩阵、proposal、临时协议、
-兼容分支和运行快照均已移除；表中的名称只用于说明实验来源，不再是可配置接口。
+本文件保留早期 ImageNet 架构研究的结果与当时使用的配方。下文的“最终架构”
+指该轮实验的选择，不代表当前 Unified A/B/C/D/E/F 消融的全部接口。
+当前默认值及评测入口见 [README](../README.md) 和 [评测结构](EVALUATION_STRUCTURE.md)。
 
 ## 最终架构
 
@@ -58,7 +59,7 @@ Gate 的完整 10K paired evaluation 是 mixed result：
 但没有在 caption-trained 模型上带来一致收益。因此接口保留用于研究和已有
 checkpoint，工程默认固定为 `none`。
 
-## 推理默认值
+## 当时的推理配方（非当前默认值）
 
 - Selfless-Flow：EMA checkpoint、BF16 model forward、CFG `3.5`、constant
   schedule、100-step Heun、`spatial_halton`、`parallel_rate=1`。

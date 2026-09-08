@@ -101,6 +101,7 @@ def main() -> None:
         label="evaluation config",
     )
     config.experiment.output_dir = str(args.output_dir)
+    config.experiment.validation_output_dir = str(args.output_dir)
     config.experiment.validation_max_batches = int(args.validation_max_batches)
     config.experiment.validation_image_every = 1
     config.experiment.validation_i2t_every = 1

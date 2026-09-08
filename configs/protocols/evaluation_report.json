@@ -1,0 +1,24 @@
+{
+  "schema": "unified_evaluation_report_selection_v1",
+  "qualitative": "qualitative/unified-all-final-ema-20260908-r1",
+  "models": {
+    "b_x0": {"root": "unified-b-x0content-0p6b/checkpoints/step-95415-ema-native-full-20260906-r1"},
+    "b_flowdiag": {"root": "unified-b-flowdiag-0p6b/final-ema-native-full-20260907-r1"},
+    "b_no_flowdiag": {
+      "root": "unified-b-0p6b/final-ema-v9-20260902",
+      "layout": "v9",
+      "historical_checkpoint_alias": "unified-b-0p6b-100b-imagenet-split-s42-r1",
+      "alias_evidence": "unified-b-0p6b/historical-control-identity.json",
+      "note": "旧结果部分来源字段保留重命名前的 B 路径；该组属于 flow 无对角线控制组，身份依据已单独保留。"
+    },
+    "a_x0": {"root": "unified-a-x0content-0p6b/checkpoints/step-95415-ema-native-full-20260907-r1"},
+    "a_legacy": {"root": "unified-a-0p6b/final-ema-v9-20260902", "layout": "v9"},
+    "c_on_b": {"root": "unified-c-on-b-x0content-0p6b/checkpoints/step-95415-ema-native-full-20260908-r1"},
+    "d_on_b": {
+      "root": "unified-d-on-b-0p6b/checkpoints/step-95415-ema-native-full-20260908-r2",
+      "note": "只读取修复后的 r2；旧 r1 图像评测已失效。"
+    },
+    "e_on_b": {"root": "unified-e-on-b-x0content-0p6b/checkpoints/step-95415-ema-native-full-20260907-r1", "note": "原生 sequential 图像顺序；图文顺序为确定性 MC1。"},
+    "f_on_b": {"root": "unified-f-on-b-0p6b/checkpoints/step-95415-ema-native-full-20260905-r1"}
+  }
+}

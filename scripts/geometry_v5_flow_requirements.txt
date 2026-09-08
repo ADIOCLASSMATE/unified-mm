@@ -1,0 +1,7 @@
+# Installed only into public/models/_dependencies/geometry-v5-flow-tf447.
+# No changes to the repository's main .venv; all downloads use direct PyPI.
+transformers==4.47.0
+tokenizers==0.21.4
+huggingface-hub==0.27.1
+diffusers==0.31.0
+attrdict==2.0.1

@@ -1,0 +1,311 @@
+#!/usr/bin/env python3
+"""Build the local evaluation homepage from explicitly selected raw results.
+
+CPU / standard library only. Missing results stay missing; invalidated runs and
+checkpoint/protocol mismatches cannot silently enter the comparison.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import tempfile
+from collections import Counter
+from datetime import UTC, datetime
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+TEXT_TASKS = ("arc_easy", "arc_challenge", "hellaswag", "piqa", "winogrande", "boolq", "openbookqa", "mmlu")
+BENCHMARKS = {"sugarcrepe": 7511, "aro_vg_relation": 23937, "aro_vg_attribution": 28748,
+              "mmbench_dev_en": 4329, "seed_bench_image": 14233}
+LABELS = {"fid": "FID ↓", "is": "IS ↑", "top1": "ImageNet Top-1", "top5": "ImageNet Top-5",
+          "text_macro": "文本八项均分", "mmlu": "MMLU 5-shot", "arc_easy": "ARC-E", "arc_challenge": "ARC-C",
+          "hellaswag": "HellaSwag", "piqa": "PIQA", "winogrande": "WinoGrande", "boolq": "BoolQ", "openbookqa": "OpenBookQA",
+          "sugarcrepe": "SugarCrepe", "aro_vg_relation": "ARO Relation", "aro_vg_attribution": "ARO Attribution",
+          "mmbench_dev_en": "MMBench circular", "seed_bench_image": "SEED image",
+          "t2i_loss": "T2I loss ↓", "i2t_loss": "I2T loss ↓", "i2t_ppl": "I2T PPL ↓"}
+for _dataset in ("coco", "flickr"):
+    for _direction in ("i2t", "t2i"):
+        for _k in (1, 5, 10):
+            LABELS[f"{_dataset}_{_direction}_r{_k}"] = f"{'COCO' if _dataset == 'coco' else 'Flickr'} {_direction.upper()} R@{_k}"
+
+
+def read(path: Path):
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def write(path: Path, text: str):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
+            handle.write(text)
+            temporary = Path(handle.name)
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def within(root: Path, relative: str) -> Path:
+    path = (root / relative).resolve()
+    if not path.is_relative_to(root.resolve()):
+        raise ValueError(f"result path escapes evaluation directory: {relative}")
+    return path
+
+
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def check_not_invalidated(path: Path, root: Path):
+    for parent in [path if path.is_dir() else path.parent, *path.parents]:
+        if not parent.is_relative_to(root):
+            break
+        if (parent / "evaluation_invalidation.json").exists():
+            raise ValueError(f"invalidated evaluation cannot be selected: {parent}")
+
+
+def check_checkpoint(payload, spec, selection, root):
+    source = payload.get("checkpoint") or payload.get("evaluation_model_source", {}).get("path")
+    require(source, f"missing checkpoint identity for {spec['id']}")
+    observed, expected = Path(source).resolve(), Path(spec["checkpoint"]).resolve()
+    if observed != expected:
+        alias = selection.get("historical_checkpoint_alias")
+        evidence_file = selection.get("alias_evidence")
+        require(alias and evidence_file, f"checkpoint mismatch for {spec['id']}: {observed} != {expected}")
+        evidence = read(within(root, evidence_file))
+        require(evidence.get("original_run_project") == alias and
+                Path(evidence["current_output_root"]).name == spec["run"] and
+                evidence.get("control_name") == "flow_head_no_diagonal" and
+                observed.parent.name == alias and observed.name == expected.name and
+                observed.parent.parent == expected.parent.parent,
+                f"unverified historical checkpoint alias for {spec['id']}")
+    step = payload.get("checkpoint_step", payload.get("evaluation_model_source", {}).get("global_step"))
+    require(step == spec["source"]["global_step"], f"checkpoint step mismatch for {spec['id']}")
+
+
+def model_metrics(root: Path, spec: dict, selection: dict) -> dict:
+    result = {"metrics": {}, "components": {}, "notes": [], "selected_root": selection.get("root")}
+    if not selection:
+        result.update(status="未收录正式指标", complete=False)
+        return result
+    run = within(root, selection["root"])
+    require(run.is_dir(), f"selected evaluation does not exist: {run}")
+    check_not_invalidated(run, root)
+    v9 = selection.get("layout") == "v9"
+    core = run if v9 else run / "core"
+    native = run if v9 else run / "pretraining-native-understanding"
+    if selection.get("note"):
+        result["notes"].append(selection["note"])
+
+    def source(path):
+        check_not_invalidated(path, root)
+        return str(path.relative_to(root))
+
+    def put(key, value, path, *, std=None):
+        require(isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value), f"invalid {key}: {path}")
+        percent = key not in {"fid", "is", "t2i_loss", "i2t_loss", "i2t_ppl"}
+        require(not percent or 0 <= value <= 1, f"invalid accuracy unit for {key}: {path}")
+        result["metrics"][key] = {"value": value, "source": source(path), "percent": percent}
+        if std is not None:
+            require(math.isfinite(std) and std >= 0, f"invalid split standard deviation: {path}")
+            result["metrics"][key]["std"] = std
+
+    def component(name, path, valid):
+        result["components"][name] = {"complete": valid, "source": source(path) if path.exists() else None}
+
+    path = core / "t2i-fid-is/metrics.json"
+    done = False
+    if path.exists():
+        data = read(path)
+        check_checkpoint(data, spec, selection, root)
+        require(data.get("schema") == "selfless_imagenet_val_t2i_fid_is_v2" and data.get("project_formal_protocol") is True,
+                f"non-formal generation result: {path}")
+        require(data.get("samples_evaluated") == 50000 and str(data.get("sampling_steps")) == "10" and
+                data.get("flow_solver") == "heun" and data.get("cfg") == 3.5 and data.get("seed") == 42,
+                f"generation protocol mismatch: {path}")
+        strategy = "sequential" if spec["image_order"] == "sequential" else "spatial_halton"
+        metrics = data["strategies"][strategy]
+        require(metrics["count"] == 50000, f"incomplete generation: {path}")
+        put("fid", metrics["fid"], path)
+        put("is", metrics["inception_score_mean"], path, std=metrics["inception_score_std"])
+        done = True
+    component("generation", path, done)
+
+    path = core / "text/summary.json"
+    done = False
+    if path.exists():
+        data = read(path)
+        check_checkpoint(data, spec, selection, root)
+        require(data.get("protocol", {}).get("protocol_schema") == "selfless_text_benchmark_v3",
+                f"obsolete text scoring protocol: {path}")
+        if data.get("complete") is True:
+            require(set(data["primary_metrics"]) == set(TEXT_TASKS), f"incomplete eight-task text result: {path}")
+            for key in TEXT_TASKS:
+                put(key, data["primary_metrics"][key], path)
+            put("text_macro", data["macro_average_primary"], path)
+            done = True
+    component("text", path, done)
+
+    path = native / "imagenet-classification/summary.json"
+    done = False
+    if path.exists():
+        data = read(path)
+        check_checkpoint(data, spec, selection, root)
+        require(data.get("schema") == "selfless_imagenet1k_zeroshot_classification_summary_v2" and
+                data.get("project_formal_protocol") is True, f"obsolete classification protocol: {path}")
+        if data.get("complete_formal_target") is True and data.get("records") == 50000:
+            put("top1", data["top_1_accuracy"], path)
+            put("top5", data["top_5_accuracy"], path)
+            done = True
+    component("classification", path, done)
+
+    bench_root = native / "retained-benchmarks"
+    manifest_path = bench_root / "manifest.json"
+    manifest = read(manifest_path) if manifest_path.exists() else None
+    if manifest:
+        check_checkpoint(manifest, spec, selection, root)
+        require(manifest.get("schema") == "selfless_multimodal_likelihood_evaluation_v5" and
+                manifest.get("project_formal_protocol") is True, f"obsolete benchmark protocol: {manifest_path}")
+        expected_mc = 1 if spec["image_order"] == "sequential" else 64
+        require(manifest.get("mc_samples") == expected_mc, f"wrong image-order MC count: {manifest_path}")
+    for task, count in BENCHMARKS.items():
+        path = bench_root / "summaries" / f"{task}.json"
+        done = False
+        if path.exists():
+            require(manifest is not None, f"benchmark has no source manifest: {path}")
+            data = read(path)
+            metrics = data["metrics"]
+            require(data.get("task") == task and data.get("mc_samples") == expected_mc,
+                    f"benchmark task or sampling mismatch: {path}")
+            if metrics.get("records") == count:
+                key = "circular_accuracy_language_prior_debiased" if task == "mmbench_dev_en" else (
+                    "accuracy_language_prior_debiased" if task == "seed_bench_image" else "language_prior_debiased_pairwise.win_rate")
+                require(metrics.get("primary_metric") == key, f"wrong benchmark primary metric: {path}")
+                value = metrics
+                for part in key.split("."):
+                    value = value[part]
+                put(task, value, path)
+                done = True
+        component(task, path, done)
+
+    for dataset, folder, image_count, caption_count in (("coco", "mscoco-5k", 5000, 25010), ("flickr", "flickr30k-1k", 1000, 5000)):
+        path = native / "standard-retrieval" / folder / "summary.json"
+        done = False
+        if path.exists():
+            data = read(path)
+            check_checkpoint(data, spec, selection, root)
+            require(data.get("schema") == "selfless_cross_dataset_retrieval_summary_v3" and
+                    data.get("project_formal_protocol") is True, f"obsolete retrieval protocol: {path}")
+            if data.get("complete_formal_target") is True and data.get("images") == image_count and data.get("captions") == caption_count:
+                for direction, field in (("i2t", "image_to_text"), ("t2i", "text_to_image")):
+                    for k in (1, 5, 10):
+                        put(f"{dataset}_{direction}_r{k}", data[field][f"recall_at_{k}"], path)
+                done = True
+        component(dataset, path, done)
+
+    path = core / "validation" / f"validation_metrics_step_{spec['source']['global_step']}.json"
+    if path.exists():
+        data = read(path)
+        for key, field in (("t2i_loss", "val/loss_t2i"), ("i2t_loss", "val/loss_i2t"), ("i2t_ppl", "val/ppl_text")):
+            if field in data.get("metrics", {}):
+                put(key, data["metrics"][field], path)
+    completed = sum(c["complete"] for c in result["components"].values())
+    result["complete"] = completed == len(result["components"])
+    result["status"] = f"{completed}/{len(result['components'])} 组已完成"
+    return result
+
+
+def gallery_data(root: Path, selection: dict):
+    gallery = within(root, selection["qualitative"])
+    manifest, summary = read(gallery / "manifest.json"), read(gallery / "summary.json")
+    require(summary.get("complete") is True, "qualitative gallery is incomplete")
+    prefix = str(gallery.relative_to(root))
+
+    def image_path(name):
+        path = within(gallery, name)
+        require(path.is_file(), f"missing gallery image: {path}")
+        return str(path.relative_to(root))
+
+    samples = json.loads(json.dumps(manifest["samples"]))
+    for rows in samples.values():
+        for row in rows:
+            for field in ("input_image", "original_image", "reference_image"):
+                if row.get(field):
+                    row[field] = image_path(row[field])
+    records, seen, counts = [], set(), Counter()
+    with (gallery / "results.jsonl").open() as handle:
+        for line in handle:
+            row = json.loads(line)
+            mode = row.get("seed") if row["task"] == "t2i" else row.get("decoding") if row["task"] == "text" else None
+            key = (row["model"], row["task"], row["sample_id"], mode)
+            require(key not in seen, f"duplicate qualitative result: {key}")
+            seen.add(key)
+            counts[row["model"], row["task"]] += 1
+            record = {k: row[k] for k in ("model", "task", "sample_id", "seed", "decoding", "text", "generated_tokens", "stop_reason") if k in row}
+            if row.get("image"):
+                record["image"] = image_path(row["image"])
+            records.append(record)
+    expected_keys = {(m["id"], task, row["id"], mode) for m in manifest["models"] for task, rows in manifest["samples"].items()
+                     for row in rows for mode in ((42, 43) if task == "t2i" else ("greedy", "sample") if task == "text" else (None,))}
+    require(seen == expected_keys, "qualitative sample identities/coverage mismatch")
+    for model in manifest["models"]:
+        for task, expected in manifest["expected_per_model"].items():
+            require(counts[model["id"], task] == expected, f"qualitative count mismatch: {model['id']}/{task}")
+    return {"manifest": manifest, "samples": samples, "records": records, "root": prefix,
+            "images_verified": sum(r["task"] == "t2i" for r in records)}
+
+
+def build(root: Path, selection_file: Path):
+    root = root.resolve()
+    selection = read(selection_file)
+    require(selection.get("schema") == "unified_evaluation_report_selection_v1", "unknown report selection schema")
+    gallery = gallery_data(root, selection)
+    models = []
+    known = {m["id"] for m in gallery["manifest"]["models"]}
+    require(set(selection["models"]) <= known, "selected metric model absent from qualitative inventory")
+    for spec in gallery["manifest"]["models"]:
+        models.append({**spec, **model_metrics(root, spec, selection["models"].get(spec["id"], {}))})
+    updated = datetime.now(UTC).isoformat(timespec="seconds")
+    artifacts = []
+    entries = [("完整定性长表与 ZIP", gallery["root"] + "/index.html"),
+               ("B_x0 FID 全量复核", "comparisons/bx0-fid-recheck-20260908/REPORT.md"),
+               ("B / D 同噪声复核图", "comparisons/bx0-fid-recheck-20260908/paired_generation.html"),
+               ("C / D / E 评测加载审计", "audits/audit-cde-evaluation-20260908-4AcX8p/REPORT.md"),
+               ("跨模型 Geometry V5", "research/cross-model-geometry-v5-20260907/RESULTS_ZH.md"),
+               ("目录迁移与完整性核验", "migrations/20260908-consolidation/journal.json")]
+    for label, path in entries:
+        if within(root, path).exists():
+            artifacts.append({"label": label, "path": path})
+    # The directory inventory includes every retained experiment, not only the
+    # current final-EMA selections used in the comparable metric table.
+    folders = [{"label": p.name, "path": p.name + "/"} for p in sorted(root.iterdir()) if p.is_dir() and not p.is_symlink()]
+    summary = {"schema": "unified_evaluation_report_v1", "updated_at": updated, "models": models,
+               "qualitative_root": gallery["root"], "qualitative_models": len(models),
+               "qualitative_records": len(gallery["records"]), "images_verified": gallery["images_verified"],
+               "formal_models": sum(bool(m["metrics"]) for m in models),
+               "formal_complete_models": sum(m["complete"] for m in models),
+               "artifacts": artifacts, "folders": folders, "runtime_hashing_enabled": False,
+               "selection": selection, "scope": "project-native suite; external official generation scorers have separate result availability"}
+    data = {**summary, "samples": gallery["samples"], "records": gallery["records"], "labels": LABELS}
+    template = (REPO / "scripts/assets/evaluation_report.html").read_text(encoding="utf-8")
+    # Generated text can contain HTML/script delimiters. It is data, never code.
+    embedded = json.dumps(data, ensure_ascii=False, separators=(",", ":")).replace("<", "\\u003c").replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
+    require(template.count("__REPORT_DATA__") == 1, "invalid report template")
+    write(root / "index.html", template.replace("__REPORT_DATA__", embedded))
+    write(root / "summary.json", json.dumps(summary, ensure_ascii=False, indent=2) + "\n")
+    write(root / "selection.json", json.dumps(selection, ensure_ascii=False, indent=2) + "\n")
+    print(json.dumps({k: summary[k] for k in ("updated_at", "qualitative_models", "qualitative_records", "images_verified", "formal_models", "formal_complete_models")}, ensure_ascii=False))
+    return summary
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", type=Path, default=REPO / "output/evaluation")
+    parser.add_argument("--selection", type=Path, default=REPO / "configs/protocols/evaluation_report.json")
+    args = parser.parse_args()
+    build(args.root, args.selection)

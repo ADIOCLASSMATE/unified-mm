@@ -380,12 +380,67 @@ def configure_model_source(config, source: EvaluationModelSource) -> None:
     )
 
 
+def _validate_dynamic_xt_hf_time_embeddings(
+    model, source: EvaluationModelSource
+) -> dict[str, Any] | None:
+    """Fail closed if HF post-load initialization changed D's learned state.
+
+    Compare values directly after the requested model-dtype cast; no hashing,
+    parameter mutation, or second state-dict overlay is involved.
+    """
+    saved_config = _read_json(source.path / "config.json")
+    if saved_config.get("architecture_variant") != "dynamic_xt":
+        return None
+    if getattr(getattr(model, "config", None), "architecture_variant", None) != "dynamic_xt":
+        raise RuntimeError("Dynamic-XT HF export loaded into a different architecture")
+
+    import torch
+    from safetensors import safe_open
+
+    names = [
+        f"model.backbone_flow_time_embedder.mlp.{layer}.{kind}"
+        for layer in (0, 2)
+        for kind in ("weight", "bias")
+    ]
+    with safe_open(
+        str(source.path / "model.safetensors"), framework="pt", device="cpu"
+    ) as handle:
+        stored_keys = set(handle.keys())
+        for name in names:
+            if name not in stored_keys:
+                raise RuntimeError(f"Dynamic-XT HF export lacks required parameter: {name}")
+            try:
+                parameter = model.get_parameter(name)
+            except (AttributeError, KeyError) as exc:
+                raise RuntimeError(f"loaded Dynamic-XT model lacks parameter: {name}") from exc
+            if parameter.is_meta:
+                raise RuntimeError(f"Dynamic-XT parameter is still on meta device: {name}")
+            actual = parameter.detach().cpu()
+            expected = handle.get_tensor(name).to(dtype=actual.dtype)
+            if not torch.isfinite(expected).all() or not torch.equal(actual, expected):
+                raise RuntimeError(
+                    "Dynamic-XT post-load weight mismatch: "
+                    f"{name}; refusing evaluation with altered time embeddings"
+                )
+    return {
+        "schema": "dynamic_xt_hf_time_embedding_values_v1",
+        "complete": True,
+        "comparison": "exact_after_model_dtype_cast",
+        "checked_parameters": names,
+        "runtime_hashing_enabled": False,
+    }
+
+
 def load_model_source_weights(model, source: EvaluationModelSource) -> dict[str, Any]:
     if source.is_hf_final_ema:
         # ``configure_model_source`` made load_model_tokenizer call
         # ``from_pretrained(source.path)``.  Loading a second state here would
         # defeat the final-export contract and can mishandle tied aliases.
-        return source.report()
+        report = source.report()
+        validation = _validate_dynamic_xt_hf_time_embeddings(model, source)
+        if validation is not None:
+            report["post_load_validation"] = validation
+        return report
 
     from utils.sharded_ema import load_sharded_ema_checkpoint
 

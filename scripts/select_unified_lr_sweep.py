@@ -8,13 +8,15 @@ import copy
 import json
 import math
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
 from omegaconf import OmegaConf
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+from utils.evaluation_paths import training_validation_file
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -177,7 +179,7 @@ def _read_arm(
     _validate_rank_files(checkpoint, world_size)
 
     metrics_payload = _read_json(
-        run_root / f"validation_metrics_step_{stop_step}.json"
+        training_validation_file(run_root, f"validation_metrics_step_{stop_step}.json")
     )
     if metrics_payload.get("schema") != "selfless_flow_validation_metrics_v1":
         raise ValueError(f"{run_root}: invalid validation metrics schema")

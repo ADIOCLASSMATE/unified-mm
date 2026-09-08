@@ -1,0 +1,35 @@
+# 文档索引
+
+日常查看结果使用 [统一评测总览](../output/evaluation/index.html)。
+
+## 当前训练与评测
+
+- [100B 消融合同](../configs/protocols/unified_ablation_100b_ascend64.yaml)
+- [评测结构与统一输出目录](EVALUATION_STRUCTURE.md)
+- [训练中下游验证](TRAINING_DOWNSTREAM_VALIDATION.md)
+- [原生图像理解评测](PRETRAINING_NATIVE_EVALUATION.md)
+- [评测协议审计](EVALUATION_PROTOCOL_AUDIT.md)
+- [GenEval / DPG-Bench / MJHQ 官方评测](OFFICIAL_T2I_BENCHMARKS.md)
+- [理解 benchmark 选择依据](IMAGE_UNDERSTANDING_BENCHMARK_SELECTION.md)
+
+## 表征研究
+
+- V5：[结果](CROSS_MODEL_GEOMETRY_V5_RESULTS_20260907.md)、[方法](CROSS_MODEL_GEOMETRY_V5_METHODS_20260907.md)、[协议](CROSS_MODEL_GEOMETRY_PROTOCOL_V5.md)、[复现](CROSS_MODEL_GEOMETRY_V5_REPRODUCE.md)、[完成审计](CROSS_MODEL_GEOMETRY_V5_COMPLETION_AUDIT_20260907.md)
+- V4：[结果](B_GEOMETRY_V4_RESULTS_20260907.md)、[协议](B_GEOMETRY_PROTOCOL_V4.md)
+- V3：[结果](B_GEOMETRY_V3_RESULTS_20260907.md)、[协议](B_GEOMETRY_PROTOCOL_V3.md)
+- V2：[结果](B_SEMANTIC_EMERGENCE_V2_RESULTS_20260907.md)、[协议](B_SEMANTIC_EMERGENCE_PROTOCOL_V2.md)
+- [最初的输入 embedding 与表征诊断](B_REPRESENTATION_PROBE_20260907.md)
+
+这些版本回答不同问题；V5 仍使用部分 V2–V4 的公共实现。较旧版本不是可直接删除的重复文件。
+
+## 历史实验与修正依据
+
+- [早期 ImageNet 架构消融](ABLATION_CONCLUSIONS.md)
+- [ImageNet-100 超参数](IMAGENET100_HYPERPARAMETER_CONCLUSION.md)
+- [ImageNet-1K 800-epoch 合同](IMAGENET1K_800EP_PRETRAINING.md)
+- [Caption 联合训练结论](IMAGENET1K_CAPTION_JOINT_CONCLUSION.md)
+- [早期平台与 ImageNet 执行记录](archive/IMAGENET_EXECUTION_NOTES.md)
+- [B X0-content 验证缓存审计](B_X0CONTENT_VALIDATION_CACHE_AUDIT_20260905.md)
+- [文本 P1 修正](TEXT_P1_CORRECTION_20260905.md)
+
+历史分数保留其当时的采样配置和协议标签；当前默认值以仓库 README 与正式评测协议为准。
