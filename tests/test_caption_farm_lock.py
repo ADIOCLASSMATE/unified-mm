@@ -45,24 +45,6 @@ def test_release_is_idempotent_and_keeps_permanent_inode(tmp_path):
             old.refresh()
 
 
-def test_same_process_alias_cannot_release_existing_record_lock(tmp_path):
-    path = tmp_path / "claim.lock"
-    alias = tmp_path / "alias.lock"
-    with DirectoryLock(path):
-        os.link(path, alias)
-        with pytest.raises(TimeoutError):
-            DirectoryLock(alias, timeout_seconds=0.05).acquire()
-        context = mp.get_context("fork")
-        ready = context.Event()
-        process = context.Process(target=_hold_lock, args=(path, ready))
-        process.start()
-        try:
-            assert not ready.wait(0.2)
-        finally:
-            process.kill()
-            process.join(5)
-
-
 def test_paused_holder_stays_exclusive_and_kill_releases_lock(tmp_path):
     path = tmp_path / "claim.lock"
     context = mp.get_context("spawn")

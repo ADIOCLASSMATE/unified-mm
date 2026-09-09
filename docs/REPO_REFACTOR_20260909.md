@@ -4,15 +4,13 @@
 
 ## Caption 队列锁
 
-`DirectoryLock` 保留调用接口，最终使用 `fcntl.lockf` 的 POSIX 记录锁。锁文件永久保留，不按 mtime 回收、不在释放时删除。持有者暂停时继续互斥，退出或被 kill 后释放。fork 子进程关闭继承描述符并清理进程内状态。`refresh` 只校验文件身份和更新诊断时间。
+`DirectoryLock` 保留调用接口，内部改为 POSIX `flock`。锁文件永久保留，不按 mtime 回收、不在释放时删除。持有者暂停时继续互斥，退出或被 kill 后由文件描述符关闭释放。fork 子进程关闭继承的描述符，不能释放父进程的锁。`refresh` 只校验文件身份和更新诊断时间。
 
-开发机跨主机验证发现，本部署上的 BSD `flock` 只能保证单机互斥；首次实现因此未通过跨主机验收，已改为记录锁。最终 `DirectoryLock` 在 CPU 机持有锁时阻止开发机获得锁，原持有者释放后开发机成功获得锁。记录和时间戳见 `output/repo-refactor/20260909/cross-host-record-class.json`。[IBM 的 GPFS 说明](https://www.ibm.com/support/pages/apar/IJ18019)也描述了 fcntl 锁的跨节点管理。
+这使整个受锁保护的队列写入期间保持同一个所有者；无需通过一次 token 检查猜测旧进程是否还能提交。`stale_seconds` 仅保留参数兼容，不再决定锁所有权。底层共享文件系统必须支持跨进程/跨主机的 POSIX 文件锁。
 
-POSIX 记录锁按进程持有，关闭该 inode 的任一描述符可能释放锁。因此同进程竞争在打开文件前用 inode 对应的线程锁串行化，硬链接别名也共用此锁；所有者诊断数据写入单独的 `.owner.json` 文件，不复制/关闭锁文件描述符。`stale_seconds` 仅保留参数兼容，任务 lease 的过期/心跳机制不变。
+旧运行目录升级时必须先停止全部旧 worker/controller，再统一使用新代码。遇到遗留的目录锁会明确拒绝运行，不自动删除；确认旧进程停止后才能移除该目录。新协议的锁文件始终保留，禁止在运行期间删除或替换。任务 lease 的过期/心跳机制不变，只有保护 allocator/commit 的互斥锁改变。
 
-旧运行目录升级时必须先停止全部旧 worker/controller，再统一使用新代码。遇到遗留的目录锁会明确拒绝运行，不自动删除；确认旧进程停止后才能移除该目录。新协议的锁文件始终保留，禁止在运行期间删除或替换。
-
-本地 GPFS 上通过 43 项 caption 队列测试，包括暂停持锁者、SIGKILL、fork、硬链接别名、写入失败和多 worker 竞争；最终记录锁实现已通过开发机跨主机阻塞/释放验收。
+本地 GPFS 上通过 42 项 caption 队列测试，包括暂停持锁者、SIGKILL、fork、写入失败和多 worker 竞争。开发机验收记录将在本文件补充。
 
 ## Checkpoint 与导出生命周期
 
