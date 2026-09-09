@@ -133,11 +133,12 @@ os.register_at_fork(after_in_child=_close_inherited_locks)
 
 
 class DirectoryLock(AbstractContextManager["DirectoryLock"]):
-    """Process-owned POSIX flock on a permanent file (legacy API name).
+    """Single-host process-owned flock on a permanent file (legacy API name).
 
     Never unlink/replace the lock file or revoke a live holder by elapsed time.
     The kernel releases ownership on close/exit; a paused holder stays owner.
-    All processes accessing a queue must use this protocol. A leftover legacy
+    Data synthesis is single-host. All local queue processes use this protocol.
+    A leftover legacy
     mkdir lock requires an offline migration after every old worker is stopped.
     """
 
