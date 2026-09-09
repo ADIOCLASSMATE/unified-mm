@@ -3,6 +3,7 @@ set -euo pipefail
 REFACTOR_SOURCE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 REFACTOR_REPORT_ROOT="${1:?provide the shared report directory}"
 REFACTOR_STAGE="${2:-all}"
+REFACTOR_LABEL="${3:-refactor-r1}"
 mkdir -p "${REFACTOR_REPORT_ROOT}"
 finish_refactor() {
   refactor_exit_code=$?
@@ -39,11 +40,17 @@ if [[ "${REFACTOR_STAGE}" == infra ]]; then
 elif [[ "${REFACTOR_STAGE}" == all ]]; then
   TORCH_DEVICE_BACKEND_AUTOLOAD=0 .venv/bin/python -m pytest -q tests --tb=short -rs \
     > "${REFACTOR_REPORT_ROOT}/pytest.log" 2>&1
+  .venv/bin/python -m torch.distributed.run --standalone --nproc_per_node=16 \
+    tests/distributed_checkpoint_smoke.py --backend hccl --output "${REFACTOR_REPORT_ROOT}/hccl.json" \
+    > "${REFACTOR_REPORT_ROOT}/hccl.log" 2>&1
   .venv/bin/python scripts/smoke_flow_shared_content_npu.py \
     --output "${REFACTOR_REPORT_ROOT}/npu-parity.json" > "${REFACTOR_REPORT_ROOT}/npu-parity.log" 2>&1
+  git show 1ad1670:models/modeling_model/modeling_selfless_generation.py \
+    > "${REFACTOR_REPORT_ROOT}/generation-before-refactor.py"
   for refactor_depth in 30 16; do
     .venv/bin/python scripts/smoke_training_validation_lifecycle.py --depth "${refactor_depth}" \
-      --label refactor-r1 --output-dir "${REFACTOR_REPORT_ROOT}/depth${refactor_depth}" \
+      --label "${REFACTOR_LABEL}" --output-dir "${REFACTOR_REPORT_ROOT}/depth${refactor_depth}" \
+      --reference-generation-file "${REFACTOR_REPORT_ROOT}/generation-before-refactor.py" \
       > "${REFACTOR_REPORT_ROOT}/depth${refactor_depth}-lifecycle.log" 2>&1
   done
 else

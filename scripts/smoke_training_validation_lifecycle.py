@@ -37,6 +37,7 @@ def main():
     parser.add_argument('--depth', type=int, choices=(16, 30), required=True)
     parser.add_argument('--label', default='validation-r2')
     parser.add_argument('--output-dir', type=Path, required=True)
+    parser.add_argument('--reference-generation-file', type=Path)
     args = parser.parse_args()
     os.chdir(ROOT)
     report = args.output_dir.resolve()
@@ -98,9 +99,13 @@ def main():
     assert math.isfinite(resumed['last_logged_loss'])
     _validate_checkpoint_complete(run / 'checkpoint-6', expected_global_step=6)
     for kind, checkpoint in (('current', 'hf_model-final'), ('ema', 'hf_model-final-ema')):
+        reference_args = (
+            ['--reference-generation-file', str(args.reference_generation_file)]
+            if kind == 'ema' and args.reference_generation_file is not None else []
+        )
         checked_run([sys.executable, 'scripts/smoke_unified_flow_head_generation.py', '--depth', str(args.depth),
                      '--checkpoint', str(run / checkpoint), '--weights', kind,
-                     '--output-dir', str(report / f'{kind}-reload')], report / f'{kind}-reload.log')
+                     '--output-dir', str(report / f'{kind}-reload'), *reference_args], report / f'{kind}-reload.log')
         assert read(report / f'{kind}-reload/report.json')['passed']
     result = {'schema':'training_validation_lifecycle_smoke_v1', 'passed':True, 'depth':args.depth,
               'source':str(ROOT), 'run':str(run), 'world_size':16,

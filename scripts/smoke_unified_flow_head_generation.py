@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 from pathlib import Path
 import sys
@@ -31,6 +32,7 @@ def main():
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--weights", choices=("ema", "current"), default="ema")
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--reference-generation-file", type=Path)
     args = parser.parse_args()
     assert torch.npu.is_available() and torch.npu.device_count() == 16
     torch.npu.set_device(0)
@@ -67,8 +69,8 @@ def main():
     batch = collate_imagenet_flow_cache([item], pad_to_length=512)
     torch.npu.reset_peak_memory_stats(device)
     started = time.monotonic()
-    latents, trace = model.generate(
-        "t2i", input_ids=batch["input_ids"].to(device),
+    generation_kwargs = dict(
+        input_ids=batch["input_ids"].to(device),
         token_types=batch["token_types"].to(device), sigma=batch["sigma"].to(device),
         spans=[(0, item["image_start"], item["image_start"] + 256)],
         image_latent_dim=16, initial_noise_bank=noise_for(0, 42).unsqueeze(0),
@@ -76,11 +78,26 @@ def main():
         flow_solver="heun", flow_num_steps=10, parallel_rate=1,
         order_strategy="spatial_halton", use_cache=True, return_trace=True,
     )
+    latents, trace = model.generate("t2i", **generation_kwargs)
     torch.npu.synchronize()
     elapsed = time.monotonic() - started
     assert tuple(latents.shape) == (1, 16, 16, 16)
     assert bool(torch.isfinite(latents).all().item())
     assert trace.get("backbone_kv_cache_enabled") is True
+    reference_report = None
+    if args.reference_generation_file is not None:
+        spec = importlib.util.spec_from_file_location(
+            "models.modeling_model._refactor_generation_reference", args.reference_generation_file,
+        )
+        reference = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(reference)
+        reference_latents, reference_trace = reference.SelflessGenerationMixin.generate_image(
+            model, **generation_kwargs,
+        )
+        torch.testing.assert_close(latents, reference_latents, rtol=0, atol=0)
+        torch.testing.assert_close(trace["generation_order"], reference_trace["generation_order"], rtol=0, atol=0)
+        reference_report = {"file": str(args.reference_generation_file), "latents_bitwise_equal": True,
+                            "generation_order_equal": True, "same_model_weights_and_noise": True}
     args.output_dir.mkdir(parents=True, exist_ok=True)
     torch.save(latents.cpu(), args.output_dir / "latents.pt")
     config.experiment.validation_vae_module_root = "public/code/mar"
@@ -98,6 +115,7 @@ def main():
               "cfg": 3.5, "order": "spatial_halton", "latent_shape": list(latents.shape),
               "latent_rms": float(latents.float().square().mean().sqrt().item()),
               "backbone_kv_cache_enabled": True, "generation_seconds": elapsed,
+              "generation_refactor_parity": reference_report,
               "peak_allocated_bytes": torch.npu.max_memory_allocated(device),
               "peak_reserved_bytes": torch.npu.max_memory_reserved(device)}
     (args.output_dir / "report.json").write_text(json.dumps(report, indent=2) + "\n")
