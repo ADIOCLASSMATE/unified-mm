@@ -4,6 +4,12 @@ REFACTOR_SOURCE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 REFACTOR_REPORT_ROOT="${1:?provide the shared report directory}"
 REFACTOR_STAGE="${2:-all}"
 REFACTOR_LABEL="${3:-refactor-r1}"
+REFACTOR_DEPTH_SELECTION="${4:-30}"
+case "${REFACTOR_DEPTH_SELECTION}" in
+  16|30) REFACTOR_DEPTHS=("${REFACTOR_DEPTH_SELECTION}") ;;
+  both) REFACTOR_DEPTHS=(30 16) ;;
+  *) printf 'unknown depth selection: %s\n' "${REFACTOR_DEPTH_SELECTION}" >&2; exit 2 ;;
+esac
 mkdir -p "${REFACTOR_REPORT_ROOT}"
 finish_refactor() {
   refactor_exit_code=$?
@@ -47,7 +53,7 @@ elif [[ "${REFACTOR_STAGE}" == all ]]; then
     --output "${REFACTOR_REPORT_ROOT}/npu-parity.json" > "${REFACTOR_REPORT_ROOT}/npu-parity.log" 2>&1
   git show 1ad1670:models/modeling_model/modeling_selfless_generation.py \
     > "${REFACTOR_REPORT_ROOT}/generation-before-refactor.py"
-  for refactor_depth in 30 16; do
+  for refactor_depth in "${REFACTOR_DEPTHS[@]}"; do
     .venv/bin/python scripts/smoke_training_validation_lifecycle.py --depth "${refactor_depth}" \
       --label "${REFACTOR_LABEL}" --output-dir "${REFACTOR_REPORT_ROOT}/depth${refactor_depth}" \
       --reference-generation-file "${REFACTOR_REPORT_ROOT}/generation-before-refactor.py" \

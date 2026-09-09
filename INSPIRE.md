@@ -115,6 +115,11 @@ only as provenance for earlier experiments.
 - The permanent development Notebook currently uses image
   `dev-wjx-ascend:v-1.4` and belongs to `公共科研项目`. This Notebook-specific
   placement does not change the training Job project/image contracts above.
+- Notebook access must reach both `qz.sii.edu.cn` and
+  `notebook-inspire-sj.sii.edu.cn` directly. If an Agent shell exports a local
+  proxy, clear it for the Inspire process and its browser/tunnel children:
+  `env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy inspire ...`.
+  This is scoped to the command and does not change global proxy settings.
 - Base image:
   `docker-t.sii.shaipower.online/inspire-studio/dev-wjx-ascend:v-1.3`
   (platform image name `dev-wjx-ascend:v-1.3`).
