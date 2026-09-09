@@ -11,3 +11,13 @@
 旧运行目录升级时必须先停止全部旧 worker/controller，再统一使用新代码。遇到遗留的目录锁会明确拒绝运行，不自动删除；确认旧进程停止后才能移除该目录。新协议的锁文件始终保留，禁止在运行期间删除或替换。任务 lease 的过期/心跳机制不变，只有保护 allocator/commit 的互斥锁改变。
 
 本地 GPFS 上通过 42 项 caption 队列测试，包括暂停持锁者、SIGKILL、fork、写入失败和多 worker 竞争。开发机验收记录将在本文件补充。
+
+## Checkpoint 与导出生命周期
+
+保存/恢复、EMA 和 HF 导出的 24 个函数迁到 `utils/training_checkpoint.py`，训练入口保留兼容导出。`checkpoint_transaction.py` 管理目录发布，`distributed_io.py` 在进入下一阶段前向所有 rank 传播局部文件错误。
+
+续训状态先写入 `.checkpoint-<step>.partial`，各 rank 的 Accelerate、RNG、数据游标、EMA 写入结束后检查文件清单，再写 v2 完成标记并发布为正式目录，最后才执行保留策略。同一步已有 checkpoint 时明确拒绝覆盖，原目录保持不变；不同训练轨迹应使用新输出目录。恢复 v2 时检查文件存在性和长度，缺失或截断直接报错；v1 历史格式保留原有检查。不新增大权重 hashing。
+
+raw final 和 EMA final 共用目录发布基础实现；替换失败会恢复上一份完整导出。原先缺少 metadata 的 raw final 可在保留备份的前提下升级。
+
+开发机已通过 123 项 infra 测试及 16-rank HCCL 故障传播：末 rank 写入失败、主 rank 写入失败均被全部 rank 观察到，之后进程组仍可完成下一次调用。后续新增 raw final 发布/回滚和模块迁移的 60 项定向回归通过。DeepSpeed 内部集合通信中的进程退出仍由后端超时与 torchrun 处理；局部文件阶段的错误传播不能替代进程组故障处理。

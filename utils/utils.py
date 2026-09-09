@@ -11,6 +11,7 @@ from typing import Any, List, Tuple
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 from transformers import AutoConfig, AutoTokenizer
 from utils.flow_head_contract import validate_flow_head_attention_contract
+from utils.distributed_io import run_io_phase
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
@@ -493,15 +494,15 @@ def prune_training_checkpoints(config, global_step) -> list[Path]:
     )
 
 
-def save_checkpoint(model, config, accelerator, global_step, *, defer_retention=False):
+def save_checkpoint(model, config, accelerator, global_step, *, defer_retention=False, directory=None):
     """Save Accelerate state; full training saves defer pruning until EMA/data commit."""
     output_dir = config.experiment.output_dir
-    save_path = Path(output_dir) / f"checkpoint-{global_step}"
+    save_path = Path(directory) if directory is not None else Path(output_dir) / f"checkpoint-{global_step}"
 
     # 这一步保存了：Model, Optimizer, LR Scheduler, Random States
-    accelerator.save_state(save_path)
+    run_io_phase(accelerator, lambda: accelerator.save_state(save_path), description="Accelerate state save")
 
-    if accelerator.is_main_process:
+    def write_metadata():
         meta_file = save_path / "metadata.json"
         metadata = {
             "global_step": global_step,
@@ -509,29 +510,22 @@ def save_checkpoint(model, config, accelerator, global_step, *, defer_retention=
         }
         with open(meta_file, "w+") as f:
             json.dump(metadata, f, indent=4)
-    accelerator.wait_for_everyone()
+    run_io_phase(accelerator, write_metadata, description="Accelerate metadata save", main_process_only=True)
     if not defer_retention:
-        if accelerator.is_main_process:
-            prune_training_checkpoints(config, global_step)
-        accelerator.wait_for_everyone()
+        run_io_phase(accelerator, lambda: prune_training_checkpoints(config, global_step),
+                     description="checkpoint retention", main_process_only=True)
 
 
-def save_hf_model(model, tokenizer, config, accelerator, global_step):
-    output_dir = config.experiment.output_dir
-    save_path = Path(output_dir) / f"hf_model-{global_step}"
+def save_hf_model(model, tokenizer, config, accelerator, global_step, *, source_global_step=None):
+    # Local import keeps model construction independent of the export lifecycle.
+    from utils.training_checkpoint import _save_model_hf_for_evaluation
 
-    # 取出模型权重
-    state_dict = accelerator.get_state_dict(model)
-    if accelerator.is_main_process:
-        unwrapped_model = accelerator.unwrap_model(model)
-        unwrapped_model.save_pretrained(
-            save_path,
-            save_function=accelerator.save,
-            state_dict=state_dict,
-            safe_serialization=True
-        )
-        tokenizer.save_pretrained(save_path)
-    accelerator.wait_for_everyone()
+    step = int(source_global_step if source_global_step is not None else global_step)
+    _save_model_hf_for_evaluation(
+        model, tokenizer, config, accelerator, step,
+        save_name=f"hf_model-{global_step}", export_kind="training",
+        floating_dtype=torch.float32, refresh=global_step == "final",
+    )
 
 
 ##################################################

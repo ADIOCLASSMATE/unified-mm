@@ -225,12 +225,14 @@ def test_manifest_tampering_is_detected(tmp_path):
         load_ema_manifest(tmp_path)
 
 
-def test_training_checkpoint_commit_marker_is_strict_and_invalidated(tmp_path):
+def test_training_checkpoint_commit_marker_is_strict_and_preserved(tmp_path):
     from pretrain.train_selfless_flow import (
         _begin_checkpoint_write,
         _validate_checkpoint_complete,
     )
 
+    tmp_path = tmp_path / "checkpoint-7"
+    tmp_path.mkdir()
     marker = tmp_path / "checkpoint_complete.json"
     marker.write_text(
         json.dumps(
@@ -244,10 +246,10 @@ def test_training_checkpoint_commit_marker_is_strict_and_invalidated(tmp_path):
     with pytest.raises(RuntimeError, match="Invalid caption checkpoint completion marker"):
         _validate_checkpoint_complete(tmp_path, expected_global_step=8)
 
-    _begin_checkpoint_write(tmp_path, accelerator=_Accelerator(rank=0))
-    assert not marker.exists()
-    with pytest.raises(RuntimeError, match="incomplete checkpoint"):
-        _validate_checkpoint_complete(tmp_path, expected_global_step=7)
+    with pytest.raises(FileExistsError, match="complete checkpoint already exists"):
+        _begin_checkpoint_write(tmp_path, accelerator=_Accelerator(rank=0))
+    assert marker.exists()
+    _validate_checkpoint_complete(tmp_path, expected_global_step=7)
 
 
 def test_ema_export_cast_preserves_tied_tensor_aliases():

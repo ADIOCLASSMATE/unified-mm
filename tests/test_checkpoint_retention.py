@@ -6,9 +6,56 @@ import torch
 from omegaconf import OmegaConf
 from safetensors.torch import save_file
 
-import pretrain.train_selfless_flow as training
-from pretrain.train_selfless_flow import _image_flow_adapter_save_enabled
+import utils.training_checkpoint as training
+from utils.training_checkpoint import _image_flow_adapter_save_enabled
 from utils.utils import checkpoint_save_due, rotate_checkpoints_for_save
+
+
+def test_raw_final_export_advances_after_resume_and_preserves_backup_on_failure(tmp_path, monkeypatch):
+    from safetensors.torch import load_file
+    from utils.utils import save_hf_model
+
+    value = torch.tensor([2.0], dtype=torch.bfloat16)
+
+    class Model:
+        def save_pretrained(self, path, *, state_dict, **kwargs):
+            path.mkdir(parents=True)
+            save_file(state_dict, str(path / "model.safetensors"))
+            (path / "config.json").write_text('{"dtype": "bfloat16"}')
+
+    class Tokenizer:
+        def save_pretrained(self, path):
+            (path / "tokenizer.json").write_text("{}")
+
+    class Accelerator:
+        is_main_process = True
+        def get_state_dict(self, model):
+            return {"weight": value.clone()}
+        def unwrap_model(self, model):
+            return model
+        def save(self, *args, **kwargs):
+            pass
+
+    config = OmegaConf.create({"experiment": {"output_dir": str(tmp_path)}})
+    args = (Model(), Tokenizer(), config, Accelerator(), "final")
+    save_hf_model(*args, source_global_step=5)
+    destination = tmp_path / "hf_model-final"
+    before = (destination / "model.safetensors").read_bytes()
+    assert load_file(str(destination / "model.safetensors"))["weight"].dtype == torch.float32
+    value.fill_(3)
+    original_replace = training.os.replace
+    with monkeypatch.context() as patch:
+        def fail(source, target):
+            if Path(source).name == ".hf_model-final.partial":
+                raise OSError("injected raw publication failure")
+            return original_replace(source, target)
+        patch.setattr(training.os, "replace", fail)
+        with pytest.raises(RuntimeError, match="injected raw"):
+            save_hf_model(*args, source_global_step=6)
+    assert (destination / "model.safetensors").read_bytes() == before
+    save_hf_model(*args, source_global_step=6)
+    assert load_file(str(destination / "model.safetensors"))["weight"].item() == 3
+    assert json.loads((destination / "model_export_metadata.json").read_text())["source_global_step"] == 6
 
 
 def _mkdirs(root: Path, *names: str) -> None:
@@ -151,6 +198,7 @@ def test_retention_waits_for_full_resumable_checkpoint_commit(tmp_path, monkeypa
                 raise OSError('injected accelerate write failure')
             directory.mkdir()
             (directory / 'state.bin').write_bytes(b'new state')
+            (directory / 'random_states_0.pkl').write_bytes(b'random state')
 
     class Loader:
         state_schema = 'test_data_state'
@@ -161,13 +209,13 @@ def test_retention_waits_for_full_resumable_checkpoint_commit(tmp_path, monkeypa
         def save_state(self, directory, accelerator, step):
             if failure == 'data':
                 raise OSError('injected data write failure')
-            (directory / 'data.pt').write_bytes(b'data cursor')
+            (directory / 'data_state_rank_00000.pt').write_bytes(b'data cursor')
 
-    def save_ema(*args):
+    def save_ema(*args, directory=None):
         assert previous.exists()
         if failure == 'ema':
             raise OSError('injected EMA write failure')
-        directory = tmp_path / 'checkpoint-20'
+        directory = Path(directory)
         (directory / 'ema.pt').write_bytes(b'EMA')
         return directory
 
@@ -195,7 +243,7 @@ def test_retention_waits_for_full_resumable_checkpoint_commit(tmp_path, monkeypa
         destination = save()
         assert not previous.exists()
         assert (destination / 'checkpoint_complete.json').is_file()
-        assert (destination / 'data.pt').is_file() and (destination / 'ema.pt').is_file()
+        assert (destination / 'data_state_rank_00000.pt').is_file() and (destination / 'ema.pt').is_file()
 
 
 def test_rotation_keeps_space_for_destination_not_created_yet(tmp_path: Path):
@@ -235,11 +283,11 @@ def test_four_rolling_saves_leave_exactly_the_latest_three(tmp_path: Path):
     ]
 
 
-def test_begin_checkpoint_write_removes_stale_partial_destination(tmp_path: Path):
+def test_begin_checkpoint_write_cleans_staging_without_touching_published_state(tmp_path: Path):
     checkpoint = tmp_path / "checkpoint-20"
-    checkpoint.mkdir()
-    (checkpoint / "stale-rank-state.pt").write_bytes(b"partial")
-    (checkpoint / "checkpoint_complete.json").write_text("stale")
+    staging = tmp_path / ".checkpoint-20.partial"
+    staging.mkdir()
+    (staging / "stale-rank-state.pt").write_bytes(b"partial")
 
     class Accelerator:
         is_main_process = True
@@ -248,12 +296,19 @@ def test_begin_checkpoint_write_removes_stale_partial_destination(tmp_path: Path
         def wait_for_everyone():
             return None
 
-    training._begin_checkpoint_write(
+    result = training._begin_checkpoint_write(
         checkpoint,
         accelerator=Accelerator(),
     )
 
     assert not checkpoint.exists()
+    assert not staging.exists()
+    assert result == staging
+    checkpoint.mkdir()
+    (checkpoint / "checkpoint_complete.json").write_text("published")
+    with pytest.raises(FileExistsError, match="complete checkpoint already exists"):
+        training._begin_checkpoint_write(checkpoint, accelerator=Accelerator())
+    assert (checkpoint / "checkpoint_complete.json").read_text() == "published"
 
 
 def test_rotation_rejects_nonpositive_limit(tmp_path: Path):

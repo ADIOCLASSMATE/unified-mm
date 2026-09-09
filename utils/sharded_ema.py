@@ -19,6 +19,8 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
+from utils.distributed_io import run_io_phase
+
 
 EMA_SCHEMA = "selfless_rank_sharded_fp32_ema_v1"
 DEFAULT_EMA_CHUNK_NUMEL = 4 * 1024 * 1024
@@ -429,29 +431,32 @@ class RankShardedEMA:
 
     def save_checkpoint(self, directory: str | Path, accelerator, *, global_step: int) -> Path:
         directory = Path(directory)
-        directory.mkdir(parents=True, exist_ok=True)
-        shard_path = directory / _shard_filename(self.rank)
-        temp_path = directory / f".{shard_path.name}.tmp-{os.getpid()}"
-        cpu_state = {
-            chunk_id: tensor.detach().to(device="cpu", non_blocking=False).contiguous()
-            for chunk_id, tensor in self.shards.items()
-        }
-        save_file(
-            cpu_state,
-            str(temp_path),
-            metadata={
-                "schema": EMA_SCHEMA,
-                "rank": str(self.rank),
-                "world_size": str(self.world_size),
-                "layout_validation": "readable_field_equality",
-            },
-        )
-        os.replace(temp_path, shard_path)
-        del cpu_state
-        accelerator.wait_for_everyone()
+
+        def write_shard():
+            directory.mkdir(parents=True, exist_ok=True)
+            shard_path = directory / _shard_filename(self.rank)
+            temp_path = directory / f".{shard_path.name}.tmp-{os.getpid()}"
+            cpu_state = {
+                chunk_id: tensor.detach().to(device="cpu", non_blocking=False).contiguous()
+                for chunk_id, tensor in self.shards.items()
+            }
+            save_file(
+                cpu_state,
+                str(temp_path),
+                metadata={
+                    "schema": EMA_SCHEMA,
+                    "rank": str(self.rank),
+                    "world_size": str(self.world_size),
+                    "layout_validation": "readable_field_equality",
+                },
+            )
+            os.replace(temp_path, shard_path)
+            del cpu_state
+
+        run_io_phase(accelerator, write_shard, description="EMA shard save")
 
         manifest_path = directory / "ema_manifest.json"
-        if accelerator.is_main_process:
+        def write_manifest():
             manifest = dict(self.layout)
             manifest["runtime"] = {
                 "global_step": int(global_step),
@@ -465,7 +470,7 @@ class RankShardedEMA:
                 encoding="utf-8",
             )
             os.replace(temp_manifest, manifest_path)
-        accelerator.wait_for_everyone()
+        run_io_phase(accelerator, write_manifest, description="EMA manifest save", main_process_only=True)
         return manifest_path
 
     def load_checkpoint(

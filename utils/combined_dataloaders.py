@@ -27,6 +27,7 @@ from omegaconf import OmegaConf
 from torch.utils.data import DataLoader, Dataset, Subset
 
 from utils.climbmix_online_dataset import ClimbMixOnlineBatchDataset
+from utils.distributed_io import run_io_phase
 from utils.imagenet_flow_dataloaders import (
     ScheduledPadCollator,
     _build_cache_dataset,
@@ -734,13 +735,15 @@ class ScheduledCombinedLoader:
 
     def save_state(self, checkpoint_dir: str | Path, accelerator, global_step: int):
         checkpoint_dir = Path(checkpoint_dir)
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        payload = self.state_dict(global_step=int(global_step))
-        path = checkpoint_dir / f"data_state_rank_{self._rank:05d}.pt"
-        temp_path = checkpoint_dir / f".{path.name}.tmp-{os.getpid()}"
-        torch.save(payload, temp_path)
-        os.replace(temp_path, path)
-        accelerator.wait_for_everyone()
+        def write_state():
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            payload = self.state_dict(global_step=int(global_step))
+            path = checkpoint_dir / f"data_state_rank_{self._rank:05d}.pt"
+            temp_path = checkpoint_dir / f".{path.name}.tmp-{os.getpid()}"
+            torch.save(payload, temp_path)
+            os.replace(temp_path, path)
+
+        run_io_phase(accelerator, write_state, description="mixed data state save")
 
     def load_state(self, checkpoint_dir: str | Path, accelerator, global_step: int):
         if self._text_iterator is not None or self._image_iterators:
