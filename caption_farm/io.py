@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import json
 import os
 import random
-import shutil
 import socket
 import time
 import uuid
+import weakref
 from contextlib import AbstractContextManager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -118,8 +119,27 @@ def atomic_link_json(path: Path, value: Any, temporary_root: Path) -> bool:
             pass
 
 
+_held_locks: weakref.WeakSet = weakref.WeakSet()
+
+
+def _close_inherited_locks() -> None:
+    # flock belongs to an open file description. A forked worker must neither
+    # keep its parent's lock alive nor unlock that shared description.
+    for lock in list(_held_locks):
+        lock._close()
+
+
+os.register_at_fork(after_in_child=_close_inherited_locks)
+
+
 class DirectoryLock(AbstractContextManager["DirectoryLock"]):
-    """Cross-process lock using the atomic POSIX mkdir primitive."""
+    """Process-owned POSIX flock on a permanent file (legacy API name).
+
+    Never unlink/replace the lock file or revoke a live holder by elapsed time.
+    The kernel releases ownership on close/exit; a paused holder stays owner.
+    All processes accessing a queue must use this protocol. A leftover legacy
+    mkdir lock requires an offline migration after every old worker is stopped.
+    """
 
     def __init__(
         self,
@@ -134,59 +154,78 @@ class DirectoryLock(AbstractContextManager["DirectoryLock"]):
         self.stale_seconds = stale_seconds
         self.poll_seconds = poll_seconds
         self.acquired = False
+        self._fd: int | None = None
+        self._pid: int | None = None
 
     def acquire(self) -> "DirectoryLock":
+        if self.acquired:
+            raise RuntimeError("cannot acquire an already held lock")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         deadline = time.monotonic() + self.timeout_seconds
-        while True:
-            try:
-                os.mkdir(self.path)
-                self.acquired = True
-                owner = {
-                    "pid": os.getpid(),
-                    "hostname": socket.gethostname(),
-                    "acquired_at": utc_now(),
-                    "acquired_unix": unix_now(),
-                }
-                atomic_write_json(self.path / "owner.json", owner)
-                return self
-            except FileExistsError:
-                self._break_stale_lock()
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(f"timed out acquiring shared lock {self.path}")
-                time.sleep(self.poll_seconds * random.uniform(0.8, 1.2))
-
-    def _break_stale_lock(self) -> None:
         try:
-            age = unix_now() - self.path.stat().st_mtime
-        except FileNotFoundError:
-            return
-        if age <= self.stale_seconds:
-            return
-        stale = self.path.parent / f"{self.path.name}.stale.{uuid.uuid4().hex}"
+            self._fd = os.open(
+                self.path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o644
+            )
+            _held_locks.add(self)
+        except IsADirectoryError as exc:
+            raise RuntimeError(
+                f"legacy directory lock at {self.path}; stop all old queue workers "
+                "and controllers before removing the directory and upgrading together"
+            ) from exc
         try:
-            os.rename(self.path, stale)
-        except (FileNotFoundError, FileExistsError, OSError):
-            return
-        shutil.rmtree(stale, ignore_errors=True)
+            while True:
+                try:
+                    fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(f"timed out acquiring shared lock {self.path}")
+                    time.sleep(self.poll_seconds * random.uniform(0.8, 1.2))
+            self.acquired = True
+            self._pid = os.getpid()
+            self.refresh()
+            owner = {
+                "protocol": "posix_flock_v1", "pid": self._pid,
+                "hostname": socket.gethostname(), "acquired_at": utc_now(),
+                "acquired_unix": unix_now(),
+            }
+            payload = (canonical_json(owner) + "\n").encode("utf-8")
+            os.ftruncate(self._fd, 0)
+            # Write via the locked descriptor; atomic replace would replace
+            # the inode carrying the lock and permit concurrent holders.
+            with os.fdopen(os.dup(self._fd), "wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            _held_locks.add(self)
+            return self
+        except BaseException:
+            self._close()
+            raise
 
     def refresh(self) -> None:
-        """Refresh a held lock while performing a bounded batch operation."""
-        if not self.acquired:
+        """Check ownership and update diagnostic mtime; this is not a lease."""
+        if not self.acquired or self._pid != os.getpid() or self._fd is None:
             raise RuntimeError("cannot refresh a lock that is not held")
         try:
-            os.utime(self.path, None)
+            visible = self.path.stat()
         except FileNotFoundError as exc:
             raise RuntimeError(f"held lock disappeared: {self.path}") from exc
+        held = os.fstat(self._fd)
+        if (visible.st_dev, visible.st_ino) != (held.st_dev, held.st_ino):
+            raise RuntimeError(f"held lock file was replaced: {self.path}")
+        os.utime(self._fd, None)
+
+    def _close(self) -> None:
+        if self._fd is not None:
+            os.close(self._fd)
+        self._fd = None
+        self._pid = None
+        self.acquired = False
+        _held_locks.discard(self)
 
     def release(self) -> None:
-        if not self.acquired:
-            return
-        try:
-            (self.path / "owner.json").unlink(missing_ok=True)
-            os.rmdir(self.path)
-        finally:
-            self.acquired = False
+        self._close()
 
     def __enter__(self) -> "DirectoryLock":
         return self.acquire()
