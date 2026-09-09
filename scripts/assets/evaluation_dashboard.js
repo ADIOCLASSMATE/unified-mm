@@ -1,5 +1,4 @@
 // Page-level navigation, fixed-protocol model metrics and the research abstract.
-const mainModelIds=new Set(['a_x0','b_x0','c_on_b','d_on_b','e_on_b','f_on_b']);
 const metricGroups={
  overview:['fid','is','top1','text_macro','mmlu','mmbench_dev_en'],
  generation:['fid','is'],
@@ -25,8 +24,11 @@ function metricLeader(models,key,protocol='cfg2'){
  return available[0]??null;
 }
 function metricLink(metric){return metric?`<a href="${esc(metric.source)}" title="查看原始结果">${fmt(metric)}</a>`:'<span class="missing">—</span>'}
+function inModelGroup(model,group){
+ return group==='all'||model.group===group||(group==='ablation'&&model.id==='b_x0');
+}
 function metricScope(scope){
- return D.models.filter(m=>scope==='all'||(scope==='main'?mainModelIds.has(m.id):Object.keys(m.metrics).length>0||modelMetric(m,'fid')));
+ return D.models.filter(m=>scope==='formal'?(Object.keys(m.metrics).length>0||modelMetric(m,'fid')):inModelGroup(m,scope));
 }
 
 function renderMetrics(){
@@ -39,7 +41,7 @@ function renderMetrics(){
  const best=Object.fromEntries(keys.map(k=>[k,metricLeader(models,k,protocol)?.metric.value]));
  $('metrics').innerHTML='<table><thead><tr><th class="model-name">模型 / 完成情况</th>'+keys.map(k=>`<th class="metric">${esc(D.labels[k])}${['fid','is'].includes(k)?`<span class="status">CFG ${protocol==='cfg2'?'2.0':'3.5'}</span>`:''}</th>`).join('')+'</tr></thead><tbody>'+models.map(m=>{
   const order=m.id==='e_on_b'?'Sequential':'Halton';
-  return `<tr data-model="${esc(m.id)}" class="${['b_x0','d_on_b'].includes(m.id)?'focus-row':''}"><td class="model-name">${esc(m.label)}<span class="status">${esc(m.status)}${includesGeneration&&modelMetric(m,'fid',protocol)?' · '+order:''}</span></td>`+keys.map(k=>{
+  return `<tr data-model="${esc(m.id)}" class="${mainModelIds.has(m.id)?'focus-row':''}"><td class="model-name">${esc(m.label)}<span class="status">${esc(m.status)}${includesGeneration&&modelMetric(m,'fid',protocol)?' · '+order:''}</span></td>`+keys.map(k=>{
    const metric=modelMetric(m,k,protocol);
    return `<td data-metric="${esc(k)}" class="metric ${metric&&metric.value===best[k]?'best':''}">${metricLink(metric)}</td>`;
   }).join('')+'</tr>';
@@ -64,21 +66,21 @@ function summaryCard(number,title,route,body,note,links='',wide=false){
 }
 
 function renderResearchOverview(){
- const models=metricScope('formal'),matrix=D.matrix_sweeps?.[0],sweep=D.sampling_sweeps?.[0],order=D.order_sweeps?.[0],training=D.training;
+ const models=metricScope('main'),matrix=D.matrix_sweeps?.[0],sweep=D.sampling_sweeps?.[0],order=D.order_sweeps?.[0],training=D.training;
  const fid=metricLeader(models,'fid'),text=metricLeader(models,'text_macro'),top1=metricLeader(models,'top1');
  const resultText=fid&&text&&top1?
   `固定 CFG=2.0、Heun=10 并保留各模型原生生成顺序后，${esc(fid.model.label)} 的 FID 最低（${fmt(fid.metric)}）；${esc(text.model.label)} 的文本八项均分最高（${fmt(text.metric)}），${esc(top1.model.label)} 的 ImageNet Top-1 最高（${fmt(top1.metric)}）。`:
   '已完成的结果按评测协议分别汇总，尚无有效分数的项目保留空白。';
  const samplingText=sweep?.conclusion&&order?.conclusion?
-  `B_x0 的采样扫描表明，最低 FID 与最高 IS 对应不同设置；固定 CFG=2.0、Heun=10 后，${esc(orderLabels[order.conclusion.best_fid.strategy])} 得到当前顺序实验中的最低 FID ${order.conclusion.best_fid.result.fid.toFixed(4)}。`:
+  `B 的采样扫描表明，最低 FID 与最高 IS 对应不同设置；固定 CFG=2.0、Heun=10 后，${esc(orderLabels[order.conclusion.best_fid.strategy])} 得到当前顺序实验中的最低 FID ${order.conclusion.best_fid.result.fid.toFixed(4)}。`:
   '采样参数与解码顺序实验单独汇总，避免将推理设置的收益混入模型结构排名。';
- $('research-abstract').innerHTML=`<div class="section-kicker">RESEARCH OVERVIEW / 研究摘要</div><h2>从总体结论，进入每一组实验。</h2><p>本报告围绕统一多模态模型的结构变体、训练动态与生成策略展开，已收录 ${training.run_count} 个训练实验、${D.formal_complete_models} 个完成正式评测的模型，以及 ${D.qualitative_records.toLocaleString()} 条定性输出。${resultText}</p><p>${samplingText}下方为各节总表与主要结论，点击入口查看完整分数、曲线、样例和数据协议。</p>`;
+ $('research-abstract').innerHTML=`<div class="section-kicker">RESEARCH OVERVIEW / 研究摘要</div><h2>正式 A / B · 当前主线</h2><p>A 与 B 均使用 XT-query / X0-content 条件；A 的 content attention 严格排除自身，B 包含自身对角线。首页、指标、曲线与样例默认比较这两个模型。${resultText}</p><p>${samplingText}</p><p class="note">C–F 是在正式 B 上的消融，可按组查看；旧版 A/B 与单任务对照另列历史。全库共 ${training.run_count} 个训练实验、${D.formal_complete_models} 个完成评测的模型、${D.qualitative_records.toLocaleString()} 条定性输出。</p>`;
 
  const modelRows=models.map(m=>[
   `<span>${esc(m.label)}</span>`,metricLink(modelMetric(m,'fid')),metricLink(modelMetric(m,'is')),
   metricLink(modelMetric(m,'text_macro')),metricLink(modelMetric(m,'top1'))
  ]);
- const modelNote=`<strong>模型之间存在任务取舍。</strong> ${resultText}本表 FID / IS 使用 CFG=2.0、Heun=10；E 保留 Sequential，其余为 Halton。完整消融页还提供文本八任务、图像理解、双向检索与历史 CFG=3.5 分数。`;
+ const modelNote=`<strong>当前比较范围：正式 A / B。</strong> ${resultText}本表 FID / IS 使用 CFG=2.0、Heun=10、Halton。模型评测页可切换 B 上的 C–F 消融或历史实验，并查看文本八任务、图像理解、双向检索与历史 CFG=3.5 分数。`;
 
  const samplingRows=[];
  if(sweep){const c=sweep.conclusion;samplingRows.push([
@@ -86,7 +88,7 @@ function renderResearchOverview(){
   c?`最低 FID <strong>${c.best_fid.result.fid.toFixed(4)}</strong><br><span class="note">CFG ${c.best_fid.cfg.toFixed(1)} · Heun ${c.best_fid.steps}</span><br>最高 IS <strong>${c.best_is.result.is.toFixed(2)}</strong><br><span class="note">CFG ${c.best_is.cfg.toFixed(1)} · Heun ${c.best_is.steps}</span>`:'尚无完整结论'
  ])}
  if(order){const c=order.conclusion;samplingRows.push([
-  '<a href="#sampling/strategies">B_x0 解码策略</a>',`${order.completed} / ${order.total}`,
+  '<a href="#sampling/strategies">B 解码策略</a>',`${order.completed} / ${order.total}`,
   c?`最低 FID <strong>${c.best_fid.result.fid.toFixed(4)}</strong><br><span class="note">${esc(orderLabels[c.best_fid.strategy])} · 较 Halton 降低 ${c.fid_reduction.toFixed(4)}</span>`:'尚无完整结论'
  ])}
  if(matrix){const c=matrix.conclusion;samplingRows.push([
@@ -103,7 +105,7 @@ function renderResearchOverview(){
  });
  const mainRuns=training.runs.filter(r=>r.group==='main');
  const pureValidation=training.runs.reduce((sum,r)=>sum+r.validation.available.climbmix,0);
- const trainNote=`<strong>${mainRuns.filter(r=>r.complete).length} / ${mainRuns.length} 个主要消融已到训练目标步数。</strong> 共 ${training.records.toLocaleString()} 个训练记录、${training.validation_records.toLocaleString()} 个验证点；T2I、I2T 与纯文本分别查看。${pureValidation?`已收录 ${pureValidation} 个纯文本验证点。`:'纯文本验证代码已补充，当前快照尚无对应验证点。'}新验证协议与训练同口径；历史验证单独标注。`;
+ const trainNote=`<strong>${mainRuns.filter(r=>r.complete).length} / ${mainRuns.length} 个主线模型已到训练目标步数。</strong> 默认展示正式 A / B。全库共 ${training.records.toLocaleString()} 个训练记录、${training.validation_records.toLocaleString()} 个验证点；T2I、I2T 与纯文本分别查看。${pureValidation?`已收录 ${pureValidation} 个纯文本验证点。`:'纯文本验证代码已补充，当前快照尚无对应验证点。'}新验证协议与训练同口径；历史验证单独标注。`;
 
  const taskLabels={t2i:'T2I · 图像生成',i2t:'I2T · 图像描述',text:'纯文本续写'};
  const qualRows=['t2i','i2t','text'].map(task=>[
@@ -123,7 +125,7 @@ function renderResearchOverview(){
  const dataNote=`<strong>训练与验证文本的来源分别记录。</strong> Original caption 来自 <a href="${esc(provenance.original_caption.url)}">${esc(provenance.original_caption.dataset)}</a>，当前 I2T 训练排除 original。合成模型、保存的协议、提示模板与缺失证据均可追溯；新增纯文本子集的独立性单独说明。`;
 
  $('research-sections').innerHTML=
-  summaryCard('01 / 模型结构与训练变体','模型消融总表','matrix',summaryTable(['模型','FID ↓ · CFG 2.0','IS ↑ · CFG 2.0','文本八项均分 ↑','ImageNet Top-1 ↑'],modelRows),modelNote,'<a href="#matrix">完整评测指标 →</a><a href="#qualitative/t2i">同输入样例 →</a>',true)+
+  summaryCard('01 / 当前主线','正式 A / B 评测','matrix',summaryTable(['模型','FID ↓ · CFG 2.0','IS ↑ · CFG 2.0','文本八项均分 ↑','ImageNet Top-1 ↑'],modelRows),modelNote,'<a href="#matrix">完整评测指标与历史消融 →</a><a href="#qualitative/t2i">同输入样例 →</a>',true)+
   summaryCard('02 / 推理时的实验变量','采样与解码消融','sampling/parameters',summaryTable(['实验','完成组数','主要结果'],samplingRows),samplingNote,'<a href="#sampling/parameters">CFG / 步数 →</a><a href="#sampling/strategies">解码策略 →</a><a href="#sampling/cross-model">跨模型换序 →</a>')+
   summaryCard('03 / 优化过程与验证覆盖','训练与验证 Loss','training',summaryTable(['实验组','模型数','有训练记录','有验证记录'],trainRows),trainNote,'<a href="#training">全部模型与任务曲线 →</a>')+
   summaryCard('04 / 同输入、同设置的输出对照','定性样例','qualitative/t2i',summaryTable(['任务','每模型输入','已保存输出'],qualRows),qualitativeNote,'<a href="#qualitative/t2i">图像生成 →</a><a href="#qualitative/i2t">图像描述 →</a><a href="#qualitative/text">文本续写 →</a>')+

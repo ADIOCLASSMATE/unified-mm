@@ -41,7 +41,10 @@ not implicitly mount the official dataset.
 ## Resources
 
 Current production training and project-formal evaluation use Ascend 910B.
-The resource and project contracts below apply to current Unified experiments;
+Current formal models are A/B (formerly A_x0/B_x0), with C–F as ablations on B;
+older A/B and retired branches are historical. Names and method definitions live in
+[EXPERIMENTS.md](docs/EXPERIMENTS.md). The resource and project contracts below
+also retain the placement needed to reproduce those historical experiments;
 [historical H100 recipes](docs/archive/IMAGENET_EXECUTION_NOTES.md) are retained
 only as provenance for earlier experiments.
 
@@ -70,32 +73,13 @@ only as provenance for earlier experiments.
   `script/selfless/pretraining_unified_baseline_lr_sweep_arm_ascend64.sh` and
   select only after all nine complete with
   `scripts/select_unified_lr_sweep.py`.
-- The formal baseline-b/C-on-B/D-on-B/E-on-B/F-on-B contract is
-  `configs/protocols/unified_ablation_100b_ascend64.yaml`; launch each selected
-  condition with
-  `script/selfless/pretraining_unified_ablation_100b_ascend64.sh`. The 0.6B
-  historical winner is frozen at backbone/special-token LR `3.0e-4` and
-  flow/projector LR `5.0e-5`; every formal arm starts from Qwen3-0.6B-Base at
-  optimizer step zero and never resumes a sweep checkpoint. Baseline b uses
-  the XLNet-style content-stream diagonal. C-on-B differs only by switching
-  the text path to single-stream next-token AR; its image path remains
-  identical to baseline b, including separate backbone XT-query/X0-content
-  flow conditions. Its current output identity is
-  `unified-c-on-b-x0content-0p6b-100b-imagenet-split-s42-r1`; it must not
-  resume retired C-on-A or legacy shared-condition C-on-B checkpoints.
-  D-on-B uses the dedicated Dynamic-XT model and generation implementation,
-  preserves `image_flow_batch_mul: 4`, and must not resume the retired A-based
-  Dynamic-XT checkpoint. Only its T2I Dynamic-XT decoder layers use activation
-  checkpointing. A single DeepSpeed BF16 overflow scan protects D's first
-  optimizer update and is then disabled; ClimbMix/I2T and all steady-state
-  updates keep the normal path. E keeps B's model but uses deterministic serialized
-  image sigma and generation order. F uses the isolated, parameter-matched
-  position-wise flow model/generation files (width 1936, depth 8). F has no
-  cross-token flow-head attention or content stream, so its persisted
-  `flow_head_attention_contract` is `not_applicable`; its backbone still uses
-  B's `xlnet_content_diagonal` contract. E/F retain
-  `image_flow_batch_mul: 4`; global and flow-head gradient checkpointing stay
-  off.
+- Formal A/B and B-based C–F share the
+  [100B training contract](configs/protocols/unified_ablation_100b_ascend64.yaml)
+  and `script/selfless/pretraining_unified_ablation_100b_ascend64.sh` launcher.
+  That contract owns architecture differences, optimizer settings and
+  architecture-specific startup/checkpointing controls. Every fresh arm starts
+  from Qwen3-0.6B-Base at optimizer step zero; do not resume LR-sweep weights or
+  substitute an older A/B/C/D checkpoint. Historical run paths remain stable.
 - Dedicated Workspace: `昇腾卡公共空间`; use it only for Ascend workloads.
 - Compute Group: `910B资源` (`ASCEND 910B (64GB)`).
 - The `high-dimensionaldata` Ascend training allocation ceiling is 256
@@ -126,15 +110,15 @@ only as provenance for earlier experiments.
 - Before every submission, check Live Job quota, image status, active project
   Jobs, availability, and whole-node capacity; always dry-run first.
 
-### B_x0 flow-head depth scaling
+### B flow-head depth scaling
 
 - The two depth-scaling arms use
-  `configs/protocols/unified_b_x0_flow_head_scaling_100b_ascend64.yaml` and
+  `configs/selfless/unified_b_x0_flow_depth{16,30}_100b_ascend64.yaml` and
   `script/selfless/pretraining_unified_flow_head_scaling_ascend64.sh --depth 16|30`.
   Both are fresh, complete 100B runs with 64 Ascend NPUs in
   `随机序语言建模-统一自回归与掩码扩散的随机顺序生成框架`.
 - Width stays 1280; head depth 16/30 gives 321,543,696/597,117,456 parameters.
-  Keep the B_x0 learning rates, source schedule, local batches, 4-step gradient
+  Keep the B learning rates, source schedule, local batches, 4-step gradient
   accumulation, and four RF samples per image. Initialization is Qwen3-0.6B-Base
   with a random flow head, never the trained baseline checkpoint.
 - Both arms require `image_flow_grad_checkpointing=true` and
@@ -251,7 +235,7 @@ only as provenance for earlier experiments.
 - `output/evaluation-checkpoints/` contains historical input weights, not result
   files. Those checkpoint identities remain outside the result directory.
 
-### B-X0 sampling sweeps
+### B sampling sweeps
 
 - The CFG/Heun sweep uses independent one-node, 16-NPU Jobs in the
   user-selected project
@@ -286,7 +270,7 @@ only as provenance for earlier experiments.
   next 16 Halton positions from generated context; they require cached
   generation, constant CFG != 1, and canonical initial noise. They do not replay training sigma
   or read target latents. Preserve saved `order_trace` records as well as PNGs.
-  See `docs/B_X0_ORDER_SWEEP.md` for the score definitions and controls.
+  See `docs/B_ORDER_SWEEP.md` for the score definitions and controls.
 - The full nine-model CFG=2.0 / Heun=10 matrix is prepared with
   `scripts/prepare_unified_matrix_sweep.py --include-random`. Evaluate Halton,
   `confidence_stability`, and `random` for each model, plus E's native sequential control.

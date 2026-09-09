@@ -1,6 +1,8 @@
-# B-X0Content 训练验证与独立生成不一致排查
+# B 训练验证与独立生成不一致排查
 
 日期：2026-09-05 UTC。
+
+模型现统一称为正式 B；文件名保留历史检索用途，见[实验定义](EXPERIMENTS.md)。
 
 训练目录：`output/unified-b-x0content-0p6b-100b-imagenet-split-s42-r1`。
 

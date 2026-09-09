@@ -54,7 +54,10 @@ function renderLossSelectors(){
  updateLossPresetButtons();
 }
 function updateLossPresetButtons(){
- $('loss-presets').querySelectorAll('button').forEach(el=>el.classList.toggle('active',el.dataset.group==='all'?lossState.selected.size===T.runs.length:el.dataset.group!=='none'&&T.runs.filter(r=>r.group===el.dataset.group).every(r=>lossState.selected.has(r.id))&&T.runs.filter(r=>lossState.selected.has(r.id)).every(r=>r.group===el.dataset.group)));
+ $('loss-presets').querySelectorAll('button').forEach(el=>{
+  const runs=T.runs.filter(r=>inModelGroup(r,el.dataset.group));
+  el.classList.toggle('active',runs.length===lossState.selected.size&&runs.every(r=>lossState.selected.has(r.id)));
+ });
 }
 
 function renderLossInventory(){
@@ -164,7 +167,7 @@ function renderLossCharts(){
 
 function initializeLoss(){
  $('loss-presets').innerHTML=[['all','全部模型'],...Object.entries(T.groups),['none','清空']].map(([group,label])=>`<button data-group="${group}">${esc(label)}</button>`).join('');
- $('loss-presets').querySelectorAll('button').forEach(el=>el.addEventListener('click',()=>{lossState.selected=new Set(T.runs.filter(r=>el.dataset.group==='all'||r.group===el.dataset.group).map(r=>r.id));$('loss-min').value='';$('loss-max').value='';renderLossSelectors();renderLossCharts();renderLossInventory()}));
+ $('loss-presets').querySelectorAll('button').forEach(el=>el.addEventListener('click',()=>{lossState.selected=new Set(T.runs.filter(r=>inModelGroup(r,el.dataset.group)).map(r=>r.id));$('loss-min').value='';$('loss-max').value='';renderLossSelectors();renderLossCharts();renderLossInventory()}));
  for(const id of ['loss-split','loss-mode','loss-smooth','loss-axis','loss-log','loss-min','loss-max','loss-val-protocol'])$(id).addEventListener('change',()=>{if(id==='loss-axis'){$('loss-min').value='';$('loss-max').value=''}renderLossCharts()});
  $('loss-early').addEventListener('click',()=>{$('loss-axis').value='step';$('loss-min').value='0';$('loss-max').value='1000';renderLossCharts()});
  $('loss-reset').addEventListener('click',()=>{$('loss-min').value='';$('loss-max').value='';renderLossCharts()});

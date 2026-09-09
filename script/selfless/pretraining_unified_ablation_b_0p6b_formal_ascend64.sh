@@ -7,6 +7,7 @@ cd "${REPO_ROOT}"
 # Baseline b is the selected main method: content-stream attention includes
 # sigma_kv == sigma_q while the query stream remains strict. Flow query AdaLN
 # uses XT hidden and flow content AdaLN uses X0 hidden.
+# The x0content run path is retained for checkpoint/result compatibility.
 export ABLATION="b"
 export RUN_PROJECT="unified-b-x0content-0p6b-100b-imagenet-split-s42-r1"
 export RUN_NAME="unified-b-x0content-qwen3-0.6b-100b-imagenet-split-s42-r1"

@@ -1,5 +1,8 @@
 # ImageNet-1K 800-epoch formal pretraining
 
+Historical ImageNet-only training contract. Current Unified A/B are defined
+in [EXPERIMENTS.md](EXPERIMENTS.md).
+
 ## Fixed training contract
 
 The formal run keeps the hyperparameters selected by the complete

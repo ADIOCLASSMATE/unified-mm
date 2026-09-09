@@ -1,10 +1,13 @@
 # Unified final-EMA matrix at CFG 2.0 / Heun 10
 
-The study evaluates the nine models selected for formal metrics in
-`configs/protocols/evaluation_report.json`: B-X0, B-flowdiag, B-no-flowdiag,
-A-X0, legacy A, C-on-B, D-on-B r4, E-on-B, and F-on-B. Each model uses its own
-step-95415 final EMA. The five extra qualitative-only models are outside this
-formal matrix.
+The retained matrix includes formal **A/B**, four ablations **C–F on B**, and
+three historical variants: legacy A (shared-condition) and legacy B with/without
+the flow diagonal.
+Names and definitions follow [EXPERIMENTS.md](EXPERIMENTS.md); result selections
+remain in `configs/protocols/evaluation_report.json`. Each model uses its own
+step-95415 final EMA (D training r4). Five additional qualitative-only models
+are outside this matrix. The homepage defaults to A/B; this full matrix retains
+the historical comparisons.
 
 Every model receives independent `spatial_halton`, `confidence_stability`, and `random`
 arms. E receives an additional `sequential` arm, because that is its native
@@ -27,7 +30,7 @@ E arm isolates the CFG change from its change of reveal order.
 - Runtime hashing and W&B remain disabled. Input identities use readable
   metadata, file size/mtime and exact post-load tensor-value checks.
 
-CFG 2.0 was chosen on B-X0. This study is a common-setting comparison; it does
+CFG 2.0 was chosen on B. This study is a common-setting comparison; it does
 not claim the independently optimal CFG for every other checkpoint. These
 validation-reference scores are project comparisons, not public leaderboard
 scores. A fixed seed and IS split standard deviations do not establish
@@ -35,7 +38,7 @@ statistical significance of small differences.
 
 ## Confidence stability across architectures
 
-The policy is unchanged from `docs/B_X0_ORDER_SWEEP.md`: score the next 16
+The policy is unchanged from [B_ORDER_SWEEP.md](B_ORDER_SWEEP.md): score the next 16
 Halton positions at t=0 and after an Euler proposal of dt=0.1, using
 
 `mean((v_next - v)^2) / (mean(v^2) + 1e-8)`, with `v = vu + 2*(vc - vu)`.
@@ -49,7 +52,7 @@ The implementation preserves each architecture's semantics:
 
 | Model family | Probe and cache behavior |
 |---|---|
-| B-X0, A-X0, C, E | Static XT query condition; pending flow content uses the previous backbone X0 hidden. A retains strict content attention. |
+| A/B and B-based C/E | Static XT query condition; pending flow content uses the previous backbone X0 hidden. A retains strict content attention. |
 | Legacy A and both legacy B controls | Static XT query condition; pending flow content retains the previous static query condition, as trained. |
 | D Dynamic-XT | Conditional/unconditional caches remain separate. Both velocity probes refresh the XT hidden from the current x and t. Pending content uses the completed X0 hidden exactly once. |
 | F position-wise | Probe velocities use the independent per-position MLP. The backbone remains cached; there is no flow content stream/cache. |
@@ -75,7 +78,7 @@ published only after that model's assigned workers, PNGs and traces pass.
 BF16 changes to fused query matrix shapes can cause different outputs even
 under the same forced order. The smoke records this difference and additionally
 replays the observed order with identical probe shapes to isolate cache
-semantics. B-X0's three formal 50K arms are checked against the previous study's
+semantics. B's three formal 50K arms are checked against the previous study's
 metrics and all 64 saved images per arm.
 
 Random uses the existing native uniform `torch.randperm(256)` order, with no
@@ -100,7 +103,7 @@ Raw scores, launch evidence, input audit, smoke controls, CSV, standalone PNG/PD
 plots and per-arm paired samples stay there. The CPU watcher
 `scripts/report_sampling_sweep.py` updates the homepage's dedicated matrix view.
 Final publication requires all 28 full evaluations and the complete metric,
-input, PNG, trace, pairing and B-X0 reproduction audits.
+input, PNG, trace, pairing and B reproduction audits.
 
 The user added Random while the initial 19 arms were running. The actual study
 therefore preserves its pre-extension protocol/state in

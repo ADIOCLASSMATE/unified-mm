@@ -109,7 +109,7 @@ def test_formal_protocol_is_comparable_complete_and_no_hash():
     assert base.model.flow_condition_contract == (
         "backbone_xt_query_backbone_x0_content"
     )
-    assert protocol.ablations.a.status == "ready_x0_content"
+    assert protocol.ablations.a.status == "formal"
     assert protocol.ablations.a.content_attention == "sigma_kv < sigma_q"
     assert protocol.ablations.a.flow_head_attention_contract == (
         "selfless_strict"
@@ -120,7 +120,7 @@ def test_formal_protocol_is_comparable_complete_and_no_hash():
         "model.flow_head_attention_contract",
     ]
     assert protocol.ablations.b.start == "qwen_pretrained_step_0"
-    assert protocol.ablations.b.status == "main_baseline_x0_content"
+    assert protocol.ablations.b.status == "formal_baseline"
     assert protocol.ablations.b.query_attention == "sigma_kv < sigma_q"
     assert protocol.ablations.b.content_attention == "sigma_kv <= sigma_q"
     assert protocol.ablations.b.flow_head_query_attention == (
@@ -145,7 +145,7 @@ def test_formal_protocol_is_comparable_complete_and_no_hash():
     assert protocol.comparability.b_vs_d_static_contract_identical is True
     assert protocol.comparability.b_vs_d_image_flow_batch_mul_identical is True
     assert protocol.ablations.c.start == "qwen_pretrained_step_0"
-    assert protocol.ablations.c.status == "ready_x0_content"
+    assert protocol.ablations.c.status == "ready"
     assert protocol.ablations.c.platform_project == (
         "随机序语言建模-统一自回归与掩码扩散的随机顺序生成框架"
     )
@@ -224,7 +224,7 @@ def test_formal_protocol_is_comparable_complete_and_no_hash():
     )
     assert protocol.ablations.d.time_embedder_optimizer_role == "backbone"
     assert protocol.ablations.d.content_compute == "once_per_layer"
-    assert protocol.ablations.e.status == "ready_x0_content"
+    assert protocol.ablations.e.status == "ready"
     assert protocol.ablations.e.base == "b"
     assert protocol.ablations.e.architecture_variant == "selfless_contextual"
     assert protocol.ablations.e.image_sigma_order == "sequential"

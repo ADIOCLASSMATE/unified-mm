@@ -1,10 +1,12 @@
 # 文档索引
 
-日常查看结果使用 [统一评测总览](../output/evaluation/index.html)。
+当前正式模型是 **A、B**；原 A_x0/B_x0 后缀停用于展示。
+先读[实验命名与定义](EXPERIMENTS.md)，日常查看[统一评测总览](../output/evaluation/index.html)。
+C–F 单列为“B 上的消融”；旧 A/B 和旧单任务对照保留为历史实验。
 
 ## 当前训练与评测
 
-- [100B 消融合同](../configs/protocols/unified_ablation_100b_ascend64.yaml)
+- [A/B 与 C–F 的 100B 训练合同](../configs/protocols/unified_ablation_100b_ascend64.yaml)
 - [评测结构与统一输出目录](EVALUATION_STRUCTURE.md)
 - [训练中下游验证](TRAINING_DOWNSTREAM_VALIDATION.md)
 - [仓库正确性与重构审计（2026-09-09）](REPO_AUDIT_20260909.md)
@@ -13,6 +15,12 @@
 - [评测协议审计](EVALUATION_PROTOCOL_AUDIT.md)
 - [GenEval / DPG-Bench / MJHQ 官方评测](OFFICIAL_T2I_BENCHMARKS.md)
 - [理解 benchmark 选择依据](IMAGE_UNDERSTANDING_BENCHMARK_SELECTION.md)
+
+## B 的采样实验
+
+- [CFG / Heun 扫描](B_SAMPLING_SWEEP.md)
+- [固定参数后的解码顺序比较](B_ORDER_SWEEP.md)
+- [跨模型固定 CFG / 顺序矩阵（含历史消融）](UNIFIED_MATRIX_CFG2_ORDER.md)
 
 ## 表征研究
 
@@ -31,7 +39,7 @@
 - [ImageNet-1K 800-epoch 合同](IMAGENET1K_800EP_PRETRAINING.md)
 - [Caption 联合训练结论](IMAGENET1K_CAPTION_JOINT_CONCLUSION.md)
 - [早期平台与 ImageNet 执行记录](archive/IMAGENET_EXECUTION_NOTES.md)
-- [B X0-content 验证缓存审计](B_X0CONTENT_VALIDATION_CACHE_AUDIT_20260905.md)
+- [B 验证缓存审计](B_X0CONTENT_VALIDATION_CACHE_AUDIT_20260905.md)
 - [文本 P1 修正](TEXT_P1_CORRECTION_20260905.md)
 
 历史分数保留其当时的采样配置和协议标签；当前默认值以仓库 README 与正式评测协议为准。

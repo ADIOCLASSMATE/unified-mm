@@ -10,27 +10,36 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from sweep_unified_t2i_sampling import locked, read, report, require, validate_metrics, write, now
 from build_evaluation_report import build
+from utils.experiment_registry import current_presentation, presentation_sort_key
+
+
+def matrix_model_presentations(protocol):
+    return {mid: current_presentation({**spec, "id": mid}) for mid, spec in protocol["models"].items()}
 
 
 def plot(root, state):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib import font_manager
+    font = next((f.name for f in font_manager.fontManager.ttflist if f.name in
+                 {"Noto Sans CJK SC", "Noto Sans CJK JP", "WenQuanYi Zen Hei"}), "DejaVu Sans")
     plt.rcParams.update({"font.size": 10, "axes.spines.top": False, "axes.spines.right": False,
-                         "savefig.dpi": 180, "pdf.fonttype": 42})
+                         "savefig.dpi": 180, "pdf.fonttype": 42, "font.family": font})
     done = [a for a in state["tasks"] if a["status"] == "done"]
     if state["phase"] == "matrix":
         if not done:
             return
         protocol = read(root / "protocol.json")
-        model_ids = list(protocol["models"])
+        models = matrix_model_presentations(protocol)
+        model_ids = sorted(models, key=lambda mid: presentation_sort_key(models[mid]))
         colors = {"spatial_halton": "#286aa5", "confidence_stability": "#137c5b", "random": "#8652aa", "sequential": "#a26b22"}
         labels = {"spatial_halton": "Halton", "confidence_stability": "Velocity stability", "random": "Random", "sequential": "E native sequential"}
         views = [("matrix-metrics", model_ids, "All nine models, including E and its sequential control"),
                  ("matrix-metrics-zoom", [m for m in model_ids if m != "e_on_b"],
                   "Expanded view of eight models | E excluded here; see full matrix for E")]
         for filename, included, subtitle in views:
-            names = [m.replace("_", "-").replace("-on-b", "/B") for m in included]
+            names = [models[mid]["label"] for mid in included]
             fig, axes = plt.subplots(1, 2, figsize=(13, 6.3), layout="constrained")
             for strategy, color in colors.items():
                 arms = [a for a in done if a["strategy"] == strategy and a["model"] in included]
@@ -68,7 +77,7 @@ def plot(root, state):
             axis.set(yticks=y, yticklabels=names, xlabel=label)
             axis.invert_yaxis()
             axis.grid(alpha=.2)
-        fig.suptitle("B-X0 reveal order | CFG 2.0, Heun 10 | paired ImageNet-val 50K")
+        fig.suptitle("B reveal order | CFG 2.0, Heun 10 | paired ImageNet-val 50K")
         for ext in ("png", "pdf"):
             fig.savefig(root / f"order-sweep.{ext}", bbox_inches="tight", pad_inches=.15)
         plt.close(fig)
@@ -79,7 +88,7 @@ def plot(root, state):
         axis.set(xlabel="50K generation minutes on 16 NPUs (includes probes)", ylabel="FID (lower is better)")
         axis.grid(alpha=.2)
         axis.legend(loc="center left", bbox_to_anchor=(1, .5), frameon=False)
-        fig.suptitle("B-X0 reveal-order quality / generation cost")
+        fig.suptitle("B reveal-order quality / generation cost")
         for ext in ("png", "pdf"):
             fig.savefig(root / f"order-cost.{ext}", bbox_inches="tight", pad_inches=.15)
         plt.close(fig)
@@ -105,7 +114,7 @@ def plot(root, state):
             axis.legend(frameon=False)
             if filename == "heun-sweep":
                 axis.set_xticks([5, 10, 20, 50, 100])
-        fig.suptitle("B-X0 final EMA | ImageNet-val 50K | paired noise, seed 42")
+        fig.suptitle("B final EMA | ImageNet-val 50K | paired noise, seed 42")
         for extension in ("png", "pdf"):
             fig.savefig(root / f"{filename}.{extension}", bbox_inches="tight", pad_inches=0.15)
         plt.close(fig)
@@ -192,13 +201,13 @@ def audit(root, state, protocol):
             old = next(a for a in old_state["tasks"] if a["strategy"] == strategy)
             current = next(a for a in state["tasks"] if a["model"] == "b_x0" and a["strategy"] == strategy)
             delta = {k: current["result"][k] - old["result"][k] for k in ["fid", "is", "is_std"]}
-            require(all(abs(v) < 1e-5 for v in delta.values()), "B-X0 metrics changed under generalized implementation")
+            require(all(abs(v) < 1e-5 for v in delta.values()), "B metrics changed under generalized implementation")
             identical = 0
             for index in protocol["saved_image_indices"]:
                 paths = [Path(a["result"]["metrics_path"]).parent / strategy / f"{index:08d}.png" for a in [old, current]]
                 with Image.open(paths[0]) as a, Image.open(paths[1]) as b:
                     identical += ImageChops.difference(a, b).getbbox() is None
-            require(identical == len(protocol["saved_image_indices"]), "B-X0 paired images changed")
+            require(identical == len(protocol["saved_image_indices"]), "B paired images changed")
             reproduction.append({"strategy": strategy, "deltas": delta, "identical_images": identical})
         write(root / "baseline-reproduction.json", {"complete": True, "at": now(), "checks": reproduction})
     write(root / "audit.json", {"complete": True, "at": now(), "arms": len(state["tasks"]),
@@ -213,6 +222,7 @@ def matrix_analysis(root, state, protocol):
     require(state["phase"] == "matrix" and state["status"] == "complete", "matrix analysis needs every arm")
     require(read(root / "audit.json")["complete"], "matrix analysis needs the full artifact audit")
     repo = Path(__file__).resolve().parents[1]
+    labels = {mid: spec["label"] for mid, spec in matrix_model_presentations(protocol).items()}
     comparisons = []
     for mid, spec in protocol["models"].items():
         rows = {a["strategy"]: a["result"] for a in state["tasks"] if a["model"] == mid}
@@ -225,7 +235,7 @@ def matrix_analysis(root, state, protocol):
                 "historical CFG comparison protocol mismatch")
         old = old_payload["strategies"][spec["native_strategy"]]
         b, s = rows["spatial_halton"], rows["confidence_stability"]
-        comparisons.append({"model": mid, "label": spec["label"], "halton": b, "stability": s,
+        comparisons.append({"model": mid, "label": labels[mid], "halton": b, "stability": s,
             "stability_minus_halton_fid": s["fid"] - b["fid"],
             "stability_minus_halton_is": s["is"] - b["is"],
             "stability_time_ratio": s["generation_seconds"] / b["generation_seconds"],
@@ -256,31 +266,31 @@ def matrix_analysis(root, state, protocol):
     write(root / "analysis.json", result)
     lines = ["# 完整消融矩阵：CFG=2.0、Heun=10", "",
         f"9 个模型、{len(state['tasks'])} 组独立 16 卡评测均完成 ImageNet-val 50K。每组保留相同的 64 张图及实际解码顺序，共 {len(state['tasks'])*64:,} 张配对样图。", "",
-        f"- Halton 下最低 FID：**{result['best_halton_fid']}**。",
-        f"- confidence_stability 下最低 FID：**{result['best_stability_fid']}**。",
-        f"- 最高 IS：Halton 为 **{result['best_halton_is']}**，Stability 为 **{result['best_stability_is']}**。",
+        f"- Halton 下最低 FID：**{labels[result['best_halton_fid']]}**。",
+        f"- confidence_stability 下最低 FID：**{labels[result['best_stability_fid']]}**。",
+        f"- 最高 IS：Halton 为 **{labels[result['best_halton_is']]}**，Stability 为 **{labels[result['best_stability_is']]}**。",
         f"- Stability 相比 Halton：**{len(result['stability_fid_improved'])}/9** 个模型 FID 降低，**{len(result['stability_is_improved'])}/9** 个模型 IS 提高。",
         f"- 保持各模型原生顺序，将 CFG 3.5 改为 2.0：**{len(result['cfg2_native_fid_improved'])}/9** 个模型 FID 降低。E 的这项比较采用额外的 sequential 结果。", "",
-        f"- 原生顺序下最低 FID 的模型，从 CFG=3.5 时的 **{result['best_cfg3p5_native_fid']}** 变为 CFG=2.0 时的 **{result['best_cfg2_native_fid']}**。因此模型的 FID 排名也取决于推理参数。", "",
+        f"- 原生顺序下最低 FID 的模型，从 CFG=3.5 时的 **{labels[result['best_cfg3p5_native_fid']]}** 变为 CFG=2.0 时的 **{labels[result['best_cfg2_native_fid']]}**。因此模型的 FID 排名也取决于推理参数。", "",
         "| 模型 | Halton FID ↓ | Halton IS ↑ | Stability FID ↓ | Stability IS ↑ | ΔFID (S−H) | 生成耗时 S/H |",
         "|---|---:|---:|---:|---:|---:|---:|"]
     for row in comparisons:
         b, s = row["halton"], row["stability"]
-        lines.append(f"| {row['model']} | {b['fid']:.4f} | {b['is']:.2f} ± {b['is_std']:.2f} | {s['fid']:.4f} | {s['is']:.2f} ± {s['is_std']:.2f} | {row['stability_minus_halton_fid']:+.4f} | {row['stability_time_ratio']:.3f}× |")
+        lines.append(f"| {row['label']} | {b['fid']:.4f} | {b['is']:.2f} ± {b['is_std']:.2f} | {s['fid']:.4f} | {s['is']:.2f} ± {s['is_std']:.2f} | {row['stability_minus_halton_fid']:+.4f} | {row['stability_time_ratio']:.3f}× |")
     if has_random:
         lines += ["", "## Random 顺序消融", "",
-            f"Random 下最低 FID：**{result['best_random_fid']}**；最高 IS：**{result['best_random_is']}**。与 Halton 比较，**{len(result['random_fid_improved'])}/9** 个模型 FID 降低，**{len(result['random_is_improved'])}/9** 个模型 IS 提高。", "",
+            f"Random 下最低 FID：**{labels[result['best_random_fid']]}**；最高 IS：**{labels[result['best_random_is']]}**。与 Halton 比较，**{len(result['random_fid_improved'])}/9** 个模型 FID 降低，**{len(result['random_is_improved'])}/9** 个模型 IS 提高。", "",
             "| 模型 | Random FID ↓ | Random IS ↑ | ΔFID (R−H) | ΔIS (R−H) | 生成耗时 R/H |",
             "|---|---:|---:|---:|---:|---:|"]
         for row in comparisons:
             r = row["random"]
-            lines.append(f"| {row['model']} | {r['fid']:.4f} | {r['is']:.2f} ± {r['is_std']:.2f} | {row['random_minus_halton_fid']:+.4f} | {row['random_minus_halton_is']:+.2f} | {row['random_time_ratio']:.3f}× |")
+            lines.append(f"| {row['label']} | {r['fid']:.4f} | {r['is']:.2f} ± {r['is_std']:.2f} | {row['random_minus_halton_fid']:+.4f} | {row['random_minus_halton_is']:+.2f} | {row['random_time_ratio']:.3f}× |")
         lines += ["", "Random 对全部 256 个位置取均匀随机排列；仍使用相同的逐位置初始噪声。固定评测 seed=42 和相同 batch/rank 划分，九个模型保存样本的随机顺序逐一匹配。它不使用 Stability 的候选探测。"]
     lines += ["", "## 与原 CFG=3.5 的原生顺序比较", "",
         "| 模型 | 原生顺序 | CFG 3.5 FID / IS | CFG 2.0 FID / IS | ΔFID |", "|---|---|---:|---:|---:|"]
     for row in comparisons:
         old, current = row["previous_metrics"], row["cfg2_native"]
-        lines.append(f"| {row['model']} | {row['previous_native_strategy']} | {old['fid']:.4f} / {old['inception_score_mean']:.2f} | {current['fid']:.4f} / {current['is']:.2f} | {row['cfg2_minus_cfg3p5_native_fid']:+.4f} |")
+        lines.append(f"| {row['label']} | {row['previous_native_strategy']} | {old['fid']:.4f} / {old['inception_score_mean']:.2f} | {current['fid']:.4f} / {current['is']:.2f} | {row['cfg2_minus_cfg3p5_native_fid']:+.4f} |")
     e = next(row for row in comparisons if row["model"] == "e_on_b")
     lines += ["", "## E 的顺序敏感性", "",
         f"E 在训练时使用 sequential。本轮 CFG=2.0 下，原生 sequential 的 FID / IS 为 **{e['cfg2_native']['fid']:.4f} / {e['cfg2_native']['is']:.2f}**；Halton 为 **{e['halton']['fid']:.4f} / {e['halton']['is']:.2f}**，Stability 为 **{e['stability']['fid']:.4f} / {e['stability']['is']:.2f}**。",
@@ -300,9 +310,9 @@ def matrix_analysis(root, state, protocol):
     lines += ["", "## 协议与解释边界", "",
         "全部使用各自 step-95415 final EMA。A 的严格注意力、旧 A/B 的 shared-query 条件、D 的动态 XT 条件刷新和 F 的无内容流结构均保留。顺序策略只改变生成顺序及其必要探测计算。",
         "", "Stability 在每组 16 个 Halton 候选中，按一次 dt=0.1 的 Euler 探测前后归一化引导速度变化从小到大排序。两次探测只使用提示词和已生成内容，最终解码从相同逐位置噪声重新开始。该分数不是校准后的概率。",
-        "", "CFG 2.0 来自 B-X0 的选优，本实验没有对每个模型分别调参。IS 的 ± 是十个分层 split 的标准差，不是跨随机种子的误差条。小幅差异不代表统计显著。计时来自不同独立节点的实际生成墙钟，包含探测开销。",
+        "", "CFG 2.0 来自 B 的选优，本实验没有对每个模型分别调参。IS 的 ± 是十个分层 split 的标准差，不是跨随机种子的误差条。小幅差异不代表统计显著。计时来自不同独立节点的实际生成墙钟，包含探测开销。",
         "", "真实权重 smoke 使用所有 16 张开发机 NPU；每个模型都通过完整生成、每卡 256 样本容量检查和相同探测形状的固定顺序复跑。BF16 在不同融合矩阵形状下存在数值差异，原始数值控制保留于 `smoke/audit.json`。",
-        "", "B-X0 各组均复现上一轮对应策略的 FID/IS 和全部 64 张配对 PNG，见 `baseline-reproduction.json`。完整输入、指标、图片与顺序核验见 `audit.json`。", "",
+        "", "B 各组均复现上一轮对应策略的 FID/IS 和全部 64 张配对 PNG，见 `baseline-reproduction.json`。完整输入、指标、图片与顺序核验见 `audit.json`。", "",
         "新旧 CFG 的评测条件与旧 B 控制组的历史更名对应关系，见 `launch/cfg-native-protocol-comparison.json`。", "",
         "[完整结果 CSV](results.csv) · [原始指标](summary.json) · [冻结协议](protocol.json) · [全矩阵 PNG](matrix-metrics.png) · [全矩阵 PDF](matrix-metrics.pdf) · [八模型放大图](matrix-metrics-zoom.png) · [放大图 PDF](matrix-metrics-zoom.pdf)"]
     (root / "RESULTS_ZH.md").write_text("\n".join(lines) + "\n")

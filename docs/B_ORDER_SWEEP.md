@@ -1,4 +1,6 @@
-# B-X0 sigma / reveal-order comparison
+# B sigma / reveal-order comparison
+
+B is the formal model defined in [EXPERIMENTS.md](EXPERIMENTS.md).
 
 This study fixes the minimum-FID choice from the completed CFG/Heun sweep:
 CFG 2.0, Heun 10. `cfg-refinement.json` revalidates the exact 50K results at

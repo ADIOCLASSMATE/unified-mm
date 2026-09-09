@@ -1,8 +1,11 @@
-# Formal unified ablation protocol. Every fresh arm starts from the same
-# Qwen3-0.6B-Base weights at optimizer step zero. A/B/C/E use split backbone
-# XT-query and X0-content flow AdaLN conditions. D/E/F are submitted to
-# the scaling-law platform project requested for this study.
+# Unified 100B training contract. Formal A/B are the former A_x0/B_x0;
+# C/D/E/F are ablations on formal B. Names and definitions:
+# docs/EXPERIMENTS.md; display groups: configs/protocols/experiment_registry.json.
+# Run paths, arm keys and checkpoint contracts retain their original identity.
+# Every fresh arm starts from Qwen3-0.6B-Base at optimizer step zero.
 schema: unified_ablation_100b_v6
+main_arms: [a, b]
+ablation_arms: [c, d, e, f]
 base_config: configs/selfless/unified_baseline_100b_ascend_64npu.yaml
 platform_project: "多模态大模型新架构评测探索与scaling-law"
 historical_platform_project_bc: "随机序语言建模-统一自回归与掩码扩散的随机顺序生成框架"
@@ -123,7 +126,7 @@ run_projects:
     f: unified-f-on-b-0p6b-100b-imagenet-split-s42-r1
 ablations:
     a:
-        status: ready_x0_content
+        status: formal
         architecture_variant: selfless_contextual
         training_objective: selfless_dual_stream
         image_sigma_order: random
@@ -139,7 +142,7 @@ ablations:
         current_x1_to_velocity_leak: false
         start: qwen_pretrained_step_0
     b:
-        status: main_baseline_x0_content
+        status: formal_baseline
         architecture_variant: selfless_contextual
         training_objective: selfless_dual_stream
         image_sigma_order: random
@@ -155,7 +158,8 @@ ablations:
         current_x1_to_velocity_leak: false
         start: qwen_pretrained_step_0
     c:
-        status: ready_x0_content
+        status: ready
+        base: b
         platform_project: "随机序语言建模-统一自回归与掩码扩散的随机顺序生成框架"
         architecture_variant: single_stream_text_ar
         training_objective: selfless_dual_stream
@@ -171,7 +175,8 @@ ablations:
         image_sigma_order: random
         start: qwen_pretrained_step_0
     d:
-        status: ready_r4_xt_query_x0_content
+        status: ready
+        base: b
         architecture_variant: dynamic_xt
         training_objective: selfless_dual_stream
         dual_stream_attention_contract: xlnet_content_diagonal
@@ -216,7 +221,7 @@ ablations:
         image_sigma_order: random
         start: qwen_pretrained_step_0
     e:
-        status: ready_x0_content
+        status: ready
         base: b
         architecture_variant: selfless_contextual
         model_implementation: identical_to_b

@@ -1,10 +1,11 @@
 # 文本评测 P1 修正（2026-09-05）
 
-适用：历史 A/B step 95,415 final EMA。不是新 x0content 重训练结果。
+适用：shared-condition 历史 A/B 的 step 95,415 final EMA。
+本文表中的 A/B 均为旧实验，不对应[当前正式 A/B](EXPERIMENTS.md)。
 
 ## 修正后的主指标（%）
 
-| 任务 | A | B | 说明 |
+| 任务 | 历史 A | 历史 B | 说明 |
 | --- | ---: | ---: | --- |
 | ARC-Easy | 65.9512 | 65.7828 | 原始选项字符数归一化 |
 | ARC-Challenge | 38.6519 | 37.7133 | 从旧 B 较高改为 A 较高 |

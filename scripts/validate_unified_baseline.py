@@ -199,7 +199,7 @@ def main():
         from utils.flow_head_scaling import validate_scaling_config
 
         if args.ablation != "b":
-            raise ValueError("flow-head scaling is defined only on B_x0")
+            raise ValueError("flow-head scaling is defined only on B")
         flow_head_scaling = validate_scaling_config(config)
     validate_wsd_contract(config)
     if str(config.dataset.class_name) != "UnifiedMixedDataset":

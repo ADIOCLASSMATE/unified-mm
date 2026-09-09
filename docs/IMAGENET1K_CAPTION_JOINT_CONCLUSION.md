@@ -1,6 +1,7 @@
 # ImageNet-1K Caption + T2I joint-training conclusion
 
-The retained production configuration is
+Historical ImageNet caption-joint study; current Unified A/B are defined in
+[EXPERIMENTS.md](EXPERIMENTS.md). The retained configuration is
 `configs/selfless/imagenet1k_caption_joint_10ep_ascend16_b1024.yaml`:
 
 - initialization: `output/selfless-flow-imagenet1k-class-ascend64-b1024-800ep/hf_model-final-ema`

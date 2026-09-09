@@ -1,7 +1,9 @@
 # Unified-MM
 
 Unified-MM 以华为昇腾 Ascend NPU 为生产后端，研究 ClimbMix 文本与 ImageNet
-图文联合训练。当前主对照是 B X0-content，并保留 A/C/D/E/F 与单源控制组。
+图文联合训练。当前正式模型是 **A、B**（原 A_x0、B_x0），B 为基线；
+C–F 是在正式 B 上的消融，旧 A/B 与旧单任务对照另列历史实验。
+命名和方法差异统一见[实验定义](docs/EXPERIMENTS.md)。
 基础架构约定：
 
 - Qwen two-stream backbone 与 dynamic dual-stream contextual flow head；
@@ -10,11 +12,12 @@ Unified-MM 以华为昇腾 Ascend NPU 为生产后端，研究 ClimbMix 文本�
 - attention output gate 保留单一接口，但默认关闭；
 - ImageNet latent dataloader 只支持 `class` 与 `caption` 两种条件模式。
 
-消融模型使用各自 checkpoint 声明的 attention、flow condition 和生成顺序。
+各模型使用各自 checkpoint 声明的 attention、flow condition 和生成顺序。
 当前协议、研究结果与早期 ImageNet 实验分别列在 [文档索引](docs/README.md)。
 
 所有模型的评测统一放在 [`output/evaluation/`](output/evaluation/)，
-打开 [评测总览](output/evaluation/index.html) 查看指标与 T2I/I2T/文本逐样本对照。
+打开 [评测总览](output/evaluation/index.html) 查看指标与 T2I/I2T/文本逐样本对照，
+默认聚焦正式 A/B，可切换 B 上的 C–F 消融或历史实验。
 训练权重、优化器和续训状态保留在各自训练目录。
 
 ## NPU 环境
@@ -41,13 +44,13 @@ uv run --frozen python -c \
 
 ## 训练
 
-Unified 0.6B 的正式消融使用 64×Ascend 910B、HCCL 和 DeepSpeed ZeRO-2。
-各训练臂由 [100B 消融协议](configs/protocols/unified_ablation_100b_ascend64.yaml)
-固定。B 与 D 的入口例如：
+Unified 0.6B 的正式 A/B 使用 64×Ascend 910B、HCCL 和 DeepSpeed ZeRO-2。
+共享配置及 B 上的 C–F 消融由 [100B 训练合同](configs/protocols/unified_ablation_100b_ascend64.yaml)
+固定。正式训练入口：
 
 ```bash
+bash script/selfless/pretraining_unified_ablation_a_0p6b_formal_ascend64.sh
 bash script/selfless/pretraining_unified_ablation_b_0p6b_formal_ascend64.sh
-bash script/selfless/pretraining_unified_ablation_d_on_b_0p6b_formal_ascend64.sh
 ```
 
 Unified 的运行时 hashing 与 W&B 保持关闭；启动前校验数据、模型来源、评测缓存和

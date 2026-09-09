@@ -11,7 +11,7 @@ from pathlib import Path
 
 import yaml
 
-from utils.experiment_registry import is_temporary_training_run, experiment_identity, read_run_identity
+from utils.experiment_registry import GROUPS, is_temporary_training_run, experiment_identity, read_run_identity
 
 FIELDS = ["step_loss", "train/loss_t2i", "train/loss_i2t", "train/loss_climbmix",
           "train/weighted_contribution_t2i", "train/weighted_contribution_i2t",
@@ -20,8 +20,6 @@ VALIDATION_FIELDS = ["val/loss", "val/loss_t2i", "val/loss_i2t", "val/loss_climb
                      "val/weighted_contribution_t2i", "val/weighted_contribution_i2t",
                      "val/weighted_contribution_climbmix"]
 COLUMNS = ["step", "total", "t2i", "i2t", "climbmix", "weighted_t2i", "weighted_i2t", "weighted_climbmix"]
-GROUPS = {"main": "主要消融", "single": "单任务对照", "scaling": "Flow-head 深度",
-          "legacy": "历史结构对照", "lr": "1.7B 学习率扫描"}
 PALETTE = ["#087e8b", "#d1495b", "#5c4d9e", "#d58a00", "#27844c", "#2563b5",
            "#aa3377", "#71752c", "#ac6031", "#526578", "#26a59a", "#bd7bad",
            "#6b8e23", "#5450c4", "#eb7134", "#1982a5", "#aa6b05", "#6a7a8b",
@@ -360,7 +358,8 @@ def plot_training(root: Path, data: dict):
                          "svg.fonttype": "none", "axes.spines.top": False, "axes.spines.right": False})
     artifacts = []
     for group, title in {"all": "All unified ablations", **GROUPS}.items():
-        runs = [r for r in data["runs"] if (r["points"] or r["validation"]["points"]) and (group == "all" or r["group"] == group)]
+        runs = [r for r in data["runs"] if (r["points"] or r["validation"]["points"])
+                and (group == "all" or r["group"] == group or (group == "ablation" and r["id"] == "b_x0"))]
         if not runs:
             continue
         fig, axes = plt.subplots(2, 2, figsize=(15, 9))

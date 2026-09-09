@@ -221,7 +221,7 @@ def report(root, state, protocol):
                                                        "is_std", "generation_seconds", "metrics_path"])
             writer.writeheader()
             writer.writerows(rows)
-        lines = ["# B-X0 reveal-order sweep", "", f"Status: **{state['status']}**.", "",
+        lines = ["# B reveal-order sweep", "", f"Status: **{state['status']}**.", "",
                  "Fixed CFG=2.0, Heun=10; final EMA step 95415; paired ImageNet-val 50K, seed 42; 16 NPUs per arm.",
                  "Selection uses minimum validation FID. Confidence scores are heuristic proxies, not calibrated probabilities.",
                  "The 16-position Halton candidate blocks are refreshed from generated context; proposals are discarded.", "",
@@ -245,7 +245,7 @@ def report(root, state, protocol):
                                                    "is_std", "generation_seconds", "metrics_path"])
         writer.writeheader()
         writer.writerows(rows)
-    lines = ["# B-X0 CFG / Heun sweep", "", f"Status: **{state['status']}**; phase: **{state['phase']}**.", "",
+    lines = ["# B CFG / Heun sweep", "", f"Status: **{state['status']}**; phase: **{state['phase']}**.", "",
              "Final EMA, ImageNet-val 50K, seed 42, paired initial noise, BF16 model / FP32 VAE.",
              "IS uses ten class-stratified splits. FID is comparable within this val-reference protocol.",
              "This is validation-set hyperparameter selection; the selected scores are not an independent holdout estimate.", "",
@@ -432,7 +432,7 @@ def prepare(args):
     saved = read(model / "config.json")
     require(saved["flow_condition_contract"] == "backbone_xt_query_backbone_x0_content"
             and saved["flow_head_attention_contract"] == "xlnet_content_diagonal",
-            "expected B-X0 checkpoint contracts")
+            "expected B checkpoint contracts")
     protocol = {"schema": "unified_t2i_cfg_heun_sweep_v1", "created_at": now(),
                 "model_source": str(model), "config": str(config),
                 "checkpoint_step": read(model / "ema_export_metadata.json")["source_global_step"],

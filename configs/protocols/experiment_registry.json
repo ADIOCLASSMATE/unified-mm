@@ -2,10 +2,70 @@
   "schema": "experiment_registry_v1",
   "experiments": [
     {
+      "run": "unified-a-x0content-0p6b-100b-imagenet-split-s42-r1",
+      "id": "a_x0",
+      "label": "A",
+      "group": "main",
+      "purpose": "formal",
+      "active_sources": [
+        "climbmix",
+        "t2i",
+        "i2t"
+      ]
+    },
+    {
       "run": "unified-b-x0content-0p6b-100b-imagenet-split-s42-r1",
       "id": "b_x0",
-      "label": "B · X0-content（新版）",
+      "label": "B",
       "group": "main",
+      "purpose": "formal",
+      "active_sources": [
+        "climbmix",
+        "t2i",
+        "i2t"
+      ]
+    },
+    {
+      "run": "unified-c-on-b-x0content-0p6b-100b-imagenet-split-s42-r1",
+      "id": "c_on_b",
+      "label": "C · B + 文本 AR",
+      "group": "ablation",
+      "purpose": "formal",
+      "active_sources": [
+        "climbmix",
+        "t2i",
+        "i2t"
+      ]
+    },
+    {
+      "run": "unified-d-on-b-0p6b-100b-imagenet-split-s42-r4",
+      "id": "d_on_b",
+      "label": "D · B + Dynamic-XT",
+      "group": "ablation",
+      "purpose": "formal",
+      "active_sources": [
+        "climbmix",
+        "t2i",
+        "i2t"
+      ]
+    },
+    {
+      "run": "unified-e-on-b-x0content-0p6b-100b-imagenet-split-s42-r1",
+      "id": "e_on_b",
+      "label": "E · B + sequential",
+      "group": "ablation",
+      "purpose": "formal",
+      "active_sources": [
+        "climbmix",
+        "t2i",
+        "i2t"
+      ]
+    },
+    {
+      "run": "unified-f-on-b-0p6b-100b-imagenet-split-s42-r1",
+      "id": "f_on_b",
+      "label": "F · B + position-wise head",
+      "group": "ablation",
       "purpose": "formal",
       "active_sources": [
         "climbmix",
@@ -16,7 +76,7 @@
     {
       "run": "unified-b-0p6b-100b-imagenet-split-s42-r1",
       "id": "b_flowdiag",
-      "label": "B · flow 对角线（指定版）",
+      "label": "历史 B · shared-condition / flow 对角线",
       "group": "legacy",
       "purpose": "formal",
       "active_sources": [
@@ -28,20 +88,8 @@
     {
       "run": "unified-b-flow-head-no-diagonal-0p6b-100b-imagenet-split-s42-r1",
       "id": "b_no_flowdiag",
-      "label": "B · flow 无对角线（旧版）",
+      "label": "历史 B · shared-condition / flow 无对角线",
       "group": "legacy",
-      "purpose": "formal",
-      "active_sources": [
-        "climbmix",
-        "t2i",
-        "i2t"
-      ]
-    },
-    {
-      "run": "unified-a-x0content-0p6b-100b-imagenet-split-s42-r1",
-      "id": "a_x0",
-      "label": "A · X0-content",
-      "group": "main",
       "purpose": "formal",
       "active_sources": [
         "climbmix",
@@ -52,56 +100,8 @@
     {
       "run": "unified-a-0p6b-100b-imagenet-split-s42-r1",
       "id": "a_legacy",
-      "label": "A · shared-condition（旧版）",
+      "label": "历史 A · shared-condition",
       "group": "legacy",
-      "purpose": "formal",
-      "active_sources": [
-        "climbmix",
-        "t2i",
-        "i2t"
-      ]
-    },
-    {
-      "run": "unified-c-on-b-x0content-0p6b-100b-imagenet-split-s42-r1",
-      "id": "c_on_b",
-      "label": "C on B · 文本 AR",
-      "group": "main",
-      "purpose": "formal",
-      "active_sources": [
-        "climbmix",
-        "t2i",
-        "i2t"
-      ]
-    },
-    {
-      "run": "unified-d-on-b-0p6b-100b-imagenet-split-s42-r4",
-      "id": "d_on_b",
-      "label": "D on B · Dynamic-XT（加载已修复）",
-      "group": "main",
-      "purpose": "formal",
-      "active_sources": [
-        "climbmix",
-        "t2i",
-        "i2t"
-      ]
-    },
-    {
-      "run": "unified-e-on-b-x0content-0p6b-100b-imagenet-split-s42-r1",
-      "id": "e_on_b",
-      "label": "E on B · sequential",
-      "group": "main",
-      "purpose": "formal",
-      "active_sources": [
-        "climbmix",
-        "t2i",
-        "i2t"
-      ]
-    },
-    {
-      "run": "unified-f-on-b-0p6b-100b-imagenet-split-s42-r1",
-      "id": "f_on_b",
-      "label": "F on B · position-wise",
-      "group": "main",
       "purpose": "formal",
       "active_sources": [
         "climbmix",
@@ -112,7 +112,7 @@
     {
       "run": "unified-c-on-a-legacy-0p6b-100b-imagenet-split-s42-r1",
       "id": "c_on_a_legacy",
-      "label": "C on A · 旧对照",
+      "label": "历史 C · 旧 A + 文本 AR",
       "group": "legacy",
       "purpose": "formal",
       "active_sources": [
@@ -124,7 +124,7 @@
     {
       "run": "unified-a-0p6b-caption-only-100bphys-s42-r1",
       "id": "a_caption_only",
-      "label": "A · caption-only",
+      "label": "历史 A · caption-only",
       "group": "single",
       "purpose": "formal",
       "active_sources": [
@@ -134,7 +134,7 @@
     {
       "run": "unified-b-0p6b-caption-only-100bphys-s42-r1",
       "id": "b_caption_only",
-      "label": "B · caption-only",
+      "label": "历史 B · caption-only",
       "group": "single",
       "purpose": "formal",
       "active_sources": [
@@ -144,7 +144,7 @@
     {
       "run": "unified-a-0p6b-text-only-100bphys-s42-r1",
       "id": "a_text_only",
-      "label": "A · text-only",
+      "label": "历史 A · text-only",
       "group": "single",
       "purpose": "formal",
       "active_sources": [
@@ -154,7 +154,7 @@
     {
       "run": "unified-b-0p6b-text-only-100bphys-s42-r1",
       "id": "b_text_only",
-      "label": "B · text-only",
+      "label": "历史 B · text-only",
       "group": "single",
       "purpose": "formal",
       "active_sources": [

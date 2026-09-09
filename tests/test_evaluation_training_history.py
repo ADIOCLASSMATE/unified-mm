@@ -59,7 +59,7 @@ def test_discovery_includes_no_ema_runs_and_uses_actual_sweep_stop(tmp_path):
     assert all(r["complete"] and r["target_steps"] == 955 and r["last_logged_step"] == 950 for r in completed)
     pending = next(r for r in data["runs"] if r["id"] == "future")
     assert pending["points"] == [] and pending["status"] == "等待训练日志"
-    assert any(r["label"] == "B · T2I-only" and r["source"] is None for r in data["runs"])
+    assert any(r["label"] == "历史 B · T2I-only" and r["source"] is None for r in data["runs"])
     assert not any("smoke" in r["run"] for r in data["runs"])
 
 

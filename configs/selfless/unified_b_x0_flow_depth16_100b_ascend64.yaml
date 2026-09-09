@@ -1,4 +1,4 @@
-# B_x0 flow-head depth scaling: 16 layers, width 1280.
+# B flow-head depth scaling: 16 layers, width 1280.
 # Unified baseline-B initialized from Qwen3-0.6B-Base.
 #
 # One optimizer update on 64 NPUs is frozen to four microbatches:
@@ -12,7 +12,7 @@
 # is frozen here; no new 0.6B sweep or sweep-checkpoint resume is permitted.
 experiment:
     identity:
-        label: "B_x0 · flow depth 16"
+        label: "B · flow depth 16"
         group: scaling
         purpose: formal
     project: "unified-b-x0content-flowdepth16-0p6b-100b-imagenet-split-s42-r1"

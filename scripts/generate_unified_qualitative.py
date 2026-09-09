@@ -41,7 +41,7 @@ from utils.evaluation_model_source import (
     configure_model_source, load_model_source_weights, resolve_evaluation_model_source,
 )
 from utils.image_generation_io import decode_latents, load_vae
-from utils.experiment_registry import is_temporary_training_run, model_labels, experiment_identity, task_training_labels, read_run_identity
+from utils.experiment_registry import is_temporary_training_run, model_labels, experiment_identity, task_training_labels, read_run_identity, current_presentation, presentation_sort_key
 from utils.imagenet_flow_batching import collate_imagenet_flow_cache
 from utils.imagenet_synthetic_text_index import ImageNetSyntheticTextIndex
 from utils.utils import load_model_tokenizer
@@ -470,7 +470,8 @@ def run(args):
 def render(args):
     root = args.output_dir.resolve()
     manifest = read_json(root / "manifest.json")
-    models, samples = manifest["models"], manifest["samples"]
+    models, samples = [current_presentation(spec) for spec in manifest["models"]], manifest["samples"]
+    models.sort(key=presentation_sort_key)
     esc = lambda x: html.escape(str(x), quote=True)
     records, counts, missing = {}, {}, []
     for spec in models:
@@ -507,8 +508,8 @@ def render(args):
             "<p>固定样本及成对噪声，所有输出保留，无质量筛选。10 步 Heun / CFG 3.5 / BF16 模型 / FP32 VAE。E 使用 sequential，其余 spatial_halton；顺序是模型合同的一部分。这里只做定性展示，不代表正式 benchmark 分数。</p>",
             "<p>I2T 显示<strong>模型实际输入 latent 的 VAE 重建图</strong>；COCO/Flickr 可展开原图。参考描述仅用于人工对照，未输入模型。纯文本使用基座续写格式、greedy 与温度 0.8（无 top-k/top-p）；中文与组合提示含域外诊断。</p>",
             "<nav><a href='#t2i'>T2I</a> · <a href='#i2t'>I2T</a> · <a href='#text'>纯文本</a> · <a href='#inventory'>模型与进度</a> · <a href='manifest.json'>完整协议/来源</a> · <a href='results.jsonl'>原始结果 JSONL</a></nav>",
-            "<div class='controls'><button onclick='selectModels(true)'>全部模型</button><button onclick='selectModels(false)'>只看主对照</button></div><div class='controls'>"]
-    main_ids = {"b_x0", "b_flowdiag", "a_x0", "c_on_b", "d_on_b", "e_on_b", "f_on_b"}
+            "<div class='controls'><button onclick='selectModels(false)'>正式 A / B</button><button onclick='selectModels(true)'>全部模型（含历史）</button></div><div class='controls'>"]
+    main_ids = {spec["id"] for spec in models if spec["group"] == "main"}
     for spec in models:
         body.append(f"<label><input class='model-toggle' type='checkbox' checked data-main='{int(spec['id'] in main_ids)}' value='{esc(spec['id'])}' onchange='toggleModel(this)'>{esc(spec['label'])}</label>")
     body.append("</div>")
@@ -548,8 +549,8 @@ def render(args):
     body.append("<section id='inventory'><h2>模型来源与进度</h2><table><tr><th>模型</th><th>Checkpoint / contract</th><th>已完成数量</th></tr>")
     for spec in models:
         body.append(f"<tr><td>{esc(spec['label'])}</td><td><pre>{esc(spec['checkpoint'])}</pre><small>step {spec['source']['global_step']} · {esc(spec['architecture'])} · backbone {esc(spec['backbone_attention'])} · flow {esc(spec['flow_attention'])}</small></td><td>{esc(counts[spec['id']])}</td></tr>")
-    body.append("</table><p>仅纳入已完成的 Unified-MM final EMA；A T2I-only 尚无 final EMA，未纳入。中间 checkpoint 与更早的独立 ImageNet-only 项目不在本轮范围。</p></section>")
-    body.append("""<script>function toggleModel(el){document.querySelectorAll('[data-model="'+el.value+'"]').forEach(x=>x.hidden=!el.checked)}function selectModels(all){document.querySelectorAll('.model-toggle').forEach(x=>{x.checked=all||x.dataset.main==='1';toggleModel(x)})}</script></html>""")
+    body.append("</table><p>仅纳入已完成的 Unified-MM final EMA；历史 A T2I-only 尚无 final EMA，未纳入。中间 checkpoint 与更早的独立 ImageNet-only 项目不在本轮范围。</p></section>")
+    body.append("""<script>function toggleModel(el){document.querySelectorAll('[data-model="'+el.value+'"]').forEach(x=>x.hidden=!el.checked)}function selectModels(all){document.querySelectorAll('.model-toggle').forEach(x=>{x.checked=all||x.dataset.main==='1';toggleModel(x)})}selectModels(false);</script></html>""")
     write_text(root / "index.html", "\n".join(body))
     write_text(root / "results.jsonl", "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in all_results))
     write_text(root / "README.md", f"# Unified-MM 生成质量对照\n\n打开同目录 `index.html`，可按模型隐藏列，查看 T2I、I2T 与纯文本逐样本对照。\n\n状态：{'全部完成' if complete else '生成中'}。共 {len(models)} 个 final EMA，每模型 128 张图、64 个 I2T、64 条文本续写。\n\nI2T 输入为固定 posterior 的 VAE 重建，参考 caption 不进入模型。单模态未训练任务在页面标注；保留所有输出，无筛选。纯文本是基座续写，不是指令聊天。\n\n精确来源及采样协议见 `manifest.json`；逐条原始输出含 token IDs 见 `results.jsonl`；各模型载入校验在 `models/*/load_reports/`。\n")

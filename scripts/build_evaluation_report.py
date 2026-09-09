@@ -22,6 +22,7 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 from scripts.evaluation_report_training import collect_training, export_training, plot_training
 from scripts.evaluation_report_provenance import collect_provenance, export_provenance
+from utils.experiment_registry import current_presentation, presentation_sort_key
 TEXT_TASKS = ("arc_easy", "arc_challenge", "hellaswag", "piqa", "winogrande", "boolq", "openbookqa", "mmlu")
 BENCHMARKS = {"sugarcrepe": 7511, "aro_vg_relation": 23937, "aro_vg_attribution": 28748,
               "mmbench_dev_en": 4329, "seed_bench_image": 14233}
@@ -461,7 +462,7 @@ def matrix_sweep_data(root: Path, selection: dict, models: list):
         comparison = []
         for mid, spec in protocol["models"].items():
             values = {r["strategy"]: r for r in rows if r["model"] == mid}
-            comparison.append({"model": mid, "label": spec["label"], "native_strategy": spec["native_strategy"],
+            comparison.append({"model": mid, "label": specs[mid]["label"], "native_strategy": spec["native_strategy"],
                 "previous": {k: specs[mid]["metrics"].get(k) for k in ["fid", "is"]}, "strategies": values})
         conclusion = None
         if state["status"] == "complete":
@@ -508,7 +509,9 @@ def build(root: Path, selection_file: Path, *, plots: bool = False):
     models = []
     known = {m["id"] for m in gallery["manifest"]["models"]}
     require(set(selection["models"]) <= known, "selected metric model absent from qualitative inventory")
-    for spec in gallery["manifest"]["models"]:
+    specs = [current_presentation(spec) for spec in gallery["manifest"]["models"]]
+    specs.sort(key=presentation_sort_key)
+    for spec in specs:
         models.append({**spec, **model_metrics(root, spec, selection["models"].get(spec["id"], {}))})
     sampling_sweeps = sampling_sweep_data(root, selection, models)
     updated = datetime.now(UTC).isoformat(timespec="seconds")
@@ -528,7 +531,7 @@ def build(root: Path, selection_file: Path, *, plots: bool = False):
                ("全模型逐步训练 loss CSV", training["csv"]),
                ("全模型训练期间验证 loss CSV", training["validation_csv"]),
                ("完整定性长表与 ZIP", gallery["root"] + "/index.html"),
-               ("B_x0 FID 全量复核", "comparisons/bx0-fid-recheck-20260908/REPORT.md"),
+               ("B FID 全量复核", "comparisons/bx0-fid-recheck-20260908/REPORT.md"),
                ("B / D 同噪声复核图", "comparisons/bx0-fid-recheck-20260908/paired_generation.html"),
                ("C / D / E 评测加载审计", "audits/audit-cde-evaluation-20260908-4AcX8p/REPORT.md"),
                ("跨模型 Geometry V5", "research/cross-model-geometry-v5-20260907/RESULTS_ZH.md"),

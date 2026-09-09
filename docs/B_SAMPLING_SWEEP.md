@@ -1,4 +1,6 @@
-# B-X0 CFG / Heun sweep
+# B CFG / Heun sweep
+
+B is the formal model defined in [EXPERIMENTS.md](EXPERIMENTS.md).
 
 This study evaluates the final step-95415 EMA from
 `output/unified-b-x0content-0p6b-100b-imagenet-split-s42-r1/hf_model-final-ema`.
@@ -73,5 +75,5 @@ The selected run is registered in
 `output/evaluation/index.html` from validated raw results. Its sampling tab
 shows the table, curves, independently selected FID/IS optima, and an image
 comparison with synchronized sample selection. Incomplete sweeps have no
-final optimum. The existing model table retains its shared CFG=3.5,
-Heun=10 protocol.
+final optimum. The model table defaults to CFG=2.0 / Heun=10 and retains
+CFG=3.5 as an explicit historical protocol selection.

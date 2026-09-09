@@ -1,7 +1,7 @@
 # 早期 ImageNet Selfless-Flow 消融结论（历史）
 
 本文件保留早期 ImageNet 架构研究的结果与当时使用的配方。下文的“最终架构”
-指该轮实验的选择，不代表当前 Unified A/B/C/D/E/F 消融的全部接口。
+指该轮实验的选择。当前正式 A/B 及保留消融的定义统一见[实验定义](EXPERIMENTS.md)。
 当前默认值及评测入口见 [README](../README.md) 和 [评测结构](EVALUATION_STRUCTURE.md)。
 
 ## 最终架构

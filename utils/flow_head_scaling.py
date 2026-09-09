@@ -1,4 +1,4 @@
-"""The two depth-only B_x0 scaling arms, with the complete baseline recipe."""
+"""The two depth-only B scaling arms, with the complete baseline recipe."""
 
 from __future__ import annotations
 
@@ -58,7 +58,7 @@ def validate_scaling_config(config) -> dict:
 
     changed = differences(actual_payload, expected_payload)
     if changed:
-        raise ValueError("scaling arm differs from B_x0 recipe: " + ", ".join(changed))
+        raise ValueError("scaling arm differs from B recipe: " + ", ".join(changed))
     return {
         "schema": "unified_b_x0_flow_depth_scaling_v1",
         "baseline_config": BASE_CONFIG,

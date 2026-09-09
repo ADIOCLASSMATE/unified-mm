@@ -1,6 +1,7 @@
 # 评测结构
 
 统一入口是 [`output/evaluation/index.html`](../output/evaluation/index.html)。
+当前正式模型是 A/B，定义与历史别名统一见[实验命名与定义](EXPERIMENTS.md)。
 所有模型的正式分数、定性输出、训练验证与表征分析都在 `output/evaluation/`；
 权重、优化器、随机状态、续训 checkpoint 和训练日志保留在训练目录。
 
@@ -29,22 +30,22 @@ output/evaluation/
 
 | 入口 | 内容 |
 | --- | --- |
-| 研究总览 `#overview` | 研究摘要，以及后续五节各自的总表、结论和详情导航 |
-| 模型消融 `#matrix` | 模型结构与训练变体的评测分数；按指标组、生成协议、模型范围切换 |
-| 采样与解码消融 `#sampling/parameters` | CFG / Heun 步数扫描、B_x0 解码策略、跨模型换序三个子页；各自保留分数、曲线与配对样例 |
-| 训练与验证 Loss `#training` | 所有训练实验的总 loss 及 T2I / I2T / 纯文本曲线 |
-| 定性样例 `#qualitative/t2i` | T2I、I2T、文本续写三个子页，共用模型与样本筛选 |
+| 研究总览 `#overview` | 正式 A/B 的摘要与对照表，以及采样、训练、样例和数据入口 |
+| 模型评测 `#matrix` | 默认正式 A/B；可切换 B 上的 C–F 消融、历史实验或全部指标，并按指标组、生成协议筛选 |
+| 采样与解码消融 `#sampling/parameters` | B 的 CFG / Heun 步数扫描、解码策略、跨模型换序（含历史消融）三个子页 |
+| 训练与验证 Loss `#training` | 默认正式 A/B 的总 loss 及 T2I / I2T / 纯文本曲线；其他实验按组选择 |
+| 定性样例 `#qualitative/t2i` | T2I、I2T、文本续写三个子页，默认正式 A/B，共用模型与样本筛选 |
 | 数据与协议 `#sources` | 数据来源、合成模型与模板、来源核验及全部文件入口 |
 
-首页与模型消融页默认使用 CFG=2.0、Heun=10 的原生顺序 FID / IS：
+首页与模型评测页默认使用 CFG=2.0、Heun=10 的原生顺序 FID / IS：
 E 使用 Sequential，其余使用 Halton，直接链接到对应的原始完成结果。
 可切换至历史 CFG=3.5；不改变文本、图像理解、检索等自身协议的分数。
-CFG=2.0 源自 B_x0 参数扫描，未对各模型分别选优；缺少该协议的分数保持空白。
+CFG=2.0 源自 B 参数扫描，未对各模型分别选优；缺少该协议的分数保持空白。
 同配置下的解码顺序比较集中在 `#sampling/cross-model`，不混入模型指标表。
 旧链接 `#sweep` / `#order` 和 `#t2i` / `#i2t` / `#text` 会跳到对应的新子页。
 
 “训练与验证 Loss”独立扫描 `output/unified-*` 的正式训练配置和 `training_metrics.jsonl`，
-覆盖主要消融、单任务/历史对照、1.7B LR sweep，以及尚未导出 EMA 的 flow-depth
+覆盖正式 A/B、B 上的 C–F 消融、历史与单任务对照、1.7B LR sweep，以及尚未导出 EMA 的 flow-depth
 实验；不将 smoke/debug/replay 纳入正式曲线。T2I、I2T、ClimbMix 分别读取
 `train/loss_t2i`、`train/loss_i2t`、`train/loss_climbmix`，并保留总 loss 和三项加权贡献。
 混合 `train/loss_text` 不冒充纯文本 loss，缺失任务保持空白。原始点完整导出；平滑仅作用于显示。

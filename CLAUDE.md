@@ -1,11 +1,23 @@
 # Unified-MM Project Context
 
+## Experiment names
+
+- Formal **A** and **B** are the former A_x0 and B_x0. Use A/B in current
+  prose and figures. C–F are ablations on formal B; older A/B and retired
+  branches are historical experiments.
+- `docs/EXPERIMENTS.md` defines the methods;
+  `configs/protocols/experiment_registry.json` owns display names and groups.
+  Keep persisted IDs, run directories and checkpoint paths stable. In particular,
+  the old `unified-a/b-0p6b-...` runs must never be presented as formal A/B.
+- The evaluation overview, metrics, loss curves and qualitative defaults focus
+  on A/B; B-based C–F ablations and historical experiments have separate filters.
+
 ## Base architecture invariants
 
 - Selfless-Flow image tokens are 256 KL16 tokens of width 16.
 - Image attention uses row/column pure 2D RoPE in both the Qwen backbone and
   dynamic dual-stream contextual flow head.
-- Do not add additive image positions. Retained A/B/C/D/E/F ablations have
+- Do not add additive image positions. A/B, C–F and historical experiments have
   explicit model and checkpoint contracts; preserve those distinctions.
 - `backbone_attention_output_gate` remains a supported option:
   `none` by default, or `per_head_identity_sigmoid` for compatible research

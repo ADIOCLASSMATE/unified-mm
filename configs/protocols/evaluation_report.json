@@ -5,7 +5,7 @@
   "order_sweeps": [{"model": "b_x0", "root": "unified-b-x0content-0p6b/sweeps/order-20260908-r1"}],
   "sampling_sweeps": [{
     "model": "b_x0",
-    "label": "B_x0 · CFG / Heun 参数扫描",
+    "label": "B · CFG / Heun 参数扫描",
     "root": "unified-b-x0content-0p6b/sweeps/cfg-heun-20260908-r1"
   }],
   "models": {

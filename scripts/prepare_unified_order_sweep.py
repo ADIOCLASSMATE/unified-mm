@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare a frozen B-X0 order study after auditing the final CFG neighborhood."""
+"""Prepare a frozen B order study after auditing the final CFG neighborhood."""
 from __future__ import annotations
 
 import argparse

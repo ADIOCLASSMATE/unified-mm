@@ -1,8 +1,9 @@
 """Shared run identity for launchers, histories and qualitative evaluation.
 
 Checkpoint model contracts remain authoritative for architecture and weights.
-The registry names retained experiments; new runs can declare experiment.identity
-in their config. Name-based fallbacks only support historical output layouts.
+The registry owns current display names/groups; persisted IDs and run paths stay
+stable so historical results and resumable training identities remain usable.
+New runs can declare experiment.identity in their config.
 """
 from __future__ import annotations
 
@@ -13,7 +14,9 @@ from pathlib import Path
 from utils.atomic_io import atomic_write_text
 
 REGISTRY_PATH = Path(__file__).resolve().parents[1] / "configs/protocols/experiment_registry.json"
-GROUPS = {"main", "single", "scaling", "legacy", "lr"}
+GROUPS = {"main": "正式 A / B", "ablation": "B 上的消融（C–F）",
+          "legacy": "历史消融", "single": "历史单任务对照",
+          "scaling": "B · Flow-head 深度", "lr": "历史 1.7B 学习率扫描"}
 SOURCES = {"climbmix", "t2i", "i2t"}
 
 
@@ -31,6 +34,20 @@ def registered_experiments():
 
 def model_labels():
     return {run: (row["id"], row["label"]) for run, row in registered_experiments().items()}
+
+
+def current_presentation(identity):
+    """Refresh registered labels/groups without changing result or task identity."""
+    registered = registered_experiments().get(identity.get("run"))
+    if registered:
+        if identity["id"] != registered["id"]:
+            raise ValueError(f"experiment id disagrees with registry: {identity['run']}")
+        return {**identity, "label": registered["label"], "group": registered["group"]}
+    return {**identity, "group": identity.get("group", identity.get("experiment_identity", {}).get("group", "legacy"))}
+
+
+def presentation_sort_key(identity):
+    return list(GROUPS).index(identity["group"]), identity["label"]
 
 
 def is_temporary_training_run(name: str) -> bool:
@@ -54,15 +71,17 @@ def experiment_identity(run: str, config=None, *, presentation=None):
         group = "single"
         if not display:
             prefix = "B" if Path(run).name.startswith("unified-b-") else "A"
+            if config.get("model", {}).get("flow_condition_contract") != "backbone_xt_query_backbone_x0_content":
+                prefix = f"历史 {prefix}"
             task = "T2I-only" if "t2i-only" in run else "caption-only" if "caption-only" in run else "text-only"
             label = f"{prefix} · {task}"
     elif "flowdepth" in run:
         group = "scaling"
-        label = f"B_x0 · flow depth {config.get('model', {}).get('image_flow_depth', '?')}"
+        label = f"B · flow depth {config.get('model', {}).get('image_flow_depth', '?')}"
     elif "-lr-sweep-" in run:
-        group, label = "lr", f"A 1.7B · {Path(run).name}"
+        group, label = "lr", f"历史 A 1.7B · {Path(run).name}"
     elif run.startswith("unified-e-on-b-0p6b"):
-        label = "E on B · 旧 shared-condition"
+        label = "历史 E · shared-condition"
     identity = {"schema": "experiment_identity_v1", "run": run,
                 "id": display.get("id", run), "label": label, "group": group,
                 "purpose": registered.get("purpose", "unclassified"),
@@ -80,7 +99,7 @@ def experiment_identity(run: str, config=None, *, presentation=None):
         raise ValueError("invalid experiment group/purpose")
     if sources is not None and (not sources or set(sources) - SOURCES):
         raise ValueError("invalid active sources in experiment identity")
-    return identity
+    return current_presentation(identity)
 
 
 def task_training_labels(identity):
@@ -97,8 +116,10 @@ def task_training_labels(identity):
 def write_run_identity(output_dir: Path, config) -> None:
     identity = experiment_identity(output_dir.name, config)
     path = output_dir / "experiment_identity.json"
-    if path.exists() and json.loads(path.read_text()) != identity:
-        raise ValueError(f"experiment identity changed within one output directory: {path}")
+    if path.exists():
+        if current_presentation(json.loads(path.read_text())) != identity:
+            raise ValueError(f"experiment identity changed within one output directory: {path}")
+        return  # A display rename must not rewrite a saved training identity.
     atomic_write_text(path, json.dumps(identity, ensure_ascii=False, indent=2) + "\n")
 
 
@@ -119,4 +140,4 @@ def read_run_identity(directory: Path, config=None, *, presentation=None):
         raise ValueError(f"invalid experiment active sources: {path}")
     if config and identity.get("active_sources") != expected["active_sources"]:
         raise ValueError(f"experiment task identity disagrees with configuration: {path}")
-    return identity
+    return current_presentation(identity)
