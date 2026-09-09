@@ -9,6 +9,7 @@ import logging
 import math
 import os
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
@@ -20,7 +21,9 @@ from utils.checkpoint_transaction import (
     prepare_checkpoint, publish_checkpoint, publish_directory, write_checkpoint_inventory, validate_checkpoint_inventory,
 )
 from utils.distributed_io import run_io_phase
-from utils.selfless_training_runtime import RESUME_SCHEMA, RESUME_CONTRACT_VERSION, build_sampler_resume_state
+from utils.selfless_training_runtime import (
+    RESUME_SCHEMA, RESUME_CONTRACT_VERSION, build_sampler_resume_state, validate_resume_contract,
+)
 from utils.sharded_ema import (
     RankShardedEMA, cast_state_dict_floating_dtype, load_ema_manifest,
     mark_hf_ema_config_dtype, merge_sharded_ema_state_dict, read_sharded_ema_rows,
@@ -35,6 +38,96 @@ def _log_info(message):
         logger.info(message)
     except RuntimeError:
         logging.getLogger(__name__).info(message)
+
+
+def _is_disabled_path(value):
+    return value is None or (
+        isinstance(value, str) and value.lower() in {"none", "null", "false", ""}
+    )
+
+
+@dataclass(frozen=True)
+class TrainingResumeState:
+    global_step: int
+    checkpoint_dir: Path | None
+    metadata: dict | None
+    cumulative_wall_seconds: float
+    cumulative_loss_checks: int
+
+
+def restore_training_state(
+    *, config, accelerator, train_dataloader, mixed_source_training,
+    config_contract, ema, ema_update_after_step,
+) -> TrainingResumeState:
+    """Validate the published state before restoring model, data cursor and EMA."""
+    checkpoint_dir = None
+    metadata = None
+    global_step = 0
+    resume_path = config.experiment.resume_from_checkpoint
+    if not _is_disabled_path(resume_path):
+        checkpoint_dir = Path(resume_path)
+
+        def validate_resume():
+            if not checkpoint_dir.exists():
+                raise FileNotFoundError(
+                    f"Specified resume checkpoint does not exist: {checkpoint_dir}"
+                )
+            metadata_file = checkpoint_dir / "metadata.json"
+            if not metadata_file.is_file():
+                raise RuntimeError(
+                    f"Refusing to resume a checkpoint without metadata: {metadata_file}"
+                )
+            saved = json.loads(metadata_file.read_text(encoding="utf-8"))
+            _validate_checkpoint_complete(checkpoint_dir, expected_global_step=int(saved["global_step"]))
+            if int(saved.get("world_size", -1)) != accelerator.num_processes:
+                raise RuntimeError(
+                    "Caption resume requires the same world size: "
+                    f"checkpoint={saved.get('world_size')}, current={accelerator.num_processes}"
+                )
+            validate_resume_contract(saved, current_contract=config_contract)
+            return saved
+
+        metadata = run_io_phase(
+            accelerator, validate_resume, description="checkpoint resume preflight", main_process_only=True,
+        )
+        global_step = int(metadata["global_step"])
+        _log_info(f"Resuming training from checkpoint: {checkpoint_dir}")
+        # DeepSpeed-internal collectives still depend on backend timeouts and
+        # the launcher; file-only phases below share errors before proceeding.
+        run_io_phase(
+            accelerator, lambda: accelerator.load_state(checkpoint_dir), description="Accelerate state restore",
+        )
+        run_io_phase(
+            accelerator, lambda: _restore_npu_rng_state(checkpoint_dir, accelerator), description="NPU RNG restore",
+        )
+        if mixed_source_training:
+            train_dataloader.load_state(checkpoint_dir, accelerator, global_step)
+        _log_info(f"Resumed at global_step={global_step}")
+    else:
+        _log_info("Starting fresh caption training.")
+
+    if ema is not None:
+        if checkpoint_dir is not None:
+            ema.load_checkpoint(checkpoint_dir, accelerator, expected_global_step=global_step)
+            _log_info(f"Loaded rank {accelerator.process_index} EMA shard at global_step={global_step}.")
+        else:
+            ema.initialize_from_model(global_step=global_step)
+            _log_info("Initialized this rank's FP32 EMA shard from the training model.")
+        if ema.started:
+            _log_info(f"EMA is active at global_step={global_step}.")
+        else:
+            _log_info(
+                "EMA updates are delayed until "
+                f"global_step={ema_update_after_step}; validation and adapter saves will use the training model until then."
+            )
+
+    return TrainingResumeState(
+        global_step=global_step,
+        checkpoint_dir=checkpoint_dir,
+        metadata=metadata,
+        cumulative_wall_seconds=float((metadata or {}).get("cumulative_training_wall_seconds", 0.0)),
+        cumulative_loss_checks=int((metadata or {}).get("cumulative_finite_loss_microbatches_checked", 0)),
+    )
 
 
 def _special_token_ids(config):

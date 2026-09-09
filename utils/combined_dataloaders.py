@@ -746,6 +746,13 @@ class ScheduledCombinedLoader:
         run_io_phase(accelerator, write_state, description="mixed data state save")
 
     def load_state(self, checkpoint_dir: str | Path, accelerator, global_step: int):
+        return run_io_phase(
+            accelerator,
+            lambda: self._load_local_state(checkpoint_dir, global_step),
+            description="mixed data state restore",
+        )
+
+    def _load_local_state(self, checkpoint_dir: str | Path, global_step: int):
         if self._text_iterator is not None or self._image_iterators:
             raise RuntimeError("mixed data state must be loaded before iteration")
         path = Path(checkpoint_dir) / f"data_state_rank_{self._rank:05d}.pt"
@@ -824,7 +831,6 @@ class ScheduledCombinedLoader:
                     "ScheduledCombinedLoader is not prepared for ClimbMix"
                 )
             self._text_dataset.set_resume_state(climbmix_state)
-        accelerator.wait_for_everyone()
 
 
 def build_unified_mixed_dataloaders(config, tokenizer):

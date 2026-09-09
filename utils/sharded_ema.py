@@ -480,6 +480,18 @@ class RankShardedEMA:
         *,
         expected_global_step: int | None = None,
     ) -> None:
+        return run_io_phase(
+            accelerator,
+            lambda: self._load_local_checkpoint(directory, expected_global_step=expected_global_step),
+            description="EMA shard restore",
+        )
+
+    def _load_local_checkpoint(
+        self,
+        directory: str | Path,
+        *,
+        expected_global_step: int | None = None,
+    ) -> None:
         directory = Path(directory)
         manifest = load_ema_manifest(directory)
         if int(manifest["world_size"]) != self.world_size:
@@ -539,7 +551,6 @@ class RankShardedEMA:
         self.shards = loaded
         self.started = bool(runtime.get("started", False))
         self.global_step = checkpoint_step
-        accelerator.wait_for_everyone()
 
 
 def _selected_canonical_names(

@@ -64,3 +64,30 @@ def test_publication_failure_keeps_previous_checkpoint(tmp_path, monkeypatch):
         publish_checkpoint(staging, destination, ACCELERATOR, global_step=2)
     assert not destination.exists()
     assert (old / "state.bin").read_bytes() == b"last complete state"
+
+
+@pytest.mark.parametrize("damage", ["missing_metadata", "missing_rank_state", "truncated_rank_state"])
+def test_restore_preflight_rejects_damage_before_model_or_optimizer_load(tmp_path, damage):
+    from utils.training_checkpoint import restore_training_state
+
+    directory = tmp_path / "checkpoint-2"
+    _write_payload(directory, world_size=1)
+    (directory / "metadata.json").write_text(json.dumps({"global_step": 2, "world_size": 1}))
+    write_checkpoint_inventory(directory, world_size=1, mixed_data=True, ema=False)
+    (directory / "checkpoint_complete.json").write_text(json.dumps({
+        "schema": "selfless_caption_checkpoint_complete_v2", "global_step": 2,
+    }))
+    if damage == "missing_metadata":
+        (directory / "metadata.json").unlink()
+    elif damage == "missing_rank_state":
+        (directory / "data_state_rank_00000.pt").unlink()
+    else:
+        (directory / "data_state_rank_00000.pt").write_bytes(b"bad")
+    loaded = []
+    accelerator = SimpleNamespace(is_main_process=True, num_processes=1, load_state=loaded.append)
+    config = SimpleNamespace(experiment=SimpleNamespace(resume_from_checkpoint=str(directory)))
+    with pytest.raises((RuntimeError, ValueError, FileNotFoundError)):
+        restore_training_state(config=config, accelerator=accelerator, train_dataloader=None,
+                               mixed_source_training=True, config_contract={}, ema=None,
+                               ema_update_after_step=0)
+    assert loaded == [], "damaged published state must be rejected before loading mutable training state"

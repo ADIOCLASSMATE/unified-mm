@@ -23,7 +23,6 @@ import importlib.util
 from pathlib import Path
 from omegaconf import OmegaConf
 import torch
-from torch.optim import AdamW
 import torch.nn.functional as F
 
 
@@ -41,12 +40,6 @@ from utils.dataset_utils import get_dataloaders
 from utils.flow_head_contract import (
     flow_head_attention_report,
     validate_flow_head_attention_contract,
-)
-from utils.wsd_schedule import get_wsd_schedule
-from utils.selfless_flow_optimizer import (
-    learning_rate_for_parameter,
-    optimizer_parameter_role,
-    weight_decay_for_parameter,
 )
 from utils.selfless_flow_adapter import load_image_flow_adapter
 from utils.selfless_training_runtime import (
@@ -91,7 +84,12 @@ from utils.utils import (
     save_hf_model,
 )
 
+from utils.training_setup import build_optimizer_and_scheduler
+from utils.training_reporting import write_training_runtime_report
+
 from utils.training_checkpoint import (
+    _is_disabled_path,
+    restore_training_state,
     _begin_checkpoint_write,
     _complete_hf_export_exists,
     _ema_decay,
@@ -592,12 +590,6 @@ def _prepare_showo_image_masks(
     return sampled_mask, image_latent_mask, mask_prob
 
 
-def _is_disabled_path(value):
-    return value is None or (
-        isinstance(value, str) and value.lower() in {"none", "null", "false", ""}
-    )
-
-
 def _apply_trainable_scope(model, config) -> dict[str, int | str]:
     """Apply the explicit optimizer scope before EMA/DeepSpeed construction."""
 
@@ -1045,102 +1037,7 @@ def main(*, model_loader=None):
     ##################################
     #   Optimizer and LR scheduler   #
     ##################################
-    optimizer_config = config.optimizer.params
-
-    # Use lower LR for the pretrained backbone and higher LR for continuous-
-    # image modules. Decay flow-head matrix weights while keeping biases,
-    # normalization parameters, and the small input projectors decay-free.
-    base_lr = float(optimizer_config.learning_rate)
-    backbone_lr = float(optimizer_config.get("backbone_learning_rate", base_lr))
-    flow_lr = float(optimizer_config.get("flow_learning_rate", base_lr))
-    projector_lr = float(optimizer_config.get("projector_learning_rate", flow_lr))
-    special_token_lr = float(optimizer_config.get("special_token_learning_rate", projector_lr))
-    global_weight_decay = float(optimizer_config.weight_decay)
-    flow_weight_decay = float(
-        optimizer_config.get("flow_weight_decay", global_weight_decay)
-    )
-    grouped = {}
-    optimizer_role_numel = {}
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        weight_decay = weight_decay_for_parameter(
-            name,
-            global_weight_decay=global_weight_decay,
-            flow_weight_decay=flow_weight_decay,
-        )
-        role = optimizer_parameter_role(name)
-        optimizer_role_numel[role] = optimizer_role_numel.get(role, 0) + int(
-            param.numel()
-        )
-        learning_rate = learning_rate_for_parameter(
-            name,
-            backbone_lr=backbone_lr,
-            flow_lr=flow_lr,
-            projector_lr=projector_lr,
-            special_token_lr=special_token_lr,
-        )
-        key = (learning_rate, weight_decay)
-        grouped.setdefault(key, []).append(param)
-
-    optimizer_grouped_parameters = [
-        {"params": params, "lr": lr, "weight_decay": weight_decay}
-        for (lr, weight_decay), params in grouped.items()
-    ]
-    logger.info(
-        "Optimizer LRs: "
-        f"backbone={backbone_lr:g}, image_token_embedder/image_flow_condition_proj={projector_lr:g}, "
-        f"image_flow_head={flow_lr:g}; "
-        f"special_tokens={special_token_lr:g}; "
-        f"weight_decay={global_weight_decay:g}, "
-        f"flow_weight_decay={flow_weight_decay:g}"
-    )
-    tied_embedding = model.lm_head.weight is model.model.embed_tokens.weight
-    if not tied_embedding:
-        raise RuntimeError(
-            "Joint training expects lm_head.weight and embed_tokens.weight to be tied"
-        )
-    logger.info(
-        "Optimizer parameter coverage: "
-        + ", ".join(
-            f"{role}={optimizer_role_numel.get(role, 0):,}"
-            for role in (
-                "backbone",
-                "tied_lm_head_embedding",
-                "image_projector",
-                "flow_head",
-            )
-        )
-        + "; lm_head/embed_tokens tied=true; special_token_learning_rate "
-        "applies to the complete tied matrix"
-    )
-
-    optimizer_type = config.optimizer.name
-    if optimizer_type == "adamw":
-        optimizer = AdamW(
-            optimizer_grouped_parameters,
-            lr=optimizer_config.learning_rate,
-            betas=(optimizer_config.beta1, optimizer_config.beta2),
-            weight_decay=optimizer_config.weight_decay,
-            eps=optimizer_config.epsilon,
-        )
-    else:
-        raise ValueError(f"Optimizer {optimizer_type} not supported")
-
-    lr_scheduler = get_wsd_schedule(
-        optimizer=optimizer,
-        num_warmup_steps=config.lr_scheduler.params.warmup_steps,
-        num_decay_steps=config.lr_scheduler.params.decay_steps,
-        num_training_steps=config.training.max_train_steps,
-        min_lr_ratio=config.lr_scheduler.params.min_lr_scale
-    )
-    logger.info(
-        "WSD schedule: "
-        f"warmup_steps={int(config.lr_scheduler.params.warmup_steps)}, "
-        f"stable_steps={int(config.training.max_train_steps) - int(config.lr_scheduler.params.warmup_steps) - int(config.lr_scheduler.params.decay_steps)}, "
-        f"warmdown_steps={int(config.lr_scheduler.params.decay_steps)}, "
-        f"min_lr_scale={float(config.lr_scheduler.params.min_lr_scale):g}"
-    )
+    optimizer, lr_scheduler = build_optimizer_and_scheduler(model, config, logger)
 
     ##################################
     #         DATALOADER             #
@@ -1290,89 +1187,19 @@ def main(*, model_loader=None):
     ##################################
     #       MODEL RESUME         #
     ##################################
-    global_step = 0
-    resume_step = 0
-    resume_checkpoint_dir = None
-    resume_metadata = None
-
-    if not _is_disabled_path(config.experiment.resume_from_checkpoint):
-        candidate_path = Path(config.experiment.resume_from_checkpoint)
-        if candidate_path.exists():
-            resume_checkpoint_dir = candidate_path
-        else:
-            raise FileNotFoundError(
-                f"Specified resume checkpoint does not exist: {candidate_path}"
-            )
-
-    if resume_checkpoint_dir and resume_checkpoint_dir.exists():
-        logger.info(f"Resuming training from checkpoint: {resume_checkpoint_dir}")
-        metadata_file = resume_checkpoint_dir / "metadata.json"
-        if not metadata_file.is_file():
-            raise RuntimeError(
-                f"Refusing to resume a checkpoint without metadata: {metadata_file}"
-            )
-        resume_metadata = json.loads(metadata_file.read_text(encoding="utf-8"))
-        resume_step = int(resume_metadata["global_step"])
-        _validate_checkpoint_complete(
-            resume_checkpoint_dir,
-            expected_global_step=resume_step,
-        )
-        if int(resume_metadata.get("world_size", -1)) != accelerator.num_processes:
-            raise RuntimeError(
-                "Caption resume requires the same world size: "
-                f"checkpoint={resume_metadata.get('world_size')}, "
-                f"current={accelerator.num_processes}"
-            )
-        validate_resume_contract(
-            resume_metadata,
-            current_contract=config_contract,
-        )
-        # Model, optimizer, scheduler, and RNG state are loaded only after the
-        # immutable resume contract has been validated.
-        accelerator.load_state(resume_checkpoint_dir)
-        _restore_npu_rng_state(resume_checkpoint_dir, accelerator)
-        if mixed_source_training:
-            train_dataloader.load_state(
-                resume_checkpoint_dir,
-                accelerator,
-                resume_step,
-            )
-        global_step = resume_step
-        logger.info(f"Resumed at global_step={global_step}")
-
-    else:
-        logger.info("Starting fresh caption training.")
-        global_step = 0
-        resume_step = 0
-
-    cumulative_wall_seconds_before_run = float(
-        (resume_metadata or {}).get("cumulative_training_wall_seconds", 0.0)
+    resume = restore_training_state(
+        config=config,
+        accelerator=accelerator,
+        train_dataloader=train_dataloader,
+        mixed_source_training=mixed_source_training,
+        config_contract=config_contract,
+        ema=ema,
+        ema_update_after_step=ema_update_after_step,
     )
-    cumulative_loss_checks_before_run = int(
-        (resume_metadata or {}).get(
-            "cumulative_finite_loss_microbatches_checked", 0
-        )
-    )
-    if ema is not None:
-        if resume_checkpoint_dir:
-            ema.load_checkpoint(
-                resume_checkpoint_dir,
-                accelerator,
-                expected_global_step=global_step,
-            )
-            logger.info(
-                f"Loaded rank {accelerator.process_index} EMA shard at global_step={global_step}."
-            )
-        else:
-            ema.initialize_from_model(global_step=global_step)
-            logger.info("Initialized this rank's FP32 EMA shard from the training model.")
-        if ema.started:
-            logger.info(f"EMA is active at global_step={global_step}.")
-        else:
-            logger.info(
-                "EMA updates are delayed until "
-                f"global_step={ema_update_after_step}; validation and adapter saves will use the training model until then."
-            )
+    global_step = resume_step = resume.global_step
+    resume_metadata = resume.metadata
+    cumulative_wall_seconds_before_run = resume.cumulative_wall_seconds
+    cumulative_loss_checks_before_run = resume.cumulative_loss_checks
 
     ##################################
     #             Training           #
@@ -2393,119 +2220,21 @@ def main(*, model_loader=None):
                 + finite_loss_microbatches_checked
             ),
         )
-    if accelerator.device.type == "npu":
-        memory_backend = "npu"
-        local_memory = torch.tensor(
-            [
-                int(torch.npu.max_memory_allocated(accelerator.device)),
-                int(torch.npu.max_memory_reserved(accelerator.device)),
-            ],
-            device=accelerator.device,
-            dtype=torch.int64,
-        )
-    elif accelerator.device.type == "cuda":
-        memory_backend = "cuda"
-        local_memory = torch.tensor(
-            [
-                int(torch.cuda.max_memory_allocated(accelerator.device)),
-                int(torch.cuda.max_memory_reserved(accelerator.device)),
-            ],
-            device=accelerator.device,
-            dtype=torch.int64,
-        )
-    else:
-        memory_backend = accelerator.device.type
-        local_memory = torch.zeros(
-            2,
-            device=accelerator.device,
-            dtype=torch.int64,
-        )
-    local_elapsed = torch.tensor(
-        [float(training_runtime_elapsed)],
-        device=accelerator.device,
-        dtype=torch.float32,
+    write_training_runtime_report(
+        config=config,
+        accelerator=accelerator,
+        model=model,
+        training_runtime_elapsed=training_runtime_elapsed,
+        global_step=global_step,
+        training_runtime_start_step=training_runtime_start_step,
+        total_batch_size=total_batch_size,
+        finite_loss_microbatches_checked=finite_loss_microbatches_checked,
+        last_logged_loss=last_logged_loss,
+        trainability=trainability,
+        ema_layout=ema_layout,
+        cumulative_wall_seconds_before_run=cumulative_wall_seconds_before_run,
+        cumulative_loss_checks_before_run=cumulative_loss_checks_before_run,
     )
-    gathered_memory = accelerator.gather(local_memory).reshape(-1, 2)
-    gathered_elapsed = accelerator.gather(local_elapsed).reshape(-1)
-    memory_max = gathered_memory.max(dim=0).values
-    elapsed_max = gathered_elapsed.max()
-    accelerator.wait_for_everyone()
-    if accelerator.is_main_process:
-        runtime_payload = {
-            "schema": "selfless_training_runtime_metrics_v1",
-            "global_step": int(global_step),
-            "run_start_global_step": int(training_runtime_start_step),
-            "world_size": int(accelerator.num_processes),
-            "total_batch_size": int(total_batch_size),
-            "steps_this_run": int(global_step - training_runtime_start_step),
-            "finite_loss_microbatches_checked": int(
-                finite_loss_microbatches_checked
-            ),
-            "last_logged_loss": last_logged_loss,
-            "training_wall_seconds": float(elapsed_max.item()),
-            "cumulative_training_wall_seconds": float(
-                cumulative_wall_seconds_before_run + elapsed_max.item()
-            ),
-            "cumulative_finite_loss_microbatches_checked": int(
-                cumulative_loss_checks_before_run
-                + finite_loss_microbatches_checked
-            ),
-            "train_samples_per_second": float(
-                (global_step - training_runtime_start_step)
-                * total_batch_size
-                / max(float(elapsed_max.item()), 1e-12)
-            ),
-            "memory_backend": memory_backend,
-            "peak_memory_allocated_bytes_per_rank": int(
-                memory_max[0].item()
-            ),
-            "peak_memory_reserved_bytes_per_rank": int(
-                memory_max[1].item()
-            ),
-            "trainability": trainability,
-        }
-        flow_net = getattr(
-            getattr(accelerator.unwrap_model(model), "image_flow_head", None),
-            "net", None,
-        )
-        flow_batch_layout = getattr(flow_net, "last_training_batch_layout", None)
-        if flow_batch_layout is not None:
-            runtime_payload["flow_training_batch_layout"] = flow_batch_layout
-        if ema_layout is not None:
-            full_ema_bytes = int(
-                sum(chunk["bytes"] for chunk in ema_layout["chunks"].values())
-            )
-            max_shard_bytes = int(max(ema_layout["rank_bytes"]))
-            runtime_payload["ema"] = {
-                "full_fp32_replica_bytes": full_ema_bytes,
-                "shard_bytes_by_rank": ema_layout["rank_bytes"],
-                "max_shard_bytes": max_shard_bytes,
-                "minimum_bytes_saved_per_rank": full_ema_bytes
-                - max_shard_bytes,
-                "minimum_fraction_saved_per_rank": (
-                    (full_ema_bytes - max_shard_bytes) / full_ema_bytes
-                    if full_ema_bytes
-                    else 0.0
-                ),
-            }
-        runtime_root = Path(config.experiment.output_dir)
-        runtime_paths = (
-            runtime_root / "training_runtime_metrics.json",
-            runtime_root
-            / (
-                "training_runtime_metrics_"
-                f"step-{training_runtime_start_step}-to-{global_step}.json"
-            ),
-        )
-        for runtime_path in runtime_paths:
-            runtime_temp_path = runtime_path.with_name(
-                f".{runtime_path.name}.tmp-{os.getpid()}"
-            )
-            runtime_temp_path.write_text(
-                json.dumps(runtime_payload, indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
-            )
-            os.replace(runtime_temp_path, runtime_path)
     if bool(config.experiment.get("save_final", True)):
         save_hf_model(model, tokenizer, config, accelerator, "final", source_global_step=global_step)
         ema_directory = _save_ema_state(ema, config, accelerator, "final")
