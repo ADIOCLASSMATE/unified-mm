@@ -12,7 +12,7 @@ import torch
 import torch.distributed as dist
 from omegaconf import OmegaConf
 
-from scripts.evaluate_multimodal_likelihood_benchmarks import atomic_write_text, initialize_device
+from utils.evaluation.multimodal_likelihood import atomic_write_text, initialize_device
 from utils.evaluation_model_source import (
     add_model_source_argument, configure_model_source, load_model_source_weights, model_source_from_args,
 )

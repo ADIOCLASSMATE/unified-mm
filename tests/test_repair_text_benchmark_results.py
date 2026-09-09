@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from scripts.evaluate_selfless_text_benchmarks import DEFAULT_TASKS, LM_EVAL_REFERENCE, MultipleChoiceExample
+from utils.evaluation.text_benchmarks import DEFAULT_TASKS, LM_EVAL_REFERENCE, MultipleChoiceExample
 from scripts.repair_text_benchmark_results import (
     renormalize_rows,
     repair_results,

@@ -21,3 +21,9 @@
 raw final 和 EMA final 共用目录发布基础实现；替换失败会恢复上一份完整导出。原先缺少 metadata 的 raw final 可在保留备份的前提下升级。
 
 开发机已通过 123 项 infra 测试及 16-rank HCCL 故障传播：末 rank 写入失败、主 rank 写入失败均被全部 rank 观察到，之后进程组仍可完成下一次调用。后续新增 raw final 发布/回滚和模块迁移的 60 项定向回归通过。DeepSpeed 内部集合通信中的进程退出仍由后端超时与 torchrun 处理；局部文件阶段的错误传播不能替代进程组故障处理。
+
+## 评测公共实现
+
+ImageNet 原生理解、纯文本、多模态 likelihood 和语言先验校准的共享类/函数迁到 `utils/evaluation/`。CLI 保留参数解析、任务组织及历史导出接口，训练和其他研究脚本直接依赖公共库。`utils`/`models`/`pretrain` 对 `scripts.*` 的依赖已清零。原子文本写入另外下沉到不加载模型的 `utils/atomic_io.py`，两份相同实现合为一份。
+
+迁移后的评分函数/类与迁移前 AST 完全相同；完整回归为 698 passed、2 skipped（CUDA FlexAttention）。三个 CLI 的参数入口保持兼容。固定数据、评分分母、MC 随机种子及缓存合同均保持原定义。

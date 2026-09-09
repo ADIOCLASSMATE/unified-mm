@@ -151,7 +151,7 @@ class ImageNetValidationSubset:
 
 
 def prepare_imagenet_subset(profile):
-    from scripts.evaluate_imagenet_pretraining_native import load_imagenet_records
+    from utils.evaluation.native_understanding import load_imagenet_records
 
     records = load_imagenet_records(Path(profile.image_manifest), Path(profile.image_classes))
     # Preserve the exact historical downstream selection AND order.
@@ -173,7 +173,7 @@ class DownstreamValidationState:
         self._shape = None
 
     def prepare(self, model, tokenizer):
-        from scripts.evaluate_imagenet_pretraining_native import CachedTokenizer
+        from utils.evaluation.native_understanding import CachedTokenizer
 
         shape = (int(model.config.image_tokens_per_img), int(model.config.image_latent_dim))
         if self.prepared is not None:
@@ -267,7 +267,7 @@ def _coverage_status(seen, expected, device):
 
 
 def _text_task(model, tokenizer, examples, task, profile, device, rank, world, deadline):
-    from scripts.evaluate_selfless_text_benchmarks import encode_choice, score_choice_requests, primary_metric
+    from utils.evaluation.text_benchmarks import encode_choice, score_choice_requests, primary_metric
 
     categories = sorted({str(example.category or "all") for example in examples})
     category_index = {name: i for i, name in enumerate(categories)}
@@ -309,11 +309,11 @@ def _text_task(model, tokenizer, examples, task, profile, device, rank, world, d
 
 
 def _imagenet_task(model, tokenizer, records, class_names, cache, profile, device, rank, world, deadline):
-    from scripts.evaluate_imagenet_pretraining_native import (
+    from utils.evaluation.native_understanding import (
         CLASS_TEXT_TEMPLATE, CLASSIFICATION_TASK, RETRIEVAL_PROMPT,
         score_candidates_with_backend, classification_metrics,
     )
-    from scripts.language_prior_calibration import language_prior_debiased_scores
+    from utils.evaluation.calibration import language_prior_debiased_scores
 
     candidates = [CLASS_TEXT_TEMPLATE.format(class_name=name) for name in class_names]
     matrix = torch.zeros((len(records), len(candidates)))
@@ -347,7 +347,7 @@ def _imagenet_task(model, tokenizer, records, class_names, cache, profile, devic
 
 
 def _grounding_task(model, tokenizer, examples, cache, null_ids, profile, device, rank, world, deadline):
-    from scripts.evaluate_multimodal_likelihood_benchmarks import (
+    from utils.evaluation.multimodal_likelihood import (
         encode_candidate_mc, score_candidate_requests, build_prediction_rows, DEBIASED_SCORE,
     )
 
@@ -394,9 +394,9 @@ def _grounding_task(model, tokenizer, examples, cache, null_ids, profile, device
 
 
 def _prepare(model, profile, imagenet_subset):
-    from scripts import evaluate_selfless_text_benchmarks as text_eval
-    from scripts import evaluate_imagenet_pretraining_native as image_eval
-    from scripts import evaluate_multimodal_likelihood_benchmarks as mm_eval
+    from utils.evaluation import text_benchmarks as text_eval
+    from utils.evaluation import native_understanding as image_eval
+    from utils.evaluation import multimodal_likelihood as mm_eval
 
     text = {task: text_eval.load_multiple_choice_task(task, Path(profile.text_root)) for task in TEXT_TASKS}
     records = imagenet_subset.records
@@ -428,7 +428,7 @@ def run_downstream_validation(model, tokenizer, *, device, output_dir, step=0,
                               ema=None, profile=None, started=None, weight_source=None, state=None):
     """Run on the unwrapped, replicated model on ALL ranks of the training group."""
     started = time.monotonic() if started is None else started
-    from scripts.evaluate_multimodal_likelihood_benchmarks import atomic_write_text
+    from utils.evaluation.multimodal_likelihood import atomic_write_text
 
     profile = profile or (state.profile if state is not None else ValidationProfile())
     state = state or DownstreamValidationState(profile)

@@ -9,7 +9,7 @@ import pytest
 from transformers import Qwen3Config
 
 from models.modeling_model.modeling_selfless_flow import Qwen3ForCausalLM
-from scripts.evaluate_selfless_text_benchmarks import (
+from utils.evaluation.text_benchmarks import (
     ChoiceRequest,
     MultipleChoiceExample,
     encode_choice,
@@ -190,7 +190,7 @@ def test_normalization_counts_original_unicode_choice_not_separator(context, cho
 
 def test_winogrande_places_each_option_in_context_and_only_scores_shared_suffix(monkeypatch, tmp_path):
     monkeypatch.setattr(
-        "scripts.evaluate_selfless_text_benchmarks.read_parquet",
+        "utils.evaluation.text_benchmarks.read_parquet",
         lambda path: [{"sentence": "The _ was red.", "option1": "ball", "option2": "big box", "answer": "2"}],
     )
     example = load_winogrande(tmp_path)[0]

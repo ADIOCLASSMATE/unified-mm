@@ -82,7 +82,7 @@ def dense_attention(**kwargs):
 
 
 def batch(rows, modality, profile, monkeypatch):
-    import scripts.evaluate_multimodal_likelihood_benchmarks as likelihood
+    import utils.evaluation.multimodal_likelihood as likelihood
 
     monkeypatch.setattr(likelihood, "build_attention_masks", dense_attention)
     cfg = SimpleNamespace(

@@ -10,7 +10,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.utils.data import Subset
 
-from scripts.evaluate_imagenet_pretraining_native import ImageNetRecord
+from utils.evaluation.native_understanding import ImageNetRecord
 from utils import training_downstream_validation as downstream
 from utils.training_unified_loss_validation import UnifiedLossValidationProfile
 
@@ -24,7 +24,7 @@ def tiny_subset(profile=None):
 
 
 def test_shared_selection_preserves_historical_downstream_ids_order_and_balance(monkeypatch):
-    from scripts import evaluate_imagenet_pretraining_native as image_eval
+    from utils.evaluation import native_understanding as image_eval
 
     records = [ImageNetRecord(c * 50 + i, c * 50 + i + 1, "unused",
         f"val/image_{c:04d}_{i:02d}", f"n{c:08d}", c) for c in range(1000) for i in range(50)]
@@ -150,7 +150,7 @@ def test_warm_runner_reuses_only_cpu_preparation_and_recomputes_scores(monkeypat
 
 
 def _write_failure_worker(rank, rendezvous, directory):
-    from scripts import evaluate_multimodal_likelihood_benchmarks as mm_eval
+    from utils.evaluation import multimodal_likelihood as mm_eval
 
     torch.set_num_threads(1)
     dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2)

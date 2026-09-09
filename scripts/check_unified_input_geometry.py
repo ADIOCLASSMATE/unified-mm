@@ -80,7 +80,7 @@ def recall1_interval(scores, image_groups, text_groups, seed):
 
 
 def main(args):
-    from scripts.evaluate_multimodal_likelihood_benchmarks import PosteriorCache
+    from utils.evaluation.multimodal_likelihood import PosteriorCache
 
     torch.set_num_threads(8)
     protocol = json.loads((args.output_dir / "protocol.json").read_text())

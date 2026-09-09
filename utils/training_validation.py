@@ -27,7 +27,7 @@ class TrainingValidator:
 
     def run(self, model, tokenizer, *, device, step, output_dir, forward_batch,
             ema=None, training_exclusion=None, training_shards=()):
-        from scripts.evaluate_multimodal_likelihood_benchmarks import atomic_write_text
+        from utils.atomic_io import atomic_write_text
 
         _synchronize(device)
         started = time.monotonic()

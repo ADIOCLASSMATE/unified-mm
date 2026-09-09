@@ -54,7 +54,7 @@ class NativeAdapter:
         self.device, self.v2, self.caches = device, v2, {}
 
     def forward(self, rows, modality, path, family):
-        from scripts.evaluate_multimodal_likelihood_benchmarks import PosteriorCache
+        from utils.evaluation.multimodal_likelihood import PosteriorCache
 
         if modality == "image" and family not in self.caches:
             self.caches[family] = PosteriorCache(

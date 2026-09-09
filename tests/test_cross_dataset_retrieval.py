@@ -10,11 +10,11 @@ from scripts.evaluate_cross_dataset_retrieval import (
     LIKELIHOOD_SCORING_CONTRACT,
     retrieval_metrics,
 )
-from scripts.evaluate_imagenet_pretraining_native import (
+from utils.evaluation.native_understanding import (
     classification_metrics,
     load_openai_clip_class_names,
 )
-from scripts.language_prior_calibration import language_prior_debiased_scores
+from utils.evaluation.calibration import language_prior_debiased_scores
 from scripts.merge_cross_dataset_retrieval_partitions import merge_score_shards
 from scripts.prepare_cross_dataset_retrieval_assets import (
     load_karpathy_test_records,

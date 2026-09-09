@@ -20,7 +20,7 @@ from scripts.probe_unified_semantics_v2 import LAYERS, Collector, load_state, ma
 def extract(args):
     import torch_npu
 
-    from scripts.evaluate_multimodal_likelihood_benchmarks import PosteriorCache
+    from utils.evaluation.multimodal_likelihood import PosteriorCache
 
     rank, world = (
         int(os.environ.get("LOCAL_RANK", "0")),

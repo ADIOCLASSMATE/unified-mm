@@ -15,13 +15,13 @@ from scripts.evaluate_cross_dataset_retrieval import (
     load_records,
     retrieval_metrics,
 )
-from scripts.evaluate_imagenet_pretraining_native import atomic_torch_save
-from scripts.evaluate_multimodal_likelihood_benchmarks import (
+from utils.evaluation.native_understanding import atomic_torch_save
+from utils.evaluation.multimodal_likelihood import (
     LIKELIHOOD_SCORING_CONTRACT,
     atomic_write_text,
     utc_now,
 )
-from scripts.language_prior_calibration import (
+from utils.evaluation.calibration import (
     LANGUAGE_PRIOR_ALPHA,
     LANGUAGE_PRIOR_ESTIMATOR,
     language_prior_debiased_scores,

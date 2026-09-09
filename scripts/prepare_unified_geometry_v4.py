@@ -47,7 +47,7 @@ def prepare(out):
         raise FileExistsError(
             "V4 samples are immutable; use existing protocol or a new version"
         )
-    from scripts.evaluate_imagenet_pretraining_native import (
+    from utils.evaluation.native_understanding import (
         DEFAULT_CLASSES,
         DEFAULT_CLASSNAMES,
         load_imagenet_records,

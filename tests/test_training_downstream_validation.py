@@ -31,7 +31,7 @@ def test_subset_is_balanced_reproducible_and_world_size_independent():
 
 
 def test_grounding_strata_and_rank_independent_image_noise():
-    from scripts.evaluate_multimodal_likelihood_benchmarks import image_order_mc_seed
+    from utils.evaluation.multimodal_likelihood import image_order_mc_seed
 
     records = [("large", i) for i in range(97)] + [("small", i) for i in range(3)]
     selected = stratified_sample(records, 20, category=lambda r: r[0], identity=lambda r: r, seed=9)
@@ -45,7 +45,7 @@ def test_grounding_strata_and_rank_independent_image_noise():
 
 
 def test_timeout_does_not_publish_a_prefix_score(monkeypatch):
-    from scripts import evaluate_selfless_text_benchmarks as scorer
+    from utils.evaluation import text_benchmarks as scorer
 
     def forbidden(*args, **kwargs):
         raise AssertionError("an expired task must not start a model forward")
@@ -57,7 +57,7 @@ def test_timeout_does_not_publish_a_prefix_score(monkeypatch):
 
 
 def test_timeout_after_some_batches_keeps_count_but_withholds_accuracy(monkeypatch):
-    from scripts import evaluate_selfless_text_benchmarks as scorer
+    from utils.evaluation import text_benchmarks as scorer
 
     monkeypatch.setattr(scorer, "encode_choice", lambda tokenizer, example, choice, length: choice)
     monkeypatch.setattr(scorer, "score_choice_requests", lambda model, requests, **kwargs: [

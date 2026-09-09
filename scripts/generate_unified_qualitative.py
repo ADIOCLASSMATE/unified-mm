@@ -182,7 +182,7 @@ def prepare(args):
                     "reference_image": f"inputs/{sample_id}.png"})
     text_index.close()
     del cache
-    from scripts.evaluate_multimodal_likelihood_benchmarks import PosteriorCache, arithmetic_seed
+    from utils.evaluation.multimodal_likelihood import PosteriorCache, arithmetic_seed
     for dataset in ("mscoco", "flickr30k"):
         assets = repo / f"public/benchmarks/{dataset}_karpathy_retrieval_v1"
         metadata = read_json(assets / "manifest.json")

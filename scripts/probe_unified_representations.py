@@ -62,7 +62,7 @@ def read_jsonl(path):
 
 def prepare(args):
     from scripts.evaluate_cross_dataset_retrieval import load_records
-    from scripts.evaluate_imagenet_pretraining_native import (
+    from utils.evaluation.native_understanding import (
         DEFAULT_CLASSES,
         DEFAULT_CLASSNAMES,
         load_imagenet_records,
@@ -145,7 +145,7 @@ def prepare(args):
 
 
 def make_batch(rows, modality, tokenizer, model, cache, device, seed):
-    from scripts.evaluate_multimodal_likelihood_benchmarks import (
+    from utils.evaluation.multimodal_likelihood import (
         build_attention_masks,
         build_image_sigma,
         image_order_mc_seed,
@@ -282,7 +282,7 @@ def extract(args):
     import torch_npu
     from omegaconf import OmegaConf
 
-    from scripts.evaluate_multimodal_likelihood_benchmarks import PosteriorCache
+    from utils.evaluation.multimodal_likelihood import PosteriorCache
     from utils.evaluation_model_source import (
         configure_model_source,
         resolve_evaluation_model_source,

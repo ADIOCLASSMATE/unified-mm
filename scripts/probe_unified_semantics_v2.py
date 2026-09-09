@@ -87,7 +87,7 @@ PROFILES = {
 
 def prepare(args):
     from scripts.evaluate_cross_dataset_retrieval import load_records
-    from scripts.evaluate_imagenet_pretraining_native import (
+    from utils.evaluation.native_understanding import (
         DEFAULT_CLASSES,
         DEFAULT_CLASSNAMES,
         load_imagenet_records,
@@ -267,7 +267,7 @@ def posterior(cache, image_id, mode):
 
 
 def make_batch(rows, modality, tokenizer, config, cache, device, seed, profile):
-    from scripts.evaluate_multimodal_likelihood_benchmarks import (
+    from utils.evaluation.multimodal_likelihood import (
         build_attention_masks,
         build_image_sigma,
         image_order_mc_seed,
@@ -523,7 +523,7 @@ def load_state(args, protocol, device):
 def extract(args):
     import torch_npu
 
-    from scripts.evaluate_multimodal_likelihood_benchmarks import PosteriorCache
+    from utils.evaluation.multimodal_likelihood import PosteriorCache
 
     rank, world = (
         int(os.environ.get("LOCAL_RANK", "0")),
@@ -759,7 +759,7 @@ def verify(args):
     import torch_npu
     from safetensors import safe_open
 
-    from scripts.evaluate_multimodal_likelihood_benchmarks import PosteriorCache
+    from utils.evaluation.multimodal_likelihood import PosteriorCache
     from scripts.probe_unified_representations import (
         FLICKR,
         FeatureCollector,

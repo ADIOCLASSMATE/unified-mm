@@ -163,7 +163,7 @@ def test_real_model_shared_forward_and_all_three_validation_tasks(contract, tmp_
     from pretrain.train_selfless_flow import _prepare_loss_forward_batch
     from utils.combined_dataloaders import build_unified_image_validation_dataloader
     from utils.training_downstream_validation import ImageNetValidationSubset, ValidationProfile
-    from scripts.evaluate_imagenet_pretraining_native import ImageNetRecord
+    from utils.evaluation.native_understanding import ImageNetRecord
 
     cfg = config_for_text(write_text(tmp_path / "text.jsonl"))
     image = _config(tmp_path, val_names=("val_1", "val_2")).dataset.params

@@ -23,13 +23,13 @@ from omegaconf import OmegaConf
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from scripts.evaluate_imagenet_pretraining_native import (  # noqa: E402
+from utils.evaluation.native_understanding import (  # noqa: E402
     CachedTokenizer,
     RETRIEVAL_PROMPT,
     atomic_torch_save,
     score_candidates_with_backend,
 )
-from scripts.evaluate_multimodal_likelihood_benchmarks import (  # noqa: E402
+from utils.evaluation.multimodal_likelihood import (  # noqa: E402
     LIKELIHOOD_SCORING_CONTRACT,
     PosteriorCache,
     atomic_write_text,
@@ -37,7 +37,7 @@ from scripts.evaluate_multimodal_likelihood_benchmarks import (  # noqa: E402
     initialize_device,
     utc_now,
 )
-from scripts.language_prior_calibration import (  # noqa: E402
+from utils.evaluation.calibration import (  # noqa: E402
     LANGUAGE_PRIOR_ALPHA,
     LANGUAGE_PRIOR_ESTIMATOR,
     language_prior_debiased_scores,

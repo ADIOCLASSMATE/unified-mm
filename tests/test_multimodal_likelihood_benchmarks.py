@@ -10,7 +10,7 @@ import torch
 from transformers import Qwen3Config
 
 from models.modeling_model.modeling_selfless_flow import Qwen3ForCausalLM
-from scripts.evaluate_multimodal_likelihood_benchmarks import (
+from utils.evaluation.multimodal_likelihood import (
     CandidateScore,
     DEBIASED_SCORE,
     LikelihoodExample,
@@ -28,7 +28,7 @@ from scripts.evaluate_multimodal_likelihood_benchmarks import (
     whatsup_metrics,
     winoground_metrics,
 )
-from scripts.evaluate_imagenet_pretraining_native import (
+from utils.evaluation.native_understanding import (
     score_text_candidates,
     score_text_candidates_cached_prefix,
 )

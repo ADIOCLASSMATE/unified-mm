@@ -184,7 +184,7 @@ def flickr_alignment(images, texts, image_rows, text_rows):
 def input_controls(args, data, samples, protocol):
     from safetensors import safe_open
 
-    from scripts.evaluate_multimodal_likelihood_benchmarks import PosteriorCache
+    from utils.evaluation.multimodal_likelihood import PosteriorCache
     from scripts.probe_unified_representations import FLICKR
 
     with safe_open(

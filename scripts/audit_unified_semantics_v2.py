@@ -222,7 +222,7 @@ def audit(root, protocol, samples):
 
 
 def vae_baseline(root, protocol, samples):
-    from scripts.evaluate_multimodal_likelihood_benchmarks import PosteriorCache
+    from utils.evaluation.multimodal_likelihood import PosteriorCache
 
     rows = samples["imagenet_images"]
     cache = PosteriorCache(
