@@ -11,7 +11,7 @@ from pathlib import Path
 
 import yaml
 
-from utils.evaluation_paths import is_temporary_training_run
+from utils.experiment_registry import is_temporary_training_run, experiment_identity, read_run_identity
 
 FIELDS = ["step_loss", "train/loss_t2i", "train/loss_i2t", "train/loss_climbmix",
           "train/weighted_contribution_t2i", "train/weighted_contribution_i2t",
@@ -20,7 +20,6 @@ VALIDATION_FIELDS = ["val/loss", "val/loss_t2i", "val/loss_i2t", "val/loss_climb
                      "val/weighted_contribution_t2i", "val/weighted_contribution_i2t",
                      "val/weighted_contribution_climbmix"]
 COLUMNS = ["step", "total", "t2i", "i2t", "climbmix", "weighted_t2i", "weighted_i2t", "weighted_climbmix"]
-MAIN = {"a_x0", "b_x0", "c_on_b", "d_on_b", "e_on_b", "f_on_b"}
 GROUPS = {"main": "主要消融", "single": "单任务对照", "scaling": "Flow-head 深度",
           "legacy": "历史结构对照", "lr": "1.7B 学习率扫描"}
 PALETTE = ["#087e8b", "#d1495b", "#5c4d9e", "#d58a00", "#27844c", "#2563b5",
@@ -264,21 +263,12 @@ def collect_training(repo: Path, root: Path, models: list[dict]):
         target = training.get("max_train_steps")
         if training.get("stop_after_steps"):
             target = min(target, training["stop_after_steps"]) if target else training["stop_after_steps"]
-        group = "main" if spec.get("id") in MAIN else "legacy"
-        label = spec.get("label", name.removeprefix("unified-").removesuffix("-100b-imagenet-split-s42-r1"))
-        if "-only-" in name:
-            group = "single"
-            if not spec:
-                prefix = "B" if directory.name.startswith("unified-b-") else "A"
-                label = prefix + " · " + ("T2I-only" if "t2i-only" in name else "caption-only" if "caption-only" in name else "text-only")
-        elif "flowdepth" in name:
-            group = "scaling"
-            label = f"B_x0 · flow depth {config.get('model', {}).get('image_flow_depth', '?')}"
-        elif "-lr-sweep-" in name:
-            group = "lr"
-            label = f"A 1.7B · {directory.name}"
-        elif name.startswith("unified-e-on-b-0p6b"):
-            label = "E on B · 旧 shared-condition"
+        identity = (read_run_identity(directory, config, presentation=spec)
+                    if (directory / "experiment_identity.json").exists()
+                    else experiment_identity(name, config, presentation=spec))
+        if identity["purpose"] == "temporary":
+            continue
+        group, label = identity["group"], identity["label"]
         metrics_path = directory / "training_metrics.jsonl"
         points, diagnostics = read_history(metrics_path)
         runtime_path = directory / "training_runtime_metrics.json"
@@ -292,7 +282,7 @@ def collect_training(repo: Path, root: Path, models: list[dict]):
         gaps = sum(b[0] - a[0] > expected_interval * 1.5 for a, b in zip(points, points[1:]))
         relative = lambda p: os.path.relpath(p, root)
         stat = metrics_path.stat() if metrics_path.exists() else None
-        runs.append({"id": spec.get("id", name), "label": label, "run": name, "group": group,
+        runs.append({"id": identity["id"], "experiment_identity": identity, "label": label, "run": name, "group": group,
             "config": relative(config_path) if config_path.exists() else None,
             "source": relative(metrics_path) if stat else None,
             "source_bytes": stat.st_size if stat else 0,

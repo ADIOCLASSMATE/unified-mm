@@ -82,8 +82,9 @@ def test_decode_records_eos_or_truncation_and_strips_prompt():
 def test_untrained_modalities_are_explicitly_marked():
     assert task_training("a-text-only")["t2i"] != "已训练"
     assert task_training("b-caption-only")["t2i"] != "已训练"
-    assert task_training("b-caption-only")["i2t"] == "已训练"
-    assert task_training("unified-b")["text"] == "已训练"
+    assert task_training("unified-b-0p6b-caption-only-100bphys-s42-r1")["i2t"] == "已训练"
+    assert task_training("unified-b-x0content-0p6b-100b-imagenet-split-s42-r1")["text"] == "已训练"
+    assert task_training("unified-b")["text"] != "已训练"
 
 
 def test_model_inventory_excludes_temporary_exports_before_loading_them(tmp_path, monkeypatch):

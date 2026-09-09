@@ -41,7 +41,7 @@ from utils.evaluation_model_source import (
     configure_model_source, load_model_source_weights, resolve_evaluation_model_source,
 )
 from utils.image_generation_io import decode_latents, load_vae
-from utils.evaluation_paths import is_temporary_training_run
+from utils.experiment_registry import is_temporary_training_run, model_labels, experiment_identity, task_training_labels, read_run_identity
 from utils.imagenet_flow_batching import collate_imagenet_flow_cache
 from utils.imagenet_synthetic_text_index import ImageNetSyntheticTextIndex
 from utils.utils import load_model_tokenizer
@@ -51,22 +51,7 @@ BASE_CONFIG = "configs/selfless/unified_baseline_100b_ascend_64npu.yaml"
 PROMPT_CONFIG = "configs/protocols/unified_qualitative_prompts_v1.json"
 T2I_PREFIX = "Generate an image matching this description:"
 I2T_PREFIX = "Describe this image in one detailed caption:"
-MODEL_LABELS = {
-    "unified-b-x0content-0p6b-100b-imagenet-split-s42-r1": ("b_x0", "B · X0-content（新版）"),
-    "unified-b-0p6b-100b-imagenet-split-s42-r1": ("b_flowdiag", "B · flow 对角线（指定版）"),
-    "unified-b-flow-head-no-diagonal-0p6b-100b-imagenet-split-s42-r1": ("b_no_flowdiag", "B · flow 无对角线（旧版）"),
-    "unified-a-x0content-0p6b-100b-imagenet-split-s42-r1": ("a_x0", "A · X0-content"),
-    "unified-a-0p6b-100b-imagenet-split-s42-r1": ("a_legacy", "A · shared-condition（旧版）"),
-    "unified-c-on-b-x0content-0p6b-100b-imagenet-split-s42-r1": ("c_on_b", "C on B · 文本 AR"),
-    "unified-d-on-b-0p6b-100b-imagenet-split-s42-r4": ("d_on_b", "D on B · Dynamic-XT（加载已修复）"),
-    "unified-e-on-b-x0content-0p6b-100b-imagenet-split-s42-r1": ("e_on_b", "E on B · sequential"),
-    "unified-f-on-b-0p6b-100b-imagenet-split-s42-r1": ("f_on_b", "F on B · position-wise"),
-    "unified-c-on-a-legacy-0p6b-100b-imagenet-split-s42-r1": ("c_on_a_legacy", "C on A · 旧对照"),
-    "unified-a-0p6b-caption-only-100bphys-s42-r1": ("a_caption_only", "A · caption-only"),
-    "unified-b-0p6b-caption-only-100bphys-s42-r1": ("b_caption_only", "B · caption-only"),
-    "unified-a-0p6b-text-only-100bphys-s42-r1": ("a_text_only", "A · text-only"),
-    "unified-b-0p6b-text-only-100bphys-s42-r1": ("b_text_only", "B · text-only"),
-}
+MODEL_LABELS = model_labels()
 
 
 def read_json(path):
@@ -96,11 +81,7 @@ def utc_now():
 
 
 def task_training(run):
-    if "text-only" in run:
-        return {"t2i": "未做图像训练；仅诊断", "i2t": "未做图像训练；仅诊断", "text": "已训练"}
-    if "caption-only" in run:
-        return {"t2i": "未训练 T2I flow；仅诊断", "i2t": "已训练", "text": "仅训练图像字幕；纯文本为迁移诊断"}
-    return {task: "已训练" for task in ("t2i", "i2t", "text")}
+    return task_training_labels(experiment_identity(run))
 
 
 def model_inventory(repo):
@@ -111,11 +92,16 @@ def model_inventory(repo):
     ordered += sorted(set(paths) - set(ordered))
     result = []
     for name in ordered:
+        run_config_path = paths[name].parent / "config.yaml"
+        run_config = OmegaConf.to_container(OmegaConf.load(run_config_path), resolve=True) if run_config_path.is_file() else None
+        identity = read_run_identity(paths[name].parent, run_config)
+        if identity["purpose"] == "temporary":
+            continue
         source = resolve_evaluation_model_source(paths[name])
         if not source.is_hf_final_ema:
             raise ValueError(f"not a final EMA: {paths[name]}")
         saved = read_json(paths[name] / "config.json")
-        model_id, label = MODEL_LABELS.get(name, (name, name))
+        model_id, label = identity["id"], identity["label"]
         result.append({"id": model_id, "label": label, "run": name,
                        "checkpoint": str(paths[name].resolve()), "source": source.report(),
                        "architecture": saved["architecture_variant"],
@@ -123,7 +109,7 @@ def model_inventory(repo):
                        "flow_attention": saved.get("flow_head_attention_contract", "not_applicable" if saved["architecture_variant"] == "positionwise_flow_head_on_b" else "selfless_strict"),
                        "flow_condition": saved.get("dynamic_xt_flow_condition_contract", saved.get("flow_condition_contract", "legacy_or_architecture_owned")),
                        "image_order": saved.get("training_image_sigma_order", "random"),
-                       "task_training": task_training(name)})
+                       "task_training": task_training_labels(identity), "experiment_identity": identity})
     if not result:
         raise ValueError("no completed Unified final EMA exports found")
     return result

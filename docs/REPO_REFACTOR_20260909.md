@@ -27,3 +27,11 @@ raw final 和 EMA final 共用目录发布基础实现；替换失败会恢复�
 ImageNet 原生理解、纯文本、多模态 likelihood 和语言先验校准的共享类/函数迁到 `utils/evaluation/`。CLI 保留参数解析、任务组织及历史导出接口，训练和其他研究脚本直接依赖公共库。`utils`/`models`/`pretrain` 对 `scripts.*` 的依赖已清零。原子文本写入另外下沉到不加载模型的 `utils/atomic_io.py`，两份相同实现合为一份。
 
 迁移后的评分函数/类与迁移前 AST 完全相同；完整回归为 698 passed、2 skipped（CUDA FlexAttention）。三个 CLI 的参数入口保持兼容。固定数据、评分分母、MC 随机种子及缓存合同均保持原定义。
+
+## 实验身份与任务状态
+
+历史模型的 ID、标签、分组和启用任务统一保存在 `configs/protocols/experiment_registry.json`。新实验可在配置中声明 `experiment.identity`，训练将其与实际任务 schedule 写入不可变的 `experiment_identity.json`；launcher、训练曲线和定性模型发现共用解析器。架构、完整权重、raw/EMA、step 和评测数据协议仍由各自已有的严格来源合同验证，身份记录不代替模型合同。
+
+没有记录任务的未知模型明确显示“训练任务未记录”，不再从普通目录名猜测所有任务都已训练。临时用途可以显式声明，历史 smoke/debug/replay 名称仍按临时实验处理。flow depth 配置中的展示身份不会改变科学参数一致性检查。
+
+48 项定向回归通过。网页重建后仍有 14 个定性模型、3,584 条记录、1,792 张图像和 9 个完整正式指标模型；未重新计算历史分数。

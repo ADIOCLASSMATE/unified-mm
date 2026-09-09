@@ -11,6 +11,10 @@
 # runs the complete 100B nominal text-target horizon. Its historical LR winner
 # is frozen here; no new 0.6B sweep or sweep-checkpoint resume is permitted.
 experiment:
+    identity:
+        label: "B_x0 · flow depth 16"
+        group: scaling
+        purpose: formal
     project: "unified-b-x0content-flowdepth16-0p6b-100b-imagenet-split-s42-r1"
     name: "unified-b-x0content-flowdepth16-0p6b-100b-imagenet-split-s42-r1"
     wandb_project: "unified-mm"

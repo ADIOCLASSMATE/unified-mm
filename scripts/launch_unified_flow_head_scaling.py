@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from utils.flow_head_scaling import config_path, validate_scaling_config
+from utils.experiment_registry import experiment_identity
 
 
 def launch_plan(depth: int, *, smoke: bool, label: str, steps: int, environment: dict) -> dict:
@@ -80,6 +81,7 @@ def launch_plan(depth: int, *, smoke: bool, label: str, steps: int, environment:
     if rank == 0:
         preflight.append("--tokenizer-probe")
     return {"contract": contract, "smoke": smoke, "world_size": world,
+            "experiment_identity": experiment_identity(project, OmegaConf.to_container(config, resolve=True)),
             "per_rank_batches": {"climbmix": 4, "t2i": 16, "i2t": 16},
             "gradient_accumulation_steps": 4, "image_flow_batch_mul": 4,
             "rank": rank, "output_root": str(output_root), "audit_root": str(audit_root),

@@ -73,6 +73,7 @@ from utils.sharded_ema import (
 )
 from models.logging import set_verbosity_info, set_verbosity_error
 from utils.evaluation_paths import training_validation_root, validation_output_dir
+from utils.experiment_registry import write_run_identity
 from utils.checkpoint_transaction import (
     prepare_checkpoint, publish_checkpoint, write_checkpoint_inventory, validate_checkpoint_inventory,
 )
@@ -1424,6 +1425,10 @@ def main(*, model_loader=None):
             OmegaConf.save(config, config_path)
         else:
             logging.info(f"Keeping existing immutable run config at {config_path}")
+
+    run_io_phase(accelerator, lambda: write_run_identity(
+        Path(config.experiment.output_dir), OmegaConf.to_container(config, resolve=True)),
+        description="run identity publication", main_process_only=True)
 
     caption_shuffle_seed = int(
         config.training.get("dataloader_shuffle_seed", config.training.seed)

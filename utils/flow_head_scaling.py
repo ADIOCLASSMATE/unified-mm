@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from omegaconf import OmegaConf
+from utils.experiment_registry import experiment_identity
 
 
 BASE_CONFIG = "configs/selfless/unified_baseline_100b_ascend_64npu.yaml"
@@ -39,6 +40,9 @@ def validate_scaling_config(config) -> dict:
     expected.evaluation.checkpoint = f"output/{run_project(depth)}/hf_model-final-ema"
     actual_payload = OmegaConf.to_container(config, resolve=True)
     expected_payload = OmegaConf.to_container(expected, resolve=True)
+    # Presentation metadata cannot affect this complete scientific comparison.
+    experiment_identity(run_project(depth), actual_payload)
+    actual_payload["experiment"].pop("identity", None)
 
     def differences(actual, reference, prefix=""):
         if isinstance(actual, dict) and isinstance(reference, dict):
