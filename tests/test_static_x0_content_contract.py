@@ -1,4 +1,5 @@
 import os
+import copy
 
 os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
 
@@ -126,6 +127,82 @@ def _randomize_flow_output(model):
         final.adaLN_modulation[-1].bias.normal_(0.0, 0.1)
         final.linear.weight.normal_(0.0, 0.1)
         final.linear.bias.normal_(0.0, 0.1)
+
+
+@pytest.mark.parametrize("checkpointing", [False, True])
+@pytest.mark.parametrize("attention_contract", ["selfless_strict", "xlnet_content_diagonal"])
+def test_shared_content_rf_batch_preserves_loss_and_all_gradients(
+    monkeypatch, checkpointing, attention_contract,
+):
+    torch.manual_seed(67)
+    config = _config(attention_contract, condition_contract=X0_CONTENT_FLOW_CONDITION_CONTRACT)
+    config.image_flow_depth = 3
+    reference = Qwen3ForCausalLM(config).train()
+    _randomize_flow_output(reference)
+    shared = copy.deepcopy(reference)
+    shared.config.image_flow_share_content = True
+    reference.image_flow_head.net.grad_checkpointing = checkpointing
+    shared.image_flow_head.net.grad_checkpointing = checkpointing
+    batch = _batch(attention_contract)
+    # Two distinct images catch repeat-major ordering mistakes that B=1 hides.
+    for key, value in list(batch.items()):
+        if torch.is_tensor(value):
+            batch[key] = value.repeat(2, *([1] * (value.dim() - 1)))
+    batch["image_span_table"][1, 0] = 1
+    batch["attention_mask"] = get_selfless_mask(batch["flow_sigma"], 8, "cpu")
+    batch["content_attention_mask"] = get_selfless_mask(
+        batch["flow_sigma"], 8, "cpu", include_diagonal=attention_contract == "xlnet_content_diagonal",
+    )
+    batch["image_latents"][1, 2:6] += 0.7
+    batch["image_local_positions"][1, 2:6] = torch.tensor([2, 0, 3, 1])
+    batch["record_flow_stats"] = False
+    content_shapes, query_shapes = [], []
+    for block in shared.image_flow_head.net.blocks:
+        original_cache = block.prepare_cross_cache
+
+        def cache(hidden, *args, original_cache=original_cache, **kwargs):
+            content_shapes.append(tuple(hidden.shape[:2]))
+            return original_cache(hidden, *args, **kwargs)
+
+        monkeypatch.setattr(block, "prepare_cross_cache", cache)
+        block.register_forward_pre_hook(lambda _module, args: query_shapes.append(tuple(args[0].shape[:2])))
+
+    torch.manual_seed(811)
+    expected = reference(**batch)
+    torch.manual_seed(811)
+    actual = shared(**batch)
+    torch.testing.assert_close(actual.loss, expected.loss, rtol=2e-6, atol=2e-6)
+    assert int(actual.per_modality_count["image_tokens"]) == 32
+    assert content_shapes == [(2, 4)] * 3
+    assert query_shapes == [(2, 4), (2, 16)] * 3
+    assert shared.image_flow_head.net.last_training_batch_layout["checkpointed_blocks"] == (3 if checkpointing else 0)
+    expected.loss.backward()
+    actual.loss.backward()
+    for (name, ref_parameter), (shared_name, parameter) in zip(
+        reference.named_parameters(), shared.named_parameters(), strict=True,
+    ):
+        assert name == shared_name
+        if ref_parameter.grad is None:
+            assert parameter.grad is None, name
+        else:
+            torch.testing.assert_close(parameter.grad, ref_parameter.grad, rtol=2e-4, atol=2e-6, msg=name)
+
+
+def test_shared_content_checkpointing_skips_non_image_minibatches(monkeypatch):
+    config = _config("xlnet_content_diagonal", condition_contract=X0_CONTENT_FLOW_CONDITION_CONTRACT)
+    config.image_flow_share_content = True
+    config.image_flow_grad_checkpointing = True
+    model = Qwen3ForCausalLM(config).train()
+
+    def unexpected_flow(*args, **kwargs):
+        raise AssertionError("I2T/text minibatches must not execute the flow head")
+
+    monkeypatch.setattr(model.image_flow_head.net, "forward", unexpected_flow)
+    batch = _batch("xlnet_content_diagonal")
+    batch.update(compute_image_loss=False, compute_text_loss=True, record_flow_stats=False)
+    result = model(**batch)
+    assert torch.isfinite(result.loss)
+    result.loss.backward()
 
 
 @pytest.mark.parametrize(

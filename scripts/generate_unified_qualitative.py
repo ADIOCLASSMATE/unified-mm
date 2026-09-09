@@ -41,6 +41,7 @@ from utils.evaluation_model_source import (
     configure_model_source, load_model_source_weights, resolve_evaluation_model_source,
 )
 from utils.image_generation_io import decode_latents, load_vae
+from utils.evaluation_paths import is_temporary_training_run
 from utils.imagenet_flow_batching import collate_imagenet_flow_cache
 from utils.imagenet_synthetic_text_index import ImageNetSyntheticTextIndex
 from utils.utils import load_model_tokenizer
@@ -103,7 +104,9 @@ def task_training(run):
 
 
 def model_inventory(repo):
-    paths = {p.parent.parent.name: p.parent for p in (repo / "output").glob("unified-*/hf_model-final-ema/config.json")}
+    paths = {p.parent.parent.name: p.parent
+             for p in (repo / "output").glob("unified-*/hf_model-final-ema/config.json")
+             if not is_temporary_training_run(p.parent.parent.name)}
     ordered = [name for name in MODEL_LABELS if name in paths]
     ordered += sorted(set(paths) - set(ordered))
     result = []

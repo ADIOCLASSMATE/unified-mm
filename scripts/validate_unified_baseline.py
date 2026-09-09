@@ -153,6 +153,7 @@ def _parse_args():
     parser.add_argument("--backbone-lr", type=float)
     parser.add_argument("--flow-lr", type=float)
     parser.add_argument("--save-ema-eval-every", type=int)
+    parser.add_argument("--flow-head-scaling", action="store_true")
     parser.add_argument(
         "--ablation",
         choices=("a", "b", "c", "d", "e", "f"),
@@ -193,6 +194,13 @@ def _parse_args():
 def main():
     args = _parse_args()
     config = OmegaConf.load(args.config)
+    flow_head_scaling = None
+    if args.flow_head_scaling:
+        from utils.flow_head_scaling import validate_scaling_config
+
+        if args.ablation != "b":
+            raise ValueError("flow-head scaling is defined only on B_x0")
+        flow_head_scaling = validate_scaling_config(config)
     validate_wsd_contract(config)
     if str(config.dataset.class_name) != "UnifiedMixedDataset":
         raise ValueError("dataset.class_name must be UnifiedMixedDataset")
@@ -433,7 +441,7 @@ def main():
         raise ValueError(
             "T2I-only Dynamic-XT checkpointing is valid only for ablation D"
         )
-    if bool(config.model.get("image_flow_grad_checkpointing", False)):
+    if bool(config.model.get("image_flow_grad_checkpointing", False)) and not args.flow_head_scaling:
         raise ValueError(
             "all formal B-based arms keep flow-head checkpointing off"
         )
@@ -663,6 +671,7 @@ def main():
 
     report = {
         "schema": "unified_baseline_preflight_v1",
+        "flow_head_scaling": flow_head_scaling,
         "config": str(Path(args.config)),
         "runtime_hashing_enabled": False,
         "initialization": {

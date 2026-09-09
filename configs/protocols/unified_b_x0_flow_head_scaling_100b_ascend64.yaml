@@ -1,0 +1,61 @@
+schema: unified_b_x0_flow_depth_scaling_v1
+platform_project: 随机序语言建模-统一自回归与掩码扩散的随机顺序生成框架
+workspace: 昇腾卡公共空间
+compute_group: 910B资源
+world_size: 64
+nodes: 4
+npu_per_node: 16
+baseline_config: configs/selfless/unified_baseline_100b_ascend_64npu.yaml
+baseline_checkpoint: output/unified-b-x0content-0p6b-100b-imagenet-split-s42-r1/hf_model-final-ema
+baseline_head_parameters: 164072976
+launcher: script/selfless/pretraining_unified_flow_head_scaling_ascend64.sh
+target_text_tokens: 100000000000
+max_train_steps: 95415
+initialization: Qwen3-0.6B-Base
+resume_from_checkpoint: none
+trainable_scope: full
+source_schedule: [climbmix, t2i, climbmix, i2t]
+per_rank_batch: {climbmix: 4, t2i: 16, i2t: 16}
+gradient_accumulation_steps: 4
+image_flow_batch_mul: 4
+flow_head_width: 1280
+flow_head_attention_heads: 8
+flow_head_mlp_ratio: 1.0
+flow_condition_contract: backbone_xt_query_backbone_x0_content
+flow_head_attention_contract: xlnet_content_diagonal
+image_flow_grad_checkpointing: true
+image_flow_share_content: true
+gradient_checkpointing_source: t2i
+flow_content_batch: 16
+flow_query_batch: 64
+global_gradient_checkpointing: false
+allocator: expandable_segments:True
+runtime_hashing_enabled: false
+wandb_mode: disabled
+arms:
+  depth16:
+    config: configs/selfless/unified_b_x0_flow_depth16_100b_ascend64.yaml
+    depth: 16
+    head_parameters: 321543696
+    total_parameters: 918660624
+  depth30:
+    config: configs/selfless/unified_b_x0_flow_depth30_100b_ascend64.yaml
+    depth: 30
+    head_parameters: 597117456
+    total_parameters: 1194234384
+acceptance:
+  notebook: dev-wjx-ascend
+  smoke_world_size: 16
+  optimizer_steps: 12
+  preserve_formal_per_rank_batches: true
+  finite_loss_every_microbatch: true
+  bf16_overflow_check_every_smoke_step: true
+  checkpoint_and_ema_export: true
+  reload_ema_and_generate: true
+evaluation:
+  weights: hf_model-final-ema
+  full_protocol: configs/protocols/unified_full_evaluation_ascend16.yaml
+  flow_solver: heun
+  sampling_steps: 10
+  cfg: 3.5
+  generation_order: spatial_halton

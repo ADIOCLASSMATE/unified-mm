@@ -1,0 +1,4 @@
+# CPU report generation, including optional standalone loss figures.
+PyYAML==6.0.3
+numpy==1.26.4
+matplotlib==3.10.8

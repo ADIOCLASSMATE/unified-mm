@@ -226,6 +226,7 @@ def load_model_tokenizer(
         "image_flow_depth",
         "image_flow_num_sampling_steps",
         "image_flow_batch_mul",
+        "image_flow_share_content",
         "image_flow_grad_checkpointing",
         "dynamic_xt_t2i_gradient_checkpointing",
         "training_image_sigma_order",
@@ -479,26 +480,23 @@ def rotate_checkpoints_for_save(
     return removing
 
 
-def save_checkpoint(model, config, accelerator, global_step):
-    output_dir = config.experiment.output_dir
-    checkpoints_total_limit = config.experiment.get("checkpoints_total_limit", None)
-    checkpoint_milestone_every = int(
-        config.experiment.get("checkpoint_milestone_every", 0)
+def prune_training_checkpoints(config, global_step) -> list[Path]:
+    """Apply retention only after the caller has committed the new checkpoint."""
+    limit = config.experiment.get("checkpoints_total_limit", None)
+    if limit is None:
+        return []
+    return rotate_checkpoints_for_save(
+        config.experiment.output_dir,
+        limit,
+        current_checkpoint_name=f"checkpoint-{global_step}",
+        milestone_every_steps=int(config.experiment.get("checkpoint_milestone_every", 0)),
     )
+
+
+def save_checkpoint(model, config, accelerator, global_step, *, defer_retention=False):
+    """Save Accelerate state; full training saves defer pruning until EMA/data commit."""
+    output_dir = config.experiment.output_dir
     save_path = Path(output_dir) / f"checkpoint-{global_step}"
-
-    if accelerator.is_main_process and checkpoints_total_limit is not None:
-        rotate_checkpoints_for_save(
-            output_dir,
-            checkpoints_total_limit,
-            current_checkpoint_name=save_path.name,
-            milestone_every_steps=checkpoint_milestone_every,
-        )
-
-    # Hold non-main ranks outside accelerator.save_state until rank 0 has
-    # finished retention.  Otherwise they can recreate or populate a directory
-    # while rank 0 is deleting old checkpoints.
-    accelerator.wait_for_everyone()
 
     # 这一步保存了：Model, Optimizer, LR Scheduler, Random States
     accelerator.save_state(save_path)
@@ -511,8 +509,13 @@ def save_checkpoint(model, config, accelerator, global_step):
         }
         with open(meta_file, "w+") as f:
             json.dump(metadata, f, indent=4)
-      
-        
+    accelerator.wait_for_everyone()
+    if not defer_retention:
+        if accelerator.is_main_process:
+            prune_training_checkpoints(config, global_step)
+        accelerator.wait_for_everyone()
+
+
 def save_hf_model(model, tokenizer, config, accelerator, global_step):
     output_dir = config.experiment.output_dir
     save_path = Path(output_dir) / f"hf_model-{global_step}"

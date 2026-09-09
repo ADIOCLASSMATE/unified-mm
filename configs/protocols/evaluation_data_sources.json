@@ -1,0 +1,114 @@
+{
+  "schema": "unified_evaluation_data_sources_v1",
+  "original_caption": {
+    "dataset": "junwann/CSFM-ImageNet1K-Caption",
+    "url": "https://huggingface.co/datasets/junwann/CSFM-ImageNet1K-Caption",
+    "model": "Qwen3-VL-8B-Instruct",
+    "paper_url": "https://arxiv.org/html/2602.05951v1#A5",
+    "evidence": "数据集来源由用户于 2026-09-09 确认；公开 dataset card 与论文 Appendix E 明确说明生成模型。当前合并文件的 original.model 为 null，上游模型信息来自公开说明。",
+    "protocol": "上游用 Qwen3-VL-8B-Instruct 为 ImageNet-1K 图像重新生成详细英文描述，字段为 recaption_short。公开数据卡和论文未给出可在当前项目复现的完整提示词、采样参数与逐条请求记录。",
+    "training_usage": "caption_include_original=false；保留在七字幕文件中，当前统一训练的 I2T 只轮换其余六条合成字幕。"
+  },
+  "training": [
+    {
+      "usage": "纯文本 / ClimbMix",
+      "source": "OptimalScale/ClimbMix：NVIDIA ClimbMix 的 GPT-2 token 反解码文本版本",
+      "source_url": "https://huggingface.co/datasets/OptimalScale/ClimbMix",
+      "size": "100 个本地 JSONL 分片；联合训练预算为 100B 名义纯文本目标 token",
+      "protocol": "实际路径 public/ClimbMix/*.jsonl。原下载清单指向 OptimalScale/ClimbMix；100 个分片的本地 Hugging Face metadata 均记录 revision 6d467b96d8f26cbe7465e2d70e36191aa75867ac。README 说明这是第三方反解码版本；Qwen tokenizer 在线编码，长度 2048。",
+      "evidence": ["public/ClimbMix/README.md", "configs/selfless/unified_baseline_100b_ascend_64npu.yaml", "utils/climbmix_online_dataset.py"]
+    },
+    {
+      "usage": "纯文本验证 / 新增固定子集",
+      "source": "OptimalScale/ClimbMix；固定源记录 manifest，不使用 caption",
+      "source_url": "https://huggingface.co/datasets/OptimalScale/ClimbMix",
+      "size": "100 个分片各固定 4 条，共 400 条记录；本次准备完成，尚无历史验证 loss",
+      "protocol": "climbmix_fixed_document_ce_v1；seed 424242；固定文档片段，最多 2048 token，首 token 与 padding 不计 loss，跨 rank 按有效目标数汇总 CE。使用当前训练权重，与下游 EMA 分数分开。只有从训练开始启用 validation_exclusion_manifest 的实验才按源记录留出；已有训练可能见过这些文本，原有数据流未改写。支持独立外部 JSONL。",
+      "evidence": ["public/datasets/climbmix_validation_v1/manifest.json", "docs/CLIMBMIX_VALIDATION.md", "utils/training_climbmix_validation.py", "utils/climbmix_online_dataset.py"]
+    },
+    {
+      "usage": "T2I 训练",
+      "source": "ImageNet-1K 官方 train 图像 + 项目合成 T2I prompts",
+      "size": "1,281,167 张图 × 12 prompts = 15,374,004 条",
+      "protocol": "每张训练图对应 12 种固定风格文本；按样本确定性初始偏移、随 epoch 轮换。图像目标仍是对应 ImageNet 原图的 MAR KL16 posterior latent，没有额外生成风格目标图。",
+      "evidence": ["public/datasets/imagenet1k_synthetic_v1/t2i/manifest.json", "public/datasets/imagenet1k_synthetic_v1/indexed/train/manifest.json", "utils/dataset_imagenet_flow_cache.py"]
+    },
+    {
+      "usage": "I2T 训练",
+      "source": "ImageNet-1K 官方 train 图像 + Qwen / MiniMax 六条合成字幕",
+      "size": "1,281,167 张图 × 6 个训练目标 = 7,687,002 条",
+      "protocol": "磁盘文件每图有 original 1 条、local_qwen 3 条、MiniMax-M3 3 条。训练排除 original，按确定性偏移轮换其余 6 条；Kimi 未进入发布版本。",
+      "evidence": ["public/datasets/imagenet1k_synthetic_v1/captions/manifest.json", "configs/selfless/unified_baseline_100b_ascend_64npu.yaml", "utils/dataset_imagenet_flow_cache.py"]
+    },
+    {
+      "usage": "训练时验证 / held-out loss",
+      "source": "ImageNet-1K 官方 val 独立缓存与独立文本索引",
+      "size": "50,000 张图；每图 1 条 visual_description 和 12 条 T2I prompts",
+      "protocol": "I2T 的单条参考字幕提取自 T2I 合成记录的 model_result.visual_description，来自 gpt-5.6-luna；T2I 固定索引 0（faithful_photo）。不是训练集六字幕，也不是 CSFM 的 val caption。",
+      "evidence": ["public/datasets/imagenet1k_synthetic_v1/indexed/val/manifest.json", "scripts/prepare_imagenet1k_val_assets.py", "docs/TRAINING_DOWNSTREAM_VALIDATION.md"]
+    }
+  ],
+  "evaluation": [
+    {
+      "usage": "FID / IS 与参数、顺序扫描",
+      "source": "ImageNet-1K val 50K",
+      "size": "50,000 张真实图；50,000 条 faithful_photo 条件",
+      "protocol": "项目内分布指标。正式基础协议为 Heun 10、CFG 3.5、seed 42；CFG 2.0 矩阵与其他扫描保留各自参数。条件来自 val 合成 prompts[0]，真实参考统计来自原始 ImageNet-val。",
+      "evidence": ["configs/protocols/unified_full_evaluation_ascend16.yaml", "public/datasets/imagenet1k_synthetic_v1/indexed/val/manifest.json", "docs/UNIFIED_MATRIX_CFG2_ORDER.md"]
+    },
+    {
+      "usage": "ImageNet 零样本分类",
+      "source": "ImageNet-1K val + 固定 1,000 类别文本",
+      "size": "50,000 张图 × 1,000 类候选",
+      "protocol": "使用 CLIP 类名约定与 a photo of a {class_name}. 固定模板；候选由类别文本构造。Selfless 计算去文本先验的条件似然 Top-1/5。",
+      "evidence": ["docs/PRETRAINING_NATIVE_EVALUATION.md", "configs/protocols/pretraining_native_understanding_evaluation_ascend16.yaml"]
+    },
+    {
+      "usage": "COCO / Flickr30K 双向检索",
+      "source": "MSCOCO / Flickr30K 的 Karpathy test 划分与已有参考字幕",
+      "size": "COCO 5,000 图 / 25,010 captions；Flickr30K 1,000 图 / 5,000 captions",
+      "protocol": "保留数据集原有字幕；没有在本项目中用 Qwen / MiniMax 重写。全候选池，去文本先验，I2T / T2I R@1/5/10。",
+      "evidence": ["public/benchmarks/mscoco_karpathy_retrieval_v1/manifest.json", "public/benchmarks/flickr30k_karpathy_retrieval_v1/manifest.json", "scripts/prepare_cross_dataset_retrieval_assets.py"]
+    },
+    {
+      "usage": "图文组合 / hard negatives",
+      "source": "SugarCrepe 官方七类扰动；ARO Visual Genome Relation / Attribution",
+      "size": "7,511 / 23,937 / 28,748 条",
+      "protocol": "使用 benchmark 已发布的正负文本和对应图像，不在本项目重新合成。报告经固定空图先验校正的 pairwise win rate；随机图像顺序 MC64，E sequential 为 MC1。",
+      "evidence": ["public/benchmarks/selfless_multimodal_likelihood_v1/manifest.json", "docs/PRETRAINING_NATIVE_EVALUATION.md"]
+    },
+    {
+      "usage": "内部理解诊断",
+      "source": "MMBench Dev-EN / SEED-Bench image 官方问题与选项",
+      "size": "MMBench 4,329 circular 行（1,164 原问题）；SEED 14,233 条",
+      "protocol": "项目候选似然适配器；用于消融趋势，不能直接对照官方自由生成榜单。",
+      "evidence": ["public/benchmarks/selfless_multimodal_likelihood_v1/manifest.json", "configs/protocols/unified_multimodal_likelihood_evaluation_ascend16.yaml"]
+    },
+    {
+      "usage": "文本八任务",
+      "source": "ARC-E / ARC-C test，HellaSwag / PIQA / WinoGrande / BoolQ validation，OpenBookQA test，MMLU test + dev demonstrations",
+      "size": "2,376 / 1,172 / 10,042 / 1,838 / 1,267 / 3,270 / 500 / 14,042 条；MMLU dev 285 条",
+      "protocol": "现有 benchmark 文本；MMLU 5-shot，其余采用冻结评测配置。所有下载 URL 与本地文件记录在 assets manifest；没有为评测重新合成题目。",
+      "evidence": ["public/benchmarks/selfless_text_v1/manifest.json", "configs/protocols/unified_full_evaluation_ascend16.yaml"]
+    },
+    {
+      "usage": "网页定性样本",
+      "source": "ImageNet-val + COCO/Flickr Karpathy test + 仓库固定自定义文本",
+      "size": "每模型 T2I 64 prompts × 2 seeds；I2T 64 图；文本 32 前缀 × 2 解码",
+      "protocol": "T2I 为 32 条 ImageNet-val faithful_photo + 32 条固定自定义 prompt；I2T 为 32 ImageNet + 16 COCO + 16 Flickr，参考 caption 仅展示、不输入模型。自定义 T2I 与文本前缀未保留作者/生成模型元数据，不能归因为上述数据合成模型。",
+      "evidence": ["configs/protocols/unified_qualitative_prompts_v1.json", "scripts/generate_unified_qualitative.py"]
+    },
+    {
+      "usage": "独立保留的官方 T2I benchmarks",
+      "source": "GenEval / DPG-Bench / MJHQ",
+      "size": "按各 benchmark 原始协议与可用结果单独记录",
+      "protocol": "使用 benchmark 自带 prompts/参考资产；尚无有效官方评分的项目不进入总表。",
+      "evidence": ["docs/OFFICIAL_T2I_BENCHMARKS.md"]
+    }
+  ],
+  "synthesis_notes": {
+    "qwen": "每图三个独立 caption slot；本地 vLLM 加载完整 FP8 权重，输入实际图像。下方保留仓库 system prompt 与三个变体。发布数据逐条记录模型名与 prompt_version；采样数值来自对应仓库配置。",
+    "minimax": "MiniMax-M3 通过图像输入 API 一次输出恰好三条英文 caption，协议 imagenet_multicap_en_v1；三个重点为主体外观、空间构图、场景与摄影背景。要求可见证据、自然完整句子、避免不支持的身份/意图/计数。当前源码默认 temperature=0.8、建议 32–60 词、max_tokens=1400；历史请求参数快照未随七字幕数据发布，不能把当前默认值当作逐次请求证明。类名 hint 可选，原始运行是否开启尚未证实。",
+    "t2i": "全量记录的生成者为 gpt-5.6-luna，reasoning_effort=low，prompt_version=imagenet1k_codex_visual_t2i_en_v2。每图输出 visual_description、subject_evidence、scene、source_composition、source_lighting 与固定 12 风格 prompts。faithful_photo 对齐原图；其余风格允许更改渲染、光照或构图，可从保存样本直接检查。完整合成指令正文、temperature/top_p 未随当前导出保留，不能从版本号还原。"
+  }
+}

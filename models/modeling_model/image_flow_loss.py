@@ -1518,6 +1518,130 @@ class ContextualFlowTransformerHead(nn.Module):
             "cache_contract": self.cache_contract(),
         }
 
+    def _forward_shared_content(
+        self, x, t, c, *, context_latents, context_conditions,
+        context_mask, content_attention_mask, query_positions,
+        context_positions, repeats, record_stats,
+    ):
+        """Evaluate RF queries against one X0 content stream per image.
+
+        The caller's repeat-major [R*B,Q,D] queries become [B,R*Q,D].
+        Queries only cross-attend to content, so this shares content compute
+        and K/V without changing visibility or mixing RF samples.
+        """
+        if x.dim() != 3 or context_latents is None or context_latents.dim() != 3:
+            raise ValueError("shared-content RF training requires sequence inputs")
+        batch_size, context_len, _ = context_latents.shape
+        if x.shape[:2] != (repeats * batch_size, context_len):
+            raise ValueError("RF queries must be [repeats * content_batch, content_len, D]")
+        if context_conditions is None or context_conditions.shape[:2] != (batch_size, context_len):
+            raise ValueError("shared-content training requires one X0 condition per content token")
+
+        def fold(value):
+            tail = value.shape[2:]
+            return value.reshape(repeats, batch_size, context_len, *tail).transpose(0, 1).reshape(
+                batch_size, repeats * context_len, *tail
+            )
+
+        def unfold(value):
+            tail = value.shape[2:]
+            return value.reshape(batch_size, repeats, context_len, *tail).transpose(0, 1).reshape(
+                repeats * batch_size, context_len, *tail
+            )
+
+        model_device = self.input_proj.weight.device
+        model_dtype = self.input_proj.weight.dtype
+        x = fold(x.to(device=model_device, dtype=model_dtype))
+        c = fold(c.to(device=model_device, dtype=model_dtype))
+        query_y = self._shape_time(fold(t), x.shape[:-1]) + self.cond_embed(c)
+        query_positions = fold(self._positions(
+            query_positions, repeats * batch_size, context_len, model_device
+        ))
+        query_rope = self._build_rope(query_positions, model_dtype)
+        context_positions = self._positions(
+            context_positions, batch_size, context_len, model_device
+        )
+        context_rope = self._build_rope(context_positions, model_dtype)
+        x = self.input_proj(x)
+        content = self._initial_content_hidden(
+            context_latents.to(device=model_device, dtype=model_dtype), context_positions
+        )
+        initial_content = content if record_stats else None
+        content_y = self._content_condition(
+            context_conditions.to(device=model_device, dtype=model_dtype)
+        )
+        context_mask, content_attention_mask = self._resolve_content_attention_mask(
+            context_mask, content_attention_mask, batch_size=batch_size,
+            sequence_length=context_len, device=model_device,
+        )
+        query_mask = self.blocks[0].prepare_context_mask(
+            context_mask.repeat(1, repeats, 1), batch_size,
+            repeats * context_len, context_len, model_device,
+        )
+        content_mask = self.blocks[0].prepare_context_mask(
+            content_attention_mask, batch_size, context_len, context_len, model_device,
+        )
+        input_layout = "BSND" if getattr(x, "is_npu", False) else "BNSD"
+        checkpoint_blocks = self.grad_checkpointing and self.training and torch.is_grad_enabled()
+        self.last_training_batch_layout = {
+            "content_batch": batch_size,
+            "query_batch": repeats * batch_size,
+            "rf_samples": repeats,
+            "content_tokens": context_len,
+            "folded_query_tokens": repeats * context_len,
+            "checkpointed_blocks": len(self.blocks) if checkpoint_blocks else 0,
+        }
+        query_stats, content_stats = [], []
+        for block in self.blocks:
+            # Capture each block's diagnostics once; checkpoint recomputation
+            # must not append a second copy during backward.
+            captured_stats = []
+
+            def dual_step(content_hidden, query_hidden, block=block, captured_stats=captured_stats):
+                cache = block.prepare_cross_cache(
+                    content_hidden, context_positions=context_positions,
+                    context_rope=context_rope, input_layout=input_layout,
+                )
+                next_content = block(
+                    content_hidden, content_y, layer_cache=cache,
+                    context_mask=content_mask, query_positions=context_positions,
+                    query_rope=context_rope, include_mlp=True, record_stats=record_stats,
+                )
+                content_stat = self._capture_block_stats(block) if record_stats else None
+                next_query = block(
+                    query_hidden, query_y, layer_cache=cache,
+                    context_mask=query_mask, query_positions=query_positions,
+                    query_rope=query_rope, record_stats=record_stats,
+                )
+                if record_stats and not captured_stats:
+                    captured_stats.extend([content_stat, self._capture_block_stats(block)])
+                return next_content, next_query
+
+            if checkpoint_blocks:
+                content, x = checkpoint(dual_step, content, x, use_reentrant=False)
+            else:
+                content, x = dual_step(content, x)
+            if record_stats:
+                content_stat, query_stat = captured_stats
+                content_stats.append({
+                    key: None if value is None else value.repeat(repeats, 1)
+                    for key, value in content_stat.items()
+                })
+                query_stats.append({
+                    key: None if value is None else unfold(value)
+                    for key, value in query_stat.items()
+                })
+        if record_stats:
+            self._publish_stream_stats(
+                query_stats, content_stats,
+                content_inputs=initial_content.detach().repeat(repeats, 1, 1),
+                content_outputs=content.detach().repeat(repeats, 1, 1),
+                query_outputs=unfold(x.detach()),
+            )
+        else:
+            self._clear_stream_stats()
+        return unfold(self.final_layer(x, query_y))
+
     def forward(
         self,
         x,
@@ -1534,7 +1658,18 @@ class ContextualFlowTransformerHead(nn.Module):
         context_conditions=None,
         latent_mixer_cache=None,
         record_stats=False,
+        query_batch_repeats=1,
     ):
+        if query_batch_repeats > 1:
+            if latent_mixer_cache is not None or time_embedding is not None or condition_embedding is not None:
+                raise ValueError("shared-content RF batching is a direct training path")
+            return self._forward_shared_content(
+                x, t, c, context_latents=context_latents,
+                context_conditions=context_conditions, context_mask=context_mask,
+                content_attention_mask=content_attention_mask,
+                query_positions=query_positions, context_positions=context_positions,
+                repeats=int(query_batch_repeats), record_stats=record_stats,
+            )
         model_dtype = self.input_proj.weight.dtype
         x = x.to(device=self.input_proj.weight.device, dtype=model_dtype)
         c = c.to(device=x.device, dtype=model_dtype)
@@ -2036,6 +2171,7 @@ class FlowLoss(nn.Module):
         context_conditions: torch.Tensor | None = None,
         latent_mixer_cache: dict[str, torch.Tensor] | None = None,
         record_stats: bool = False,
+        query_batch_repeats: int = 1,
     ) -> torch.Tensor:
         model_dtype = self.net.input_proj.weight.dtype
         model_device = self.net.input_proj.weight.device
@@ -2055,6 +2191,8 @@ class FlowLoss(nn.Module):
             model_device,
             model_dtype,
         )
+        if query_batch_repeats > 1:
+            context_kwargs["query_batch_repeats"] = query_batch_repeats
         latent_mixer_cache = self._cache_to_device(
             latent_mixer_cache,
             model_device,

@@ -519,6 +519,29 @@ def test_checkpoint_image_contract_mismatch_is_rejected(tmp_path):
         )
 
 
+@pytest.mark.parametrize("depth", [16, 30])
+def test_neutral_evaluation_config_uses_checkpoint_flow_capacity(tmp_path, depth):
+    checkpoint = tmp_path / "checkpoint-10"
+    model_contract = _text_ar_model_contract()
+    model_contract.update(image_flow_depth=depth, image_flow_width=1536)
+    _write_sharded_source(checkpoint, model_contract=model_contract)
+    config = _evaluation_config()
+    configure_model_source(config, resolve_evaluation_model_source(checkpoint))
+    assert config.model.image_flow_depth == depth
+    assert config.model.image_flow_width == 1536
+    assert config.model.image_latent_dim == 16
+
+
+@pytest.mark.parametrize("depth", [0, -1, True, 16.5])
+def test_evaluation_rejects_invalid_checkpoint_flow_capacity(tmp_path, depth):
+    checkpoint = tmp_path / "checkpoint-10"
+    model_contract = _text_ar_model_contract()
+    model_contract['image_flow_depth'] = depth
+    _write_sharded_source(checkpoint, model_contract=model_contract)
+    with pytest.raises(ValueError, match='invalid image_flow_depth'):
+        configure_model_source(_evaluation_config(), resolve_evaluation_model_source(checkpoint))
+
+
 def test_sharded_checkpoint_without_model_contract_is_rejected(tmp_path):
     checkpoint = tmp_path / "checkpoint-10"
     _write_sharded_source(checkpoint)

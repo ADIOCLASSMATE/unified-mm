@@ -20,7 +20,7 @@ ImageNet 用选中的全部 2,000 张图估计无标签语言先验，alpha=1。
 两个图文任务使用 MC16、3 张固定空图和 alpha=1 的先验校准；顺序图像模型
 只有一个确定顺序，使用 MC1，记录实际 MC 数。MC16 快评与正式 MC64 结果分开解释。
 
-每次都按相同 seed 从整个数据池分层抽样，先固定全局清单，再用
+首次按固定 seed 从整个数据池分层抽样，之后复用同一有序全局清单，再用
 `indices[rank::world_size]` 分片。分片不补齐，不重复样本，支持空分片。
 图像 posterior 噪声与顺序 MC 由样本身份确定，与 rank 无关。
 计数、正确数和分类分数矩阵全局汇总，类别宏平均在汇总后计算。
@@ -32,7 +32,16 @@ NPU 模型，也不会重置优化器；模型模式、共享参数、buffers �
 Torch 随机数状态在正常结束及异常退出时恢复。该方式沿用训练已有的
 ZeRO-2 完整参数复制前提，不能直接用于 ZeRO-3 参数分片。
 
-训练验证不再调用旧的前几个 batch loss/生成图片/生成 caption 流程。
+周期验证同时执行[与训练同口径的 loss 验证](UNIFIED_LOSS_VALIDATION.md)：
+T2I / I2T 直接复用上述每类 2 张的 2,000 张 ImageNet 清单，保留其历史样本顺序；
+ClimbMix 继续使用固定 400 条源记录。使用当前训练权重，对活跃的 T2I / I2T /
+纯文本任务按训练调度与 microbatch 平均汇总，保存
+`validation_unified_loss_metrics_step_<N>.json`。它有独立耗时记录，不计入下游
+验证的 EMA 协议和时间预算。整轮耗时另由 `val/validation_seconds` 记录。
+训练只创建一个持久的 `TrainingValidator`，下游准备的样本、CPU posterior 和
+分词缓存跨验证轮复用，模型评分每轮重算；不会驻留第二份设备模型。
+数据排除与历史训练独立性见
+[纯文本验证 loss](CLIMBMIX_VALIDATION.md)。不恢复旧的周期生成图/生成 caption 流程。
 FID/IS、检索与其余图文任务留在独立的完整评测流程中。快评用于观察文本和图像
 理解趋势，不能由此推断生成 FID 的排名。独立完整评测仍可调用原有全量 loss
 验证函数；历史 LR sweep 的 loss 选择脚本也只适用于原有历史产物。
@@ -44,16 +53,21 @@ FID/IS、检索与其余图文任务留在独立的完整评测流程中。快�
 未完成的任务记录真实已处理条数与 `time_budget_exhausted`，不产生准确率。
 `complete` 表示样本是否全部完成，`within_time_budget` 单独表示是否在 600 秒内。
 该截止时间是协作式的，不会在执行中的设备算子内强制打断训练进程。
+`prepare_seconds` 和 `prepare_cache_hit` 区分首次准备与后续缓存命中。
+所有 rank 0 结果写入都先原子落盘，再通过 rank 间失败同步推进下一阶段。
 
 每个验证点写入：
 
 - `output/evaluation/training-validation/<run>/downstream_validation/step-<N>/subset.json`：全局样本 ID 与配置。
 - 同目录 `summary.json`：模型契约、EMA 来源、各任务完成情况、得分与时间。
 - Tracker 的 `val/downstream/<task>`、`val/downstream/text_mean` 与耗时/完成标记。
+- 上级目录 `validation_summary_step_<N>.json`：整轮 loss + 下游验证状态、耗时及文件导航。
 
 计时验收只使用固定的 16 卡开发机，调用同一个训练验证函数。计时脚本额外包含
 checkpoint 加载和分片 EMA 初始化，并检查验证后训练权重、训练模式恢复。
 `launcher.status` 另记进程启动、HCCL 建组和退出在内的总时间。
+此独立脚本计量下游评分，不包含新增三任务 loss 验证；整轮时长读取训练的
+`validation_summary_step_<N>.json`，不能用下面的旧计时替代新整轮耗时。
 
 ```bash
 bash script/selfless/benchmark_training_validation_ascend16.sh \
@@ -73,3 +87,10 @@ ImageNet Top-1 为 45.15%，与从已有全量分数矩阵重算同一 2,000 张
 这次计时证明当前 0.6B 配置在 16 卡上的预算；没有对 64/256 卡做额外计时。
 1.7B 复用同一实现与截止时间，尚无其 16 卡完整通过的时间结论。
 已经运行中的训练进程需要在下一次正常启动/恢复时才会加载新版代码。
+
+2026-09-09 在同一固定 16 卡开发机完成 depth16 / depth30 的真实训练内验证，
+每档在 step 2 / step 4 运行两轮，全部 11 项完成。下游耗时分别为 depth16
+388.43 / 382.63 秒、depth30 387.26 / 389.71 秒；加上统一 loss 的整轮耗时为
+395.59 / 386.75 秒与 396.05 / 394.81 秒。两档第二轮都命中 CPU 准备缓存，
+准备耗时约 0.19 秒。共享 2,000 张类别均衡清单、loss 当前权重来源和下游 EMA
+来源均在验收中检查。详见[统一 loss 实测](UNIFIED_LOSS_VALIDATION.md)。

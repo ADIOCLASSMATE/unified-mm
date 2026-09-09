@@ -239,6 +239,13 @@ def _apply_checkpoint_model_contract(config, saved_model, *, label: str) -> None
                 )
             config.model[field] = int(saved_value)
             continue
+        if field in {"image_flow_width", "image_flow_depth"}:
+            # Model capacity belongs to the checkpoint. The shared evaluation
+            # YAML supplies dataset/scoring defaults for every scaling arm.
+            if isinstance(saved_value, bool) or not isinstance(saved_value, int) or saved_value <= 0:
+                raise ValueError(f"{label} has invalid {field}={saved_value!r}")
+            config.model[field] = saved_value
+            continue
         expected = config.model.get(field)
         if expected is not None and str(saved_value) != str(expected):
             raise ValueError(

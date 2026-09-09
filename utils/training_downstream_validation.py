@@ -7,7 +7,7 @@ EMA restoration and logging. An unfinished task never produces a score.
 """
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass, replace
 import json
@@ -92,6 +92,102 @@ def stratified_sample(items, count, *, category, identity, seed):
         selected.extend(pool[:sizes[key]])
     rng.shuffle(selected)
     return selected
+
+
+@dataclass(frozen=True)
+class ImageNetValidationSubset:
+    """One ordered, class-balanced list shared by loss and downstream scoring."""
+
+    records: tuple
+    seed: int
+    per_class: int
+    image_manifest: str
+    image_classes: str
+
+    def __post_init__(self):
+        counts = Counter(record.class_index for record in self.records)
+        if not counts or set(counts.values()) != {self.per_class}:
+            raise ValueError("ImageNet validation subset must be balanced per class")
+        for key in ("image_id", "img_id"):
+            if len({getattr(record, key) for record in self.records}) != len(self.records):
+                raise ValueError(f"duplicate ImageNet subset {key}")
+
+    def validate_profile(self, profile):
+        if (self.seed != profile.seed or self.per_class != profile.imagenet_per_class or
+                Path(self.image_manifest).resolve() != Path(profile.image_manifest).resolve() or
+                Path(self.image_classes).resolve() != Path(profile.image_classes).resolve()):
+            raise ValueError("shared ImageNet subset differs from downstream_validation configuration")
+
+    def metadata(self):
+        return {"schema": "training_imagenet_subset_v1", "seed": self.seed,
+                "per_class": self.per_class, "samples": len(self.records),
+                "classes": len({record.class_index for record in self.records}),
+                "image_manifest": self.image_manifest, "image_classes": self.image_classes,
+                "sample_ids": [record.image_id for record in self.records],
+                "img_ids": [record.img_id for record in self.records],
+                "class_indices": [record.class_index for record in self.records]}
+
+    def indices_for(self, subset):
+        """Resolve official IDs to this Subset's offsets, never assume row order."""
+        dataset = subset.dataset
+        if dataset.dataset_split != "val":
+            raise ValueError("shared ImageNet subset requires an independent val dataset")
+        image_ids = dataset.img_ids.tolist()
+        positions = {int(image_ids[int(row)]): offset for offset, row in enumerate(subset.indices)}
+        if len(positions) != len(subset):
+            raise ValueError("duplicate image identities in validation loader")
+        indices = []
+        for record in self.records:
+            if record.img_id not in positions:
+                raise ValueError(f"shared ImageNet sample absent from loss dataset: {record.image_id}")
+            actual_id = f"val/{Path(dataset.source_paths_full[record.img_id]).stem}"
+            if actual_id != record.image_id or dataset.synsets[record.img_id] != record.synset:
+                raise ValueError(f"ImageNet loss/downstream identity mismatch: {record.image_id}")
+            offset = positions[record.img_id]
+            if dataset._is_training_index(int(subset.indices[offset])):
+                raise ValueError("ImageNet loss samples must use fixed validation serialization")
+            indices.append(offset)
+        return indices
+
+
+def prepare_imagenet_subset(profile):
+    from scripts.evaluate_imagenet_pretraining_native import load_imagenet_records
+
+    records = load_imagenet_records(Path(profile.image_manifest), Path(profile.image_classes))
+    # Preserve the exact historical downstream selection AND order.
+    selected = stratified_sample(records, 1000 * profile.imagenet_per_class,
+                                 category=lambda r: r.class_index, identity=lambda r: r.image_id,
+                                 seed=profile.seed)
+    return ImageNetValidationSubset(tuple(selected), profile.seed, profile.imagenet_per_class,
+                                    profile.image_manifest, profile.image_classes)
+
+
+class DownstreamValidationState:
+    """Per-training-process CPU data/token cache; never retain model scores."""
+
+    def __init__(self, profile, *, imagenet_subset=None):
+        self.profile = profile
+        self.imagenet_subset = imagenet_subset
+        self.prepared = None
+        self.tokenizer = None
+        self._shape = None
+
+    def prepare(self, model, tokenizer):
+        from scripts.evaluate_imagenet_pretraining_native import CachedTokenizer
+
+        shape = (int(model.config.image_tokens_per_img), int(model.config.image_latent_dim))
+        if self.prepared is not None:
+            if self._shape != shape or self.tokenizer.tokenizer is not tokenizer:
+                raise ValueError("validation cache cannot be reused with different image dimensions or tokenizer")
+            return True
+        if self.imagenet_subset is None:
+            self.imagenet_subset = prepare_imagenet_subset(self.profile)
+        self.imagenet_subset.validate_profile(self.profile)
+        prepared = _prepare(model, self.profile, self.imagenet_subset)
+        self.prepared = prepared
+        self.tokenizer = CachedTokenizer(tokenizer)
+        self._shape = shape
+        return False
 
 
 def rank_indices(count, rank, world_size):
@@ -297,15 +393,13 @@ def _grounding_task(model, tokenizer, examples, cache, null_ids, profile, device
     return status
 
 
-def _prepare(model, profile):
+def _prepare(model, profile, imagenet_subset):
     from scripts import evaluate_selfless_text_benchmarks as text_eval
     from scripts import evaluate_imagenet_pretraining_native as image_eval
     from scripts import evaluate_multimodal_likelihood_benchmarks as mm_eval
 
     text = {task: text_eval.load_multiple_choice_task(task, Path(profile.text_root)) for task in TEXT_TASKS}
-    records = image_eval.load_imagenet_records(Path(profile.image_manifest), Path(profile.image_classes))
-    records = stratified_sample(records, 1000 * profile.imagenet_per_class,
-                                category=lambda r: r.class_index, identity=lambda r: r.image_id, seed=profile.seed)
+    records = imagenet_subset.records
     class_names, _ = image_eval.load_openai_clip_class_names(Path(profile.image_classnames))
     manifest = json.loads((Path(profile.grounding_root) / "manifest.json").read_text())
     grounding = {}
@@ -331,13 +425,13 @@ def _prepare(model, profile):
 
 
 def run_downstream_validation(model, tokenizer, *, device, output_dir, step=0,
-                              ema=None, profile=None, started=None, weight_source=None):
+                              ema=None, profile=None, started=None, weight_source=None, state=None):
     """Run on the unwrapped, replicated model on ALL ranks of the training group."""
     started = time.monotonic() if started is None else started
     from scripts.evaluate_multimodal_likelihood_benchmarks import atomic_write_text
-    from scripts.evaluate_imagenet_pretraining_native import CachedTokenizer
 
-    profile = profile or ValidationProfile()
+    profile = profile or (state.profile if state is not None else ValidationProfile())
+    state = state or DownstreamValidationState(profile)
     rank, world = (dist.get_rank(), dist.get_world_size()) if _distributed() else (0, 1)
     _synchronize(device)
     if _distributed():
@@ -359,13 +453,21 @@ def run_downstream_validation(model, tokenizer, *, device, output_dir, step=0,
     if ema is not None:
         summary["ema"] = {"step": ema.global_step, "decay": ema.decay, "dtype": "fp32_shards"}
     with evaluation_state(model, device, ema):
+        prepare_started = time.monotonic()
         with _local_phase(device):
-            text, records, names, grounding, image_cache, grounding_cache, null_ids, ids = _prepare(model, profile)
-        if rank == 0:
-            atomic_write_text(output_dir / "subset.json", json.dumps({"schema": PROFILE, "seed": profile.seed,
-                              "sample_ids": ids, "profile": asdict(profile)}, ensure_ascii=False) + "\n")
-            atomic_write_text(output_dir / "summary.json", json.dumps(summary, indent=2) + "\n")
-        tokenizer = CachedTokenizer(tokenizer)
+            if state.profile != profile:
+                raise ValueError("downstream validation cache profile changed")
+            cache_hit = state.prepare(model, tokenizer)
+            text, records, names, grounding, image_cache, grounding_cache, null_ids, ids = state.prepared
+        summary["prepare_seconds"] = float(_reduce([time.monotonic() - prepare_started], device, dist.ReduceOp.MAX)[0])
+        summary["prepare_cache_hit"] = bool(_reduce([int(cache_hit)], device, dist.ReduceOp.MIN)[0])
+        with _local_phase(device):
+            if rank == 0:
+                atomic_write_text(output_dir / "subset.json", json.dumps({"schema": PROFILE, "seed": profile.seed,
+                                  "sample_ids": ids, "imagenet_subset": state.imagenet_subset.metadata(),
+                                  "profile": asdict(profile)}, ensure_ascii=False) + "\n")
+                atomic_write_text(output_dir / "summary.json", json.dumps(summary, indent=2) + "\n")
+        tokenizer = state.tokenizer
         tasks = [(task, lambda task=task: _text_task(model, tokenizer, text[task], task, profile,
                                                    device, rank, world, deadline)) for task in TEXT_TASKS]
         tasks.append(("imagenet", lambda: _imagenet_task(model, tokenizer, records, names, image_cache,
@@ -378,19 +480,21 @@ def run_downstream_validation(model, tokenizer, *, device, output_dir, step=0,
             result = evaluate()
             result["wall_seconds"] = float(_reduce([time.monotonic() - began], device, dist.ReduceOp.MAX)[0])
             summary["tasks"][task] = result
-            if rank == 0:
-                print(json.dumps({"event": "training_downstream_task", "step": step, "task": task,
-                                  **{k: v for k, v in result.items() if k != "metrics"}}), flush=True)
-                atomic_write_text(output_dir / "summary.json", json.dumps(summary, indent=2) + "\n")
+            with _local_phase(device):
+                if rank == 0:
+                    print(json.dumps({"event": "training_downstream_task", "step": step, "task": task,
+                                      **{k: v for k, v in result.items() if k != "metrics"}}), flush=True)
+                    atomic_write_text(output_dir / "summary.json", json.dumps(summary, indent=2) + "\n")
     _synchronize(device)
     summary["wall_seconds"] = float(_reduce([time.monotonic() - deadline.started], device, dist.ReduceOp.MAX)[0])
     summary["within_time_budget"] = summary["wall_seconds"] <= profile.max_seconds
     summary["complete"] = all(item["complete"] for item in summary["tasks"].values())
     if all(summary["tasks"][task]["complete"] for task in TEXT_TASKS):
         summary["text_mean"] = sum(summary["tasks"][task]["primary"] for task in TEXT_TASKS) / len(TEXT_TASKS)
-    if rank == 0:
-        atomic_write_text(output_dir / "summary.json", json.dumps(summary, indent=2) + "\n")
-        print(json.dumps({"event": "training_downstream_complete", "step": step,
-                          "complete": summary["complete"], "wall_seconds": summary["wall_seconds"],
-                          "within_time_budget": summary["within_time_budget"]}), flush=True)
+    with _local_phase(device):
+        if rank == 0:
+            atomic_write_text(output_dir / "summary.json", json.dumps(summary, indent=2) + "\n")
+            print(json.dumps({"event": "training_downstream_complete", "step": step,
+                              "complete": summary["complete"], "wall_seconds": summary["wall_seconds"],
+                              "within_time_budget": summary["within_time_budget"]}), flush=True)
     return summary

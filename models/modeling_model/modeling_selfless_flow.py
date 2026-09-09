@@ -102,8 +102,31 @@ class X0ContentFlowLoss(FlowLoss):
 
     _CONTEXT_KEY = "_x0_content_training_context_conditions"
 
-    def _training_context(self, *args, **kwargs):
-        context = super()._training_context(*args, **kwargs)
+    def _training_context(
+        self, target, sigma, image_positions, context_latents=None,
+        context_mask=None, content_attention_mask=None,
+    ):
+        content_batch = target.shape[0] if context_latents is None else context_latents.shape[0]
+        repeats, remainder = divmod(target.shape[0], content_batch)
+        if remainder or repeats < 1:
+            raise ValueError("query batch must be an integer multiple of content batch")
+        shared = repeats > 1
+        context = super()._training_context(
+            context_latents if shared else target,
+            sigma[:content_batch] if shared and sigma is not None else sigma,
+            image_positions[:content_batch] if shared and image_positions is not None else image_positions,
+            context_latents=context_latents,
+            context_mask=context_mask[:content_batch] if shared and context_mask is not None else context_mask,
+            content_attention_mask=(content_attention_mask[:content_batch]
+                                    if shared and content_attention_mask is not None
+                                    else content_attention_mask),
+        )
+        if shared:
+            context["query_positions"] = (
+                image_positions if image_positions is not None
+                else context["context_positions"].repeat(repeats, 1)
+            )
+            context["query_batch_repeats"] = repeats
         context_conditions = self.__dict__.get(self._CONTEXT_KEY)
         if context_conditions is None:
             raise RuntimeError(
@@ -2125,12 +2148,16 @@ class Qwen3ForCausalLM(
 
                     if self.image_flow_batch_mul > 1:
                         repeats = self.image_flow_batch_mul
-                        image_targets = image_targets.repeat(repeats, 1, 1)
-                        image_context_latents = image_context_latents.repeat(
-                            repeats, 1, 1
+                        share_content = use_x0_content_condition and bool(
+                            getattr(self.config, "image_flow_share_content", False)
                         )
+                        image_targets = image_targets.repeat(repeats, 1, 1)
+                        if not share_content:
+                            image_context_latents = image_context_latents.repeat(
+                                repeats, 1, 1
+                            )
                         image_conditions = image_conditions.repeat(repeats, 1, 1)
-                        if image_content_conditions is not None:
+                        if image_content_conditions is not None and not share_content:
                             image_content_conditions = (
                                 image_content_conditions.repeat(repeats, 1, 1)
                             )

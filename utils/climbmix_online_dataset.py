@@ -44,6 +44,8 @@ class _ClimbMixPacker:
         tokenizer_batch_documents: int,
         max_document_chars: int,
         resume_state: dict[str, Any] | None,
+        excluded_rows: dict[str, set[int]] | None = None,
+        exclusion_contract: dict | None = None,
     ) -> None:
         self.shard_paths = tuple(Path(path) for path in shard_paths)
         self.tokenizer = tokenizer
@@ -55,6 +57,9 @@ class _ClimbMixPacker:
         self.seed = int(seed)
         self.tokenizer_batch_documents = int(tokenizer_batch_documents)
         self.max_document_chars = int(max_document_chars)
+        self.excluded_rows = {str(path): (excluded_rows or {}).get(str(path.resolve()), set())
+                              for path in self.shard_paths}
+        self.exclusion_contract = exclusion_contract
         self.state = self._normalize_state(resume_state)
         self._handle = None
         self._handle_shard_position: int | None = None
@@ -73,6 +78,7 @@ class _ClimbMixPacker:
             "physical_tokens_emitted": 0,
             "supervised_tokens_emitted": 0,
             "documents_read": 0,
+            "validation_exclusion": self.exclusion_contract,
         }
 
     def _normalize_state(
@@ -93,6 +99,12 @@ class _ClimbMixPacker:
                     "ClimbMix resume state differs from the stream contract: "
                     f"{key}={state.get(key)!r}, expected={value!r}"
                 )
+        if state.get("validation_exclusion") != self.exclusion_contract:
+            raise ValueError(
+                "ClimbMix validation exclusions differ from the saved stream; "
+                "keep the original exclusion configuration when resuming. "
+                "A new holdout applies only to a new training run."
+            )
         shard_position = int(state.get("shard_position", -1))
         if not 0 <= shard_position < len(self.shard_paths):
             raise ValueError(
@@ -199,6 +211,8 @@ class _ClimbMixPacker:
                 self._advance_shard()
                 continue
             self.state["byte_offset"] = int(handle.tell())
+            if line_start in self.excluded_rows.get(str(path), ()):
+                continue
             try:
                 row = json.loads(raw_line)
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -388,6 +402,7 @@ class ClimbMixOnlineBatchDataset(IterableDataset):
         max_document_chars: int = 262_144,
         rayon_num_threads: int = 2,
         resume_state: dict[str, Any] | None = None,
+        validation_exclusion_manifest: str | Path | None = None,
     ) -> None:
         super().__init__()
         paths = tuple(Path(path) for path in shard_paths)
@@ -427,6 +442,12 @@ class ClimbMixOnlineBatchDataset(IterableDataset):
         self.max_document_chars = int(max_document_chars)
         self.rayon_num_threads = int(rayon_num_threads)
         self.resume_state = copy.deepcopy(resume_state)
+        self.excluded_rows, self.exclusion_contract = {}, None
+        if validation_exclusion_manifest:
+            from utils.climbmix_validation_data import load_validation_manifest
+            _, _, self.excluded_rows, self.exclusion_contract = load_validation_manifest(validation_exclusion_manifest)
+            if not set(self.excluded_rows).issubset({str(p.resolve()) for p in paths}):
+                raise ValueError("validation exclusions refer to shards outside the training stream")
 
     def set_resume_state(self, state: dict[str, Any] | None) -> None:
         self.resume_state = copy.deepcopy(state)
@@ -469,6 +490,8 @@ class ClimbMixOnlineBatchDataset(IterableDataset):
             tokenizer_batch_documents=self.tokenizer_batch_documents,
             max_document_chars=self.max_document_chars,
             resume_state=self.resume_state,
+            excluded_rows=self.excluded_rows,
+            exclusion_contract=self.exclusion_contract,
         )
         try:
             while True:

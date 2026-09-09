@@ -125,6 +125,79 @@ def test_rotation_excludes_destination_created_early_by_non_main_rank(tmp_path: 
     ]
 
 
+@pytest.mark.parametrize('failure', ['accelerate', 'data', 'metadata', 'ema', 'complete', None])
+def test_retention_waits_for_full_resumable_checkpoint_commit(tmp_path, monkeypatch, failure):
+    import logging
+
+    monkeypatch.setattr(training, 'logger', logging.getLogger(__name__))
+    previous = tmp_path / 'checkpoint-10'
+    previous.mkdir()
+    (previous / 'state.bin').write_bytes(b'last recoverable training state')
+    config = OmegaConf.create({'experiment': {
+        'output_dir': str(tmp_path), 'checkpoints_total_limit': 1,
+        'save_image_flow_adapter': False}, 'model': {}})
+
+    class Accelerator:
+        is_main_process = True
+        num_processes = 1
+        gradient_accumulation_steps = 1
+        device = torch.device('cpu')
+
+        def wait_for_everyone(self):
+            pass
+
+        def save_state(self, directory):
+            if failure == 'accelerate':
+                raise OSError('injected accelerate write failure')
+            directory.mkdir()
+            (directory / 'state.bin').write_bytes(b'new state')
+
+    class Loader:
+        state_schema = 'test_data_state'
+
+        def __len__(self):
+            return 1
+
+        def save_state(self, directory, accelerator, step):
+            if failure == 'data':
+                raise OSError('injected data write failure')
+            (directory / 'data.pt').write_bytes(b'data cursor')
+
+    def save_ema(*args):
+        assert previous.exists()
+        if failure == 'ema':
+            raise OSError('injected EMA write failure')
+        directory = tmp_path / 'checkpoint-20'
+        (directory / 'ema.pt').write_bytes(b'EMA')
+        return directory
+
+    monkeypatch.setattr(training, '_save_ema_state', save_ema)
+    if failure in {'metadata', 'complete'}:
+        def fail(*args, **kwargs):
+            raise OSError('injected final metadata write failure')
+        monkeypatch.setattr(training, '_write_training_checkpoint_metadata'
+                            if failure == 'metadata' else '_mark_checkpoint_complete', fail)
+
+    def save():
+        return training._save_resumable_training_checkpoint(
+            model=None, config=config, accelerator=Accelerator(), global_step=20,
+            train_dataloader=Loader(), mixed_source_training=True, epoch=0,
+            batches_consumed_in_epoch=20, sampler_shuffle_seed=42,
+            config_contract=None, ema_layout=None, ema=None,
+            cumulative_training_wall_seconds=1., cumulative_finite_loss_microbatches_checked=20)
+
+    if failure:
+        with pytest.raises(OSError, match='injected'):
+            save()
+        assert (previous / 'state.bin').read_bytes() == b'last recoverable training state'
+        assert not (tmp_path / 'checkpoint-20/checkpoint_complete.json').exists()
+    else:
+        destination = save()
+        assert not previous.exists()
+        assert (destination / 'checkpoint_complete.json').is_file()
+        assert (destination / 'data.pt').is_file() and (destination / 'ema.pt').is_file()
+
+
 def test_rotation_keeps_space_for_destination_not_created_yet(tmp_path: Path):
     _mkdirs(tmp_path, "checkpoint-10", "checkpoint-20", "checkpoint-30")
 
@@ -810,3 +883,105 @@ def test_evaluation_pair_manifest_commits_only_two_valid_exports(tmp_path: Path)
             FakeAccelerator(),
             global_step,
         )
+
+
+@pytest.fixture
+def final_ema_export(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    ema = SimpleNamespace(started=True, global_step=5)
+    source = tmp_path / "ema-final"
+    source.mkdir()
+    (source / "ema_manifest.json").write_text("{}")
+    monkeypatch.setattr(training, "merge_sharded_ema_state_dict", lambda path: {
+        "weight": torch.full((2,), float(ema.global_step)),
+    })
+    monkeypatch.setattr(training, "load_ema_manifest", lambda path: {
+        "runtime": {"global_step": ema.global_step}, "world_size": 1,
+    })
+
+    class Model:
+        calls = 0
+        fail_write = False
+
+        def save_pretrained(self, path, *, state_dict, safe_serialization):
+            self.calls += 1
+            path.mkdir()
+            _write_test_safetensors(path / "model.safetensors", state_dict)
+            if self.fail_write:
+                raise OSError("injected staging failure")
+            (path / "config.json").write_text('{"dtype":"float32"}')
+
+    model = Model()
+    tokenizer = SimpleNamespace(save_pretrained=lambda path: (path / "tokenizer.json").write_text("{}"))
+    accelerator = SimpleNamespace(is_main_process=True, num_processes=1, unwrap_model=lambda value: value)
+    config = OmegaConf.create({"experiment": {"output_dir": str(tmp_path)}, "training": {}})
+
+    def save():
+        training._save_ema_hf_model(ema, model, tokenizer, config, accelerator, "final", source)
+
+    return SimpleNamespace(ema=ema, model=model, save=save, path=tmp_path / "hf_model-final-ema")
+
+
+def test_final_ema_advances_after_resume_and_remains_idempotent(final_ema_export):
+    from safetensors.torch import load_file
+
+    export = final_ema_export
+    export.save()
+    export.ema.global_step = 6
+    export.save()
+    assert json.loads((export.path / "ema_export_metadata.json").read_text())["source_global_step"] == 6
+    assert torch.equal(load_file(export.path / "model.safetensors")["weight"], torch.full((2,), 6.0))
+    export.save()
+    assert export.model.calls == 2
+    assert not export.path.with_name(".hf_model-final-ema.previous").exists()
+    export.ema.global_step = 4
+    with pytest.raises(RuntimeError, match="different HF export"):
+        export.save()
+
+
+@pytest.mark.parametrize("failure", ("staging", "publication"))
+def test_failed_final_ema_refresh_preserves_previous_complete_export(final_ema_export, monkeypatch, failure):
+    export = final_ema_export
+    export.save()
+    previous = {path.name: path.read_bytes() for path in export.path.iterdir()}
+    export.ema.global_step = 6
+    replace = training.os.replace
+    with monkeypatch.context() as patch:
+        if failure == "staging":
+            patch.setattr(export.model, "fail_write", True)
+        else:
+            def fail_publication(source, destination):
+                if Path(source).name == ".hf_model-final-ema.partial":
+                    raise OSError("injected publication failure")
+                return replace(source, destination)
+            patch.setattr(training.os, "replace", fail_publication)
+        with pytest.raises(RuntimeError, match="injected"):
+            export.save()
+    assert {path.name: path.read_bytes() for path in export.path.iterdir()} == previous
+    assert not export.path.with_name(".hf_model-final-ema.partial").exists()
+    export.save()
+    assert json.loads((export.path / "ema_export_metadata.json").read_text())["source_global_step"] == 6
+
+
+def test_final_ema_recovers_interrupted_directory_publication(final_ema_export):
+    export = final_ema_export
+    export.save()
+    export.path.rename(export.path.with_name(".hf_model-final-ema.previous"))
+    export.ema.global_step = 6
+    export.save()
+    assert json.loads((export.path / "ema_export_metadata.json").read_text())["source_global_step"] == 6
+    assert not export.path.with_name(".hf_model-final-ema.previous").exists()
+
+
+def test_older_export_permission_does_not_relax_kind_or_periodic_identity(final_ema_export):
+    export = final_ema_export
+    export.save()
+    expected = {"schema": "selfless_ema_hf_export_v1", "export_kind": "training",
+                "floating_dtype": "float32", "source_global_step": 6}
+    with pytest.raises(RuntimeError, match="different HF export"):
+        training._complete_hf_export_exists(export.path, metadata_name="ema_export_metadata.json",
+                                            expected_metadata=expected)
+    with pytest.raises(RuntimeError, match="different HF export"):
+        training._complete_hf_export_exists(export.path, metadata_name="ema_export_metadata.json",
+            expected_metadata={**expected, "export_kind": "evaluation"}, allow_older_step=True)

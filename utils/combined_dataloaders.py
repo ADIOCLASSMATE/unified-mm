@@ -509,6 +509,14 @@ class ScheduledCombinedLoader:
             )
         return description
 
+    @property
+    def climbmix_validation_exclusion(self):
+        return self._text_dataset.exclusion_contract if self._text_dataset is not None else None
+
+    @property
+    def climbmix_shard_paths(self):
+        return self._text_dataset.shard_paths if self._text_dataset is not None else ()
+
     def prepare_with_accelerator(self, accelerator):
         if self._prepared:
             raise RuntimeError("ScheduledCombinedLoader was prepared twice")
@@ -576,6 +584,7 @@ class ScheduledCombinedLoader:
                 climbmix.get("max_document_chars", 262_144)
             ),
             rayon_num_threads=int(climbmix.get("rayon_num_threads", 2)),
+            validation_exclusion_manifest=climbmix.get("validation_exclusion_manifest"),
         )
         worker_count = int(climbmix.dataloader_workers)
         loader_kwargs: dict[str, Any] = {}

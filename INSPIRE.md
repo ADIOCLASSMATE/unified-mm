@@ -121,6 +121,29 @@ only as provenance for earlier experiments.
 - Before every submission, check Live Job quota, image status, active project
   Jobs, availability, and whole-node capacity; always dry-run first.
 
+### B_x0 flow-head depth scaling
+
+- The two depth-scaling arms use
+  `configs/protocols/unified_b_x0_flow_head_scaling_100b_ascend64.yaml` and
+  `script/selfless/pretraining_unified_flow_head_scaling_ascend64.sh --depth 16|30`.
+  Both are fresh, complete 100B runs with 64 Ascend NPUs in
+  `随机序语言建模-统一自回归与掩码扩散的随机顺序生成框架`.
+- Width stays 1280; head depth 16/30 gives 321,543,696/597,117,456 parameters.
+  Keep the B_x0 learning rates, source schedule, local batches, 4-step gradient
+  accumulation, and four RF samples per image. Initialization is Qwen3-0.6B-Base
+  with a random flow head, never the trained baseline checkpoint.
+- Both arms require `image_flow_grad_checkpointing=true` and
+  `image_flow_share_content=true`. Following D's infrastructure pattern, only
+  the T2I flow branch checkpoints its blocks. X0 content and per-layer K/V
+  remain batch B; query-only RF expansion has logical batch 4B. Pure-text and
+  I2T minibatches keep their existing backbone path. This is activation
+  checkpointing; gradient accumulation remains four steps.
+- Run the 16-NPU smoke with the formal per-rank shapes before submission.
+  Validate NPU BF16 loss/backward parity, finite training, peak memory, final
+  checkpoint/EMA exports, and cached generation after reloading each EMA.
+  Freeze the complete source for formal jobs and keep reports under
+  `output/experiments/unified-b-x0-flow-head-scaling/`.
+
 ### Unified 0.6B ImageNet-native full evaluation
 
 - The reusable 16-NPU protocol is

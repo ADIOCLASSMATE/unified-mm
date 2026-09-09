@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build the local evaluation homepage from explicitly selected raw results.
 
-CPU / standard library only. Missing results stay missing; invalidated runs and
+CPU only (PyYAML; optional Matplotlib figures). Missing results stay missing; invalidated runs and
 checkpoint/protocol mismatches cannot silently enter the comparison.
 """
 
@@ -11,12 +11,17 @@ import argparse
 import json
 import math
 import os
+import sys
 import tempfile
 from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
+from scripts.evaluation_report_training import collect_training, export_training, plot_training
+from scripts.evaluation_report_provenance import collect_provenance, export_provenance
 TEXT_TASKS = ("arc_easy", "arc_challenge", "hellaswag", "piqa", "winogrande", "boolq", "openbookqa", "mmlu")
 BENCHMARKS = {"sugarcrepe": 7511, "aro_vg_relation": 23937, "aro_vg_attribution": 28748,
               "mmbench_dev_en": 4329, "seed_bench_image": 14233}
@@ -495,7 +500,7 @@ def matrix_sweep_data(root: Path, selection: dict, models: list):
     return studies
 
 
-def build(root: Path, selection_file: Path):
+def build(root: Path, selection_file: Path, *, plots: bool = False):
     root = root.resolve()
     selection = read(selection_file)
     require(selection.get("schema") == "unified_evaluation_report_selection_v1", "unknown report selection schema")
@@ -507,8 +512,22 @@ def build(root: Path, selection_file: Path):
         models.append({**spec, **model_metrics(root, spec, selection["models"].get(spec["id"], {}))})
     sampling_sweeps = sampling_sweep_data(root, selection, models)
     updated = datetime.now(UTC).isoformat(timespec="seconds")
+    provenance = collect_provenance(REPO, root)
+    export_provenance(root, provenance, write)
+    training = collect_training(REPO, root, models)
+    training["updated_at"] = updated
+    training_summary = export_training(root, training, write)
+    plot_manifest = root / "training-loss/plots.json"
+    if plots:
+        plot_data = {"updated_at": updated, "artifacts": plot_training(root, training)}
+        write(plot_manifest, json.dumps(plot_data, ensure_ascii=False, indent=2) + "\n")
+    if plot_manifest.exists():
+        training["plots"] = training_summary["plots"] = read(plot_manifest)
     artifacts = []
-    entries = [("完整定性长表与 ZIP", gallery["root"] + "/index.html"),
+    entries = [("数据集来源与合成协议", provenance["document"]),
+               ("全模型逐步训练 loss CSV", training["csv"]),
+               ("全模型训练期间验证 loss CSV", training["validation_csv"]),
+               ("完整定性长表与 ZIP", gallery["root"] + "/index.html"),
                ("B_x0 FID 全量复核", "comparisons/bx0-fid-recheck-20260908/REPORT.md"),
                ("B / D 同噪声复核图", "comparisons/bx0-fid-recheck-20260908/paired_generation.html"),
                ("C / D / E 评测加载审计", "audits/audit-cde-evaluation-20260908-4AcX8p/REPORT.md"),
@@ -526,12 +545,17 @@ def build(root: Path, selection_file: Path):
                "formal_models": sum(bool(m["metrics"]) for m in models),
                "formal_complete_models": sum(m["complete"] for m in models),
                "artifacts": artifacts, "folders": folders, "runtime_hashing_enabled": False,
+               "data_provenance": provenance, "training": training_summary,
                "sampling_sweeps": sampling_sweeps,
                "order_sweeps": order_sweep_data(root, selection, models),
                "matrix_sweeps": matrix_sweep_data(root, selection, models),
                "selection": selection, "scope": "project-native suite; external official generation scorers have separate result availability"}
-    data = {**summary, "samples": gallery["samples"], "records": gallery["records"], "labels": LABELS}
+    data = {**summary, "training": training, "samples": gallery["samples"], "records": gallery["records"], "labels": LABELS}
     template = (REPO / "scripts/assets/evaluation_report.html").read_text(encoding="utf-8")
+    require(template.count("__REPORT_EXTENSIONS__") == 1, "invalid report extension marker")
+    extensions = "\n".join((REPO / "scripts/assets" / name).read_text(encoding="utf-8")
+                           for name in ("evaluation_dashboard.js", "evaluation_training.js", "evaluation_provenance.js"))
+    template = template.replace("__REPORT_EXTENSIONS__", extensions)
     # Generated text can contain HTML/script delimiters. It is data, never code.
     embedded = json.dumps(data, ensure_ascii=False, separators=(",", ":")).replace("<", "\\u003c").replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
     require(template.count("__REPORT_DATA__") == 1, "invalid report template")
@@ -546,5 +570,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=REPO / "output/evaluation")
     parser.add_argument("--selection", type=Path, default=REPO / "configs/protocols/evaluation_report.json")
+    parser.add_argument("--plots", action="store_true", help="also refresh standalone PNG/SVG loss figures (requires Matplotlib)")
     args = parser.parse_args()
-    build(args.root, args.selection)
+    build(args.root, args.selection, plots=args.plots)

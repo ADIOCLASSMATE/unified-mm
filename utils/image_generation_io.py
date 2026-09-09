@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+from collections.abc import Mapping
 from pathlib import Path
 
 import torch
@@ -162,7 +163,7 @@ def load_adapter(model, adapter_path: str | Path) -> dict:
 
 
 def load_model_state(model, model_state_path: str | Path) -> dict:
-    """Load an optional full-model state used by legacy evaluators."""
+    """Load a complete legacy model state, validating before changing weights."""
 
     if not model_state_path:
         return {"model_state": None}
@@ -175,18 +176,44 @@ def load_model_state(model, model_state_path: str | Path) -> dict:
             path = candidate
     if not path.is_file():
         raise FileNotFoundError(path)
-    payload = torch.load(path, map_location="cpu")
+    payload = torch.load(path, map_location="cpu", weights_only=True)
     state = (
         payload["module"]
         if isinstance(payload, dict) and "module" in payload
         else payload
     )
-    missing, unexpected = model.load_state_dict(state, strict=False)
+    if not isinstance(state, Mapping) or not state:
+        raise ValueError(f"expected a nonempty full-model state dictionary: {path}")
+    target = model.state_dict(keep_vars=True)
+    unexpected = set(state) - set(target)
+    mismatched = [name for name in set(state) & set(target)
+                  if not isinstance(state[name], torch.Tensor)
+                  or state[name].shape != target[name].shape]
+    # A full export may omit a tied alias. It must still provide the actual
+    # parameter through another name; unrelated missing weights are an error.
+    expanded = dict(state)
+    aliases = {}
+    supplied = {id(target[name]): name for name in set(state) & set(target)
+                if name not in mismatched}
+    for name in set(target) - set(state):
+        source = supplied.get(id(target[name]))
+        if source is not None:
+            expanded[name] = state[source]
+            aliases[name] = source
+    missing = set(target) - set(expanded)
+    if missing or unexpected or mismatched:
+        raise ValueError(
+            f"incomplete or incompatible full-model state {path}: "
+            f"missing={sorted(missing)}, unexpected={sorted(unexpected)}, "
+            f"shape_or_type_mismatch={sorted(mismatched)}"
+        )
+    model.load_state_dict(expanded, strict=True)
     return {
         "model_state": str(path),
         "keys": len(state),
-        "missing": list(missing),
-        "unexpected": list(unexpected),
+        "missing": [],
+        "unexpected": [],
+        "restored_tied_aliases": aliases,
     }
 
 

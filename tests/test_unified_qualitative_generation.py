@@ -86,6 +86,27 @@ def test_untrained_modalities_are_explicitly_marked():
     assert task_training("unified-b")["text"] == "已训练"
 
 
+def test_model_inventory_excludes_temporary_exports_before_loading_them(tmp_path, monkeypatch):
+    from scripts import generate_unified_qualitative as generation
+
+    names = ['unified-formal', 'unified-formal-smoke-check', 'unified-formal-debug', 'unified-formal-replay']
+    for name in names:
+        export = tmp_path / 'output' / name / 'hf_model-final-ema'
+        export.mkdir(parents=True)
+        (export / 'config.json').write_text(json.dumps({
+            'architecture_variant': 'selfless_contextual',
+            'dual_stream_attention_contract': 'selfless_strict',
+        }))
+    loaded = []
+    def resolve(path):
+        loaded.append(path.parent.name)
+        assert path.parent.name == 'unified-formal'
+        return SimpleNamespace(is_hf_final_ema=True, report=lambda: {})
+    monkeypatch.setattr(generation, 'resolve_evaluation_model_source', resolve)
+    models = generation.model_inventory(tmp_path)
+    assert [model['run'] for model in models] == loaded == ['unified-formal']
+
+
 def test_manifest_prompt_cardinality_and_uniqueness():
     from pathlib import Path
     data = json.loads(Path("configs/protocols/unified_qualitative_prompts_v1.json").read_text())

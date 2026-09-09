@@ -6,6 +6,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 EVALUATION_ROOT = REPO_ROOT / "output/evaluation"
 
 
+def is_temporary_training_run(name: str) -> bool:
+    """Exclude diagnostic copies consistently from formal result inventories."""
+    return any(marker in name for marker in ("smoke", "debug", "replay"))
+
+
 def training_validation_root(run_root: str | Path) -> Path:
     run_root = Path(run_root).resolve()
     try:

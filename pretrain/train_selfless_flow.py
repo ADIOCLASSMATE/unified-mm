@@ -80,6 +80,7 @@ from utils.utils import (
     get_showo_mae_mask,
     get_selfless_mask,
     load_model_tokenizer,
+    prune_training_checkpoints,
     sample_showo_mae_image_mask,
     save_checkpoint,
     save_hf_model,
@@ -282,6 +283,121 @@ def _debug_nonfinite_loss_trace_details(
     return details
 
 
+def _prepare_loss_forward_batch(batch, *, config, device, source_name, mixed_source_training=True):
+    """Shared training/validation masks, CFG dropout and task-specific forward."""
+    input_ids = batch["input_ids"].contiguous().to(
+        device, non_blocking=True
+    )  # [B, L] — no shift for selfless
+    token_types = batch["token_types"].to(
+        device, non_blocking=True
+    )  # [B, L]
+    sigma = batch["sigma"].to(
+        device, non_blocking=True
+    )  # [B, L], pre-computed by dataloader
+    labels = batch["labels"].to(
+        device, non_blocking=True
+    )  # [B, L], pre-computed by dataloader
+    image_loss_mask = batch["image_loss_mask"].to(
+        device,
+        dtype=torch.bool,
+        non_blocking=True,
+    )
+    segment_ids = batch.get("segment_ids", None)
+    if segment_ids is not None:
+        segment_ids = segment_ids.to(device, non_blocking=True)
+    position_ids = batch.get("position_ids", None)
+    if position_ids is not None:
+        position_ids = position_ids.to(device, non_blocking=True)
+    image_local_positions = batch.get("image_local_positions", None)
+    if image_local_positions is not None:
+        image_local_positions = image_local_positions.to(
+            device, non_blocking=True
+        )
+    image_span_table = batch.get("image_span_table", None)
+    if image_span_table is not None:
+        image_span_table = image_span_table.to(
+            device, non_blocking=True
+        )
+    image_latents = batch.get("image_latents", None)
+    if image_latents is not None:
+        image_latents = image_latents.to(
+            device, non_blocking=True
+        )
+    B, L = input_ids.shape
+    image_uncond_rows = None
+    image_uncond_mask = batch.get("image_uncond_mask", None)
+    if image_uncond_mask is not None:
+        image_uncond_mask = image_uncond_mask.to(
+            device, dtype=torch.bool, non_blocking=True
+        )
+    image_uncond_prob = float(config.model.get("image_uncond_prob", 0.0))
+    if image_uncond_mask is None and image_uncond_prob > 0.0:
+        has_image = (token_types == 1).any(dim=1)
+        sampled_rows = (
+            torch.rand(B, device=device) < image_uncond_prob
+        ) & has_image
+        image_uncond_rows = sampled_rows
+
+    image_loss_mask, image_latent_mask, showo_mask_prob = (
+        _prepare_showo_image_masks(
+            config=config,
+            token_types=token_types,
+            image_span_table=image_span_table,
+            image_loss_mask=image_loss_mask,
+            mask_generation_images=(source_name == "t2i"),
+        )
+    )
+    selfless_attention_mask, content_attention_mask = (
+        _build_backbone_attention_masks(
+            config=config,
+            input_ids=input_ids,
+            token_types=token_types,
+            sigma=sigma,
+            segment_ids=segment_ids,
+            image_uncond_rows=image_uncond_rows,
+            image_uncond_mask=image_uncond_mask,
+        )
+    )
+    forward_kwargs = {
+        "X0_input_ids": input_ids,
+        "labels": labels,
+        "attention_mask": selfless_attention_mask,
+    }
+    if content_attention_mask is not None:
+        forward_kwargs["content_attention_mask"] = (
+            content_attention_mask
+        )
+    if segment_ids is not None:
+        forward_kwargs["_text_segment_ids"] = segment_ids
+    if token_types is not None:
+        forward_kwargs["token_types"] = token_types
+        forward_kwargs["flow_sigma"] = sigma
+        if mixed_source_training:
+            forward_kwargs["compute_text_loss"] = source_name in {
+                "climbmix",
+                "i2t",
+            }
+            forward_kwargs["compute_image_loss"] = (
+                source_name == "t2i"
+            )
+        if position_ids is not None:
+            forward_kwargs["position_ids"] = position_ids
+        if image_local_positions is not None:
+            forward_kwargs["image_local_positions"] = image_local_positions
+        if image_span_table is not None:
+            forward_kwargs["image_span_table"] = image_span_table
+        forward_kwargs["image_loss_mask"] = image_loss_mask
+        if image_latent_mask is not None:
+            forward_kwargs["image_latent_mask"] = image_latent_mask
+    if image_latents is not None:
+        forward_kwargs["image_latents"] = image_latents
+    return forward_kwargs, {
+        "image_uncond_rows": image_uncond_rows,
+        "image_uncond_mask": image_uncond_mask,
+        "showo_mask_prob": showo_mask_prob,
+    }
+
+
 def _source_loss_metric_payload(
     reduced_source_totals: torch.Tensor,
     *,
@@ -289,56 +405,16 @@ def _source_loss_metric_payload(
     gradient_accumulation_steps: int,
     active_sources=None,
 ) -> tuple[dict[str, float], dict[str, tuple[float, float]]]:
-    """Convert reduced source totals into raw losses and step contributions.
+    from utils.unified_loss_protocol import source_loss_metric_payload
 
-    Each row stores ``loss * target_count``, ``target_count``, and the sum of
-    already task-weighted microbatch losses.  The weighted values are divided
-    by data-parallel world size and gradient accumulation, so their sum is
-    directly comparable with ``step_loss``.
-    """
-
-    if active_sources is None:
-        active_sources = _MIXED_SOURCE_NAMES
-    active_sources = _active_mixed_source_names(active_sources)
-    expected_values = len(active_sources) * 3
-    if reduced_source_totals.numel() != expected_values:
-        raise ValueError(
-            "source loss totals must contain three values per source, got "
-            f"{reduced_source_totals.numel()} instead of {expected_values}"
-        )
-    denominator = int(num_processes) * int(gradient_accumulation_steps)
-    if denominator <= 0:
-        raise ValueError(
-            "num_processes * gradient_accumulation_steps must be positive"
-        )
-
-    rows = reduced_source_totals.reshape(len(active_sources), 3)
-    logs: dict[str, float] = {}
-    display: dict[str, tuple[float, float]] = {}
-    for index, source in enumerate(active_sources):
-        target_count = float(rows[index, 1].item())
-        if target_count <= 0.0:
-            raise RuntimeError(
-                f"mixed source {source!r} produced no optimization targets"
-            )
-        raw_loss = float((rows[index, 0] / rows[index, 1]).item())
-        weighted_contribution = float(
-            (rows[index, 2] / float(denominator)).item()
-        )
-        if not math.isfinite(raw_loss) or not math.isfinite(
-            weighted_contribution
-        ):
-            raise FloatingPointError(
-                f"non-finite source metric for {source}: "
-                f"loss={raw_loss}, contribution={weighted_contribution}"
-            )
-        logs[f"train/loss_{source}"] = raw_loss
-        logs[f"train/weighted_contribution_{source}"] = (
-            weighted_contribution
-        )
-        logs[f"train/{source}_target_tokens"] = target_count
-        display[source] = (raw_loss, weighted_contribution)
-    return logs, display
+    active_sources = _active_mixed_source_names(
+        _MIXED_SOURCE_NAMES if active_sources is None else active_sources
+    )
+    return source_loss_metric_payload(
+        reduced_source_totals, num_processes=num_processes,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        active_sources=active_sources, prefix="train",
+    )
 
 
 def _append_training_metrics_jsonl(
@@ -373,6 +449,9 @@ def _append_training_metrics_jsonl(
         "global_step": int(global_step),
         "metrics": metrics,
     }
+    if config.get("dataset", {}).get("class_name") == "UnifiedMixedDataset":
+        from utils.unified_loss_protocol import loss_protocol
+        payload["loss_protocol"] = loss_protocol(config)
     with output_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, sort_keys=True) + "\n")
 
@@ -775,8 +854,9 @@ def _complete_hf_export_exists(
     *,
     metadata_name: str,
     expected_metadata: dict,
+    allow_older_step: bool = False,
 ) -> bool:
-    """Accept a matching completed export and reject ambiguous leftovers."""
+    """Validate an export; a complete older final export may be refreshed."""
 
     save_path = Path(save_path)
     if not save_path.exists():
@@ -808,6 +888,16 @@ def _complete_hf_export_exists(
         for key, value in expected_metadata.items()
         if metadata.get(key) != value
     }
+    old_step = metadata.get("source_global_step")
+    expected_step = expected_metadata.get("source_global_step")
+    refreshing_older_step = (
+        allow_older_step
+        and type(old_step) is int
+        and type(expected_step) is int
+        and 0 <= old_step < expected_step
+    )
+    if refreshing_older_step:
+        mismatches.pop("source_global_step", None)
     if mismatches:
         raise RuntimeError(
             f"Refusing to overwrite a different HF export at {save_path}: "
@@ -837,7 +927,7 @@ def _complete_hf_export_exists(
             f"HF export stored key count mismatch at {save_path}: "
             f"metadata={recorded_stored_count}, actual={stored_weight_key_count}"
         )
-    return True
+    return not refreshing_older_step
 
 
 def _validate_hf_safetensors(
@@ -1058,12 +1148,34 @@ def _save_ema_hf_model(
         Path(config.experiment.output_dir)
         / f".{resolved_save_name}.ema-state.partial"
     )
+    # Step-named evaluation exports are immutable. The canonical final export
+    # advances when a stopped run resumes and reaches a later optimizer step.
+    refresh_final = (
+        global_step == "final"
+        and resolved_save_name == "hf_model-final-ema"
+        and export_kind == "training"
+    )
+    previous_save_path = save_path.with_name(f".{save_path.name}.previous")
 
     def prepare_export():
+        if refresh_final and previous_save_path.exists():
+            # Recover an interruption between the two directory renames. If
+            # publication finished, validate the new export before cleanup.
+            if not save_path.exists():
+                os.replace(previous_save_path, save_path)
+            else:
+                _complete_hf_export_exists(
+                    save_path,
+                    metadata_name="ema_export_metadata.json",
+                    expected_metadata=expected_metadata,
+                    allow_older_step=True,
+                )
+                shutil.rmtree(previous_save_path)
         if _complete_hf_export_exists(
             save_path,
             metadata_name="ema_export_metadata.json",
             expected_metadata=expected_metadata,
+            allow_older_step=refresh_final,
         ):
             for stale_path in (partial_save_path, temporary_ema_directory):
                 if stale_path.exists():
@@ -1150,10 +1262,26 @@ def _save_ema_hf_model(
                 expected_metadata=expected_metadata,
             )
             if save_path.exists():
-                raise RuntimeError(
-                    f"EMA export appeared during publication: {save_path}"
-                )
-            os.replace(partial_save_path, save_path)
+                if not refresh_final or _complete_hf_export_exists(
+                    save_path,
+                    metadata_name="ema_export_metadata.json",
+                    expected_metadata=expected_metadata,
+                    allow_older_step=True,
+                ):
+                    raise RuntimeError(
+                        f"EMA export appeared during publication: {save_path}"
+                    )
+                # Keep the old complete export until staging and validation
+                # succeed; restore it if publishing the replacement fails.
+                os.replace(save_path, previous_save_path)
+            try:
+                os.replace(partial_save_path, save_path)
+            except Exception:
+                if refresh_final and previous_save_path.exists() and not save_path.exists():
+                    os.replace(previous_save_path, save_path)
+                raise
+            if refresh_final and previous_save_path.exists():
+                shutil.rmtree(previous_save_path)
             if using_temporary_state and source_ema_directory.exists():
                 shutil.rmtree(source_ema_directory)
             return "saved"
@@ -1405,7 +1533,7 @@ def _save_resumable_training_checkpoint(
         checkpoint_dir,
         accelerator=accelerator,
     )
-    save_checkpoint(model, config, accelerator, int(global_step))
+    save_checkpoint(model, config, accelerator, int(global_step), defer_retention=True)
     _save_npu_rng_state(checkpoint_dir, accelerator)
     if mixed_source_training:
         train_dataloader.save_state(
@@ -1445,6 +1573,11 @@ def _save_resumable_training_checkpoint(
         checkpoint_dir,
         accelerator=accelerator,
         global_step=int(global_step),
+    )
+    _run_main_process_export_operation(
+        accelerator,
+        lambda: prune_training_checkpoints(config, int(global_step)),
+        description=f"applying retention after completed checkpoint {checkpoint_dir}",
     )
     if _image_flow_adapter_save_enabled(config, final=False):
         if (
@@ -2007,6 +2140,7 @@ def main(*, model_loader=None):
     logger.info("Creating dataloaders and lr_scheduler")
 
     train_dataloader, val_dataloader = get_dataloaders(config, tokenizer)
+    training_validator = None
     if mixed_source_training:
         description = train_dataloader.runtime_description()
         if tuple(train_dataloader.active_sources) != active_mixed_sources:
@@ -2015,8 +2149,17 @@ def main(*, model_loader=None):
                 f"runtime={train_dataloader.active_sources}, "
                 f"expected={active_mixed_sources}"
             )
-        # Training validation uses fixed downstream manifests on all ranks.
-        # The paired image loader remains available to standalone full evaluation.
+        if int(config.experiment.val_every) > 0:
+            from utils.training_validation import TrainingValidator
+            from utils.training_downstream_validation import _local_phase
+
+            with _local_phase(accelerator.device):
+                training_validator = TrainingValidator(
+                    config, image_loader=val_dataloader,
+                    image_collators={source: loader.collate_fn for source, loader in train_dataloader.image_loaders.items()},
+                )
+        # The loss validator owns a fixed global batch plan and shards it itself.
+        # Do not let Accelerate pad/repeat its validation samples across ranks.
         val_dataloader = None
         logger.info("Mixed DataLoader runtime: %s", description)
     else:
@@ -2429,45 +2572,21 @@ def main(*, model_loader=None):
                 "image batch."
             )
         if is_multimodal:
-            input_ids = batch["input_ids"].contiguous().to(
-                accelerator.device, non_blocking=True
-            )  # [B, L] — no shift for selfless
-            token_types = batch["token_types"].to(
-                accelerator.device, non_blocking=True
-            )  # [B, L]
-            sigma = batch["sigma"].to(
-                accelerator.device, non_blocking=True
-            )  # [B, L], pre-computed by dataloader
-            labels = batch["labels"].to(
-                accelerator.device, non_blocking=True
-            )  # [B, L], pre-computed by dataloader
-            image_loss_mask = batch["image_loss_mask"].to(
-                accelerator.device,
-                dtype=torch.bool,
-                non_blocking=True,
+            forward_kwargs, prepared = _prepare_loss_forward_batch(
+                batch, config=config, device=accelerator.device,
+                source_name=source_name, mixed_source_training=mixed_source_training,
             )
-            segment_ids = batch.get("segment_ids", None)
-            if segment_ids is not None:
-                segment_ids = segment_ids.to(accelerator.device, non_blocking=True)
-            position_ids = batch.get("position_ids", None)
-            if position_ids is not None:
-                position_ids = position_ids.to(accelerator.device, non_blocking=True)
-            image_local_positions = batch.get("image_local_positions", None)
-            if image_local_positions is not None:
-                image_local_positions = image_local_positions.to(
-                    accelerator.device, non_blocking=True
-                )
-            image_span_table = batch.get("image_span_table", None)
-            logical_images = int(image_span_table.shape[0]) if image_span_table is not None else 0
-            if image_span_table is not None:
-                image_span_table = image_span_table.to(
-                    accelerator.device, non_blocking=True
-                )
-            image_latents = batch.get("image_latents", None)
-            if image_latents is not None:
-                image_latents = image_latents.to(
-                    accelerator.device, non_blocking=True
-                )
+            input_ids = forward_kwargs["X0_input_ids"]
+            token_types = forward_kwargs["token_types"]
+            sigma = forward_kwargs["flow_sigma"]
+            labels = forward_kwargs["labels"]
+            image_loss_mask = forward_kwargs["image_loss_mask"]
+            segment_ids = forward_kwargs.get("_text_segment_ids")
+            spans = forward_kwargs.get("image_span_table")
+            logical_images = int(spans.shape[0]) if spans is not None else 0
+            image_uncond_rows = prepared["image_uncond_rows"]
+            image_uncond_mask = prepared["image_uncond_mask"]
+            showo_mask_prob = prepared["showo_mask_prob"]
             pack_stats = batch.get("pack_stats", None)
             B, L = input_ids.shape
             training_window.record_batch(
@@ -2479,41 +2598,6 @@ def main(*, model_loader=None):
             )
             if acc_physical_token_positions is not None:
                 acc_physical_token_positions += int(B * L)
-
-            image_uncond_rows = None
-            image_uncond_mask = batch.get("image_uncond_mask", None)
-            if image_uncond_mask is not None:
-                image_uncond_mask = image_uncond_mask.to(
-                    accelerator.device, dtype=torch.bool, non_blocking=True
-                )
-            image_uncond_prob = float(config.model.get("image_uncond_prob", 0.0))
-            if image_uncond_mask is None and image_uncond_prob > 0.0:
-                has_image = (token_types == 1).any(dim=1)
-                sampled_rows = (
-                    torch.rand(B, device=accelerator.device) < image_uncond_prob
-                ) & has_image
-                image_uncond_rows = sampled_rows
-
-            image_loss_mask, image_latent_mask, showo_mask_prob = (
-                _prepare_showo_image_masks(
-                    config=config,
-                    token_types=token_types,
-                    image_span_table=image_span_table,
-                    image_loss_mask=image_loss_mask,
-                    mask_generation_images=(source_name == "t2i"),
-                )
-            )
-            selfless_attention_mask, content_attention_mask = (
-                _build_backbone_attention_masks(
-                    config=config,
-                    input_ids=input_ids,
-                    token_types=token_types,
-                    sigma=sigma,
-                    segment_ids=segment_ids,
-                    image_uncond_rows=image_uncond_rows,
-                    image_uncond_mask=image_uncond_mask,
-                )
-            )
 
             if global_step == 0 and accelerator.is_main_process and not hasattr(main, '_logged_first_batch'):
                 main._logged_first_batch = True
@@ -2569,39 +2653,6 @@ def main(*, model_loader=None):
         # *-------*-------*-------*-------*-------*-------*
         grad_norm_value = None
         with accelerator.accumulate(model):
-            forward_kwargs = {
-                "X0_input_ids": input_ids,
-                "labels": labels if is_multimodal else input_ids,
-                "attention_mask": selfless_attention_mask,
-            }
-            if content_attention_mask is not None:
-                forward_kwargs["content_attention_mask"] = (
-                    content_attention_mask
-                )
-            if segment_ids is not None:
-                forward_kwargs["_text_segment_ids"] = segment_ids
-            if token_types is not None:
-                forward_kwargs["token_types"] = token_types
-                forward_kwargs["flow_sigma"] = sigma
-                if mixed_source_training:
-                    forward_kwargs["compute_text_loss"] = source_name in {
-                        "climbmix",
-                        "i2t",
-                    }
-                    forward_kwargs["compute_image_loss"] = (
-                        source_name == "t2i"
-                    )
-                if position_ids is not None:
-                    forward_kwargs["position_ids"] = position_ids
-                if image_local_positions is not None:
-                    forward_kwargs["image_local_positions"] = image_local_positions
-                if image_span_table is not None:
-                    forward_kwargs["image_span_table"] = image_span_table
-                forward_kwargs["image_loss_mask"] = image_loss_mask
-                if image_latent_mask is not None:
-                    forward_kwargs["image_latent_mask"] = image_latent_mask
-            if is_multimodal and image_latents is not None:
-                forward_kwargs["image_latents"] = image_latents
             record_backbone_gate_stats = (
                 str(config.model.get("backbone_attention_output_gate", "none"))
                 != "none"
@@ -2918,6 +2969,7 @@ def main(*, model_loader=None):
 
                 logs = {
                     "step_loss": global_avg_loss_value,
+                    "train/loss": global_avg_loss_value,
                     "lr": lr_scheduler.get_last_lr()[0],
                     "samples/sec/gpu": samples_per_second_per_gpu,
                     "physical_rows/sec/gpu": (
@@ -3233,31 +3285,27 @@ def main(*, model_loader=None):
             # Validation
             if int(config.experiment.val_every) > 0 and global_step % int(config.experiment.val_every) == 0:
                 if mixed_source_training:
-                    validation_started = time.monotonic()
-                    from utils.training_downstream_validation import (
-                        ValidationProfile, run_downstream_validation,
-                    )
+                    def loss_forward(current_model, validation_batch, source):
+                        kwargs, _ = _prepare_loss_forward_batch(
+                            validation_batch, config=config, device=accelerator.device,
+                            source_name=source, mixed_source_training=True,
+                        )
+                        return current_model(**kwargs)
 
-                    validation = run_downstream_validation(
+                    validation = training_validator.run(
                         accelerator.unwrap_model(model), tokenizer,
-                        device=accelerator.device,
-                        output_dir=validation_output_dir(config) / "downstream_validation" / f"step-{global_step}",
-                        step=global_step, ema=ema,
-                        profile=ValidationProfile.from_config(config),
-                        started=validation_started,
+                        device=accelerator.device, step=global_step, ema=ema,
+                        output_dir=validation_output_dir(config), forward_batch=loss_forward,
+                        training_exclusion=train_dataloader.climbmix_validation_exclusion,
+                        training_shards=train_dataloader.climbmix_shard_paths,
                     )
-                    validation_logs = {
-                        "val/downstream_complete": int(validation["complete"]),
-                        "val/downstream_seconds": validation["wall_seconds"],
-                        "val/downstream_within_budget": int(validation["within_time_budget"]),
-                    }
-                    validation_logs.update({
-                        f"val/downstream/{task}": result["primary"]
-                        for task, result in validation["tasks"].items() if result["complete"]
-                    })
-                    if "text_mean" in validation:
-                        validation_logs["val/downstream/text_mean"] = validation["text_mean"]
-                    accelerator.log(validation_logs, step=global_step)
+                    accelerator.log(validation["metrics"], step=global_step)
+                    logger.info(
+                        "Training validation: complete=%s, total=%.2fs, loss=%.2fs, downstream=%.2fs, cache_hit=%s",
+                        validation["complete"], validation["wall_seconds"],
+                        validation["loss"]["wall_seconds"] if validation["loss"] else 0.0,
+                        validation["downstream"]["wall_seconds"], validation["downstream"]["prepare_cache_hit"],
+                    )
                 elif val_dataloader is not None:
                     validate(
                         model,
@@ -3404,6 +3452,13 @@ def main(*, model_loader=None):
             ),
             "trainability": trainability,
         }
+        flow_net = getattr(
+            getattr(accelerator.unwrap_model(model), "image_flow_head", None),
+            "net", None,
+        )
+        flow_batch_layout = getattr(flow_net, "last_training_batch_layout", None)
+        if flow_batch_layout is not None:
+            runtime_payload["flow_training_batch_layout"] = flow_batch_layout
         if ema_layout is not None:
             full_ema_bytes = int(
                 sum(chunk["bytes"] for chunk in ema_layout["chunks"].values())
