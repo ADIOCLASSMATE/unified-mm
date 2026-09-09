@@ -12,7 +12,7 @@ sys.path.insert(0, str(ROOT))
 from scripts.analyze_geometry_v4_robustness import native_arrays
 from scripts.analyze_unified_geometry_v3 import error_bootstrap, preprocess
 from scripts.geometry_v4_math import describe_fit, evaluate_pair, fit_pair
-from scripts.probe_unified_representations import emit, write_json
+from utils.research.representation_protocol import emit, write_json
 from scripts.probe_unified_semantics_v2 import LAYERS
 
 

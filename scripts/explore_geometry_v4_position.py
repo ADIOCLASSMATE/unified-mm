@@ -18,7 +18,7 @@ from scripts.analyze_unified_geometry_v3 import (
 )
 from scripts.geometry_v4_math import describe_fit, evaluate_pair, fit_pair, spectral_fit
 from scripts.prepare_geometry_v4_views import grouped
-from scripts.probe_unified_representations import emit, write_json
+from utils.research.representation_protocol import emit, write_json
 
 PROFILES = ("native_sigma1", "native_sigma2", "native_mean")
 MODES = ("centered_euclidean", "centered_unit_sphere")

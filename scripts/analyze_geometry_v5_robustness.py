@@ -17,7 +17,7 @@ from scripts.bootstrap_geometry_v5 import atomic_torch_save, test_groups
 from scripts.geometry_v4_math import evaluate_pair
 from scripts.geometry_v5_protocol import canonical_mode, layer_values, load_pair_views
 from scripts.prepare_cross_model_geometry_v5 import V4
-from scripts.prepare_geometry_v5_assets import RUN, emit, write_json
+from utils.research.geometry_v5_assets import RUN, emit, write_json
 from scripts.prepare_geometry_v5_views import grouped
 
 DATA, PERTURBED, CONTEXT = {}, {}, {}

@@ -16,7 +16,7 @@ from pathlib import Path
 from PIL import Image
 
 from scripts.geometry_v5_protocol import SETTINGS
-from scripts.prepare_geometry_v5_assets import RUN, emit, write_json
+from utils.research.geometry_v5_assets import RUN, emit, write_json
 from scripts.report_geometry_v5 import endpoint
 
 MODELS = ("b", "f", "qwen_text", "dinov2", "mae", "siglip", "janusflow", "showo2")

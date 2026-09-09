@@ -8,6 +8,7 @@
 - [评测结构与统一输出目录](EVALUATION_STRUCTURE.md)
 - [训练中下游验证](TRAINING_DOWNSTREAM_VALIDATION.md)
 - [仓库正确性与重构审计（2026-09-09）](REPO_AUDIT_20260909.md)
+- [重构实施、回退点与开发机验收](REPO_REFACTOR_20260909.md)
 - [原生图像理解评测](PRETRAINING_NATIVE_EVALUATION.md)
 - [评测协议审计](EVALUATION_PROTOCOL_AUDIT.md)
 - [GenEval / DPG-Bench / MJHQ 官方评测](OFFICIAL_T2I_BENCHMARKS.md)

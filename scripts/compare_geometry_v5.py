@@ -9,7 +9,7 @@ from pathlib import Path
 import torch
 
 from scripts.bootstrap_geometry_v5 import SEED, freeze_statistics
-from scripts.prepare_geometry_v5_assets import RUN, emit, write_json
+from utils.research.geometry_v5_assets import RUN, emit, write_json
 
 
 @lru_cache(maxsize=8)

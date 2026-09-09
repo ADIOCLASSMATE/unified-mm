@@ -4,7 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
-from scripts.prepare_geometry_v5_assets import RUN, emit
+from utils.research.geometry_v5_assets import RUN, emit
 
 NAMES = {
     "b_native": "B",

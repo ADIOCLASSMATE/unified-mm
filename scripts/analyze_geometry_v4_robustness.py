@@ -14,7 +14,7 @@ from scripts.analyze_unified_geometry_v3 import geometry_statistics, preprocess
 from scripts.analyze_unified_semantics_v2 import load_dataset
 from scripts.geometry_v4_math import describe_fit, evaluate_pair, fit_pair, spectral_fit
 from scripts.prepare_geometry_v4_views import grouped
-from scripts.probe_unified_representations import emit, write_json
+from utils.research.representation_protocol import emit, write_json
 from scripts.probe_unified_semantics_v2 import LAYERS
 
 SEED = 20260909

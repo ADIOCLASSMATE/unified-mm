@@ -21,7 +21,7 @@ from scripts.analyze_unified_semantics_v2 import (
     load_dataset,
     split_mask,
 )
-from scripts.probe_unified_representations import emit, write_json
+from utils.research.representation_protocol import emit, write_json
 
 
 def grouped_retrieval_null(scores, image_groups, text_groups, repeats=999):

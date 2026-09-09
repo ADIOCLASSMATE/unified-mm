@@ -10,7 +10,7 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from scripts.analyze_unified_semantics_v2 import load_dataset
-from scripts.probe_unified_representations import emit
+from utils.research.representation_protocol import emit
 
 
 def grouped(features, rows, groups, predicate):

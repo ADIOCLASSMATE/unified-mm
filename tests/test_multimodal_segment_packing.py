@@ -7,12 +7,12 @@ from omegaconf import OmegaConf
 from transformers import Qwen3Config
 
 from models.modeling_model.modeling_selfless_flow import Qwen3Model
+from utils.imagenet_flow_dataloaders import build_imagenet_flow_cache_dataloaders
 from utils.dataset_imagenet_flow_cache import (
     DEFAULT_CAPTION_PREFIX,
     ImageNetFlowCacheDataset,
     POSTERIOR_CACHE_FORMAT,
     POSTERIOR_STATS_LAYOUT,
-    build_imagenet_flow_cache_dataloaders,
     collate_imagenet_flow_cache,
 )
 from utils.multimodal_segment_packing import (

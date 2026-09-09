@@ -15,7 +15,7 @@ from safetensors import safe_open
 from torchvision.transforms.functional import to_tensor
 
 from scripts.geometry_v5_encoders import LayerCollector, PixelLoader, verify_parameters
-from scripts.prepare_geometry_v5_assets import MODELS
+from utils.research.geometry_v5_assets import MODELS
 
 JANUS_SOURCE = (
     MODELS

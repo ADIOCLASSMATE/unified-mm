@@ -4,7 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
-from scripts.prepare_geometry_v5_assets import ROOT, RUN, write_json
+from utils.research.geometry_v5_assets import ROOT, RUN, write_json
 
 BASELINE = ROOT / "output/unified-b-x0content-0p6b-100b-imagenet-split-s42-r1"
 V4 = ROOT / "output/evaluation/research" / BASELINE.name / "representation-diagnostic/geometry-v4-20260907"

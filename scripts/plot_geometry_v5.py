@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from scripts.bootstrap_geometry_v5 import endpoint_plan
-from scripts.prepare_geometry_v5_assets import RUN, emit, write_json
+from utils.research.geometry_v5_assets import RUN, emit, write_json
 
 PRIMARY = [
     "b_native",

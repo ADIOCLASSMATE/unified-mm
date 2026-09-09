@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
 
-from scripts.probe_unified_representations import emit, read_jsonl, write_json
+from utils.research.representation_protocol import emit, read_jsonl, write_json
 
 ROOT = Path(__file__).resolve().parents[1]
 RUN = ROOT / "output/unified-b-x0content-0p6b-100b-imagenet-split-s42-r1"
@@ -760,13 +760,9 @@ def verify(args):
     from safetensors import safe_open
 
     from utils.evaluation.multimodal_likelihood import PosteriorCache
-    from scripts.probe_unified_representations import (
-        FLICKR,
-        FeatureCollector,
-    )
-    from scripts.probe_unified_representations import (
-        make_batch as legacy_batch,
-    )
+    from utils.research.representation_protocol import FLICKR
+    from utils.research.representation_features import FeatureCollector
+    from utils.research.representation_features import make_batch as legacy_batch
 
     torch.set_num_threads(2)
     if not torch.npu.is_available():

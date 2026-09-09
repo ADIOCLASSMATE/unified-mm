@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from scripts.freeze_geometry_v5_analysis import comparison_value
-from scripts.prepare_geometry_v5_assets import RUN, emit, write_json
+from utils.research.geometry_v5_assets import RUN, emit, write_json
 
 REVISION = "showo2-fp32-cal-revision-2"
 SETTINGS = {"showo2_understanding", "showo2_generation"}

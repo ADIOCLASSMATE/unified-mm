@@ -11,6 +11,7 @@ import torch
 from torch.utils.data import DataLoader, RandomSampler, Subset
 
 from utils.imagenet_flow_batching import collate_imagenet_flow_cache
+from utils.dataset_imagenet_flow_cache import ImageNetFlowCacheDataset
 from utils.multimodal_segment_packing import (
     collate_segment_packed,
     is_power_of_two,
@@ -111,8 +112,6 @@ def training_samples_per_epoch(config, dataset_size: int) -> int | None:
 
 
 def _build_cache_dataset(config, params, tokenizer):
-    from utils.dataset_imagenet_flow_cache import ImageNetFlowCacheDataset
-
     return ImageNetFlowCacheDataset(
         cache_path=params.cache_path,
         tokenizer=tokenizer,

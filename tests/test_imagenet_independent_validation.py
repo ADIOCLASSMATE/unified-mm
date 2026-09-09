@@ -4,12 +4,10 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 
+from utils.imagenet_flow_dataloaders import build_imagenet_flow_cache_dataloaders
 from utils.dataset_imagenet_flow_cache import (
     POSTERIOR_CACHE_FORMAT,
     POSTERIOR_STATS_LAYOUT,
-)
-from utils.imagenet_flow_dataloaders import (
-    build_imagenet_flow_cache_dataloaders,
 )
 from utils.combined_dataloaders import (
     build_unified_image_validation_dataloader,

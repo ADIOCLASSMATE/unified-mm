@@ -12,7 +12,7 @@ import requests
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from scripts.probe_unified_representations import emit, write_json
+from utils.research.representation_protocol import emit, write_json
 
 VG_SOURCE = "https://homes.cs.washington.edu/~ranjay/visualgenome/data/dataset/image_data.json.zip"
 

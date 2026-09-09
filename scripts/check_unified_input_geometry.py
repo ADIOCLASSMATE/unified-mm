@@ -19,7 +19,7 @@ from scripts.analyze_unified_representations import (
     normalize,
     retrieval_scores,
 )
-from scripts.probe_unified_representations import FLICKR, emit, write_json
+from utils.research.representation_protocol import FLICKR, emit, write_json
 
 
 def token_maxsim(latents, word_vectors, weight, bias, caption_tokens):

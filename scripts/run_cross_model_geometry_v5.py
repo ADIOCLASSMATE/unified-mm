@@ -8,7 +8,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from scripts.prepare_geometry_v5_assets import ROOT, RUN, emit, write_json
+from utils.research.geometry_v5_assets import ROOT, RUN, emit, write_json
 
 
 def run_stage(root, name, command):

@@ -12,7 +12,7 @@ import yaml
 from safetensors import safe_open
 
 from scripts.prepare_cross_model_geometry_v5 import BASELINE, F_RUN
-from scripts.prepare_geometry_v5_assets import MODELS, RUN, emit, write_json
+from utils.research.geometry_v5_assets import MODELS, RUN, emit, write_json
 
 
 def read(path):

@@ -35,3 +35,28 @@ ImageNet 原生理解、纯文本、多模态 likelihood 和语言先验校准�
 没有记录任务的未知模型明确显示“训练任务未记录”，不再从普通目录名猜测所有任务都已训练。临时用途可以显式声明，历史 smoke/debug/replay 名称仍按临时实验处理。flow depth 配置中的展示身份不会改变科学参数一致性检查。
 
 48 项定向回归通过。网页重建后仍有 14 个定性模型、3,584 条记录、1,792 张图像和 9 个完整正式指标模型；未重新计算历史分数。
+
+## 训练与生成职责拆分
+
+训练入口另外拆出 `training_setup.py` 的优化器/调度器构造、`training_checkpoint.py` 的恢复预检与状态恢复，以及 `training_reporting.py` 的跨 rank 运行统计。优化器参数分组和 WSD 算法原样迁移；恢复预检由主 rank 检查完成标记、文件清单和配置合同后共享结果，再加载可变状态。数据游标、NPU RNG 和 EMA 分片读取中的局部错误向所有 rank 传播，运行报告也共用原子写入和主 rank 错误传播。
+
+生成侧将静态 K/V cache 和 image backbone query 分别移到 `modeling_selfless_cache.py` 与 `image_generation_backbone.py`。序列张量的引用保持稳定，pending content 位置按每次调用显式传入，以保留置信度探测的提交时机。CFG 分支排列、strict sigma、2D RoPE、X0/XT 条件、缓存写入与采样算法均沿用原实现。迁移前后 cache 类与 query 计算的 AST 一致。
+
+训练相关 98 项定向回归、恢复预检 8 项、生成合同 102 项回归通过。真实权重的生成前后数值对照在开发机完整验收时进行。
+
+## 维护入口
+
+ImageNet 数据集模块不再反向导入 loader 构造；构造统一从 `utils.imagenet_flow_dataloaders` 或 `utils.dataset_utils` 进入。仓库测试已迁移到该入口。
+
+V5 公共资产协议、下载函数以及早期表征诊断的协议/特征提取器迁入 `utils/research/`，原 CLI 保留兼容导出，研究脚本改为依赖公共库。保留 V2–V5 各自的方法、结果和版本入口，不改历史模型身份或分数。
+
+`pyproject.toml` 固定少量正确性 lint 规则，`bash script/check_repo.sh` 复用已有环境运行 lint 和 CPU 回归。报告及研究依赖仍在各自 requirements 文件中，不改变正在使用的共享环境。
+
+完整开发机验收命令：
+
+```bash
+bash script/selfless/validate_repo_refactor_ascend16.sh \
+  /absolute/path/to/report all refactor-r1
+```
+
+必须使用新的 label；该命令依次运行完整回归、16-rank HCCL 文件故障传播、NPU BF16 loss/梯度对照和 depth30/depth16 的完整保存/恢复验收。每个模型验证两次完整的 2,000 张均衡 ImageNet 样本及 400 条 ClimbMix，覆盖冷/热缓存、11 项下游任务、step 2/4/5/6 checkpoint、step 2/4 raw/EMA 配对导出和 final raw/EMA 实际重载生成。EMA 生成还与提交 `1ad1670` 的原生成实现使用相同权重/噪声逐位比较。

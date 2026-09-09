@@ -8,7 +8,7 @@ import socket
 import torch
 import torch_npu
 
-from scripts.prepare_geometry_v5_assets import RUN, write_json
+from utils.research.geometry_v5_assets import RUN, write_json
 
 assert torch.npu.is_available() and torch.npu.device_count() == 16
 torch.npu.set_device(0)

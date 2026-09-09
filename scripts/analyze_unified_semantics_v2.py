@@ -22,7 +22,7 @@ from scripts.analyze_unified_representations import (
     ridge_predict,
     top1,
 )
-from scripts.probe_unified_representations import emit, write_json
+from utils.research.representation_protocol import emit, write_json
 from scripts.probe_unified_semantics_v2 import LAYERS
 
 DATA = {}

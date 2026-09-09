@@ -115,9 +115,15 @@ python3 scripts/build_evaluation_report.py
 
 ```bash
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
-PYTHONPATH="${PWD}:${PYTHONPATH:-}" TORCH_COMPILE_DISABLE=1 \
-  uv run --frozen python -m pytest -q tests
-uvx ruff check models utils pretrain scripts tests
+bash script/check_repo.sh
 ```
+
+此入口使用现有根目录 `.venv` 和 PATH 中的 Ruff，按 `pyproject.toml` 的
+正确性规则检查后运行完整 CPU 回归，不会同步或修改训练环境。需要多卡的保存、
+恢复和生成验收使用固定开发机，命令见 [重构验收记录](docs/REPO_REFACTOR_20260909.md)。
+
+报告端依赖单独列在 `scripts/evaluation_report_requirements.txt`，包括网页和独立
+loss 图所需的 PyYAML、NumPy、Matplotlib；研究环境的额外依赖保留在各自
+`scripts/geometry_v5_*_requirements.txt`。正式作业运行期间不要重装共享环境。
 
 平台路径和资源约束见 [INSPIRE.md](INSPIRE.md)。

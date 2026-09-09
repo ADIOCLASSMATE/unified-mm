@@ -10,7 +10,7 @@ from PIL import Image
 from safetensors import safe_open
 from torchvision import transforms
 
-from scripts.prepare_geometry_v5_assets import MODELS
+from utils.research.geometry_v5_assets import MODELS
 
 
 def verify_parameters(model, path):

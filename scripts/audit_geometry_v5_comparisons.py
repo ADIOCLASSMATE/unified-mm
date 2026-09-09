@@ -7,7 +7,7 @@ from pathlib import Path
 
 from scripts.audit_geometry_v5_results import finite_tree
 from scripts.compare_geometry_v5 import compare_endpoints, key_for, load_arrays
-from scripts.prepare_geometry_v5_assets import RUN, emit, write_json
+from utils.research.geometry_v5_assets import RUN, emit, write_json
 
 
 def read(path):

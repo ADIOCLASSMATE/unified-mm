@@ -10,7 +10,7 @@ from pathlib import Path
 import torch
 
 from scripts.geometry_v5_flow import FlowAdapter
-from scripts.prepare_geometry_v5_assets import RUN, emit, write_json
+from utils.research.geometry_v5_assets import RUN, emit, write_json
 
 
 def eligible_indices(rows, dataset, profile, cal_smoke, limit):

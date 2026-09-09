@@ -21,7 +21,7 @@ from scripts.analyze_unified_geometry_v3 import (
     preprocess,
 )
 from scripts.geometry_v4_math import describe_fit, evaluate_pair, fit_pair, spectral_fit
-from scripts.probe_unified_representations import emit, write_json
+from utils.research.representation_protocol import emit, write_json
 from scripts.probe_unified_semantics_v2 import LAYERS
 
 SEED = 20260909

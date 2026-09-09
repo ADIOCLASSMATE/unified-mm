@@ -12,7 +12,7 @@ from torchvision import transforms
 
 from scripts.geometry_v5_encoders import PixelLoader
 from scripts.prepare_cross_model_geometry_v5 import ROOT, V4
-from scripts.prepare_geometry_v5_assets import RUN, emit, write_json
+from utils.research.geometry_v5_assets import RUN, emit, write_json
 
 
 def audit_samples(root):

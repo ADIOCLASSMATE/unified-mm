@@ -10,7 +10,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from scripts.prepare_geometry_v5_assets import RUN, emit, fetch, write_json
+from utils.research.geometry_v5_assets import RUN, emit, fetch, write_json
 
 
 def chunk_path(entry, start, end):

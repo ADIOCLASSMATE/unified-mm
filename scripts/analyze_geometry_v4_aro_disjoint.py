@@ -13,7 +13,7 @@ sys.path.insert(0, str(ROOT))
 import scripts.analyze_unified_geometry_v4 as primary
 from scripts.analyze_unified_geometry_v3 import apply_frame, preprocess
 from scripts.geometry_v4_math import fit_pair, spectral_fit
-from scripts.probe_unified_representations import emit, write_json
+from utils.research.representation_protocol import emit, write_json
 
 
 def main():

@@ -185,7 +185,7 @@ def input_controls(args, data, samples, protocol):
     from safetensors import safe_open
 
     from utils.evaluation.multimodal_likelihood import PosteriorCache
-    from scripts.probe_unified_representations import FLICKR
+    from utils.research.representation_protocol import FLICKR
 
     with safe_open(
         str(Path(protocol["model"]["path"]) / "model.safetensors"), framework="pt"
@@ -300,7 +300,7 @@ def plot_results(rows, output):
 
 
 def main(args):
-    from scripts.probe_unified_representations import emit, write_json
+    from utils.research.representation_protocol import emit, write_json
 
     torch.set_num_threads(args.threads)
     protocol = json.loads((args.output_dir / "protocol.json").read_text())

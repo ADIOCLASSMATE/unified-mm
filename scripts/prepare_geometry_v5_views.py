@@ -7,7 +7,7 @@ from pathlib import Path
 
 import torch
 
-from scripts.prepare_geometry_v5_assets import RUN, emit
+from utils.research.geometry_v5_assets import RUN, emit
 
 
 def grouped(features, rows, groups, predicate):

@@ -14,7 +14,7 @@ import torch
 from scripts.analyze_geometry_v5_robustness import profiles_for, robust_view
 from scripts.bootstrap_geometry_v5 import test_groups
 from scripts.geometry_v5_protocol import layer_values, load_pair_views
-from scripts.prepare_geometry_v5_assets import RUN, emit, write_json
+from utils.research.geometry_v5_assets import RUN, emit, write_json
 
 
 def read(path):
