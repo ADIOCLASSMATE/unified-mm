@@ -223,6 +223,58 @@ only as provenance for earlier experiments.
 - `output/evaluation-checkpoints/` contains historical input weights, not result
   files. Those checkpoint identities remain outside the result directory.
 
+### B-X0 sampling sweeps
+
+- The CFG/Heun sweep uses independent one-node, 16-NPU Jobs in the
+  user-selected project
+  `随机序语言建模-统一自回归与掩码扩散的随机顺序生成框架`.
+  The sampling plan and explicit platform fields are retained in the sweep's
+  `protocol.json`; this evaluation placement does not change training rules.
+- The sweep scheduler is `scripts/sweep_unified_t2i_sampling.py`, the Job
+  submitter is `scripts/submit_unified_t2i_sweep.py`, and the CPU report watcher
+  is `scripts/report_sampling_sweep.py`. Results live under
+  `output/evaluation/unified-b-x0content-0p6b/sweeps/`.
+- Evaluate each CFG in 0.5 increments at 10-step Heun on ImageNet-val 50K;
+  select minimum FID and maximum IS separately, then evaluate both selected
+  CFGs at 5/10/20/50/100 steps. Keep the paired sample/noise contract and ten
+  class-stratified IS splits. Any guard-boundary optimum remains unresolved
+  until the range is extended.
+- The evaluator's `--save_image_count` retains an evenly spaced subset of
+  the full evaluation ordering, plus the actual prompts, image IDs, and
+  canonical noise seeds. This export does not change generation or metrics.
+  The current sweep keeps 64 paired images per combination.
+- Add selected sweep roots to `sampling_sweeps` in
+  `configs/protocols/evaluation_report.json`. The homepage includes the
+  sweep conclusions, curves, and paired-image comparison while preserving
+  the common fixed-parameter model comparison.
+- Before a reveal-order study, audit CFG ±0.5 and ±1.0 at the selected
+  minimum-FID Heun step. Reuse exact completed 50K points when present;
+  a boundary winner still requires extension. Preparation is handled by
+  `scripts/prepare_unified_order_sweep.py` and preserves the evidence in
+  `cfg-refinement.json`.
+- Reveal-order studies use the same independent 16-NPU Job placement and
+  paired metric/image protocol. Register their roots in `order_sweeps` in
+  the report selection. The `confidence_*` experimental policies rank each
+  next 16 Halton positions from generated context; they require cached
+  generation, constant CFG != 1, and canonical initial noise. They do not replay training sigma
+  or read target latents. Preserve saved `order_trace` records as well as PNGs.
+  See `docs/B_X0_ORDER_SWEEP.md` for the score definitions and controls.
+- The full nine-model CFG=2.0 / Heun=10 matrix is prepared with
+  `scripts/prepare_unified_matrix_sweep.py --include-random`. Evaluate Halton,
+  `confidence_stability`, and `random` for each model, plus E's native sequential control.
+  Random preserves the fixed evaluator seed/batch partition and its native
+  uniform permutation; verify matching saved random orders across models.
+  Each final EMA keeps its own attention and flow-condition contracts; D
+  refreshes the dynamic XT condition for both probes, and F retains no flow
+  content cache. Follow `docs/UNIFIED_MATRIX_CFG2_ORDER.md` for the smoke and
+  pairing gates. Register the root in `matrix_sweeps` in the report selection.
+  Use independent 16-NPU Jobs in the same user-selected random-order project,
+  with up to 12 concurrent Jobs and rolling admission after per-model smoke.
+- Job launchers must include existing mounted Ascend driver library
+  directories, as in the qualitative launcher. Throttle submissions and
+  retry rejected rate-limited reads. A controller/resource-query error must
+  preserve healthy independent Jobs and their progress.
+
 ### Unified qualitative generation
 
 - The reusable all-final-EMA generation entry is

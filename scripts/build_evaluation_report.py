@@ -260,6 +260,241 @@ def gallery_data(root: Path, selection: dict):
             "images_verified": sum(r["task"] == "t2i" for r in records)}
 
 
+def sampling_sweep_data(root: Path, selection: dict, models: list):
+    if __package__:
+        from .sweep_unified_t2i_sampling import validate_metrics, task, winners
+    else:
+        from sweep_unified_t2i_sampling import validate_metrics, task, winners
+    sweeps = []
+    for selected in selection.get("sampling_sweeps", []):
+        directory = within(root, selected["root"])
+        check_not_invalidated(directory, root)
+        summary = read(directory / "summary.json")
+        protocol = summary["protocol"]
+        spec = next(m for m in models if m["id"] == selected["model"])
+        require(Path(protocol["model_source"]).resolve() == Path(spec["checkpoint"]).resolve()
+                and protocol["checkpoint_step"] == spec["source"]["global_step"], "sweep checkpoint mismatch")
+        rows, completed, paired_samples = [], [], None
+        for result in summary["results"]:
+            arm = task(result["cfg"], result["heun_steps"], result["phase"])
+            row = {**result, "id": arm["id"]}
+            if result["status"] == "done":
+                path = Path(result["metrics_path"]).resolve()
+                require(path.is_relative_to(root), "sweep metric escapes evaluation directory")
+                check_not_invalidated(path, root)
+                metric = validate_metrics(path, protocol, arm)
+                require(all(result[key] == metric[key] for key in ("fid", "is", "is_std")), "sweep summary metric mismatch")
+                row["metrics_path"] = str(path.relative_to(root))
+                arm.update(status="done", result=metric)
+                completed.append(arm)
+                samples, images = [], []
+                for index in protocol.get("saved_image_indices", []):
+                    image_path = path.parent / "spatial_halton" / f"{index:08d}.png"
+                    record = read(image_path.with_suffix(".json"))
+                    samples.append({key: record[key] for key in ("global_sample_index", "image_id", "canonical_noise_seed", "prompt")})
+                    images.append(str(image_path.relative_to(root)))
+                if paired_samples is None:
+                    paired_samples = samples
+                require(samples == paired_samples, "sweep images do not share sample identities, prompts and noise")
+                row["images"] = images
+            rows.append(row)
+        sweep = {"label": selected["label"], "root": str(directory.relative_to(root)),
+                 "status": summary["status"], "phase": summary["phase"], "error": summary.get("error"),
+                 "completed": len(completed), "total": len(rows), "rows": rows,
+                 "samples": paired_samples or [], "cfg_selection": summary.get("cfg_selection"),
+                 "conclusion": None, "plots": []}
+        if summary["status"] == "complete":
+            require(len(completed) == len(rows), "completed sweep has unfinished arms")
+            cfg_arms = [a for a in completed if a["phase"] == "cfg"]
+            selected_cfg = winners(cfg_arms)
+            require(all(summary["cfg_selection"][key]["id"] == arm["id"] for key, arm in selected_cfg.items()),
+                    "sweep CFG selection mismatch")
+            for arm in selected_cfg.values():
+                observed = {a["steps"] for a in completed if a["cfg"] == arm["cfg"]}
+                require(set(protocol["heun_steps"]) <= observed, "sweep Heun coverage incomplete")
+            best = winners(completed)
+            baseline = next(a for a in completed if a["cfg"] == 3.5 and a["steps"] == 10)
+            sweep["conclusion"] = {**best, "baseline": baseline,
+                                    "fid_reduction": baseline["result"]["fid"] - best["best_fid"]["result"]["fid"],
+                                    "is_increase": best["best_is"]["result"]["is"] - baseline["result"]["is"]}
+        for filename in ("cfg-sweep.png", "heun-sweep.png"):
+            path = directory / filename
+            if path.is_file():
+                sweep["plots"].append(str(path.relative_to(root)))
+        sweeps.append(sweep)
+    return sweeps
+
+
+def order_sweep_data(root: Path, selection: dict, models: list):
+    if __package__:
+        from .sweep_unified_t2i_sampling import validate_metrics, winners
+    else:
+        from sweep_unified_t2i_sampling import validate_metrics, winners
+    studies = []
+    for selected in selection.get("order_sweeps", []):
+        directory = within(root, selected["root"])
+        check_not_invalidated(directory, root)
+        summary, state = read(directory / "summary.json"), read(directory / "state.json")
+        protocol = summary["protocol"]
+        spec = next(m for m in models if m["id"] == selected["model"])
+        require(Path(protocol["model_source"]).resolve() == Path(spec["checkpoint"]).resolve()
+                and protocol["checkpoint_step"] == spec["source"]["global_step"], "order sweep checkpoint mismatch")
+        require(summary["status"] == state["status"], "order summary/state mismatch")
+        refine = read(directory / "cfg-refinement.json")
+        previous_protocol = read(Path(protocol["previous_sweep"]) / "protocol.json")
+        for arm in refine["arms"]:
+            require(validate_metrics(arm["result"]["metrics_path"], previous_protocol, arm) == arm["result"],
+                    "CFG refinement evidence changed")
+        cfgs = {a["cfg"] for a in refine["arms"]}
+        best_cfg = winners(refine["arms"])["best_fid"]
+        require(cfgs == set(refine["cfg_values"]) and min(cfgs) < best_cfg["cfg"] < max(cfgs)
+                and best_cfg["cfg"] == protocol["cfg_fixed"]
+                and all(a["steps"] == protocol["heun_fixed"] for a in refine["arms"]), "CFG refinement incomplete")
+        rows, complete, samples = [], [], None
+        for arm in state["tasks"]:
+            row = {"id": arm["id"], "strategy": arm["strategy"], "status": arm["status"],
+                   "cfg": arm["cfg"], "steps": arm["steps"]}
+            if arm["status"] == "done":
+                path = Path(arm["result"]["metrics_path"]).resolve()
+                require(path.is_relative_to(root), "order metric escapes evaluation directory")
+                check_not_invalidated(path, root)
+                metric = validate_metrics(path, protocol, arm)
+                require(metric == arm["result"], "order summary metric mismatch")
+                row.update({**metric, "metrics_path": str(path.relative_to(root))})
+                row["images"], row["orders"] = [], []
+                identities = []
+                for index in protocol["saved_image_indices"]:
+                    image_path = path.parent / arm["strategy"] / f"{index:08d}.png"
+                    require(image_path.is_file(), "order sample image missing")
+                    record = read(image_path.with_suffix(".json"))
+                    identities.append({k: record[k] for k in ("global_sample_index", "image_id", "canonical_noise_seed", "prompt")})
+                    row["images"].append(str(image_path.relative_to(root)))
+                    order_path = image_path.parent / "order_trace" / f"{index:08d}.json"
+                    order = read(order_path)
+                    require(order["strategy"] == arm["strategy"] and order["global_sample_index"] == index
+                            and order["policy"] == protocol["order_policies"][arm["strategy"]], "order trace identity mismatch")
+                    row["orders"].append({**order, "source": str(order_path.relative_to(root))})
+                if samples is None:
+                    samples = identities
+                require(identities == samples, "order images are not paired")
+                complete.append(arm)
+            rows.append(row)
+        conclusion = None
+        if state["status"] == "complete":
+            require(len(complete) == len(rows) and {a["strategy"] for a in complete} == set(protocol["strategies"]), "order sweep is incomplete")
+            selected_arms = winners(complete)
+            require(all(state["order_selection"][k]["id"] == a["id"] for k, a in selected_arms.items()), "order selection mismatch")
+            baseline = next(a for a in complete if a["strategy"] == "spatial_halton")
+            conclusion = {**selected_arms, "baseline": baseline,
+                          "fid_reduction": baseline["result"]["fid"] - selected_arms["best_fid"]["result"]["fid"]}
+        studies.append({"root": str(directory.relative_to(root)), "status": state["status"],
+                        "completed": len(complete), "total": len(rows), "rows": rows,
+                        "samples": samples or [], "refinement": refine, "conclusion": conclusion,
+                        "controls": read(directory / "controls.json") if (directory / "controls.json").exists() else None,
+                        "plots": [str(p.relative_to(root)) for p in [directory / "order-sweep.png", directory / "order-cost.png"] if p.is_file()]})
+    return studies
+
+
+def matrix_sweep_data(root: Path, selection: dict, models: list):
+    if __package__:
+        from .sweep_unified_t2i_sampling import validate_metrics
+    else:
+        from sweep_unified_t2i_sampling import validate_metrics
+    studies = []
+    for selected in selection.get("matrix_sweeps", []):
+        directory = within(root, selected["root"])
+        check_not_invalidated(directory, root)
+        protocol, state = read(directory / "protocol.json"), read(directory / "state.json")
+        require(protocol["schema"] == "unified_t2i_ablation_matrix_v1" and state["phase"] == "matrix",
+                "unknown ablation matrix protocol")
+        require(set(protocol["models"]) == set(selection["models"]), "matrix omits selected formal models")
+        matrix_strategies = protocol.get("matrix_strategies", ["spatial_halton", "confidence_stability"])
+        require(len(matrix_strategies) == len(set(matrix_strategies))
+                and {"spatial_halton", "confidence_stability"} <= set(matrix_strategies)
+                <= {"spatial_halton", "confidence_stability", "random"}, "unknown matrix comparison strategies")
+        expected = {(m, s) for m in protocol["models"] for s in matrix_strategies}
+        expected.add(("e_on_b", "sequential"))
+        require(len(state["tasks"]) == len(expected) and {(a["model"], a["strategy"]) for a in state["tasks"]} == expected,
+                "matrix arm coverage mismatch")
+        specs = {m["id"]: m for m in models}
+        for mid, spec in protocol["models"].items():
+            current = specs[mid]
+            require(Path(spec["model_source"]).resolve() == Path(current["checkpoint"]).resolve()
+                    and spec["checkpoint_step"] == current["source"]["global_step"], "matrix checkpoint mismatch")
+        rows, samples = [], None
+        for arm in state["tasks"]:
+            require(arm["cfg"] == protocol["cfg_fixed"] == 2 and arm["steps"] == protocol["heun_fixed"] == 10,
+                    "matrix sampling settings changed")
+            row = {k: arm[k] for k in ["id", "model", "strategy", "status", "cfg", "steps"]}
+            row["label"] = specs[arm["model"]]["label"]
+            if arm["status"] == "done":
+                path = Path(arm["result"]["metrics_path"]).resolve()
+                require(path.is_relative_to(directory), "matrix metric escapes its frozen study")
+                check_not_invalidated(path, root)
+                result = validate_metrics(path, protocol, arm)
+                require(result == arm["result"], "matrix metrics changed")
+                row.update({**result, "metrics_path": str(path.relative_to(root))})
+                row["images"], row["orders"], identities = [], [], []
+                for index in protocol["saved_image_indices"]:
+                    image_path = path.parent / arm["strategy"] / f"{index:08d}.png"
+                    record = read(image_path.with_suffix(".json"))
+                    identities.append({k: record[k] for k in ["global_sample_index", "image_id", "canonical_noise_seed", "prompt"]})
+                    row["images"].append(str(image_path.relative_to(root)))
+                    trace_path = image_path.parent / "order_trace" / f"{index:08d}.json"
+                    trace = read(trace_path)
+                    require(trace["strategy"] == arm["strategy"] and trace["global_sample_index"] == index
+                            and trace["policy"] == protocol["order_policies"][arm["strategy"]], "matrix trace identity mismatch")
+                    ranks = [v for line in trace["generation_order"] for v in line]
+                    require(len(trace["generation_order"]) == 16 and all(len(line) == 16 for line in trace["generation_order"])
+                            and sorted(ranks) == list(range(1, 257)), "matrix trace permutation invalid")
+                    row["orders"].append({**trace, "source": str(trace_path.relative_to(root))})
+                if samples is None:
+                    samples = identities
+                require(identities == samples, "matrix prompts, image IDs or noise differ")
+            rows.append(row)
+        complete = [r for r in rows if r["status"] == "done"]
+        comparison = []
+        for mid, spec in protocol["models"].items():
+            values = {r["strategy"]: r for r in rows if r["model"] == mid}
+            comparison.append({"model": mid, "label": spec["label"], "native_strategy": spec["native_strategy"],
+                "previous": {k: specs[mid]["metrics"].get(k) for k in ["fid", "is"]}, "strategies": values})
+        conclusion = None
+        if state["status"] == "complete":
+            require(len(complete) == len(rows), "complete matrix has unfinished arms")
+            audit_path = directory / "audit.json"
+            require(audit_path.is_file(), "completed matrix requires its full image/input audit")
+            audit = read(audit_path)
+            require(audit["complete"] and audit["arms"] == len(rows) and audit["images_verified"] == len(rows) * 64
+                    and audit["order_traces_verified"] and audit["paired_image_identities_verified"], "matrix audit incomplete")
+            baseline = [r for r in complete if r["strategy"] == "spatial_halton"]
+            stability = [r for r in complete if r["strategy"] == "confidence_stability"]
+            previous_best = min(comparison, key=lambda m: m["previous"]["fid"]["value"])
+            conclusion = {"best_halton": min(baseline, key=lambda r: r["fid"]),
+                "best_stability": min(stability, key=lambda r: r["fid"]),
+                "best_is_halton": max(baseline, key=lambda r: r["is"]),
+                "best_is_stability": max(stability, key=lambda r: r["is"]),
+                "best_cfg3p5_native": {"model": previous_best["model"], "label": previous_best["label"],
+                    "fid": previous_best["previous"]["fid"]["value"]},
+                "best_cfg2_native": min([m["strategies"][m["native_strategy"]] for m in comparison], key=lambda r: r["fid"]),
+                "cfg2_native_fid_improved": [m["model"] for m in comparison
+                    if m["strategies"][m["native_strategy"]]["fid"] < m["previous"]["fid"]["value"]],
+                "cfg2_native_is_improved": [m["model"] for m in comparison
+                    if m["strategies"][m["native_strategy"]]["is"] > m["previous"]["is"]["value"]],
+                "improved_fid_models": [r["model"] for r in stability if r["fid"] < next(b["fid"] for b in baseline if b["model"] == r["model"])],
+                "improved_is_models": [r["model"] for r in stability if r["is"] > next(b["is"] for b in baseline if b["model"] == r["model"])]}
+            random = [r for r in complete if r["strategy"] == "random"]
+            if random:
+                conclusion.update(best_random=min(random, key=lambda r: r["fid"]),
+                    best_is_random=max(random, key=lambda r: r["is"]),
+                    random_improved_fid_models=[r["model"] for r in random if r["fid"] < next(b["fid"] for b in baseline if b["model"] == r["model"])],
+                    random_improved_is_models=[r["model"] for r in random if r["is"] > next(b["is"] for b in baseline if b["model"] == r["model"])])
+        studies.append({"root": str(directory.relative_to(root)), "status": state["status"],
+            "completed": len(complete), "total": len(rows), "rows": rows, "models": comparison,
+            "samples": samples or [], "conclusion": conclusion, "strategies": matrix_strategies,
+            "plots": [str(p.relative_to(root)) for p in [directory / "matrix-metrics.png", directory / "matrix-metrics-zoom.png"] if p.exists()]})
+    return studies
+
+
 def build(root: Path, selection_file: Path):
     root = root.resolve()
     selection = read(selection_file)
@@ -270,6 +505,7 @@ def build(root: Path, selection_file: Path):
     require(set(selection["models"]) <= known, "selected metric model absent from qualitative inventory")
     for spec in gallery["manifest"]["models"]:
         models.append({**spec, **model_metrics(root, spec, selection["models"].get(spec["id"], {}))})
+    sampling_sweeps = sampling_sweep_data(root, selection, models)
     updated = datetime.now(UTC).isoformat(timespec="seconds")
     artifacts = []
     entries = [("完整定性长表与 ZIP", gallery["root"] + "/index.html"),
@@ -290,6 +526,9 @@ def build(root: Path, selection_file: Path):
                "formal_models": sum(bool(m["metrics"]) for m in models),
                "formal_complete_models": sum(m["complete"] for m in models),
                "artifacts": artifacts, "folders": folders, "runtime_hashing_enabled": False,
+               "sampling_sweeps": sampling_sweeps,
+               "order_sweeps": order_sweep_data(root, selection, models),
+               "matrix_sweeps": matrix_sweep_data(root, selection, models),
                "selection": selection, "scope": "project-native suite; external official generation scorers have separate result availability"}
     data = {**summary, "samples": gallery["samples"], "records": gallery["records"], "labels": LABELS}
     template = (REPO / "scripts/assets/evaluation_report.html").read_text(encoding="utf-8")

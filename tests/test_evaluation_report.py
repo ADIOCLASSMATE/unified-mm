@@ -6,6 +6,7 @@ from scripts.build_evaluation_report import (
     check_checkpoint,
     gallery_data,
     model_metrics,
+    sampling_sweep_data,
     within,
 )
 
@@ -58,3 +59,20 @@ def test_gallery_rejects_missing_image_and_wrong_sample_coverage(tmp_path):
 def test_result_paths_cannot_escape_the_evaluation_directory(tmp_path):
     with pytest.raises(ValueError, match="escapes"):
         within(tmp_path, "../training")
+
+
+def test_unfinished_sampling_sweep_never_announces_an_optimum(tmp_path):
+    sweep = tmp_path / "sampling"
+    sweep.mkdir()
+    summary = {"status": "running", "phase": "cfg", "results": [],
+               "protocol": {"model_source": "/training/b/hf_model-final-ema", "checkpoint_step": 95415}}
+    (sweep / "summary.json").write_text(json.dumps(summary))
+    models = [{"id": "b_x0", "checkpoint": "/training/b/hf_model-final-ema", "source": {"global_step": 95415}}]
+    selection = {"sampling_sweeps": [{"model": "b_x0", "label": "B sweep", "root": "sampling"}]}
+    result = sampling_sweep_data(tmp_path, selection, models)
+    assert result[0]["conclusion"] is None
+    assert result[0]["completed"] == 0
+    summary["protocol"]["checkpoint_step"] = 60000
+    (sweep / "summary.json").write_text(json.dumps(summary))
+    with pytest.raises(ValueError, match="sweep checkpoint mismatch"):
+        sampling_sweep_data(tmp_path, selection, models)

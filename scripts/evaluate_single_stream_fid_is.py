@@ -29,6 +29,8 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from utils.image_order_strategies import order_policy, checkpoint_generation_contract
+
 from scripts.image_evaluation_metrics import (  # noqa: E402
     FeatureMoments,
     InceptionScoreMoments,
@@ -49,6 +51,7 @@ from models.modeling_model.image_backbone import (  # noqa: E402
     pure_2d_position_contract,
 )
 from utils.dataset_utils import get_dataloaders  # noqa: E402
+from utils.evaluation_image_subset import evenly_spaced_image_indices  # noqa: E402
 from utils.combined_dataloaders import (  # noqa: E402
     build_unified_image_validation_dataloader,
 )
@@ -274,6 +277,10 @@ def parse_args():
         ),
     )
     parser.add_argument("--save_images", action="store_true")
+    parser.add_argument(
+        "--save_image_count", type=int, default=0,
+        help="Save this many evenly spaced evaluation images and prompt records; zero keeps --save_images behavior.",
+    )
     parser.add_argument(
         "--allow_sigma_strategies",
         action="store_true",
@@ -791,6 +798,9 @@ def build_evaluation_resume_contract(
             "save_images": bool(args.save_images),
         },
     }
+    if int(getattr(args, "save_image_count", 0)) > 0:
+        contract["output"]["save_image_count"] = int(args.save_image_count)
+        contract["output"]["image_selection"] = "evenly_spaced_global_sample_indices"
     return contract
 
 
@@ -1796,6 +1806,7 @@ def main(*, model_loader=None):
         )
     progress = not args.no_progress and is_main_process(rank)
     out_dir = Path(args.output_dir)
+    saved_image_indices = set(evenly_spaced_image_indices(int(args.samples), int(args.save_image_count)))
     if is_main_process(rank):
         out_dir.mkdir(parents=True, exist_ok=True)
     distributed_barrier(distributed, device)
@@ -2535,8 +2546,33 @@ def main(*, model_loader=None):
                             float(value) * count
                         )
                     state["flow_cfg_cache_divergence_count"] += count
-            if args.save_images:
-                save_indexed_images(generated_images.cpu(), out_dir / str(strategy), selected_global_indices)
+            if args.save_images or saved_image_indices:
+                kept_rows = [i for i, index in enumerate(selected_global_indices)
+                             if not saved_image_indices or index in saved_image_indices]
+                kept_indices = [selected_global_indices[i] for i in kept_rows]
+                if kept_rows:
+                    directory = out_dir / str(strategy)
+                    save_indexed_images(generated_images[kept_rows].cpu(), directory, kept_indices)
+                    records = ordered_eval_sample_records(loader.dataset, loader_rows=kept_indices,
+                                                          global_sample_indices=kept_indices)
+                    for row, record in zip(kept_rows, records):
+                        batch_row, image_start, _ = spans[row]
+                        record.update(
+                            canonical_noise_seed=(int(args.seed) + record["global_sample_index"]) % EVALUATOR_RNG_SEED_MODULUS,
+                            prompt=tokenizer.decode(input_ids[batch_row, :image_start].tolist(), skip_special_tokens=True),
+                            image=f"{record['global_sample_index']:08d}.png",
+                        )
+                        write_json_atomic(directory / f"{record['global_sample_index']:08d}.json", record)
+                        if trace and isinstance(trace.get("generation_order"), torch.Tensor):
+                            order_record = {
+                                "global_sample_index": record["global_sample_index"],
+                                "strategy": str(strategy), "policy": order_policy(str(strategy)),
+                                "generation_order": trace["generation_order"][row].cpu().tolist(),
+                            }
+                            proxy = trace.get("order_confidence_proxy")
+                            if isinstance(proxy, torch.Tensor):
+                                order_record["confidence_proxy"] = proxy[row].float().cpu().tolist()
+                            write_json_atomic(directory / "order_trace" / f"{record['global_sample_index']:08d}.json", order_record)
 
         generated += len(spans)
         batch_offset = seen_complete_spans
@@ -2660,6 +2696,7 @@ def main(*, model_loader=None):
         "project_formal_protocol": formal_protocol,
         "leaderboard_comparable_to_adm_dit": False,
         "implementation_contracts": {
+            "checkpoint_generation": checkpoint_generation_contract(model.config),
             "evaluator_rng_contract": EVALUATOR_RNG_CONTRACT,
             "canonical_initial_noise_enabled": bool(canonical_pairing_enabled),
             "backbone_attention": {
@@ -2850,11 +2887,17 @@ def main(*, model_loader=None):
         "cfg": float(args.cfg),
         "cfg_schedule": str(args.cfg_schedule),
         "sampling_steps": str(args.sampling_steps),
+        "order_strategy_protocols": {str(s): order_policy(str(s)) for s in strategies},
         "temperature": float(args.temperature),
         "flow_solver": str(args.flow_solver),
         "parallel_rate": int(args.parallel_rate),
         "backbone_kv_cache": not bool(args.disable_backbone_kv_cache),
         "inception_weights_path": inception_weights_path,
+        "saved_image_subset": {
+            "count": len(saved_image_indices),
+            "selection": "evenly_spaced_global_sample_indices",
+            "global_sample_indices": sorted(saved_image_indices),
+        } if saved_image_indices else None,
         "strategies": {},
     }
     for strategy, state in metrics.items():

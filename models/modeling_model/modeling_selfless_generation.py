@@ -16,6 +16,10 @@ from torch.nn.attention.flex_attention import create_block_mask
 from transformers.cache_utils import Cache
 
 from .image_position_utils import build_row_col_position_ids
+from utils.image_order_strategies import (
+    CONFIDENCE_BLOCK_SIZE, CONFIDENCE_PROBE_DT, CONFIDENCE_STRATEGIES,
+    confidence_scores, order_policy,
+)
 
 
 class _SelflessStaticCacheLayer:
@@ -191,6 +195,16 @@ class SelflessGenerationMixin:
     # backbone call. Dynamic-XT overrides this because its ODE evaluator owns
     # two independently queried read-only caches.
     _supports_paired_backbone_cfg = True
+
+    def _order_probe_content_conditions(self, *, pending_hidden, previous_conditions):
+        """Keep each checkpoint's native flow-content conditioning contract."""
+        if self._uses_backbone_x0_flow_content_condition():
+            if pending_hidden is None:
+                raise RuntimeError("confidence probe lost pending X0 content")
+            return self._prepare_image_flow_condition(pending_hidden)
+        if previous_conditions is None:
+            raise RuntimeError("confidence probe lost the legacy query condition")
+        return previous_conditions
 
     def _generation_attention_contract(self) -> str:
         """Return the only A/B generation switch.
@@ -405,7 +419,7 @@ class SelflessGenerationMixin:
         if strategy == "sequential":
             base = torch.arange(token_count, device=device, dtype=torch.long)
             orders = base.unsqueeze(0).expand(original_sigma.shape[0], -1)
-        elif strategy == "spatial_halton":
+        elif strategy == "spatial_halton" or strategy in CONFIDENCE_STRATEGIES:
             base = self._halton_image_order(token_count, side, device)
             orders = base.unsqueeze(0).expand(original_sigma.shape[0], -1)
         elif strategy == "spatial_uniform":
@@ -444,7 +458,7 @@ class SelflessGenerationMixin:
         else:
             raise ValueError(
                 "order_strategy must be one of sequential, spatial_halton, "
-                f"spatial_uniform, random, or sigma; got {strategy!r}"
+                f"spatial_uniform, random, sigma, or {tuple(CONFIDENCE_STRATEGIES)}; got {strategy!r}"
             )
         return strategy, orders.clone(), strategy == "sigma"
 
@@ -721,6 +735,13 @@ class SelflessGenerationMixin:
             image_tokens_per_img=image_tokens_per_img,
             side=side,
         )
+        confidence_order = order_strategy in CONFIDENCE_STRATEGIES
+        if confidence_order and not (
+            use_cache and flow_cfg != 1.0 and selected_initial_noise is not None
+            and str(flow_cfg_schedule or "constant").lower() == "constant"
+        ):
+            raise ValueError("confidence ordering requires cached generation, constant CFG != 1, and an explicit initial_noise_bank")
+        order_scores = torch.zeros_like(generation_orders, dtype=torch.float32) if confidence_order else None
 
         original_span_sigma = torch.gather(
             selected_sigma,
@@ -985,16 +1006,15 @@ class SelflessGenerationMixin:
             image_uncond_rows: torch.Tensor | None,
             label: str,
         ) -> tuple[torch.Tensor, torch.Tensor | None]:
-            current_positions = span_starts + current_local_positions
-            current_indices = current_positions.unsqueeze(1)
-            current_query_sigma = current_sigma[
-                batch_indices,
-                current_positions,
-            ].unsqueeze(1)
+            multiple_queries = current_local_positions.ndim == 2
+            current_indices = (span_starts[:, None] + current_local_positions
+                               if multiple_queries else (span_starts + current_local_positions).unsqueeze(1))
+            query_count = current_indices.shape[1]
+            current_query_sigma = torch.gather(current_sigma, 1, current_indices)
             if pending_local_positions is None:
                 query_indices = current_indices
                 query_sigma = current_query_sigma
-                content_queries = mask_only_query
+                content_queries = mask_only_query.expand(-1, query_count)
                 cache_read_only = True
             else:
                 pending_positions = span_starts + pending_local_positions
@@ -1013,7 +1033,8 @@ class SelflessGenerationMixin:
                     ],
                     dim=1,
                 )
-                content_queries = content_then_mask_queries
+                content_queries = (content_then_mask_queries if query_count == 1 else
+                                   torch.cat([torch.ones_like(mask_only_query), mask_only_query.expand(-1, query_count)], dim=1))
                 cache_read_only = False
 
             query_valid = torch.ones_like(content_queries)
@@ -1107,11 +1128,112 @@ class SelflessGenerationMixin:
             ).last_hidden_state
             pending_x0_hidden = (
                 hidden[:, 0]
-                if use_x0_content_condition
+                if (use_x0_content_condition or confidence_order)
                 and pending_local_positions is not None
                 else None
             )
-            return hidden[:, -1], pending_x0_hidden
+            return (hidden[:, -query_count:] if multiple_queries else hidden[:, -1]), pending_x0_hidden
+
+        def rank_confidence_block(step_index):
+            # A probe may commit the already completed previous content token,
+            # exactly once. Candidate queries and their ODE proposals never
+            # enter either cache. Normal serialized decoding then starts from
+            # its original per-position noise with the newly selected order.
+            nonlocal pending_local_positions, pending_flow_latents
+            nonlocal pending_flow_conditions, pending_flow_positions
+            stop = min(step_index + CONFIDENCE_BLOCK_SIZE, image_tokens_per_img)
+            positions = generation_orders[:, step_index:stop].clone()
+            if pair_backbone_cfg:
+                hidden, pending_hidden = cached_query(
+                    positions, cache=conditional_cache, image_uncond_rows=paired_cfg_rows,
+                    label=f"confidence_probe_step={step_index + 1}",
+                )
+            else:
+                # D owns separate CFG caches. Its ordinary static forward
+                # commits the completed X0 before read-only dynamic probes.
+                hc, pc = cached_query(
+                    positions, cache=conditional_cache, image_uncond_rows=None,
+                    label=f"conditional_cache_step={step_index + 1}",
+                )
+                hu, pu = cached_query(
+                    positions, cache=unconditional_cache, image_uncond_rows=unconditional_rows,
+                    label=f"unconditional_cache_step={step_index + 1}",
+                )
+                hidden = torch.cat([hc, hu])
+                pending_hidden = torch.cat([pc, pu]) if pc is not None else None
+            z = self._prepare_image_flow_condition(hidden)
+            x = selected_initial_noise[batch_indices[:, None], positions] * flow_temperature
+            paired_positions = torch.cat([positions, positions])
+            x_pair = torch.cat([x, x]).to(latent_dtype)
+            t = torch.zeros(x_pair.shape[:-1], device=device, dtype=torch.float32)
+            head = self.image_flow_head
+            if pending_flow_latents is not None and flow_cache is not None:
+                content_conditions = self._order_probe_content_conditions(
+                    pending_hidden=pending_hidden, previous_conditions=pending_flow_conditions,
+                )
+                head.net.forward_with_pending_content(
+                    x_pair[:, 0], head._scale_time(t[:, 0]), z[:, 0],
+                    latent_mixer_cache=flow_cache,
+                    context_latents=pending_flow_latents,
+                    context_conditions=content_conditions,
+                    context_positions=pending_flow_positions,
+                    query_positions=paired_positions[:, 0],
+                )
+            evaluator = self._make_backbone_flow_condition_evaluator(
+                selected_input_ids=selected_input_ids, selected_token_types=selected_token_types,
+                current_sigma=current_sigma, work_latents=work_latents,
+                base_image_latent_mask=base_image_latent_mask, filled=filled,
+                span_starts=span_starts, sample_indices=batch_indices,
+                seq_positions=span_starts[:, None] + positions, local_positions=positions,
+                attention_mask=None, uncond_attention_mask=None, use_flow_cfg=True,
+                backbone_cache_enabled=True, backbone_cond_cache=conditional_cache,
+                backbone_uncond_cache=unconditional_cache, backbone_key_sigma=key_sigma,
+                backbone_key_valid=key_valid, backbone_key_is_image=key_is_target_image,
+                backbone_max_cache_len=sequence_length, full_position_ids=full_position_ids,
+                image_tokens_per_img=image_tokens_per_img, debug_finite=debug_finite,
+                generation_step=step_index + 1,
+            )
+            # Static models keep the original fused probe math. D refreshes
+            # its XT hidden for both (x,t) probes; F has no flow content cache.
+            context = ({"query_positions": paired_positions,
+                        "condition_embedding": head.net.cond_embed(z)}
+                       if flow_cache is not None and evaluator is None else None)
+
+            def probe_velocity(state_x, state_t):
+                condition = evaluator(state_x, state_t[:selected_batch]) if evaluator else z
+                paired_x = torch.cat([state_x, state_x]).to(latent_dtype)
+                if flow_cache is None:
+                    return head.velocity(paired_x, state_t, condition).float()
+                velocity_context = context if context is not None else {
+                    "query_positions": paired_positions,
+                    "condition_embedding": head.net.cond_embed(condition),
+                }
+                return head._velocity_prepared(
+                    paired_x, state_t, condition, velocity_context, flow_cache,
+                ).float()
+
+            velocities = probe_velocity(x, t)
+            vc, vu = velocities.chunk(2)
+            guided = vu + flow_cfg * (vc - vu)
+            next_guided = None
+            if order_strategy in {"confidence_stability", "confidence_halton"}:
+                x_next = x + CONFIDENCE_PROBE_DT * guided
+                v_next = probe_velocity(x_next, t + CONFIDENCE_PROBE_DT)
+                vc_next, vu_next = v_next.chunk(2)
+                next_guided = vu_next + flow_cfg * (vc_next - vu_next)
+            scores = confidence_scores(order_strategy, vc, vu, cfg=flow_cfg,
+                                       next_guided_velocity=next_guided)
+            if not bool(torch.isfinite(scores).all()):
+                raise FloatingPointError("non-finite confidence order scores")
+            if order_strategy != "confidence_halton":
+                permutation = torch.argsort(scores, dim=1, stable=True,
+                                            descending=order_strategy == "confidence_cfg_reverse")
+                generation_orders[:, step_index:stop] = positions.gather(1, permutation)
+            order_scores.scatter_(1, positions, scores)
+            pending_local_positions = None
+            pending_flow_latents = None
+            pending_flow_conditions = None
+            pending_flow_positions = None
 
         for step_index in range(image_tokens_per_img):
             if (
@@ -1149,6 +1271,10 @@ class SelflessGenerationMixin:
                         pending_indices,
                         torch.ones_like(pending_indices, dtype=torch.bool),
                     )
+                if confidence_order and step_index % CONFIDENCE_BLOCK_SIZE == 0:
+                    rank_confidence_block(step_index)
+                    current_local_positions = generation_orders[:, step_index]
+                    current_positions = span_starts + current_local_positions
                 if pair_backbone_cfg:
                     paired_hidden, paired_pending_x0_hidden = cached_query(
                         current_local_positions,
@@ -1514,6 +1640,9 @@ class SelflessGenerationMixin:
                 attention_contract == "xlnet_content_diagonal"
             ),
             "order_strategy": order_strategy,
+            "order_policy": order_policy(order_strategy),
+            "order_confidence_proxy": (order_scores.view(selected_batch, side, side)
+                                       if order_scores is not None else None),
             "generation_order": generation_order,
             "generation_step": generation_order,
             "generation_score": generation_score,

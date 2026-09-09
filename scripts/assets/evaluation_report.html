@@ -11,6 +11,7 @@ button,input,select{font:inherit}button,select{border:1px solid var(--line);back
 header{background:var(--paper);border-bottom:1px solid var(--line)}.wrap{max-width:1640px;margin:auto;padding:26px 38px}.eyebrow{font-size:12px;letter-spacing:.16em;color:var(--accent);font-weight:700}h1{font-size:34px;letter-spacing:-.025em;line-height:1.25;margin:10px 0}h2{font-size:22px;margin:0 0 8px}h3{font-size:17px;margin:0 0 10px}p{margin:8px 0}small,.muted{color:var(--muted)}.header-line{display:flex;align-items:flex-start;justify-content:space-between;gap:20px}.header-links{display:flex;gap:15px;white-space:nowrap;padding-top:18px}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-top:24px}.stat{border-left:3px solid #b9d9d0;padding:0 16px}.stat strong{display:block;font-size:29px;line-height:1.2}.stat span{font-size:13px;color:var(--muted)}
 nav{position:sticky;top:0;background:rgba(255,255,255,.97);border-bottom:1px solid var(--line);z-index:6}.tabs{display:flex;gap:5px;padding:10px 38px;max-width:1640px;margin:auto;overflow:auto}.tabs button{border:0;white-space:nowrap}.tabs button.active{background:var(--pale);color:var(--accent);font-weight:700}.panel[hidden]{display:none}.panel{padding-bottom:35px}.box{background:#fff;border:1px solid var(--line);border-radius:12px;padding:22px;margin:18px 0}.conclusion{background:#eaf3ef;border-color:#c5ded2}.conclusion p{max-width:1100px}.toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin:15px 0}.toolbar .spacer{flex:1}.scroll{overflow:auto;background:white;border:1px solid var(--line);border-radius:10px}.metrics-scroll{max-height:70vh}table{border-collapse:separate;border-spacing:0;min-width:100%;font-variant-numeric:tabular-nums}th,td{padding:13px 16px;border-right:1px solid #edf1f1;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}th{background:#eef4f2;color:#39535a;font-weight:600;font-size:13px;white-space:nowrap;position:sticky;top:0;z-index:2}tr:last-child td{border-bottom:0}.metric{white-space:nowrap;text-align:right}.metric a{color:var(--ink)}.metric a:hover{color:var(--accent)}.best{font-weight:750;background:#edf7f0}.model-name{min-width:220px;max-width:285px;position:sticky;left:0;background:#fff;z-index:1}.focus-row .model-name{border-left:3px solid var(--accent)}th.model-name{background:#eef4f2;z-index:3}.status{display:block;font-size:11px;margin-top:5px;color:var(--muted)}.missing{color:#9aabad}.badge{display:inline-block;background:#edf3f3;color:#486168;border-radius:5px;padding:1px 6px;font-size:11px}.note{font-size:13px;line-height:1.7;color:var(--muted)}.selectors{display:flex;flex-wrap:wrap;gap:7px}.chip{display:flex;align-items:center;gap:6px;background:#fff;border:1px solid var(--line);border-radius:6px;padding:5px 9px;font-size:13px;cursor:pointer}.chip:has(input:checked){background:var(--pale);border-color:#8abca9}input[type=checkbox]{accent-color:var(--accent)}input[type=search]{min-width:260px;flex:1;border:1px solid var(--line);border-radius:7px;padding:8px 11px}.gallery td{min-width:280px;width:280px;padding:14px}.gallery .prompt-cell{position:sticky;left:0;background:#f0f5f3;z-index:1;min-width:260px;max-width:320px;width:280px}.gallery th:first-child{left:0;z-index:3}.gallery img{width:256px;height:256px;object-fit:contain;border-radius:6px;background:#f4f4f1}.gallery p{margin:7px 0}.generated-text{white-space:pre-wrap;overflow-wrap:anywhere;max-height:530px;overflow:auto;line-height:1.7}.prompt-text{white-space:pre-wrap;font-size:13px;overflow-wrap:anywhere}.task-note{display:block;font-size:11px;font-weight:400;color:#816439;white-space:normal;max-width:260px}details{margin:10px 0}summary{cursor:pointer;color:var(--accent)}.gallery-scroll{max-height:76vh}.pagination{display:flex;align-items:center;justify-content:center;gap:15px;margin:15px 0}.pagination button:disabled{opacity:.35;cursor:default}.empty{padding:45px;text-align:center;color:var(--muted)}.links-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:12px}.artifact{display:block;border:1px solid var(--line);border-radius:9px;padding:16px;background:#fff}.artifact small{display:block;overflow-wrap:anywhere}.source-list{overflow-wrap:anywhere}.source-list code{font-size:12px}footer{color:var(--muted);font-size:12px;border-top:1px solid var(--line);padding:22px 0}#error{background:#fff0ec;color:#983e23;padding:20px}noscript{display:block;padding:30px}
 @media(max-width:780px){.wrap{padding:20px 16px}.tabs{padding:8px 12px}.header-line{display:block}.header-links{padding-top:8px}.stats{grid-template-columns:repeat(2,1fr);gap:20px}h1{font-size:28px}.box{padding:16px}.gallery .prompt-cell{position:static;min-width:230px}.model-name{min-width:185px}.toolbar input[type=search]{min-width:180px}.stat strong{font-size:25px}}
+.sweep-plots img{width:100%;height:auto}.sweep-pair{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px}.sweep-pair img{width:min(100%,512px);height:auto;border-radius:8px}.sweep-pair figure{margin:0}.sweep-pair figcaption{margin-bottom:8px}.sweep-toolbar label{min-width:0;max-width:100%}.sweep-toolbar select{max-width:100%}
 </style>
 </head>
 <body>
@@ -20,16 +21,58 @@ nav{position:sticky;top:0;background:rgba(255,255,255,.97);border-bottom:1px sol
   <div class="stats" id="stats"></div><p class="note" id="updated"></p>
 </div></header>
 <nav aria-label="评测视图"><div class="tabs">
-  <button class="active" data-tab="overview">指标与结论</button><button data-tab="t2i">图像生成</button><button data-tab="i2t">图像描述</button><button data-tab="text">文本续写</button><button data-tab="sources">全部文件与协议</button>
+  <button class="active" data-tab="overview">指标与结论</button><button data-tab="matrix">消融矩阵 · CFG 2.0</button><button data-tab="sweep">CFG / Heun 扫描</button><button data-tab="order">Sigma / 解码顺序</button><button data-tab="t2i">图像生成</button><button data-tab="i2t">图像描述</button><button data-tab="text">文本续写</button><button data-tab="sources">全部文件与协议</button>
 </div></nav>
 <main class="wrap">
 <div id="error" hidden></div>
 <section class="panel" id="overview">
-  <div class="box conclusion"><h3>当前结论</h3><div id="conclusion"></div></div>
+  <div class="box conclusion" id="matrix-overview"></div>
+  <div class="box conclusion"><h3>原 CFG=3.5 协议下的模型比较</h3><div id="conclusion"></div></div>
+  <div class="box" id="sweep-overview"></div>
+  <div class="box" id="order-overview"></div>
   <div class="toolbar"><h2>模型指标</h2><span class="spacer"></span><label>指标组 <select id="metric-group"><option value="overview">关键指标</option><option value="text">文本八任务</option><option value="understanding">图像理解</option><option value="coco">COCO 检索</option><option value="flickr">Flickr30K 检索</option><option value="diagnostics">验证诊断</option></select></label></div>
   <p class="note">点击分数查看原始结果。绿色为已收录模型中的数值最优；不表示统计显著。缺失项显示「—」，不会用旧协议或未完成分片补齐。</p>
   <div class="scroll metrics-scroll" id="metrics"></div>
   <div class="box note"><strong>比较范围</strong><p>FID 使用 ImageNet-val 50K，10-step Heun、CFG 3.5、seed 42；用于项目内同协议比较。IS 的 ± 是十个按类别分层 split 的标准差。E 按自身训练约定使用 sequential，其余使用 spatial_halton。</p><p>文本八项均分是内部跨任务摘要；MMBench circular 与 SEED 是内部消融指标。图文组合任务：随机顺序模型 MC64，E 为确定性 MC1。GenEval、DPG-Bench、MJHQ 官方评分独立保留，尚无有效分数的项目不进入本表。</p></div>
+</section>
+<section class="panel" id="matrix" hidden>
+  <h2>完整消融矩阵 · CFG=2.0 / Heun=10</h2>
+  <div class="box conclusion" id="matrix-conclusion"></div>
+  <p class="note">9 个正式模型，各使用自己的 step-95415 final EMA、注意力与 flow 条件。每组 16 卡生成 ImageNet-val 50K，固定 seed 42、逐位置初始噪声、BF16 模型和 FP32 VAE。IS 的 ± 为十个按类别分层 split 的标准差。</p>
+  <div class="box"><h3>同一配置下比较生成顺序</h3><p>全部模型比较 spatial_halton、confidence_stability 与 random。Stability 在接下来的 16 个 Halton 位置中，优先生成一次 Δt=0.1 探测前后引导速度变化较小的位置。探测只读取已生成内容；候选最终都从原始噪声重新解码。Random 对全部 256 个位置取均匀随机排列，固定评测种子与批次划分，不进行候选探测。</p><p class="note">A 保留严格注意力；旧模型保留 shared-query 条件；D 的两次探测均重新计算当前 XT 条件；F 继续使用无跨 token 内容流的逐位置 flow head。E 额外保留 CFG=2.0 的 sequential 对照，以区分 CFG 变化和换序的影响。CFG=2.0 来自 B-X0 的选优，尚未对每个模型分别调参。</p></div>
+  <div class="box sweep-plots" id="matrix-plots"></div>
+  <div class="scroll metrics-scroll" id="matrix-table"></div>
+  <div class="box note" id="matrix-e-control"></div>
+  <div class="box" id="matrix-images-box"><h3>相同提示与噪声 · 跨模型和顺序对照</h3>
+    <div class="toolbar sweep-toolbar"><label>左侧 <select id="matrix-left"></select></label><label>右侧 <select id="matrix-right"></select></label><label>样本 <select id="matrix-sample"></select></label></div>
+    <p class="prompt-text" id="matrix-prompt"></p><div class="sweep-pair" id="matrix-pair"></div>
+    <p class="note">每组保留相同的 64 个验证集样本。顺序图反映实际解码 trace，悬停可查看位置、揭示步和分数。BF16 的探测计算可能产生少量数值差异；单次固定种子的分数差异不代表统计显著。</p>
+  </div>
+</section>
+<section class="panel" id="sweep" hidden>
+  <h2>B_x0 · CFG / Heun 参数扫描</h2>
+  <div class="box conclusion" id="sweep-conclusion"></div>
+  <p class="note">每组 ImageNet-val 50K，固定 seed 42 和逐样本初始噪声。先在 10-step Heun 下以 0.5 为间隔扫描 CFG，再分别对最低 FID 与最高 IS 的 CFG 扫描 5、10、20、50、100 步。边界最优点继续扩展。每组保留横跨验证集的相同 64 张图；± 为十个按类别分层 split 的标准差。</p>
+  <div class="box sweep-plots" id="sweep-plots"></div>
+  <div class="scroll" id="sweep-table"></div>
+  <div class="box" id="sweep-images-box"><h3>同一样本 · 参数对照</h3><p class="note">图片直接来自这次 50K 评测。选择两组参数和一个样本，比较提示词与噪声完全一致的生成结果。</p>
+    <div class="toolbar sweep-toolbar"><label>左侧参数 <select id="sweep-left"></select></label><label>右侧参数 <select id="sweep-right"></select></label><label>样本 <select id="sweep-sample"></select></label></div>
+    <p class="prompt-text" id="sweep-prompt"></p><div class="sweep-pair" id="sweep-pair"></div>
+  </div>
+  <p class="note">这些分数用于验证集上的采样参数选择。其他模型的固定参数指标仍按其原有共同协议呈现。</p>
+</section>
+<section class="panel" id="order" hidden>
+  <h2>B_x0 · Sigma / 解码顺序</h2>
+  <div class="box conclusion" id="order-conclusion"></div>
+  <div class="box" id="cfg-refinement"></div>
+  <p class="note">这里的 sigma 指位置的揭示顺序。所有策略固定 CFG=2.0、Heun=10，在相同的 ImageNet-val 50K、seed 42 和逐位置噪声上比较。真实图像与训练时的 sigma 排列不参与顺序选择。</p>
+  <div class="box"><h3>本次比较的方法</h3><p>Halton 保持空间分散；sequential 逐行扫描；spatial_uniform 是现有的中心向外顺序；random 为每张图抽取随机排列。</p><p>三个新方法每次对接下来的 16 个 Halton 位置评分，利用已生成内容，在组内决定后续顺序。CFG agreement 先选条件与无条件速度预测相近的位置；CFG reverse 反向选择；velocity stability 先选一次 Δt=0.1 的 Euler 探测前后，引导速度变化较小的位置。所有候选最终都从原始噪声重新生成。probe control 执行相同探测并保留 Halton 顺序，用来检查探测开销和数值影响。</p><p class="note">这两个分数是为连续 latent 设计的启发式指标，尚未校准为置信概率。<a href="https://openaccess.thecvf.com/content/CVPR2022/html/Chang_MaskGIT_Masked_Generative_Image_Transformer_CVPR_2022_paper.html">MaskGIT</a> 的高置信优先提供了思路；本实验没有离散 token 的预测概率，因此用速度一致性作可检验的替代。</p></div>
+  <div class="box sweep-plots" id="order-plots"></div><div class="scroll" id="order-table"></div>
+  <div class="box" id="order-images-box"><h3>同提示、同噪声 · 图像和实际解码顺序</h3>
+    <div class="toolbar sweep-toolbar"><label>左侧策略 <select id="order-left"></select></label><label>右侧策略 <select id="order-right"></select></label><label>样本 <select id="order-sample"></select></label></div>
+    <p id="order-prompt" class="prompt-text"></p><div class="sweep-pair" id="order-pair"></div>
+    <p class="note">顺序图由实际生成 trace 绘制，深色较早、浅色较晚；悬停可查看位置、揭示步和分数。每组保留相同的 64 个验证集样本。</p>
+  </div>
 </section>
 <section class="panel" id="qualitative" hidden>
   <h2 id="gallery-title"></h2><p class="note" id="gallery-note"></p>
@@ -67,7 +110,7 @@ function renderMetrics(){
 function renderConclusion(){
  const b=D.models.find(m=>m.id==='b_x0'),d=D.models.find(m=>m.id==='d_on_b');
  const fids=D.models.filter(m=>m.metrics.fid).sort((a,b)=>a.metrics.fid.value-b.metrics.fid.value);
- let text=fids.length?`<p><strong>${esc(fids[0].label)} 的 FID 最低：${fmt(fids[0].metrics.fid)}。</strong>这是当前已完成、已收录的 ${fids.length} 个模型之间的比较。</p>`:'';
+ let text=fids.length?`<p><strong>${esc(fids[0].label)} 的 FID 最低：${fmt(fids[0].metrics.fid)}。</strong>这是 CFG=3.5、Heun=10 的共同协议下，当前已完成、已收录的 ${fids.length} 个模型之间的比较。</p>`:'';
  if(b?.metrics.fid&&d?.metrics.fid)text+=`<p>B_x0 / D：FID <strong>${fmt(b.metrics.fid)} / ${fmt(d.metrics.fid)}</strong>；文本均分 ${fmt(b.metrics.text_macro)} / ${fmt(d.metrics.text_macro)}；ImageNet Top-1 ${fmt(b.metrics.top1)} / ${fmt(d.metrics.top1)}。</p>`;
  text+='<p class="note">FID 描述整批图像的特征分布。形体、构图和提示词遵循请结合成对样本判断；D 的目视优势可以与 B_x0 更低的 FID 同时成立。</p>';
  const pending=D.models.filter(m=>m.selected_root&&!m.complete);if(pending.length)text+=`<p class="note">尚有 ${pending.length} 个模型的项目套件未齐；已完成部分照常展示，缺失项保持空白。</p>`;
@@ -75,7 +118,7 @@ function renderConclusion(){
 }
 function showTab(tab){
  state.tab=tab;const isGallery=['t2i','i2t','text'].includes(tab);
- $('overview').hidden=tab!=='overview';$('sources').hidden=tab!=='sources';$('qualitative').hidden=!isGallery;
+ $('overview').hidden=tab!=='overview';$('sources').hidden=tab!=='sources';$('sweep').hidden=tab!=='sweep';$('order').hidden=tab!=='order';$('matrix').hidden=tab!=='matrix';$('qualitative').hidden=!isGallery;
  document.querySelectorAll('[data-tab]').forEach(b=>b.classList.toggle('active',b.dataset.tab===tab));
  if(isGallery){state.task=tab;state.page=0;setupTask();renderGallery()}
 }
@@ -119,6 +162,101 @@ function renderGallery(){
  }
  $('gallery').innerHTML=content+'</tbody></table>';$('gallery').scrollTop=0;
 }
+function sweepChoice(arm){return `CFG ${arm.cfg.toFixed(1)} · Heun ${arm.steps??arm.heun_steps} · FID ${(arm.result?.fid??arm.fid).toFixed(4)} · IS ${(arm.result?.is??arm.is).toFixed(2)}`}
+const orderLabels={spatial_halton:'Halton',sequential:'Sequential',spatial_uniform:'Center-out',random:'Random',confidence_cfg:'CFG agreement',confidence_cfg_reverse:'CFG reverse',confidence_stability:'Velocity stability',confidence_halton:'Probe control'};
+function renderMatrix(){
+ const s=D.matrix_sweeps?.[0];if(!s){$('matrix-overview').hidden=true;$('matrix-conclusion').textContent='尚未收录新参数消融矩阵。';$('matrix-images-box').hidden=true;return}
+ const hasRandom=s.strategies?.includes('random');
+ let text=`<h3>消融矩阵 · CFG=2.0、Heun=10</h3><p>已完成 ${s.completed} / ${s.total} 组；9 个模型分别比较 Halton、confidence_stability${hasRandom?'、Random':''}，另含 E 的 sequential 对照。</p>`;
+ if(s.conclusion){const c=s.conclusion,b=c.best_halton,v=c.best_stability;
+  text+=`<p><strong>Halton 最低 FID：${esc(b.label)}，${b.fid.toFixed(4)}</strong>，IS ${b.is.toFixed(2)} ± ${b.is_std.toFixed(2)}。<br><strong>confidence_stability 最低 FID：${esc(v.label)}，${v.fid.toFixed(4)}</strong>，IS ${v.is.toFixed(2)} ± ${v.is_std.toFixed(2)}。</p>`;
+  const bi=c.best_is_halton,vi=c.best_is_stability;
+  text+=`<p>最高 IS：Halton 为 ${esc(bi.label)}，${bi.is.toFixed(2)} ± ${bi.is_std.toFixed(2)}（FID ${bi.fid.toFixed(4)}）；Stability 为 ${esc(vi.label)}，${vi.is.toFixed(2)} ± ${vi.is_std.toFixed(2)}（FID ${vi.fid.toFixed(4)}）。</p>`;
+  text+=`<p>切换到 confidence_stability 后，${c.improved_fid_models.length} / 9 个模型的 FID 降低，${c.improved_is_models.length} / 9 个模型的 IS 提高。共保存 ${s.total*64} 张配对图及实际解码顺序。</p>`;
+  const dc=s.models.find(m=>m.model==='d_on_b').strategies;
+  if(dc.confidence_stability.fid>dc.spatial_halton.fid&&dc.confidence_stability.is>dc.spatial_halton.is)text+=`<p>D 的 Stability 存在指标取舍：FID ${dc.spatial_halton.fid.toFixed(4)} → ${dc.confidence_stability.fid.toFixed(4)}，IS ${dc.spatial_halton.is.toFixed(2)} → ${dc.confidence_stability.is.toFixed(2)}，IS 提升伴随 FID 上升。</p>`;
+  if(c.best_random){const r=c.best_random,ri=c.best_is_random;text+=`<p><strong>Random 最低 FID：${esc(r.label)}，${r.fid.toFixed(4)}</strong>，IS ${r.is.toFixed(2)} ± ${r.is_std.toFixed(2)}；最高 IS 为 ${esc(ri.label)}，${ri.is.toFixed(2)} ± ${ri.is_std.toFixed(2)}（FID ${ri.fid.toFixed(4)}）。相比 Halton，Random 在 ${c.random_improved_fid_models.length} / 9 个模型上降低 FID，在 ${c.random_improved_is_models.length} / 9 个模型上提高 IS。</p>`}
+  if(c.cfg2_native_fid_improved)text+=`<p>保持各模型原生顺序，将 CFG 从 3.5 降到 2.0：${c.cfg2_native_fid_improved.length} / 9 个模型的 FID 降低，${c.cfg2_native_is_improved.length} / 9 个模型的 IS 提高；E 使用额外的 sequential 结果比较。CFG=2.0 来自 B-X0 的选优，尚未对其余模型分别调参。</p>`;
+  if(c.best_cfg3p5_native)text+=`<p>原生顺序下的最低 FID 模型：CFG=3.5 时为 ${esc(c.best_cfg3p5_native.label)}（${c.best_cfg3p5_native.fid.toFixed(4)}），CFG=2.0 时为 ${esc(c.best_cfg2_native.label)}（${c.best_cfg2_native.fid.toFixed(4)}）。模型排名会受到推理参数影响。</p>`;
+  const ec=s.models.find(m=>m.model==='e_on_b').strategies;
+  text+=`<p><strong>E 应单独看待：</strong>其训练采用 sequential，本轮原生顺序 FID 为 ${ec.sequential.fid.toFixed(4)}，改用 Halton / Stability${hasRandom?' / Random':''} 为 ${ec.spatial_halton.fid.toFixed(4)} / ${ec.confidence_stability.fid.toFixed(4)}${hasRandom?' / '+ec.random.fid.toFixed(4):''}。${Math.min(ec.spatial_halton.fid,ec.confidence_stability.fid,ec.random?.fid??Infinity)>ec.sequential.fid?'本协议下应保留 sequential。':''}</p>`;
+ }else text+='<p>其余组合仍在评测；完整矩阵就绪后再给出最终排名。</p>';
+ $('matrix-overview').innerHTML=text+'<button id="open-matrix">查看完整矩阵、变化幅度和样图</button>';$('open-matrix').onclick=()=>showTab('matrix');
+ $('matrix-conclusion').innerHTML=text+`<p><a href="${esc(s.root)}/results.csv">结果 CSV</a> · <a href="${esc(s.root)}/protocol.json">冻结协议</a> · <a href="${esc(s.root)}/README.md">实验记录</a>${s.conclusion?` · <a href="${esc(s.root)}/RESULTS_ZH.md">完整分析</a> · <a href="${esc(s.root)}/audit.json">产物核验</a>`:''}</p>`;
+ const score=(r,key)=>r?.status==='done'?`<a href="${esc(r.metrics_path)}">${r[key].toFixed(key==='fid'?4:2)}${key==='is'?' ± '+r.is_std.toFixed(2):''}</a>`:'<span class="missing">—</span>';
+ const delta=v=>(v>=0?'+':'')+v.toFixed(4);
+ $('matrix-table').innerHTML='<table><thead><tr><th class="model-name">模型</th><th>原 CFG 3.5 / 原生顺序<br>FID / IS</th><th>CFG 2 / Halton<br>FID ↓</th><th>Halton<br>IS ↑</th><th>CFG 2 / Stability<br>FID ↓</th><th>Stability<br>IS ↑</th>'+(hasRandom?'<th>CFG 2 / Random<br>FID ↓</th><th>Random<br>IS ↑</th>':'')+'<th>Stability − Halton<br>ΔFID ↓</th>'+(hasRandom?'<th>Random − Halton<br>ΔFID ↓</th>':'')+'<th>Stability / Halton<br>生成耗时</th></tr></thead><tbody>'+s.models.map(m=>{const b=m.strategies.spatial_halton,v=m.strategies.confidence_stability,r=m.strategies.random,ready=b?.status==='done'&&v?.status==='done',randomReady=b?.status==='done'&&r?.status==='done';return `<tr><td class="model-name">${esc(m.label)}<span class="status">原生顺序：${esc(orderLabels[m.native_strategy])}</span></td><td class="metric">${m.previous.fid?`<a href="${esc(m.previous.fid.source)}">${m.previous.fid.value.toFixed(4)} / ${m.previous.is.value.toFixed(2)}</a>`:'—'}</td><td class="metric">${score(b,'fid')}</td><td class="metric">${score(b,'is')}</td><td class="metric">${score(v,'fid')}</td><td class="metric">${score(v,'is')}</td>${hasRandom?`<td class="metric">${score(r,'fid')}</td><td class="metric">${score(r,'is')}</td>`:''}<td class="metric ${ready&&v.fid<b.fid?'best':''}">${ready?delta(v.fid-b.fid):'—'}</td>${hasRandom?`<td class="metric ${randomReady&&r.fid<b.fid?'best':''}">${randomReady?delta(r.fid-b.fid):'—'}</td>`:''}<td class="metric">${ready?(v.generation_seconds/b.generation_seconds).toFixed(3)+'×<span class="status">'+(b.generation_seconds/60).toFixed(1)+' → '+(v.generation_seconds/60).toFixed(1)+' 分钟</span>':'—'}</td></tr>`}).join('')+'</tbody></table>';
+ const e=s.models.find(m=>m.model==='e_on_b'),seq=e?.strategies.sequential;
+ $('matrix-e-control').innerHTML=`<strong>E 的原生顺序对照</strong><p>CFG=2.0、Heun=10、sequential：FID ${score(seq,'fid')}，IS ${score(seq,'is')}。与原 CFG=3.5 / sequential 比较只改变 CFG；与本轮 Halton 或 Stability 比较只改变顺序。</p>`;
+ if(seq?.status==='done'&&e.strategies.spatial_halton.status==='done'&&e.strategies.confidence_stability.status==='done'){
+  const er=e.strategies.random,allReady=!hasRandom||er?.status==='done';
+  $('matrix-e-control').innerHTML+=`<p>本轮 Halton / Stability 相对 sequential 的 ΔFID 为 ${delta(e.strategies.spatial_halton.fid-seq.fid)} / ${delta(e.strategies.confidence_stability.fid-seq.fid)}。${hasRandom?(er?.status==='done'?'Random 相对 sequential 的 ΔFID 为 '+delta(er.fid-seq.fid)+'。':'Random 对照仍在评测。'):''}${allReady&&Math.min(e.strategies.spatial_halton.fid,e.strategies.confidence_stability.fid,er?.fid??Infinity)>seq.fid?'E 在本协议下应保留训练时的 sequential 顺序。':''}</p>`;
+ }
+ $('matrix-plots').hidden=!s.plots.length;$('matrix-plots').innerHTML=s.plots.map(p=>`<a href="${esc(p)}"><img src="${esc(p)}" alt="消融矩阵 FID 与 IS 对照，图中标注包含的模型范围"></a>`).join('');
+ const done=s.rows.filter(r=>r.status==='done');$('matrix-images-box').hidden=!done.length;if(!done.length)return;
+ for(const side of ['left','right'])$('matrix-'+side).innerHTML=done.map(r=>`<option value="${esc(r.id)}">${esc(r.label)} · ${esc(orderLabels[r.strategy])}</option>`).join('');
+ $('matrix-left').value=done.find(r=>r.model==='b_x0'&&r.strategy==='spatial_halton')?.id??done[0].id;
+ $('matrix-right').value=done.find(r=>r.model==='b_x0'&&r.strategy==='confidence_stability')?.id??done[done.length-1].id;
+ $('matrix-sample').innerHTML=s.samples.map((r,i)=>`<option value="${i}">#${r.global_sample_index} · noise ${r.canonical_noise_seed}</option>`).join('');
+ const pair=()=>{const i=Number($('matrix-sample').value),sample=s.samples[i];$('matrix-prompt').textContent=sample.prompt;
+  $('matrix-pair').innerHTML=['left','right'].map(side=>{const r=done.find(r=>r.id===$('matrix-'+side).value),trace=r.orders[i];return `<figure><figcaption>${esc(r.label)} · ${esc(orderLabels[r.strategy])}<br>FID ${r.fid.toFixed(4)} · IS ${r.is.toFixed(2)}</figcaption><a href="${esc(r.images[i])}"><img src="${esc(r.images[i])}" alt="${esc(sample.prompt)}"></a>${orderMap(trace)}<a href="${esc(trace.source)}">实际解码顺序与分数</a></figure>`}).join('')};
+ for(const id of ['matrix-left','matrix-right','matrix-sample'])$(id).onchange=pair;pair();
+}
+function orderMap(trace){
+ const ranks=trace.generation_order,n=ranks.length,total=n*n,proxy=trace.confidence_proxy;
+ return `<svg viewBox="0 0 ${n*16} ${n*16}" style="width:256px;max-width:100%;display:block;margin:12px 0" role="img" aria-label="实际解码顺序">`+ranks.flatMap((row,y)=>row.map((rank,x)=>`<rect x="${x*16}" y="${y*16}" width="15" height="15" fill="hsl(215 66% ${24+65*(rank-1)/(total-1)}%)"><title>位置 (${y}, ${x}) · 第 ${rank} 步${proxy?' · 分数 '+proxy[y][x].toPrecision(5):''}</title></rect>`)).join('')+'</svg>';
+}
+function renderOrder(){
+ const s=D.order_sweeps?.[0];if(!s){$('order-overview').hidden=true;$('order-conclusion').textContent='尚未收录解码顺序实验。';$('order-images-box').hidden=true;return}
+ let text=`<h3>B_x0 · 固定最佳 FID 参数后的顺序比较</h3><p>已完成 ${s.completed} / ${s.total} 组；CFG=2.0，Heun=10，每组 16 卡、50K 张图。</p>`;
+ if(s.conclusion){const best=s.conclusion.best_fid,base=s.conclusion.baseline,r=best.result;
+  text+=`<p><strong>最低 FID：${esc(orderLabels[best.strategy])}，FID ${r.fid.toFixed(4)}，IS ${r.is.toFixed(2)} ± ${r.is_std.toFixed(2)}。</strong>相对 Halton 的 FID 下降 ${s.conclusion.fid_reduction.toFixed(4)}；生成耗时 ${(r.generation_seconds/60).toFixed(1)} 分钟，Halton 为 ${(base.result.generation_seconds/60).toFixed(1)} 分钟。</p>`;
+  text+=`<p>本轮最低 FID 配置：<code>CFG=2.0 · Heun=10 · order_strategy=${esc(best.strategy)}</code>。已保存 ${s.total*64} 张配对样图及实际解码顺序。</p>`;
+  if(s.controls){const c=s.controls;text+=`<p class="note">Halton 已复现上一轮选定参数的结果。保持原顺序的探测对照相对 Halton：FID 变化 ${c.probe_control_fid_delta>=0?'+':''}${c.probe_control_fid_delta.toFixed(4)}，IS 变化 ${c.probe_control_is_delta>=0?'+':''}${c.probe_control_is_delta.toFixed(2)}，耗时 ${c.probe_control_time_ratio.toFixed(2)}×。BF16 下探测会改变融合计算的矩阵形状，数值差异已单独保留；小幅优势不等于统计显著。</p>`}
+ }else text+='<p>实验尚未全部完成，暂不宣布顺序最优结论。</p>';
+ $('order-overview').innerHTML=text+'<button id="open-order">查看顺序对比和样图</button>';$('open-order').onclick=()=>showTab('order');
+ $('order-conclusion').innerHTML=text+`<p><a href="${esc(s.root)}/results.csv">结果 CSV</a> · <a href="${esc(s.root)}/protocol.json">冻结协议</a> · <a href="${esc(s.root)}/cfg-refinement.json">CFG 邻域复核</a></p>`;
+ const f=s.refinement;$('cfg-refinement').innerHTML=`<h3>最终步数下的 CFG 邻域已覆盖</h3><p>Heun=${f.selected_heun_steps}，复核 ${f.cfg_values.join('、')}，覆盖候选 CFG=2.0 周围的 ±0.5、±1.0。复用已完成且协议一致的 50K 评测；最优点 2.0 位于内部，无需继续扩展。</p><div class="scroll"><table><thead><tr><th>CFG</th><th>FID ↓</th><th>IS ↑</th></tr></thead><tbody>`+f.arms.map(a=>`<tr><td>${a.cfg.toFixed(1)}</td><td>${a.result.fid.toFixed(4)}</td><td>${a.result.is.toFixed(2)} ± ${a.result.is_std.toFixed(2)}</td></tr>`).join('')+'</tbody></table></div>';
+ $('order-plots').hidden=!s.plots.length;$('order-plots').innerHTML=s.plots.map(p=>`<a href="${esc(p)}"><img src="${esc(p)}" alt="解码顺序的 FID、IS 和耗时比较"></a>`).join('');
+ const rows=[...s.rows].sort((a,b)=>(a.fid??Infinity)-(b.fid??Infinity));
+ $('order-table').innerHTML='<table><thead><tr><th>策略</th><th>FID ↓</th><th>IS ↑</th><th>50K 生成耗时</th><th>状态</th></tr></thead><tbody>'+rows.map(r=>`<tr><td>${esc(orderLabels[r.strategy])}</td><td>${r.status==='done'?`<a href="${esc(r.metrics_path)}">${r.fid.toFixed(4)}</a>`:'—'}</td><td>${r.status==='done'?r.is.toFixed(2)+' ± '+r.is_std.toFixed(2):'—'}</td><td>${r.status==='done'?(r.generation_seconds/60).toFixed(1)+' 分钟':'—'}</td><td>${esc(r.status)}</td></tr>`).join('')+'</tbody></table>';
+ const done=rows.filter(r=>r.status==='done');$('order-images-box').hidden=!done.length;if(!done.length)return;
+ for(const side of ['left','right'])$('order-'+side).innerHTML=done.map(r=>`<option value="${esc(r.id)}">${esc(orderLabels[r.strategy])} · FID ${r.fid.toFixed(4)}</option>`).join('');
+ $('order-left').value=done.find(r=>r.strategy==='spatial_halton')?.id??done[0].id;
+ const bestAlternative=done.find(r=>!['spatial_halton','confidence_halton'].includes(r.strategy))??done[done.length-1];
+ $('order-right').value=s.conclusion&&s.conclusion.best_fid.strategy!=='spatial_halton'?s.conclusion.best_fid.id:bestAlternative.id;
+ $('order-sample').innerHTML=s.samples.map((r,i)=>`<option value="${i}">#${r.global_sample_index} · noise ${r.canonical_noise_seed}</option>`).join('');
+ const pair=()=>{const i=Number($('order-sample').value),sample=s.samples[i];$('order-prompt').textContent=sample.prompt;
+  $('order-pair').innerHTML=['left','right'].map(side=>{const a=done.find(r=>r.id===$('order-'+side).value),trace=a.orders[i];return `<figure><figcaption>${esc(orderLabels[a.strategy])} · FID ${a.fid.toFixed(4)}</figcaption><a href="${esc(a.images[i])}"><img src="${esc(a.images[i])}" alt="${esc(sample.prompt)}"></a>${orderMap(trace)}<a href="${esc(trace.source)}">实际解码顺序与分数 JSON</a></figure>`}).join('')};
+ for(const id of ['order-left','order-right','order-sample'])$(id).onchange=pair;pair();
+}
+function renderSweep(){
+ const s=D.sampling_sweeps?.[0];
+ if(!s){$('sweep-overview').hidden=true;$('sweep-conclusion').textContent='尚未收录采样参数扫描。';$('sweep-images-box').hidden=true;return}
+ const status=s.status==='complete'?'全部完成':s.status==='failed'?'执行中断，等待处理':'运行中';
+ let text=`<h3>${esc(s.label)}</h3><p>${status} · 已完成 ${s.completed} / ${s.total} 组 · 当前阶段 ${s.phase==='cfg'?'CFG':'Heun steps'}。</p>`;
+ if(s.conclusion){const f=s.conclusion.best_fid,i=s.conclusion.best_is;
+  text+=`<p><strong>已测组合最低 FID：${f.result.fid.toFixed(4)}</strong>，CFG=${f.cfg.toFixed(1)}、Heun=${f.steps}，对应 IS ${f.result.is.toFixed(2)} ± ${f.result.is_std.toFixed(2)}。</p><p><strong>已测组合最高 IS：${i.result.is.toFixed(2)} ± ${i.result.is_std.toFixed(2)}</strong>，CFG=${i.cfg.toFixed(1)}、Heun=${i.steps}，对应 FID ${i.result.fid.toFixed(4)}。</p><p>相对 CFG=3.5 / Heun=10：最低 FID 降低 ${s.conclusion.fid_reduction.toFixed(4)}，最高 IS 提高 ${s.conclusion.is_increase.toFixed(2)}。</p>`;
+  text+=`<p>最低 FID 配置的 50K 生成耗时为 ${(f.result.generation_seconds/60).toFixed(1)} 分钟；最高 IS 配置为 ${(i.result.generation_seconds/60).toFixed(1)} 分钟，均使用 16 张 NPU。</p>`;
+  const fifty=s.rows.find(r=>r.status==='done'&&r.cfg===i.cfg&&r.heun_steps===50),hundred=s.rows.find(r=>r.status==='done'&&r.cfg===i.cfg&&r.heun_steps===100);
+  if(fifty&&hundred){const gain=hundred.is-fifty.is;text+=`<p>在 CFG=${i.cfg.toFixed(1)} 下，50→100 步的 IS 变化为 ${gain>=0?'+':''}${gain.toFixed(3)}，50K 生成耗时从 ${(fifty.generation_seconds/60).toFixed(1)} 分钟增加到 ${(hundred.generation_seconds/60).toFixed(1)} 分钟。</p>`}
+ }else if(s.cfg_selection){text+='<p>10-step CFG 选优：'+Object.entries(s.cfg_selection).map(([key,a])=>`${key==='best_fid'?'最低 FID':'最高 IS'} → CFG ${a.cfg.toFixed(1)}`).join('；')+'。Heun 步数扫描尚未完成。</p>'}
+ if(s.error)text+='<p class="note">执行记录已保存在实验目录；当前尚无完整结论。</p>';
+ const links=`<p><a href="${esc(s.root)}/results.csv">结果 CSV</a> · <a href="${esc(s.root)}/summary.json">完整指标</a> · <a href="${esc(s.root)}/README.md">实验记录</a></p>`;
+ $('sweep-overview').innerHTML=text+'<button id="open-sweep">查看曲线、结果表和成对图片</button>';
+ $('open-sweep').addEventListener('click',()=>showTab('sweep'));
+ $('sweep-conclusion').innerHTML=text+links;
+ $('sweep-plots').hidden=!s.plots.length;$('sweep-plots').innerHTML=s.plots.map(p=>`<a href="${esc(p)}"><img src="${esc(p)}" alt="CFG 或 Heun 的 FID / IS 曲线"></a>`).join('');
+ const rows=[...s.rows].sort((a,b)=>a.phase.localeCompare(b.phase)||a.cfg-b.cfg||a.heun_steps-b.heun_steps);
+ $('sweep-table').innerHTML='<table><thead><tr><th>阶段</th><th>CFG</th><th>Heun 步数</th><th>FID ↓</th><th>IS ↑</th><th>50K 生成耗时</th><th>状态</th></tr></thead><tbody>'+rows.map(r=>`<tr><td>${r.phase==='cfg'?'CFG':'Heun'}</td><td>${r.cfg.toFixed(1)}</td><td>${r.heun_steps}</td><td>${r.status==='done'?`<a href="${esc(r.metrics_path)}">${r.fid.toFixed(4)}</a>`:'—'}</td><td>${r.status==='done'?r.is.toFixed(2)+' ± '+r.is_std.toFixed(2):'—'}</td><td>${r.status==='done'?(r.generation_seconds/60).toFixed(1)+' 分钟':'—'}</td><td>${esc(r.status)}</td></tr>`).join('')+'</tbody></table>';
+ const done=rows.filter(r=>r.status==='done'&&r.images?.length);$('sweep-images-box').hidden=!done.length;if(!done.length)return;
+ for(const side of ['left','right'])$('sweep-'+side).innerHTML=done.map(r=>`<option value="${esc(r.id)}">${sweepChoice(r)}</option>`).join('');
+ $('sweep-left').value=s.conclusion?.best_fid.id??s.cfg_selection?.best_fid.id??done[0].id;$('sweep-right').value=s.conclusion?.best_is.id??s.cfg_selection?.best_is.id??done[done.length-1].id;
+ $('sweep-sample').innerHTML=s.samples.map((r,i)=>`<option value="${i}">#${r.global_sample_index} · noise ${r.canonical_noise_seed}</option>`).join('');
+ const renderPair=()=>{const index=Number($('sweep-sample').value),sample=s.samples[index];$('sweep-prompt').textContent=sample.prompt;
+  $('sweep-pair').innerHTML=['left','right'].map(side=>{const arm=done.find(r=>r.id===$('sweep-'+side).value),path=arm.images[index];return `<figure><figcaption>${sweepChoice(arm)}</figcaption><a href="${esc(path)}"><img src="${esc(path)}" alt="${esc(sample.prompt)}"></a></figure>`}).join('')};
+ for(const id of ['sweep-left','sweep-right','sweep-sample'])$(id).addEventListener('change',renderPair);renderPair();
+}
 function initialize(){
  $('stats').innerHTML=[[D.qualitative_models,'模型 final EMA'],[D.formal_models,'已有正式指标'],[D.qualitative_records.toLocaleString(),'条定性输出'],[D.formal_complete_models,'已完成项目套件']].map(([n,t])=>`<div class="stat"><strong>${n}</strong><span>${t}</span></div>`).join('');
  $('updated').textContent=`指标快照：${D.updated_at.replace('T',' ').replace('+00:00',' UTC')} · 未完成结果保留空白。`;
@@ -131,7 +269,7 @@ function initialize(){
  $('metric-group').addEventListener('change',renderMetrics);$('reload').addEventListener('click',()=>location.reload());
  for(const id of ['sample-search','sample-group','sample-mode','page-size'])$(id).addEventListener(id==='sample-search'?'input':'change',()=>{state.page=0;renderGallery()});
  $('previous').addEventListener('click',()=>{state.page--;renderGallery()});$('next').addEventListener('click',()=>{state.page++;renderGallery()});
- renderMetrics();renderConclusion();renderSelectors();
+ renderMetrics();renderConclusion();renderSelectors();renderSweep();renderOrder();renderMatrix();
 }
 try{initialize()}catch(error){$('error').hidden=false;$('error').textContent='报告显示失败：'+error.message;throw error}
 </script>

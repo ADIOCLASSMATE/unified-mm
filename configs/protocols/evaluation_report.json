@@ -1,6 +1,13 @@
 {
   "schema": "unified_evaluation_report_selection_v1",
+  "matrix_sweeps": [{"root": "ablation-matrix/cfg2-heun10-order-20260909-r1"}],
   "qualitative": "qualitative/unified-all-final-ema-20260908-r1",
+  "order_sweeps": [{"model": "b_x0", "root": "unified-b-x0content-0p6b/sweeps/order-20260908-r1"}],
+  "sampling_sweeps": [{
+    "model": "b_x0",
+    "label": "B_x0 · CFG / Heun 参数扫描",
+    "root": "unified-b-x0content-0p6b/sweeps/cfg-heun-20260908-r1"
+  }],
   "models": {
     "b_x0": {"root": "unified-b-x0content-0p6b/checkpoints/step-95415-ema-native-full-20260906-r1"},
     "b_flowdiag": {"root": "unified-b-flowdiag-0p6b/final-ema-native-full-20260907-r1"},

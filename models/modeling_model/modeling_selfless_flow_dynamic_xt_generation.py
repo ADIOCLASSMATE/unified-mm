@@ -23,6 +23,13 @@ class DynamicXtGenerationMixin:
 
     _supports_paired_backbone_cfg = False
 
+    def _order_probe_content_conditions(self, *, pending_hidden, previous_conditions):
+        del previous_conditions
+        if pending_hidden is None:
+            raise RuntimeError("Dynamic-XT confidence probe lost pending X0 content")
+        self._dynamic_xt_content_condition_commits += 1
+        return self._prepare_image_flow_condition(pending_hidden)
+
     def sample_image_flow_with_cfg(self, z, *args, **kwargs):
         """Replace D's retired static-query content condition with fused X0."""
 
@@ -98,14 +105,15 @@ class DynamicXtGenerationMixin:
         debug_finite = bool(state["debug_finite"])
         generation_step = int(state["generation_step"])
         batch_size = int(sample_indices.numel())
+        multiple_queries = seq_positions.ndim == 2
+        query_indices = seq_positions if multiple_queries else seq_positions.unsqueeze(1)
+        query_count = query_indices.shape[1]
         device = selected_input_ids.device
         self._dynamic_xt_generation_span_starts = state["span_starts"]
 
         def cache_mask(image_uncond: bool):
-            query_sigma = current_sigma[
-                sample_indices,
-                seq_positions,
-            ].unsqueeze(1)
+            query_sigma = (torch.gather(current_sigma, 1, query_indices) if multiple_queries else
+                           current_sigma[sample_indices, seq_positions].unsqueeze(1))
             allowed = state["backbone_key_valid"].unsqueeze(1) & (
                 state["backbone_key_sigma"].unsqueeze(1)
                 < query_sigma.unsqueeze(-1)
@@ -123,17 +131,17 @@ class DynamicXtGenerationMixin:
                 mask_mod,
                 B=batch_size,
                 H=None,
-                Q_LEN=1,
+                Q_LEN=query_count,
                 KV_LEN=int(state["backbone_max_cache_len"]),
                 device=device,
             )
 
         def evaluate_branch(x_t, t, *, image_uncond: bool):
-            aligned_x_t = x_t.unsqueeze(1)
-            aligned_t = t.unsqueeze(1)
+            aligned_x_t = x_t if multiple_queries else x_t.unsqueeze(1)
+            aligned_t = t if multiple_queries else t.unsqueeze(1)
             dynamic_query_mask = torch.ones(
                 batch_size,
-                1,
+                query_count,
                 device=device,
                 dtype=torch.bool,
             )
@@ -143,16 +151,14 @@ class DynamicXtGenerationMixin:
                     raise RuntimeError(
                         "Dynamic-XT cached flow evaluation requires one query per row"
                     )
-                query_indices = seq_positions.unsqueeze(1)
                 position_ids = torch.gather(
                     state["full_position_ids"],
                     dim=2,
                     index=query_indices.unsqueeze(0).expand(2, -1, -1),
                 )
-                query_latents = work_latents[
-                    sample_indices,
-                    seq_positions,
-                ].unsqueeze(1)
+                query_latents = (torch.gather(work_latents, 1,
+                    query_indices.unsqueeze(-1).expand(-1, -1, self.image_latent_dim))
+                    if multiple_queries else work_latents[sample_indices, seq_positions].unsqueeze(1))
                 hidden = self.model(
                     X0_input_ids=torch.gather(
                         selected_input_ids,
@@ -185,8 +191,12 @@ class DynamicXtGenerationMixin:
                         f"dynamic_xt_{'uncond' if image_uncond else 'cond'}_"
                         f"flow_eval_generation_step={generation_step}"
                     ),
-                ).last_hidden_state[:, 0]
+                ).last_hidden_state
+                if not multiple_queries:
+                    hidden = hidden[:, 0]
             else:
+                if multiple_queries:
+                    raise ValueError("Dynamic-XT candidate probes require a read-only backbone cache")
                 full_x_t = torch.zeros(
                     *selected_input_ids.shape,
                     self.image_latent_dim,
