@@ -1,0 +1,161 @@
+# Fresh B image-task controls: same source dataset and exposure as unified B.
+schema: unified_b_image_only_matched_v1
+base_config: configs/selfless/unified_baseline_100b_ascend_64npu.yaml
+platform_project: 随机序语言建模-统一自回归与掩码扩散的随机顺序生成框架
+world_size: 16
+nodes: 1
+npu_per_node: 16
+seed: 42
+initialization: qwen3_0p6b_base_step_zero
+architecture_variant: selfless_contextual
+training_objective: selfless_dual_stream
+dual_stream_attention_contract: xlnet_content_diagonal
+flow_head_attention_contract: xlnet_content_diagonal
+flow_condition_contract: backbone_xt_query_backbone_x0_content
+target_physical_tokens_per_run: 50024939520
+runtime_hashing_enabled: false
+wandb_mode: disabled
+batch_shape_selection:
+  climbmix:
+    rejected:
+    - GA1/B32 forward OOM
+    - GA2/B16 forward OOM
+    - GA4/B8 backward OOM
+    selected: GA8/B4/L2048
+    five_step_training_wall_seconds: 27.612201690673828
+  i2t:
+    rejected:
+    - GA1/B64/L512 forward OOM
+    selected: GA2/B32/L512
+    five_step_training_wall_seconds: 11.544341087341309
+    lower_padding_comparator: 'GA9/B8/[448x8,512]: 15.443490028381348 seconds'
+  t2i:
+    selected: GA2/B32/L512 with shared X0 content and flow checkpointing
+    peak_allocated_bytes: 56989097472
+    steady_seconds_per_step_approx: 2.5
+    ga4_b16_steady_seconds_per_step_approx: 2.8
+    historical_rejections: GA1/B64 and GA2/B32 OOMs were measured before shared-content
+      infrastructure.
+    measurement_reference: output/experiments/unified-b-image-only-matched/launch-20260910-r1/perf-ga2.log
+loss_scaling_contract:
+  mode: full_single_task_objective
+  lambda_text: 0.05
+  lambda_image: 1.0
+  matches_combined_source_gradient_fraction: false
+comparison_scope:
+  mode: equal_source_exposure_to_unified_b
+  combined_label_is_nominal_climbmix_targets: true
+  combined_total_physical_tokens: 200099758080
+  combined_cumulative_source_physical_tokens:
+    climbmix: 100049879040
+    i2t: 50024939520
+    t2i: 50024939520
+  matches_combined_source_exposure: true
+combined_reference:
+  world_size: 64
+  source_schedule:
+  - climbmix
+  - t2i
+  - climbmix
+  - i2t
+  physical_tokens_per_optimizer_step: 2097152
+  source_contributions:
+    climbmix:
+      occurrences: 2
+      per_rank_micro_batch: 4
+      sequence_length: 2048
+      physical_tokens_per_optimizer_step: 1048576
+    i2t:
+      occurrences: 1
+      per_rank_micro_batch: 16
+      padded_sequence_length: 512
+      physical_tokens_per_optimizer_step: 524288
+    t2i:
+      occurrences: 1
+      per_rank_micro_batch: 16
+      padded_sequence_length: 512
+      physical_tokens_per_optimizer_step: 524288
+  max_train_steps: 95415
+single_source_runs:
+  i2t:
+    config: configs/selfless/unified_b_i2t_only_matched_ascend16.yaml
+    job_name: umm-b-i2t-only-bmatched-16-s42-r1
+    output_root: output/unified-b-x0content-0p6b-i2t-only-bmatched-s42-r1
+    per_rank_micro_batch: 32
+    pad_to_length_schedule:
+    - 512
+    - 512
+    gradient_accumulation_steps: 2
+    logical_samples_per_optimizer_step: 1024
+    combined_source_logical_samples_per_optimizer_step: 1024
+    physical_tokens_per_rank_per_optimizer_step: 32768
+    physical_tokens_per_optimizer_step: 524288
+    max_train_steps: 95415
+    actual_physical_tokens: 50024939520
+    overshoot_physical_tokens: 0
+    warmup_steps: 596
+    decay_steps: 23854
+  t2i:
+    config: configs/selfless/unified_b_t2i_only_matched_ascend16.yaml
+    job_name: umm-b-t2i-only-bmatched-16-s42-r1
+    output_root: output/unified-b-x0content-0p6b-t2i-only-bmatched-s42-r1
+    per_rank_micro_batch: 32
+    pad_to_length_schedule:
+    - 512
+    - 512
+    gradient_accumulation_steps: 2
+    logical_samples_per_optimizer_step: 1024
+    combined_source_logical_samples_per_optimizer_step: 1024
+    physical_tokens_per_rank_per_optimizer_step: 32768
+    physical_tokens_per_optimizer_step: 524288
+    max_train_steps: 95415
+    actual_physical_tokens: 50024939520
+    overshoot_physical_tokens: 0
+    warmup_steps: 596
+    decay_steps: 23854
+full_training_length_audit:
+  tokenizer: public/models/Qwen--Qwen3-0.6B-Base
+  i2t:
+    selected_variants_per_image: 6
+    records: 7687002
+    min: 282
+    mean: 326.9370739073569
+    p50: 327
+    p90: 338
+    p95: 342
+    p99: 351
+    p999: 367
+    max: 446
+    greater_than_384: 1356
+    greater_than_448: 0
+  t2i:
+    selected_variants_per_image: 12
+    records: 15374004
+    min: 275
+    mean: 298.9392282582989
+    p50: 299
+    p90: 305
+    p95: 307
+    p99: 313
+    p999: 322
+    max: 372
+    greater_than_384: 0
+shared_optimizer:
+  backbone_and_special_learning_rate: 0.0003
+  flow_and_projector_learning_rate: 5.0e-05
+  beta1: 0.9
+  beta2: 0.95
+  weight_decay: 0.01
+  flow_weight_decay: 0.01
+  max_grad_norm: 1.0
+shared_checkpointing:
+  save_every: 2000
+  validation_every: 10000
+  checkpoints_total_limit: 3
+  checkpoint_milestone_every: 125100
+  save_ema_eval_every: 25020
+  save_model_with_ema_eval: true
+  save_final_resumable_checkpoint: true
+infrastructure:
+  image_flow_grad_checkpointing: true
+  image_flow_share_content: true

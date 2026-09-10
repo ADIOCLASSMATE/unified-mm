@@ -1,0 +1,145 @@
+schema: showo2_unified_ablation_v1
+baseline: B current XT-query/X0-content unified
+formal_world_size: 64
+frozen_from_b:
+  dataset:
+    class_name: UnifiedMixedDataset
+    params:
+      schedule:
+      - climbmix
+      - t2i
+      - climbmix
+      - i2t
+      sources:
+        climbmix:
+          shard_glob: public/ClimbMix/*.jsonl
+          tokenizer_path: public/models/Qwen--Qwen3-0.6B-Base
+          sequence_length: 2048
+          micro_batch_size: 4
+          dataloader_workers: 1
+          dataloader_prefetch_factor: 4
+          tokenizer_batch_documents: 32
+          max_document_chars: 32768
+          rayon_num_threads: 2
+        t2i:
+          micro_batch_size: 16
+          dataloader_workers: 2
+          dataloader_prefetch_factor: 4
+        i2t:
+          micro_batch_size: 16
+          dataloader_workers: 2
+          dataloader_prefetch_factor: 4
+      image:
+        cache_path: public/datasets/imagenet_full/vae_posterior_mar_kl16/posterior_stats_imagenet1k_train_fp16.pt
+        manifest_jsonl: public/datasets/imagenet_full/manifest.jsonl
+        expected_split: train
+        expected_records: 1281167
+        conditioning_mode: caption
+        caption_jsonl: public/datasets/imagenet1k_synthetic_v1/captions/imagenet1k_train_7captions.jsonl
+        synthetic_text_index_manifest: public/datasets/imagenet1k_synthetic_v1/indexed/train/manifest.json
+        caption_list_key: captions
+        caption_list_text_key: text
+        caption_path_key: path
+        caption_id_key: id
+        caption_include_original: false
+        caption_validation_index: 0
+        t2i_prompt_validation_index: 0
+        caption_t2i_prefix: 'Generate an image matching this description:'
+        caption_i2t_prefix: 'Describe this image in one detailed caption:'
+        cache_caption_tokens: false
+        model_context_length: 32768
+        image_tokens_per_img: 256
+        image_latent_dim: 16
+        image_sigma_order: random
+        max_seq_length: 512
+        pad_to_length: 512
+        pad_to_multiple_of: 64
+        validation:
+          cache_path: public/datasets/imagenet_full/vae_posterior_mar_kl16/posterior_stats_imagenet1k_val_fp16.pt
+          manifest_jsonl: public/datasets/imagenet_full/manifest_val.jsonl
+          expected_split: val
+          expected_records: 50000
+          caption_jsonl: public/datasets/imagenet1k_synthetic_v1/captions/imagenet1k_val_visual_descriptions.jsonl
+          synthetic_text_index_manifest: public/datasets/imagenet1k_synthetic_v1/indexed/val/manifest.json
+    preprocessing:
+      max_seq_length: 512
+  lr_scheduler:
+    scheduler: wsd
+    params:
+      learning_rate: 0.0003
+      warmup_steps: 596
+      decay_steps: 23854
+      min_lr_scale: 0.1
+  training.batch_size: 16
+  training.total_batch_size: 2560
+  training.gradient_accumulation_steps: 4
+  training.mixed_precision: bf16
+  training.gradient_accumulation_dtype: fp32
+  training.seed: 42
+  training.dataloader_shuffle_seed: 42
+  training.dataloader_workers: 0
+  training.runtime_hashing_enabled: false
+  training.target_text_tokens: 100000000000
+  training.nominal_text_targets_per_step_64npu: 1048064
+  training.max_train_steps: 95415
+  training.stop_after_steps: 95415
+  training.max_grad_norm: 1.0
+  training.step_scheduler_with_optimizer: false
+  training.from_scratch: false
+  training.trainable_scope: full
+  training.use_ema: true
+  training.ema_decay: 0.9999
+  training.ema_update_after_step: 0
+  training.ema_shard_chunk_numel: 4194304
+  training.ema_validate: true
+  training.ema_save_hf_model: true
+  optimizer.params.learning_rate: 0.0003
+  optimizer.params.backbone_learning_rate: 0.0003
+  optimizer.params.projector_learning_rate: 5.0e-05
+  optimizer.params.flow_learning_rate: 5.0e-05
+  optimizer.params.special_token_learning_rate: 0.0003
+  optimizer.params.scale_lr: false
+  optimizer.params.beta1: 0.9
+  optimizer.params.beta2: 0.95
+  optimizer.params.weight_decay: 0.01
+  optimizer.params.flow_weight_decay: 0.01
+  optimizer.params.epsilon: 1.0e-08
+  model.model_path: public/models/Qwen--Qwen3-0.6B-Base
+  model.image_tokens_per_img: 256
+  model.image_latent_dim: 16
+  model.image_flow_width: 1280
+  model.image_flow_depth: 8
+  model.image_flow_batch_mul: 4
+  model.image_flow_num_sampling_steps: '10'
+  model.image_flow_time_sampling: logit_normal
+  model.image_flow_logit_mean: 0.0
+  model.image_flow_logit_std: 1.0
+  model.image_flow_time_uniform_mix: 0.1
+  model.image_flow_time_eps: 1.0e-05
+  model.image_flow_time_scale: 1000.0
+  model.image_input_noise_strength: 0.01
+  model.image_uncond_prob: 0.1
+  model.lambda_text: 0.05
+  model.lambda_image: 1.0
+  model.training_image_sigma_order: random
+  experiment.save_every: 2000
+  experiment.checkpoints_total_limit: 3
+  experiment.checkpoint_milestone_every: 125100
+  experiment.save_ema_eval_every: 25020
+  experiment.save_model_with_ema_eval: true
+  experiment.ema_eval_dtype: bf16
+  experiment.val_every: 10000
+  experiment.save_final: true
+  experiment.save_final_checkpoint: true
+new_architecture:
+  training_objective: showo2_full_image_flow
+  semantic_pretrained_lr: 2.0e-06
+  siglip: google/siglip-so400m-patch14-384
+  semantic_layers: 26
+  time_granularity: one per image
+  time_carrier: BOI at the existing physical position
+  flow_head_intermediate_size: 1472
+  head_parameter_relative_tolerance: 0.01
+projects:
+  single: high-dimensionaldata
+  dual-siglip: high-dimensionaldata

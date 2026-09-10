@@ -42,6 +42,8 @@ from utils.evaluation.calibration import (  # noqa: E402
     LANGUAGE_PRIOR_ESTIMATOR,
     language_prior_debiased_scores,
 )
+from utils.evaluation.model_contracts import scoring_contract
+
 from utils.evaluation_model_source import (  # noqa: E402
     add_model_source_argument,
     configure_model_source,
@@ -340,7 +342,7 @@ def main() -> None:
     config = OmegaConf.load(args.config)
     configure_model_source(config, source)
     objective = str(config.model.get("training_objective", "selfless_dual_stream"))
-    if objective != "selfless_dual_stream":
+    if objective not in {"selfless_dual_stream", "showo2_full_image_flow"}:
         raise ValueError(f"retrieval likelihood requires Selfless, got {objective}")
     attention_contract = str(
         config.model.get("dual_stream_attention_contract", "selfless_strict")
@@ -351,8 +353,11 @@ def main() -> None:
     image_sigma_order = (
         configured_order if args.image_sigma_order == "auto" else args.image_sigma_order
     )
-    if attention_contract not in {"selfless_strict", "xlnet_content_diagonal"}:
+    if attention_contract not in {"selfless_strict", "xlnet_content_diagonal", "showo2_omni_attention"}:
         raise ValueError(f"unknown attention contract: {attention_contract}")
+    if attention_contract == "showo2_omni_attention":
+        image_sigma_order = "sequential"
+        args.scoring_backend = "repeated_full_sequence"
     if image_sigma_order not in {"random", "sequential"}:
         raise ValueError(f"unknown image sigma order: {image_sigma_order}")
 
@@ -420,8 +425,8 @@ def main() -> None:
                 ),
             },
             "scoring": {
-                "model_contract": "selfless_same_position_query_stream",
-                "contract": LIKELIHOOD_SCORING_CONTRACT,
+                "model_contract": scoring_contract(attention_contract, "selfless_same_position_query_stream"),
+                "contract": scoring_contract(attention_contract, LIKELIHOOD_SCORING_CONTRACT),
                 "dual_stream_attention_contract": attention_contract,
                 "query_stream_diagonal": False,
                 "content_stream_diagonal": (
@@ -500,7 +505,7 @@ def main() -> None:
         {
             "query_indices": torch.tensor(query_indices, dtype=torch.long),
             "conditional_mean_token_loglikelihood": local_scores,
-            "scoring_contract": LIKELIHOOD_SCORING_CONTRACT,
+            "scoring_contract": scoring_contract(attention_contract, LIKELIHOOD_SCORING_CONTRACT),
             "dual_stream_attention_contract": attention_contract,
             "runtime_hashing_enabled": False,
         },
@@ -520,7 +525,7 @@ def main() -> None:
                 payload = torch.load(str(path), map_location="cpu", weights_only=True)
                 if payload.get("runtime_hashing_enabled", True) is not False:
                     raise ValueError("retrieval shard violates the no-hash contract")
-                if payload.get("scoring_contract") != LIKELIHOOD_SCORING_CONTRACT:
+                if payload.get("scoring_contract") != scoring_contract(attention_contract, LIKELIHOOD_SCORING_CONTRACT):
                     raise ValueError("retrieval shard uses the wrong scoring contract")
                 if payload.get("dual_stream_attention_contract") != attention_contract:
                     raise ValueError("retrieval shard uses the wrong attention contract")
@@ -558,7 +563,7 @@ def main() -> None:
                 },
                 "world_size": world_size,
                 "scoring": {
-                    "contract": LIKELIHOOD_SCORING_CONTRACT,
+                    "contract": scoring_contract(attention_contract, LIKELIHOOD_SCORING_CONTRACT),
                     "dual_stream_attention_contract": attention_contract,
                     "query_stream_diagonal": False,
                     "content_stream_diagonal": (
@@ -601,7 +606,7 @@ def main() -> None:
                 payload = torch.load(str(path), map_location="cpu", weights_only=True)
                 if payload.get("runtime_hashing_enabled", True) is not False:
                     raise ValueError("retrieval shard violates the no-hash contract")
-                if payload.get("scoring_contract") != LIKELIHOOD_SCORING_CONTRACT:
+                if payload.get("scoring_contract") != scoring_contract(attention_contract, LIKELIHOOD_SCORING_CONTRACT):
                     raise ValueError("retrieval shard uses the wrong scoring contract")
                 if payload.get("dual_stream_attention_contract") != attention_contract:
                     raise ValueError("retrieval shard uses the wrong attention contract")
@@ -638,7 +643,7 @@ def main() -> None:
                     ),
                     "coco_five_fold_1k_average": False,
                     "scoring": {
-                        "contract": LIKELIHOOD_SCORING_CONTRACT,
+                        "contract": scoring_contract(attention_contract, LIKELIHOOD_SCORING_CONTRACT),
                         "dual_stream_attention_contract": attention_contract,
                         "query_stream_diagonal": False,
                         "content_stream_diagonal": (
@@ -670,7 +675,7 @@ def main() -> None:
                     "caption_to_image": torch.arange(len(records)).repeat_interleave(
                         torch.tensor(caption_counts, dtype=torch.long)
                     ),
-                    "scoring_contract": LIKELIHOOD_SCORING_CONTRACT,
+                    "scoring_contract": scoring_contract(attention_contract, LIKELIHOOD_SCORING_CONTRACT),
                     "dual_stream_attention_contract": attention_contract,
                     "language_prior_alpha": LANGUAGE_PRIOR_ALPHA,
                     "language_prior_estimator": LANGUAGE_PRIOR_ESTIMATOR,

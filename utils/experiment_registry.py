@@ -15,7 +15,8 @@ from utils.atomic_io import atomic_write_text
 
 REGISTRY_PATH = Path(__file__).resolve().parents[1] / "configs/protocols/experiment_registry.json"
 GROUPS = {"main": "正式 A / B", "ablation": "B 上的消融（C–F）",
-          "legacy": "历史消融", "single": "历史单任务对照",
+          "showo2": "Show-o2-style · 语义分支",
+          "legacy": "历史消融", "single": "单任务对照",
           "scaling": "B · Flow-head 深度", "lr": "历史 1.7B 学习率扫描"}
 SOURCES = {"climbmix", "t2i", "i2t"}
 

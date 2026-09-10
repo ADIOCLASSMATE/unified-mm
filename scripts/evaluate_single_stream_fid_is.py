@@ -1859,6 +1859,7 @@ def main(*, model_loader=None):
     if attention_contract not in {
         "selfless_strict",
         "xlnet_content_diagonal",
+        "showo2_omni_attention",
     }:
         raise ValueError(
             "unsupported model.dual_stream_attention_contract="
@@ -1914,6 +1915,10 @@ def main(*, model_loader=None):
         config,
         model_dtype=requested_model_dtype,
     )
+    flow_net = getattr(model.image_flow_head, "net", model.image_flow_head)
+    is_s2 = attention_contract == "showo2_omni_attention"
+    if is_s2:
+        args.disable_backbone_kv_cache = True
     loaded_attention_contract = str(
         getattr(
             model.config,
@@ -2697,6 +2702,8 @@ def main(*, model_loader=None):
         "leaderboard_comparable_to_adm_dit": False,
         "implementation_contracts": {
             "checkpoint_generation": checkpoint_generation_contract(model.config),
+            "full_image_refresh_each_velocity": is_s2,
+            "image_generation_order_applicable": not is_s2,
             "evaluator_rng_contract": EVALUATOR_RNG_CONTRACT,
             "canonical_initial_noise_enabled": bool(canonical_pairing_enabled),
             "backbone_attention": {
@@ -2790,9 +2797,9 @@ def main(*, model_loader=None):
                 "attention_contract": flow_head_attention_contract,
                 "depth": int(config.model.get("image_flow_depth", 8)),
                 "width": int(config.model.get("image_flow_width", 1280)),
-                "mlp_ratio": 1.0,
+                "mlp_ratio": (float(config.model.get("s2_flow_intermediate", 1472)) / int(config.model.get("image_flow_width", 1280)) if is_s2 else 1.0),
                 "attention_heads": (
-                    8
+                    (int(config.model.get("image_flow_width", 1280)) // int(config.model.get("s2_flow_head_dim", 64)) if is_s2 else 8)
                     if flow_head_attention["applicable"]
                     else 0
                 ),
@@ -2803,13 +2810,13 @@ def main(*, model_loader=None):
                 ),
                 "adaln_zero_init": True,
                 "position_contract": (
-                    model.image_flow_head.net.position_contract()
-                    if hasattr(model.image_flow_head.net, "position_contract")
+                    flow_net.position_contract()
+                    if hasattr(flow_net, "position_contract")
                     else None
                 ),
                 "cache_contract": (
-                    model.image_flow_head.net.cache_contract()
-                    if hasattr(model.image_flow_head.net, "cache_contract")
+                    flow_net.cache_contract()
+                    if hasattr(flow_net, "cache_contract")
                     else None
                 ),
             },

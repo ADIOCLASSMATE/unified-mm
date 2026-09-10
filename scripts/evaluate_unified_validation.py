@@ -91,6 +91,7 @@ def main() -> None:
     if attention_contract not in {
         "selfless_strict",
         "xlnet_content_diagonal",
+        "showo2_omni_attention",
     }:
         raise ValueError(
             "unsupported dual-stream attention contract: "

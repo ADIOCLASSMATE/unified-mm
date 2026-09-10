@@ -35,6 +35,8 @@ from omegaconf import OmegaConf
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from utils.evaluation.model_contracts import scoring_contract
+
 from utils.evaluation_model_source import (  # noqa: E402
     add_model_source_argument,
     configure_model_source,
@@ -153,7 +155,7 @@ def main() -> None:
     config = OmegaConf.load(args.config)
     configure_model_source(config, source)
     objective = str(config.model.get("training_objective", "selfless_dual_stream"))
-    if objective != "selfless_dual_stream":
+    if objective not in {"selfless_dual_stream", "showo2_full_image_flow"}:
         raise ValueError(
             "likelihood benchmark runner currently requires selfless_dual_stream, "
             f"got {objective!r}"
@@ -161,7 +163,7 @@ def main() -> None:
     attention_contract = str(
         config.model.get("dual_stream_attention_contract", "selfless_strict")
     ).strip().lower()
-    if attention_contract not in {"selfless_strict", "xlnet_content_diagonal"}:
+    if attention_contract not in {"selfless_strict", "xlnet_content_diagonal", "showo2_omni_attention"}:
         raise ValueError(f"unknown dual-stream attention contract: {attention_contract}")
     configured_order = str(
         config.dataset.params.image.get("image_sigma_order", "random")
@@ -169,6 +171,9 @@ def main() -> None:
     image_sigma_order = (
         configured_order if args.image_sigma_order == "auto" else args.image_sigma_order
     )
+    if attention_contract == "showo2_omni_attention":
+        image_sigma_order = "sequential"
+        args.mc = 1  # Exact AR score; no image-order Monte Carlo distribution.
     if image_sigma_order not in {"random", "sequential"}:
         raise ValueError(f"unknown image sigma order: {image_sigma_order}")
     if int(args.mc) > 1 and image_sigma_order != "random":
@@ -261,7 +266,7 @@ def main() -> None:
             ),
             "mc_aggregation": "mean_loglikelihood",
             "mc_common_random_numbers_across_candidates": True,
-            "image_order_mc_contract": IMAGE_ORDER_MC_CONTRACT,
+            "image_order_mc_contract": ("not_applicable_full_image_ar" if attention_contract == "showo2_omni_attention" else IMAGE_ORDER_MC_CONTRACT),
             "language_prior_alpha": LANGUAGE_PRIOR_ALPHA,
             "language_prior_estimator": LANGUAGE_PRIOR_ESTIMATOR,
             "language_prior_null_image_ids": list(null_image_ids),
@@ -271,7 +276,7 @@ def main() -> None:
             "seed": int(args.seed),
             "image_sigma_order": image_sigma_order,
             "dual_stream_attention_contract": attention_contract,
-            "scoring_contract": LIKELIHOOD_SCORING_CONTRACT,
+            "scoring_contract": scoring_contract(attention_contract, LIKELIHOOD_SCORING_CONTRACT),
             "query_stream_diagonal": False,
             "content_stream_diagonal": (
                 attention_contract == "xlnet_content_diagonal"
@@ -350,7 +355,7 @@ def main() -> None:
                     "runtime_hashing_enabled": False,
                     "accuracy_and_rate_unit": "unit_interval",
                     "scoring": {
-                        "contract": LIKELIHOOD_SCORING_CONTRACT,
+                        "contract": scoring_contract(attention_contract, LIKELIHOOD_SCORING_CONTRACT),
                         "dual_stream_attention_contract": attention_contract,
                         "query_stream_diagonal": False,
                         "content_stream_diagonal": (
@@ -359,7 +364,7 @@ def main() -> None:
                         "mc_samples": int(args.mc),
                         "mc_aggregation": "mean_loglikelihood",
                         "mc_common_random_numbers_across_candidates": True,
-                        "image_order_mc_contract": IMAGE_ORDER_MC_CONTRACT,
+                        "image_order_mc_contract": ("not_applicable_full_image_ar" if attention_contract == "showo2_omni_attention" else IMAGE_ORDER_MC_CONTRACT),
                         "primary_candidate_score": DEBIASED_SCORE,
                         "reported_score_variant": "language_prior_debiased_only",
                         "language_prior_alpha": LANGUAGE_PRIOR_ALPHA,

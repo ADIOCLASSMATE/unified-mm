@@ -32,6 +32,7 @@ from omegaconf import OmegaConf
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from utils.evaluation.model_contracts import scoring_contract
 from utils.evaluation.multimodal_likelihood import (  # noqa: E402
     CandidateScore,
     LIKELIHOOD_SCORING_CONTRACT,
@@ -365,6 +366,9 @@ def clone_prefix_cache(
                 hidden_attr,
                 cached_text_source.expand(batch_size, -1).clone(),
             )
+    if hasattr(prefix_cache, "semantic_state"):
+        from models.modeling_model.modeling_selfless_siglip import copy_semantic_cache
+        copy_semantic_cache(prefix_cache, cloned, repeats=batch_size)
     return cloned
 
 
@@ -643,6 +647,9 @@ def score_text_candidates_cached_prefix(
 
 def score_candidates_with_backend(**kwargs) -> tuple[torch.Tensor, torch.Tensor]:
     args = kwargs["args"]
+    if getattr(kwargs["model"].config, "architecture_variant", None) == "showo2_unified":
+        kwargs["image_sigma_order"] = "sequential"
+        return score_text_candidates(**kwargs)
     if args.scoring_backend == "cached_prefix":
         return score_text_candidates_cached_prefix(**kwargs)
     return score_text_candidates(**kwargs)
@@ -759,7 +766,7 @@ def evaluate_classification(
         {
             "query_indices": torch.tensor(query_indices, dtype=torch.long),
             "conditional_mean_token_loglikelihood": local_scores,
-            "scoring_contract": LIKELIHOOD_SCORING_CONTRACT,
+            "scoring_contract": scoring_contract(attention_contract, LIKELIHOOD_SCORING_CONTRACT),
             "dual_stream_attention_contract": attention_contract,
             "runtime_hashing_enabled": False,
         },
@@ -776,7 +783,7 @@ def evaluate_classification(
         payload = torch.load(str(path), map_location="cpu", weights_only=True)
         if payload.get("runtime_hashing_enabled", True) is not False:
             raise ValueError("retrieval shard violates the no-hash contract")
-        if payload.get("scoring_contract") != LIKELIHOOD_SCORING_CONTRACT:
+        if payload.get("scoring_contract") != scoring_contract(attention_contract, LIKELIHOOD_SCORING_CONTRACT):
             raise ValueError("retrieval shard uses the wrong scoring contract")
         if payload.get("dual_stream_attention_contract") != attention_contract:
             raise ValueError("retrieval shard uses the wrong attention contract")
@@ -826,7 +833,7 @@ def evaluate_classification(
             "class_text_template": CLASS_TEXT_TEMPLATE,
             "language_prior_alpha": LANGUAGE_PRIOR_ALPHA,
             "language_prior_estimator": LANGUAGE_PRIOR_ESTIMATOR,
-            "scoring_contract": LIKELIHOOD_SCORING_CONTRACT,
+            "scoring_contract": scoring_contract(attention_contract, LIKELIHOOD_SCORING_CONTRACT),
             "dual_stream_attention_contract": attention_contract,
             "runtime_hashing_enabled": False,
         },

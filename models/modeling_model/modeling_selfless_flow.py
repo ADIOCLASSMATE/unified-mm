@@ -1105,6 +1105,8 @@ class Qwen3RotaryEmbedding(nn.Module):
 
 @auto_docstring
 class Qwen3Model(Qwen3PreTrainedModel):
+    supported_training_objectives = frozenset({"selfless_dual_stream"})
+
     def __init__(self, config: Qwen3Config):
         validate_model_image_layout(config)
         super().__init__(config)
@@ -1113,13 +1115,10 @@ class Qwen3Model(Qwen3PreTrainedModel):
         self.training_objective = str(
             getattr(config, "training_objective", "selfless_dual_stream")
         ).strip().lower()
-        if self.training_objective not in {
-            "selfless_dual_stream",
-            "showo_mae_flow",
-        }:
+        if self.training_objective not in self.supported_training_objectives:
             raise ValueError(
-                "training_objective must be selfless_dual_stream or "
-                f"showo_mae_flow, got {self.training_objective!r}"
+                "training_objective must be selfless_dual_stream, "
+                f"got {self.training_objective!r}"
             )
 
         self.image_latent_dim = int(
@@ -1220,6 +1219,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
         image_latents_are_noisy: bool = False,
         debug_finite: bool = False,
         debug_label: str = "",
+        image_context: dict | None = None,
     ) -> torch.Tensor:
         if token_types is None:
             return self.embed_tokens(input_ids)
@@ -1374,9 +1374,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
         """Select the XT stream while preserving the baseline default."""
 
         del require_image_query_stream, text_ar_mode, image_spans_present
-        return self.training_objective == "selfless_dual_stream" and bool(
-            self.training or calculate_likelihood
-        )
+        return bool(self.training or calculate_likelihood)
 
     def _prepare_stream_attention_masks(
         self,
@@ -1515,6 +1513,16 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 ),
                 debug_finite=debug_finite_backbone,
                 debug_label=debug_backbone_label,
+                image_context={
+                    "attention_mask": attention_mask,
+                    "content_attention_mask": content_attention_mask,
+                    "past_key_values": past_key_values,
+                    "cache_position": cache_position,
+                    "cache_read_only": kwargs.get("cache_read_only", False),
+                    "cache_write_prefix": kwargs.get("cache_write_prefix"),
+                    "cache_write_mask": kwargs.get("cache_write_mask"),
+                    "use_cache": use_cache,
+                },
             )
         _debug_require_finite_tensor(
             debug_finite_backbone,
@@ -1982,23 +1990,15 @@ class Qwen3ForCausalLM(
                 token_types = token_types.to(hidden_states.device)
                 labels = labels.to(hidden_states.device)
                 text_loss = hidden_states.sum() * 0.0
-                if self.training_objective == "showo_mae_flow":
-                    text_hidden_source = hidden_states[:, :-1]
-                    text_targets_source = labels[:, 1:]
-                    text_types_source = token_types[:, 1:]
-                else:
-                    text_hidden_source = hidden_states
-                    text_targets_source = labels
-                    text_types_source = token_types
                 valid_text_mask = (
-                    ((text_types_source == 0) | (text_types_source == 2))
-                    & (text_targets_source != -100)
+                    ((token_types == 0) | (token_types == 2))
+                    & (labels != -100)
                     & compute_text_loss
                 )
                 text_token_count = valid_text_mask.sum()
                 if compute_text_loss and self.lambda_text > 0.0:
-                    text_hidden = text_hidden_source[valid_text_mask]
-                    text_targets = text_targets_source[valid_text_mask]
+                    text_hidden = hidden_states[valid_text_mask]
+                    text_targets = labels[valid_text_mask]
                     text_logits = self.lm_head(text_hidden)
                     text_loss = F.cross_entropy(
                         text_logits,
@@ -2128,24 +2128,6 @@ class Qwen3ForCausalLM(
                             rows.unsqueeze(1), token_indices
                         ]
 
-                    image_flow_context_mask = None
-                    if self.training_objective == "showo_mae_flow":
-                        if image_latent_mask_arg is None:
-                            raise ValueError(
-                                "showo_mae_flow requires image_latent_mask"
-                            )
-                        full_visible_mask = image_latent_mask_arg.to(
-                            device=hidden_states.device,
-                            dtype=torch.bool,
-                        )
-                        visible_image_tokens = full_visible_mask[
-                            rows.unsqueeze(1), token_indices
-                        ]
-                        image_flow_context_mask = visible_image_tokens.unsqueeze(
-                            1
-                        ).expand(-1, image_tokens_per_img, -1)
-                        image_sigmas = None
-
                     if self.image_flow_batch_mul > 1:
                         repeats = self.image_flow_batch_mul
                         share_content = use_x0_content_condition and bool(
@@ -2161,17 +2143,12 @@ class Qwen3ForCausalLM(
                             image_content_conditions = (
                                 image_content_conditions.repeat(repeats, 1, 1)
                             )
-                        if image_sigmas is not None:
-                            image_sigmas = image_sigmas.repeat(repeats, 1)
+                        image_sigmas = image_sigmas.repeat(repeats, 1)
                         image_positions_for_flow = image_positions_for_flow.repeat(
                             repeats, 1
                         )
                         if image_loss_mask is not None:
                             image_loss_mask = image_loss_mask.repeat(repeats, 1)
-                        if image_flow_context_mask is not None:
-                            image_flow_context_mask = image_flow_context_mask.repeat(
-                                repeats, 1, 1
-                            )
                     image_flow_kwargs = dict(
                         target=image_targets,
                         z=image_conditions,
@@ -2179,7 +2156,6 @@ class Qwen3ForCausalLM(
                         sigma=image_sigmas,
                         image_positions=image_positions_for_flow,
                         context_latents=image_context_latents,
-                        context_mask=image_flow_context_mask,
                         record_stats=record_flow_stats,
                     )
                     if image_content_conditions is not None:

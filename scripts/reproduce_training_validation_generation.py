@@ -33,7 +33,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pretrain.train_selfless_flow import (  # noqa: E402
     _build_backbone_attention_masks,
-    _prepare_showo_image_masks,
 )
 from utils.combined_dataloaders import (  # noqa: E402
     build_unified_image_validation_dataloader,
@@ -136,13 +135,6 @@ def main() -> None:
         image_span_table = host_image_span_table.to(device)
         image_latents = batch["image_latents"].to(device)
 
-        image_loss_mask, image_latent_mask, _ = _prepare_showo_image_masks(
-            config=config,
-            token_types=token_types,
-            image_span_table=image_span_table,
-            image_loss_mask=image_loss_mask,
-            mask_generation_images=True,
-        )
         attention_mask, content_attention_mask = _build_backbone_attention_masks(
             config=config,
             input_ids=input_ids,
@@ -167,9 +159,6 @@ def main() -> None:
         )
         if content_attention_mask is not None:
             forward_kwargs["content_attention_mask"] = content_attention_mask
-        if image_latent_mask is not None:
-            forward_kwargs["image_latent_mask"] = image_latent_mask
-
         print("Running the validation-loss forward to advance NPU RNG...", flush=True)
         model(**forward_kwargs)
 

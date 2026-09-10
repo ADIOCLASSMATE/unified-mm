@@ -21,21 +21,21 @@ case "${SOURCE_TASK}" in
     SOURCE_TASK="climbmix"
     DEFAULT_CONFIG="configs/selfless/unified_single_text_0p6b_100b_ascend16.yaml"
     DEFAULT_RUN_PROJECT="unified-b-0p6b-text-only-100bphys-s42-r1"
-    FORMAL_STEPS=95368
+    DEFAULT_PROTOCOL="configs/protocols/unified_single_source_0p6b_100b_ascend16.yaml"
     DEFAULT_SAVE_EMA_EVAL_EVERY=25020
     ;;
   i2t|caption)
     SOURCE_TASK="i2t"
-    DEFAULT_CONFIG="configs/selfless/unified_single_caption_0p6b_100b_ascend16.yaml"
-    DEFAULT_RUN_PROJECT="unified-b-0p6b-caption-only-100bphys-s42-r1"
-    FORMAL_STEPS=190736
+    DEFAULT_CONFIG="configs/selfless/unified_b_i2t_only_matched_ascend16.yaml"
+    DEFAULT_RUN_PROJECT="unified-b-x0content-0p6b-i2t-only-bmatched-s42-r1"
+    DEFAULT_PROTOCOL="configs/protocols/unified_b_image_only_matched_ascend16.yaml"
     DEFAULT_SAVE_EMA_EVAL_EVERY=25020
     ;;
   t2i|image)
     SOURCE_TASK="t2i"
-    DEFAULT_CONFIG="configs/selfless/unified_single_t2i_0p6b_100b_ascend16.yaml"
-    DEFAULT_RUN_PROJECT="unified-b-0p6b-t2i-only-100bphys-s42-r1"
-    FORMAL_STEPS=190736
+    DEFAULT_CONFIG="configs/selfless/unified_b_t2i_only_matched_ascend16.yaml"
+    DEFAULT_RUN_PROJECT="unified-b-x0content-0p6b-t2i-only-bmatched-s42-r1"
+    DEFAULT_PROTOCOL="configs/protocols/unified_b_image_only_matched_ascend16.yaml"
     DEFAULT_SAVE_EMA_EVAL_EVERY=25020
     ;;
   *)
@@ -45,7 +45,8 @@ case "${SOURCE_TASK}" in
 esac
 
 CONFIG="${CONFIG:-${DEFAULT_CONFIG}}"
-PROTOCOL="${PROTOCOL:-configs/protocols/unified_single_source_0p6b_100b_ascend16.yaml}"
+PROTOCOL="${PROTOCOL:-${DEFAULT_PROTOCOL}}"
+FORMAL_STEPS="$(python -c 'import sys; from omegaconf import OmegaConf; print(int(OmegaConf.load(sys.argv[1]).training.max_train_steps))' "${CONFIG}")"
 ACCELERATE_CONFIG="${ACCELERATE_CONFIG:-accelerate_configs/16_npus_1node_deepspeed_zero2.yaml}"
 RESUME_FROM="${RESUME_FROM:-none}"
 STOP_AFTER_STEPS="${STOP_AFTER_STEPS:-${FORMAL_STEPS}}"
@@ -74,6 +75,14 @@ EXPECTED_WORLD_SIZE=16
 export HCCL_INTRA_ROCE_ENABLE="${HCCL_INTRA_ROCE_ENABLE:-1}"
 export HCCL_CONNECT_TIMEOUT="${HCCL_CONNECT_TIMEOUT:-600}"
 export RAYON_NUM_THREADS="${RAYON_NUM_THREADS:-2}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export PYTHONUNBUFFERED=1
+for driver_library_dir in /usr/local/Ascend/driver/lib64/driver \
+  /usr/local/Ascend/driver/lib64/common /usr/local/Ascend/driver/lib64; do
+  if [[ -d "${driver_library_dir}" ]]; then
+    export LD_LIBRARY_PATH="${driver_library_dir}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+  fi
+done
 # The parent process tokenizes during dataset construction.  The ClimbMix
 # worker creates its own bounded Rayon pool after fork.
 export TOKENIZERS_PARALLELISM=false

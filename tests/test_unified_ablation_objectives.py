@@ -1,16 +1,9 @@
-import math
-
 import pytest
 import torch
-import torch.nn.functional as F
 from transformers import Qwen3Config
 
 from models.modeling_model.modeling_selfless_flow import Qwen3ForCausalLM
-from utils.utils import (
-    get_selfless_mask,
-    get_showo_mae_mask,
-    sample_showo_mae_image_mask,
-)
+from utils.utils import get_selfless_mask
 
 
 def _allowed(mask, q_idx: int, kv_idx: int) -> bool:
@@ -59,6 +52,18 @@ def _tiny_model(
     for key, value in values.items():
         setattr(config, key, value)
     return Qwen3ForCausalLM(config)
+
+
+@pytest.mark.parametrize("objective", ["showo_mae_flow", "unknown_objective"])
+def test_unsupported_training_objective_fails_before_training(objective):
+    from omegaconf import OmegaConf
+    from pretrain.train_selfless_flow import _training_objective
+
+    with pytest.raises(ValueError, match="training_objective must be selfless_dual_stream"):
+        _tiny_model(objective)
+    config = OmegaConf.create({"model": {"training_objective": objective}})
+    with pytest.raises(ValueError, match="unsupported model.training_objective"):
+        _training_objective(config)
 
 
 def test_xlnet_b_content_mask_has_diagonal_but_query_mask_does_not():
@@ -244,189 +249,3 @@ def test_xlnet_b_content_diagonal_reaches_later_query_layers():
     ).last_hidden_state
     assert torch.isfinite(xlnet_hidden).all()
     assert not torch.allclose(selfless_hidden, xlnet_hidden)
-
-
-def test_showo_omni_mask_is_causal_for_text_and_full_for_image():
-    input_ids = torch.tensor([[11, 8, 8, 12, 5]])
-    token_types = torch.tensor([[2, 1, 1, 2, 0]], dtype=torch.uint8)
-    mask = get_showo_mae_mask(
-        input_ids=input_ids,
-        token_types=token_types,
-        device="cpu",
-        boi_token_id=11,
-    )
-    assert _allowed(mask, 1, 0)
-    assert _allowed(mask, 1, 1)
-    assert _allowed(mask, 1, 2)
-    assert not _allowed(mask, 1, 3)
-    assert _allowed(mask, 4, 4)
-    assert _allowed(mask, 4, 2)
-    assert not _allowed(mask, 3, 4)
-
-    uncond = get_showo_mae_mask(
-        input_ids=input_ids,
-        token_types=token_types,
-        device="cpu",
-        boi_token_id=11,
-        image_uncond_rows=torch.tensor([True]),
-    )
-    assert not _allowed(uncond, 1, 0)
-    assert _allowed(uncond, 1, 2)
-
-
-def test_showo_mask_sampling_matches_official_cosine_random_permutation():
-    span_table = torch.tensor([[0, 0, 1, 4, 0], [1, 0, 1, 4, 1]])
-    eligible = torch.zeros(2, 6, dtype=torch.bool)
-    eligible[0, 1:5] = True
-    generator = torch.Generator().manual_seed(123)
-    sampled, ratios = sample_showo_mae_image_mask(
-        image_span_table=span_table,
-        full_image_loss_mask=eligible,
-        image_tokens_per_img=4,
-        generator=generator,
-    )
-
-    reference = torch.Generator().manual_seed(123)
-    timesteps = torch.rand(2, generator=reference)
-    expected_ratios = torch.cos(timesteps * (math.pi * 0.5))
-    counts = (4 * expected_ratios).round().clamp(min=1, max=4)
-    order = torch.rand(2, 4, generator=reference).argsort(dim=-1)
-    expected_local = (order < counts.unsqueeze(-1)) & eligible[:, 1:5]
-    assert torch.equal(ratios, expected_ratios)
-    assert torch.equal(sampled[:, 1:5], expected_local)
-    assert sampled[0].sum() == counts[0]
-    assert sampled[1].sum() == 0
-
-
-def test_showo_single_stream_text_uses_next_token_targets():
-    model = _tiny_model("showo_mae_flow").train()
-    input_ids = torch.tensor([[3, 4, 5, 6]])
-    token_types = torch.zeros_like(input_ids, dtype=torch.uint8)
-    labels = input_ids.clone()
-    labels[:, 0] = -100
-    mask = get_showo_mae_mask(
-        input_ids=input_ids,
-        token_types=token_types,
-        device="cpu",
-        boi_token_id=11,
-        segment_ids=torch.zeros_like(input_ids),
-    )
-    output = model(
-        X0_input_ids=input_ids,
-        labels=labels,
-        attention_mask=mask,
-        token_types=token_types,
-        image_span_table=torch.empty(0, 5, dtype=torch.long),
-        image_loss_mask=torch.zeros_like(input_ids, dtype=torch.bool),
-        compute_text_loss=True,
-        compute_image_loss=False,
-        return_logits=False,
-    )
-    manual = F.cross_entropy(
-        model.lm_head(output.last_hidden_state[:, :-1]).reshape(-1, 40),
-        labels[:, 1:].reshape(-1),
-    )
-    assert output.per_modality_count["text_tokens"].item() == 3
-    assert torch.allclose(
-        output.per_modality_loss["text_loss"], manual, atol=1.0e-6
-    )
-
-
-def test_showo_masked_clean_latent_cannot_enter_backbone_content():
-    model = _tiny_model("showo_mae_flow").train()
-    input_ids = torch.tensor([[11, 8, 8, 8, 8, 12]])
-    token_types = torch.tensor([[2, 1, 1, 1, 1, 2]], dtype=torch.uint8)
-    visible = torch.tensor([[False, True, False, True, False, False]])
-    latents = torch.randn(1, 6, 4)
-    changed = latents.clone()
-    changed[:, 2] += 1000.0
-    changed[:, 4] -= 1000.0
-    mask = get_showo_mae_mask(
-        input_ids=input_ids,
-        token_types=token_types,
-        device="cpu",
-        boi_token_id=11,
-    )
-    kwargs = dict(
-        X0_input_ids=input_ids,
-        attention_mask=mask,
-        token_types=token_types,
-        image_latent_mask=visible,
-        image_span_table=torch.tensor([[0, 0, 1, 4, 0]]),
-        calculate_likelihood=True,
-    )
-    first = model.model(image_latents=latents, **kwargs).last_hidden_state
-    second = model.model(image_latents=changed, **kwargs).last_hidden_state
-    assert torch.equal(first, second)
-
-
-def test_showo_flow_context_excludes_masked_clean_latents():
-    model = _tiny_model("showo_mae_flow").eval()
-    net = model.image_flow_head.net
-    x = torch.randn(1, 4, 4)
-    t = torch.rand(1, 4)
-    condition = torch.randn(1, 4, 16)
-    context = torch.randn(1, 4, 4)
-    changed = context.clone()
-    changed[:, 1] += 1000.0
-    changed[:, 3] -= 1000.0
-    visible = torch.tensor([[True, False, True, False]])
-    context_mask = visible.unsqueeze(1).expand(-1, 4, -1)
-    positions = torch.arange(4).unsqueeze(0)
-    kwargs = dict(
-        x=x,
-        t=t,
-        c=condition,
-        context_mask=context_mask,
-        query_positions=positions,
-        context_positions=positions,
-        context_conditions=condition,
-    )
-    first = net(context_latents=context, **kwargs)
-    second = net(context_latents=changed, **kwargs)
-    assert torch.equal(first, second)
-
-
-def test_showo_mae_flow_end_to_end_trains_only_sampled_image_positions():
-    model = _tiny_model("showo_mae_flow").train()
-    input_ids = torch.tensor([[3, 11, 8, 8, 8, 8, 12, 9]])
-    token_types = torch.tensor(
-        [[0, 2, 1, 1, 1, 1, 2, 0]], dtype=torch.uint8
-    )
-    visible = torch.tensor(
-        [[False, False, True, False, True, False, False, False]]
-    )
-    masked = token_types.eq(1) & ~visible
-    latents = torch.zeros(1, 8, 4)
-    latents[:, 2:6] = torch.randn(1, 4, 4)
-    attention_mask = get_showo_mae_mask(
-        input_ids=input_ids,
-        token_types=token_types,
-        device="cpu",
-        boi_token_id=11,
-    )
-    output = model(
-        X0_input_ids=input_ids,
-        labels=input_ids.clone(),
-        attention_mask=attention_mask,
-        token_types=token_types,
-        image_latents=latents,
-        image_latent_mask=visible,
-        image_local_positions=torch.tensor(
-            [[-1, -1, 0, 1, 2, 3, -1, -1]]
-        ),
-        image_span_table=torch.tensor([[0, 0, 2, 6, 0]]),
-        image_loss_mask=masked,
-        compute_text_loss=False,
-        compute_image_loss=True,
-        record_flow_stats=True,
-        return_logits=False,
-    )
-    assert torch.isfinite(output.loss)
-    assert output.per_modality_count["text_tokens"].item() == 0
-    assert output.per_modality_count["image_tokens"].item() == 2
-    assert torch.isfinite(output.per_modality_loss["image_loss"])
-    output.loss.backward()
-    gradient = model.image_flow_head.net.final_layer.linear.weight.grad
-    assert gradient is not None
-    assert torch.isfinite(gradient).all()

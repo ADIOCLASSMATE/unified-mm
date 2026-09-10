@@ -160,8 +160,6 @@ if [[ "${PRESERVE_MODEL_CONTRACT}" == "false" ]]; then
   COMMAND+=(
     "model.training_objective=selfless_dual_stream"
     "model.dual_stream_attention_contract=xlnet_content_diagonal"
-    "model.showo_mask_schedule=cosine"
-    "model.showo_min_masking_rate=0.0"
   )
 fi
 printf '%q ' "${COMMAND[@]}" >"${AUDIT_DIR}/launch_command.sh"

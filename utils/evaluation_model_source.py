@@ -146,6 +146,12 @@ def resolve_evaluation_model_source(path: str | Path) -> EvaluationModelSource:
             # contract, so the authoritative HF config is checked below too.
             required_prefixes += ("model.backbone_flow_time_embedder.",)
         hf_config = _read_json(source / "config.json")
+        if hf_config.get("architecture_variant") == "selfless_siglip":
+            required_prefixes += ("model.semantic_encoder.", "model.semantic_input_proj.", "model.image_fusion.")
+        if hf_config.get("architecture_variant") == "showo2_unified":
+            required_prefixes = ("model.image_token_embedder.", "model.image_time_embedder.", "image_flow_head.")
+            if hf_config.get("s2_use_siglip"):
+                required_prefixes += ("model.semantic_encoder.", "model.semantic_input_proj.", "model.image_fusion.")
         if str(hf_config.get("architecture_variant", "")).strip().lower() == "dynamic_xt":
             required_prefixes += ("model.backbone_flow_time_embedder.",)
         required_prefixes = tuple(dict.fromkeys(required_prefixes))
@@ -221,7 +227,7 @@ def _apply_checkpoint_model_contract(config, saved_model, *, label: str) -> None
         if field in {
             "architecture_variant",
             "dual_stream_attention_contract",
-        }:
+        } or (saved_architecture == "showo2_unified" and field == "training_objective"):
             # One neutral evaluation YAML serves every ablation. The weight
             # source owns both implementation identity and the backbone A/B
             # mask switch; parameters alone cannot recover either distinction.
@@ -268,7 +274,16 @@ def _apply_checkpoint_model_contract(config, saved_model, *, label: str) -> None
             default_flow_head_attention_contract,
         )
     ).strip().lower()
-    if saved_architecture == "positionwise_flow_head_on_b":
+    if saved_architecture == "selfless_siglip":
+        for field, value in saved_model.items():
+            if field.startswith("b_siglip_"):
+                config.model[field] = value
+    if saved_architecture == "showo2_unified":
+        valid_flow_head_contract = flow_head_attention_contract == "showo2_omni_attention"
+        for field, value in saved_model.items():
+            if field.startswith("s2_"):
+                config.model[field] = value
+    elif saved_architecture == "positionwise_flow_head_on_b":
         valid_flow_head_contract = flow_head_attention_contract == "not_applicable"
     else:
         valid_flow_head_contract = flow_head_attention_contract in {
@@ -298,7 +313,9 @@ def _apply_checkpoint_model_contract(config, saved_model, *, label: str) -> None
         )
     ).strip().lower()
     valid_flow_condition_contracts = (
-        {"not_applicable"}
+        {"backbone_noisy_image_hidden"}
+        if saved_architecture == "showo2_unified"
+        else {"not_applicable"}
         if saved_architecture == "positionwise_flow_head_on_b"
         else {
             "backbone_xt_shared_query_content",

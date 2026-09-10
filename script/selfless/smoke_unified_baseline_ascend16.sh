@@ -288,8 +288,6 @@ COMMAND=(
   "dataset.params.image.image_sigma_order=${IMAGE_SIGMA_ORDER}"
   "experiment.validation_single_stream_order_strategies=[${VALIDATION_ORDER_STRATEGY}]"
   "evaluation.strategies=${VALIDATION_ORDER_STRATEGY}"
-  "model.showo_mask_schedule=cosine"
-  "model.showo_min_masking_rate=0.0"
   "training.stop_after_steps=${SMOKE_STEPS}"
 )
 if [[ "${ABLATION}" == "f" ]]; then

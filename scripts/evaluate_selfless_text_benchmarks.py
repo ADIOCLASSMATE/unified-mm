@@ -35,6 +35,8 @@ from omegaconf import OmegaConf
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from utils.evaluation.model_contracts import scoring_contract
+
 from utils.evaluation_model_source import (  # noqa: E402
     add_model_source_argument,
     configure_model_source,
@@ -135,6 +137,7 @@ def main() -> None:
     if attention_contract not in {
         "selfless_strict",
         "xlnet_content_diagonal",
+        "showo2_omni_attention",
     }:
         raise ValueError(
             "unsupported dual-stream attention contract: "
@@ -175,7 +178,7 @@ def main() -> None:
             "device": args.device,
             "model_dtype": args.model_dtype,
             "dual_stream_attention_contract": attention_contract,
-            "scoring_contract": TEXT_SCORING_CONTRACT,
+            "scoring_contract": scoring_contract(attention_contract, TEXT_SCORING_CONTRACT),
             "protocol_schema": TEXT_PROTOCOL_SCHEMA,
             "max_length": args.max_length,
             "limit": args.limit,
@@ -238,9 +241,9 @@ def main() -> None:
             "protocol": {
                 "normalization": TEXT_NORMALIZATION,
                 "winogrande_scoring": WINOGRANDE_SCORING,
-                "scoring_contract": TEXT_SCORING_CONTRACT,
+                "scoring_contract": scoring_contract(attention_contract, TEXT_SCORING_CONTRACT),
                 "protocol_schema": TEXT_PROTOCOL_SCHEMA,
-                "selfless_query_stream_same_position_scoring": True,
+                "selfless_query_stream_same_position_scoring": attention_contract != "showo2_omni_attention",
                 "dual_stream_attention_contract": attention_contract,
                 "query_stream_diagonal": False,
                 "content_stream_diagonal": (

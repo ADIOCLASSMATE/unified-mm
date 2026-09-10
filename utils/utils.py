@@ -1,5 +1,4 @@
 import json
-import math
 import os
 from pathlib import Path
 import re
@@ -98,6 +97,8 @@ def load_model_tokenizer(
     model_config_class=None,
 ):
     from models.modeling_model.image_backbone import validate_image_data_layout
+    from models.modeling_model.modeling_showo2_unified import Showo2UnifiedConfig, Showo2UnifiedForCausalLM
+    from models.modeling_model.modeling_selfless_siglip import SelflessSiglipConfig, SelflessSiglipForCausalLM
     from models.modeling_model.modeling_single_stream_text_ar import (
         SingleStreamTextARConfig,
         SingleStreamTextARQwen3ForCausalLM,
@@ -149,6 +150,14 @@ def load_model_tokenizer(
         )
 
         implementation_label = "positionwise_selfless"
+    elif architecture_variant == "showo2_unified":
+        Qwen3ForCausalLM = Showo2UnifiedForCausalLM
+        model_config_class = Showo2UnifiedConfig
+        implementation_label = "showo2_unified"
+    elif architecture_variant == "selfless_siglip":
+        Qwen3ForCausalLM = SelflessSiglipForCausalLM
+        model_config_class = SelflessSiglipConfig
+        implementation_label = "selfless_siglip"
     elif architecture_variant == "single_stream_text_ar":
         Qwen3ForCausalLM = SingleStreamTextARQwen3ForCausalLM
         if model_config_class is None:
@@ -211,13 +220,18 @@ def load_model_tokenizer(
         )
 
     multimodal_config_keys = (
+        "b_siglip_path", "b_siglip_width", "b_siglip_intermediate", "b_siglip_heads",
+        "b_siglip_depth", "b_siglip_gradient_checkpointing", "b_siglip_initialization_seed",
+        "b_siglip_visibility_contract",
+        "s2_use_siglip", "s2_siglip_path", "s2_semantic_width", "s2_semantic_intermediate",
+        "s2_semantic_heads", "s2_semantic_depth", "s2_flow_intermediate", "s2_flow_head_dim",
+        "s2_full_prediction_checkpointing", "s2_initialization_seed",
+        "s2_mc_batch_size", "s2_semantic_gradient_checkpointing", "s2_backbone_checkpoint_every",
         "architecture_variant",
         "training_objective",
         "dual_stream_attention_contract",
         "flow_head_attention_contract",
         "flow_condition_contract",
-        "showo_mask_schedule",
-        "showo_min_masking_rate",
         "boi_token_id",
         "eoi_token_id",
         "image_mask_token_id",
@@ -291,6 +305,8 @@ def load_model_tokenizer(
     for key in multimodal_config_keys:
         if key == "architecture_variant" and model_class is None:
             value = architecture_variant
+        elif key.startswith(("s2_", "b_siglip_")) and source_has_image_flow:
+            value = getattr(model_config, key, None)
         elif key == "flow_head_attention_contract" and source_has_image_flow:
             # A trained checkpoint owns this numerical contract. Legacy A/B
             # configs lack the field because their contextual head was strict;
@@ -344,6 +360,16 @@ def load_model_tokenizer(
         )
         if not source_has_image_flow:
             model.reset_image_modules()
+            if architecture_variant == "showo2_unified" and model_config.s2_use_siglip:
+                report = model.initialize_semantic_weights(model_config.s2_siglip_path)
+                if logger is not None:
+                    logger.info("SigLIP initialization: %d tensors, %d vision layers, %s",
+                                len(report["loaded_tensors"]), report["layers"], report["source"])
+            elif architecture_variant == "selfless_siglip":
+                report = model.initialize_semantic_weights(model_config.b_siglip_path)
+                if logger is not None:
+                    logger.info("B + SigLIP initialization: %d tensors, %d vision layers, %s",
+                                len(report["loaded_tensors"]), report["layers"], report["source"])
         if (
             str(config.model.get("backbone_attention_output_gate", "none"))
             != "none"
@@ -377,6 +403,28 @@ def load_model_tokenizer(
         model.config.use_cache = False
         if logger is not None:
             logger.info("Gradient checkpointing enabled")
+
+    if architecture_variant == "showo2_unified":
+        # HF's recursive enable also visits the flow/semantic heads. Restore
+        # their independent infra settings after configuring the backbone.
+        model.image_flow_head.gradient_checkpointing = bool(
+            getattr(model.config, "image_flow_grad_checkpointing", True))
+        if model.model.semantic_encoder is not None:
+            model.model.semantic_encoder.gradient_checkpointing = bool(
+                getattr(model.config, "s2_semantic_gradient_checkpointing", True))
+        backbone_checkpointing = bool(config.training.get("use_gradient_checkpointing", False))
+        checkpoint_every = int(getattr(model.config, "s2_backbone_checkpoint_every", 1))
+        if checkpoint_every not in (1, 2):
+            raise ValueError("S2 backbone checkpoint interval must be 1 or 2")
+        for index, layer in enumerate(model.model.layers):
+            layer.gradient_checkpointing = backbone_checkpointing and index % checkpoint_every == 0
+        if logger is not None:
+            logger.info("S2 execution: MC draws=%d, MC batch=%d, checkpointing backbone=%d/%d flow=%s semantic=%s full=%s",
+                model.image_flow_batch_mul, int(getattr(model.config, "s2_mc_batch_size", 1)),
+                sum(layer.gradient_checkpointing for layer in model.model.layers), len(model.model.layers),
+                model.image_flow_head.gradient_checkpointing,
+                model.model.semantic_encoder.gradient_checkpointing if model.model.semantic_encoder is not None else None,
+                bool(getattr(model.config, "s2_full_prediction_checkpointing", True)))
 
     return model, tokenizer
     
@@ -697,167 +745,3 @@ def get_selfless_mask(
         KV_LEN=seq_len,
         device=device,
     )
-
-
-def get_showo_mae_mask(
-    *,
-    input_ids: torch.Tensor,
-    token_types: torch.Tensor,
-    device,
-    boi_token_id: int,
-    segment_ids: torch.Tensor | None = None,
-    image_uncond_rows: torch.Tensor | None = None,
-    image_uncond_mask: torch.Tensor | None = None,
-) -> torch.Tensor | BlockMask:
-    """Build Show-O omni attention: causal text and full image blocks.
-
-    Image queries see all image tokens in their own image span and all
-    preceding tokens. Text/special queries remain causal. Padding and tokens
-    from another packed segment are never visible.
-    """
-
-    input_ids = input_ids.to(device=device)
-    token_types = token_types.to(device=device)
-    if input_ids.shape != token_types.shape or input_ids.ndim != 2:
-        raise ValueError(
-            "input_ids and token_types must be aligned rank-2 tensors, got "
-            f"{tuple(input_ids.shape)} and {tuple(token_types.shape)}"
-        )
-    batch_size, seq_len = input_ids.shape
-    positions = torch.arange(seq_len, device=device, dtype=torch.long)
-    causal = positions.view(1, 1, seq_len) <= positions.view(1, seq_len, 1)
-    valid = token_types != 3
-    allowed = (
-        causal
-        & valid.unsqueeze(-1)
-        & valid.unsqueeze(1)
-    )
-
-    image_span_ids = torch.cumsum(
-        input_ids.eq(int(boi_token_id)).to(torch.long), dim=1
-    )
-    q_image = token_types.eq(1).unsqueeze(-1)
-    kv_image = token_types.eq(1).unsqueeze(1)
-    same_image_span = image_span_ids.unsqueeze(-1).eq(
-        image_span_ids.unsqueeze(1)
-    )
-    allowed = allowed | (
-        q_image
-        & kv_image
-        & same_image_span
-        & valid.unsqueeze(-1)
-        & valid.unsqueeze(1)
-    )
-
-    if segment_ids is not None:
-        if tuple(segment_ids.shape) != tuple(input_ids.shape):
-            raise ValueError("segment_ids must align with input_ids")
-        segment_ids = segment_ids.to(device=device, dtype=torch.long)
-        same_segment = segment_ids.unsqueeze(-1).eq(segment_ids.unsqueeze(1))
-        allowed = (
-            allowed
-            & same_segment
-            & segment_ids.unsqueeze(-1).ge(0)
-            & segment_ids.unsqueeze(1).ge(0)
-        )
-
-    if image_uncond_rows is not None or image_uncond_mask is not None:
-        if image_uncond_mask is not None:
-            if segment_ids is None:
-                raise ValueError("image_uncond_mask requires segment_ids")
-            if tuple(image_uncond_mask.shape) != tuple(input_ids.shape):
-                raise ValueError("image_uncond_mask must align with input_ids")
-            q_is_uncond_image = image_uncond_mask.to(
-                device=device, dtype=torch.bool
-            ).unsqueeze(-1)
-        else:
-            if tuple(image_uncond_rows.shape) != (batch_size,):
-                raise ValueError(
-                    "image_uncond_rows must have shape "
-                    f"{(batch_size,)}, got {tuple(image_uncond_rows.shape)}"
-                )
-            q_is_uncond_image = (
-                image_uncond_rows.to(device=device, dtype=torch.bool).view(
-                    batch_size, 1
-                )
-                & token_types.eq(1)
-            ).unsqueeze(-1)
-        allowed = allowed & (
-            ~q_is_uncond_image
-            | (kv_image & same_image_span)
-        )
-
-    if input_ids.device.type == "npu":
-        return (~allowed).unsqueeze(1)
-
-    def showo_fn(b, h, q_idx, kv_idx):
-        del h
-        return allowed[b, q_idx, kv_idx]
-
-    return create_block_mask(
-        showo_fn,
-        B=batch_size,
-        H=None,
-        Q_LEN=seq_len,
-        KV_LEN=seq_len,
-        device=device,
-    )
-
-
-def sample_showo_mae_image_mask(
-    *,
-    image_span_table: torch.Tensor,
-    full_image_loss_mask: torch.Tensor,
-    image_tokens_per_img: int,
-    min_masking_rate: float = 0.0,
-    generator: torch.Generator | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Sample the official Show-O cosine-ratio random image mask."""
-
-    if not 0.0 <= float(min_masking_rate) <= 1.0:
-        raise ValueError("min_masking_rate must lie in [0, 1]")
-    if image_span_table.ndim != 2 or image_span_table.shape[1] < 4:
-        raise ValueError("image_span_table must have shape [num_images, >=4]")
-    if full_image_loss_mask.ndim != 2:
-        raise ValueError("full_image_loss_mask must be rank 2")
-    num_images = int(image_span_table.shape[0])
-    if num_images <= 0:
-        raise ValueError("Show-O masking requires at least one image span")
-    image_tokens_per_img = int(image_tokens_per_img)
-    device = full_image_loss_mask.device
-    spans = image_span_table.to(device=device, dtype=torch.long)
-    rows = spans[:, 0]
-    starts = spans[:, 2]
-    offsets = torch.arange(
-        image_tokens_per_img, device=device, dtype=torch.long
-    ).unsqueeze(0)
-    token_indices = starts.unsqueeze(1) + offsets
-    eligible = full_image_loss_mask.to(device=device, dtype=torch.bool)[
-        rows.unsqueeze(1), token_indices
-    ]
-
-    timesteps = torch.rand(
-        num_images, device=device, generator=generator, dtype=torch.float32
-    )
-    mask_prob = torch.cos(timesteps * (math.pi * 0.5)).clamp(
-        min=float(min_masking_rate), max=1.0
-    )
-    num_masked = (image_tokens_per_img * mask_prob).round().clamp(
-        min=1, max=image_tokens_per_img
-    )
-    random_order = torch.rand(
-        num_images,
-        image_tokens_per_img,
-        device=device,
-        generator=generator,
-        dtype=torch.float32,
-    ).argsort(dim=-1)
-    # Joint validation also contains I2T spans whose image-loss eligibility is
-    # all false. They remain fully visible while T2I spans receive the sampled
-    # Show-O mask. The operation stays device-side and adds no host sync.
-    local_mask = (random_order < num_masked.unsqueeze(-1)) & eligible
-    sampled_mask = torch.zeros_like(
-        full_image_loss_mask, device=device, dtype=torch.bool
-    )
-    sampled_mask[rows.unsqueeze(1), token_indices] = local_mask
-    return sampled_mask, mask_prob

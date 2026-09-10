@@ -572,6 +572,10 @@ def build_attention_masks(
     attention_contract: str,
     device: torch.device,
 ) -> tuple[Any, Any | None]:
+    if attention_contract == "showo2_omni_attention":
+        from models.modeling_model.modeling_showo2_unified import omni_allowed_mask, attention_from_allowed
+        return attention_from_allowed(omni_allowed_mask(input_ids, token_types,
+            boi_token_id=boi_token_id, segment_ids=segment_ids)), None
     kwargs = {
         "sigma": sigma,
         "seq_len": int(sigma.shape[1]),

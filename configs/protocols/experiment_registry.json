@@ -134,7 +134,17 @@
     {
       "run": "unified-b-0p6b-caption-only-100bphys-s42-r1",
       "id": "b_caption_only",
-      "label": "历史 B · caption-only",
+      "label": "历史 B · caption-only（错误 100B 预算，产物已删除）",
+      "group": "legacy",
+      "purpose": "unclassified",
+      "active_sources": [
+        "i2t"
+      ]
+    },
+    {
+      "run": "unified-b-x0content-0p6b-i2t-only-bmatched-s42-r1",
+      "id": "b_i2t_only_matched",
+      "label": "B · I2T-only",
       "group": "single",
       "purpose": "formal",
       "active_sources": [
@@ -159,6 +169,62 @@
       "purpose": "formal",
       "active_sources": [
         "climbmix"
+      ]
+    },
+    {
+      "run": "unified-b-x0content-0p6b-t2i-only-100bphys-s42-r1",
+      "id": "b_t2i_only",
+      "label": "历史 B · T2I-only（错误 100B 预算，已停止）",
+      "group": "legacy",
+      "purpose": "unclassified",
+      "active_sources": [
+        "t2i"
+      ]
+    },
+    {
+      "run": "unified-s2-single-0p6b-100b-imagenet-split-s42-r1",
+      "id": "s2_single",
+      "label": "S2-single",
+      "group": "showo2",
+      "purpose": "formal",
+      "active_sources": [
+        "climbmix",
+        "t2i",
+        "i2t"
+      ]
+    },
+    {
+      "run": "unified-s2-dual-siglip-0p6b-100b-imagenet-split-s42-r1",
+      "id": "s2_dual_siglip",
+      "label": "S2-dual-siglip",
+      "group": "showo2",
+      "purpose": "formal",
+      "active_sources": [
+        "climbmix",
+        "t2i",
+        "i2t"
+      ]
+    },
+    {
+      "run": "unified-b-siglip-0p6b-100b-imagenet-split-s42-r1",
+      "id": "b_siglip",
+      "label": "B + SigLIP",
+      "group": "showo2",
+      "purpose": "formal",
+      "active_sources": [
+        "climbmix",
+        "t2i",
+        "i2t"
+      ]
+    },
+    {
+      "run": "unified-b-x0content-0p6b-t2i-only-bmatched-s42-r1",
+      "id": "b_t2i_only_matched",
+      "label": "B · T2I-only",
+      "group": "single",
+      "purpose": "formal",
+      "active_sources": [
+        "t2i"
       ]
     }
   ]

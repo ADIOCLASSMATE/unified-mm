@@ -84,7 +84,16 @@ def restore_training_state(
                     "Caption resume requires the same world size: "
                     f"checkpoint={saved.get('world_size')}, current={accelerator.num_processes}"
                 )
-            validate_resume_contract(saved, current_contract=config_contract)
+            changes = validate_resume_contract(saved, current_contract=config_contract,
+                allow_s2_infra_migration=bool(config.experiment.get("allow_s2_infra_migration", False)))
+            if changes:
+                audit = {"schema": "showo2_infra_resume_v1", "checkpoint": str(checkpoint_dir),
+                    "global_step": int(saved["global_step"]), "changes": changes,
+                    "all_other_contract_fields_equal": True, "bitwise_equivalence_claimed": False,
+                    "restore": ["model", "optimizer", "scheduler", "data_cursor", "RNG", "FP32_EMA"]}
+                destination = Path(config.experiment.output_dir) / f"infra_resume-{saved['global_step']}.json"
+                destination.write_text(json.dumps(audit, indent=2) + "\n")
+                _log_info(f"Audited S2 infrastructure migration: {changes}")
             return saved
 
         metadata = run_io_phase(

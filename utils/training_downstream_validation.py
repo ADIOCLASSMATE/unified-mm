@@ -355,7 +355,8 @@ def _grounding_task(model, tokenizer, examples, cache, null_ids, profile, device
     category_index = {name: i for i, name in enumerate(categories)}
     totals = torch.zeros((len(categories), 4))  # count, strict wins, ties, margin sum
     seen = torch.zeros(len(examples))
-    order = model.config.training_image_sigma_order
+    from utils.evaluation.model_contracts import image_order_for_scoring
+    order = image_order_for_scoring(model.config, model.config.training_image_sigma_order)
     mc_samples = profile.mc_samples if order == "random" else 1
     encode_kwargs = dict(image_tokens=int(model.config.image_tokens_per_img),
                          boi_token_id=int(model.config.boi_token_id), eoi_token_id=int(model.config.eoi_token_id),

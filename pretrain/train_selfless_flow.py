@@ -75,11 +75,9 @@ from utils.utils import (
     checkpoint_save_due,
     flatten_omega_conf,
     get_config,
-    get_showo_mae_mask,
     get_selfless_mask,
     load_model_tokenizer,
     prune_training_checkpoints,
-    sample_showo_mae_image_mask,
     save_checkpoint,
     save_hf_model,
 )
@@ -368,15 +366,6 @@ def _prepare_loss_forward_batch(batch, *, config, device, source_name, mixed_sou
         ) & has_image
         image_uncond_rows = sampled_rows
 
-    image_loss_mask, image_latent_mask, showo_mask_prob = (
-        _prepare_showo_image_masks(
-            config=config,
-            token_types=token_types,
-            image_span_table=image_span_table,
-            image_loss_mask=image_loss_mask,
-            mask_generation_images=(source_name == "t2i"),
-        )
-    )
     selfless_attention_mask, content_attention_mask = (
         _build_backbone_attention_masks(
             config=config,
@@ -417,14 +406,14 @@ def _prepare_loss_forward_batch(batch, *, config, device, source_name, mixed_sou
         if image_span_table is not None:
             forward_kwargs["image_span_table"] = image_span_table
         forward_kwargs["image_loss_mask"] = image_loss_mask
-        if image_latent_mask is not None:
-            forward_kwargs["image_latent_mask"] = image_latent_mask
     if image_latents is not None:
         forward_kwargs["image_latents"] = image_latents
+    if config.model.get("architecture_variant") == "showo2_unified":
+        forward_kwargs["s2_image_uncond_rows"] = image_uncond_rows
+        forward_kwargs["s2_image_uncond_mask"] = image_uncond_mask
     return forward_kwargs, {
         "image_uncond_rows": image_uncond_rows,
         "image_uncond_mask": image_uncond_mask,
-        "showo_mask_prob": showo_mask_prob,
     }
 
 
@@ -490,7 +479,12 @@ def _training_objective(config) -> str:
     objective = str(
         config.model.get("training_objective", "selfless_dual_stream")
     ).strip().lower()
-    if objective not in {"selfless_dual_stream", "showo_mae_flow"}:
+    if objective == "showo2_full_image_flow" and config.model.get("architecture_variant") == "showo2_unified":
+        if config.model.get("dual_stream_attention_contract") != "showo2_omni_attention":
+            raise ValueError("Show-o2 requires omni attention")
+        validate_flow_head_attention_contract(config.model)
+        return objective
+    if objective != "selfless_dual_stream":
         raise ValueError(f"unsupported model.training_objective={objective!r}")
     attention_contract = str(
         config.model.get(
@@ -506,12 +500,6 @@ def _training_objective(config) -> str:
             f"{attention_contract!r}"
         )
     validate_flow_head_attention_contract(config.model)
-    if (
-        objective == "showo_mae_flow"
-        and str(config.model.get("showo_mask_schedule", "cosine")).lower()
-        != "cosine"
-    ):
-        raise ValueError("showo_mae_flow requires showo_mask_schedule=cosine")
     return objective
 
 
@@ -526,20 +514,11 @@ def _build_backbone_attention_masks(
     image_uncond_mask=None,
 ):
     objective = _training_objective(config)
-    if objective == "showo_mae_flow":
-        return (
-            get_showo_mae_mask(
-                input_ids=input_ids,
-                token_types=token_types,
-                device=input_ids.device,
-                boi_token_id=int(config.model.boi_token_id),
-                segment_ids=segment_ids,
-                image_uncond_rows=image_uncond_rows,
-                image_uncond_mask=image_uncond_mask,
-            ),
-            None,
-        )
-
+    if objective == "showo2_full_image_flow":
+        from models.modeling_model.modeling_showo2_unified import omni_allowed_mask, attention_from_allowed
+        return attention_from_allowed(omni_allowed_mask(input_ids, token_types,
+            boi_token_id=int(config.model.boi_token_id), segment_ids=segment_ids,
+            image_uncond_rows=image_uncond_rows, image_uncond_mask=image_uncond_mask)), None
     mask_kwargs = {
         "sigma": sigma,
         "seq_len": input_ids.shape[1],
@@ -563,31 +542,6 @@ def _build_backbone_attention_masks(
         else None
     )
     return query_mask, content_mask
-
-
-def _prepare_showo_image_masks(
-    *,
-    config,
-    token_types,
-    image_span_table,
-    image_loss_mask,
-    mask_generation_images: bool,
-):
-    if _training_objective(config) != "showo_mae_flow":
-        return image_loss_mask, None, None
-    image_latent_mask = token_types.eq(1)
-    if not mask_generation_images or image_span_table.shape[0] == 0:
-        return image_loss_mask, image_latent_mask, None
-    sampled_mask, mask_prob = sample_showo_mae_image_mask(
-        image_span_table=image_span_table,
-        full_image_loss_mask=image_loss_mask,
-        image_tokens_per_img=int(config.model.image_tokens_per_img),
-        min_masking_rate=float(
-            config.model.get("showo_min_masking_rate", 0.0)
-        ),
-    )
-    image_latent_mask = image_latent_mask & ~sampled_mask
-    return sampled_mask, image_latent_mask, mask_prob
 
 
 def _apply_trainable_scope(model, config) -> dict[str, int | str]:
@@ -1425,7 +1379,6 @@ def main(*, model_loader=None):
             logical_images = int(spans.shape[0]) if spans is not None else 0
             image_uncond_rows = prepared["image_uncond_rows"]
             image_uncond_mask = prepared["image_uncond_mask"]
-            showo_mask_prob = prepared["showo_mask_prob"]
             pack_stats = batch.get("pack_stats", None)
             B, L = input_ids.shape
             training_window.record_batch(
@@ -1456,12 +1409,6 @@ def main(*, model_loader=None):
                     logger.info(
                         "image-uncond packed image tokens in first batch: "
                         f"{int(image_uncond_mask.sum().item())}"
-                    )
-                if showo_mask_prob is not None:
-                    logger.info(
-                        "Show-O MAE mask ratio in first batch: "
-                        f"mean={showo_mask_prob.mean().item():.4f}, "
-                        f"masked={int(image_loss_mask.sum().item())}"
                     )
                 if pack_stats is not None:
                     valid_tokens, image_tokens, padding_tokens, packed_len = map(
@@ -3185,13 +3132,6 @@ def _validate_multimodal(
             )
         B, L = input_ids.shape
 
-        image_loss_mask, image_latent_mask, _ = _prepare_showo_image_masks(
-            config=config,
-            token_types=token_types,
-            image_span_table=image_span_table,
-            image_loss_mask=image_loss_mask,
-            mask_generation_images=True,
-        )
         selfless_attention_mask, content_attention_mask = (
             _build_backbone_attention_masks(
                 config=config,
@@ -3219,8 +3159,6 @@ def _validate_multimodal(
             forward_kwargs["compute_image_loss"] = validate_image_source
         if content_attention_mask is not None:
             forward_kwargs["content_attention_mask"] = content_attention_mask
-        if image_latent_mask is not None:
-            forward_kwargs["image_latent_mask"] = image_latent_mask
         output = model(**forward_kwargs)
         per_modality_loss = getattr(output, "per_modality_loss", None)
         per_modality_count = getattr(output, "per_modality_count", None)

@@ -62,8 +62,6 @@ model:
     # Persist the training order into every checkpoint. E overrides this to
     # sequential so evaluation cannot silently fall back to B's random order.
     training_image_sigma_order: "random"
-    showo_mask_schedule: "cosine"
-    showo_min_masking_rate: 0.0
     use_flex_attention: true
     image_tokens_per_img: 256
     image_latent_dim: 16

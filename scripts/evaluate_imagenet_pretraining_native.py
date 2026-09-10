@@ -55,6 +55,8 @@ from models.modeling_model.image_position_utils import (  # noqa: E402
 from models.modeling_model.modeling_selfless_flow import (  # noqa: E402
     SelflessStaticCache,
 )
+from utils.evaluation.model_contracts import scoring_contract
+
 from utils.evaluation_model_source import (  # noqa: E402
     add_model_source_argument,
     configure_model_source,
@@ -134,7 +136,7 @@ def main() -> None:
     config = OmegaConf.load(args.config)
     configure_model_source(config, source)
     objective = str(config.model.get("training_objective", "selfless_dual_stream"))
-    if objective != "selfless_dual_stream":
+    if objective not in {"selfless_dual_stream", "showo2_full_image_flow"}:
         raise ValueError(f"pretraining-native likelihood requires Selfless, got {objective}")
     attention_contract = str(
         config.model.get("dual_stream_attention_contract", "selfless_strict")
@@ -145,8 +147,11 @@ def main() -> None:
     image_sigma_order = (
         configured_order if args.image_sigma_order == "auto" else args.image_sigma_order
     )
-    if attention_contract not in {"selfless_strict", "xlnet_content_diagonal"}:
+    if attention_contract not in {"selfless_strict", "xlnet_content_diagonal", "showo2_omni_attention"}:
         raise ValueError(f"unknown attention contract: {attention_contract}")
+    if attention_contract == "showo2_omni_attention":
+        image_sigma_order = "sequential"
+        args.scoring_backend = "repeated_full_sequence"
     if image_sigma_order not in {"random", "sequential"}:
         raise ValueError(f"unknown image sigma order: {image_sigma_order}")
 
@@ -211,8 +216,8 @@ def main() -> None:
                 "template_selection_used_imagenet_val_labels": False,
             },
             "scoring": {
-                "model_contract": "selfless_same_position_query_stream",
-                "contract": LIKELIHOOD_SCORING_CONTRACT,
+                "model_contract": scoring_contract(attention_contract, "selfless_same_position_query_stream"),
+                "contract": scoring_contract(attention_contract, LIKELIHOOD_SCORING_CONTRACT),
                 "dual_stream_attention_contract": attention_contract,
                 "query_stream_diagonal": False,
                 "content_stream_diagonal": (
@@ -262,7 +267,7 @@ def main() -> None:
                 "runtime_hashing_enabled": False,
                 "project_formal_protocol": bool(args.require_formal_protocol),
                 "scoring": {
-                    "contract": LIKELIHOOD_SCORING_CONTRACT,
+                    "contract": scoring_contract(attention_contract, LIKELIHOOD_SCORING_CONTRACT),
                     "dual_stream_attention_contract": attention_contract,
                     "backend": str(args.scoring_backend),
                     "conditional_candidate_score": "mean_token_loglikelihood",

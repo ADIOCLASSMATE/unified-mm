@@ -59,6 +59,8 @@ DEFAULT_TASKS = (
 )
 MC_TASKS = DEFAULT_TASKS
 CHOICE_LETTERS = ("A", "B", "C", "D")
+from utils.evaluation.model_contracts import scoring_contract
+
 TEXT_SCORING_CONTRACT = "selfless_same_position_dual_stream_v2"
 TEXT_PROTOCOL_SCHEMA = "selfless_text_benchmark_v3"
 TEXT_NORMALIZATION = "original_choice_characters"
@@ -572,6 +574,7 @@ def score_choice_requests(
         if attention_contract not in {
             "selfless_strict",
             "xlnet_content_diagonal",
+            "showo2_omni_attention",
         }:
             raise ValueError(
                 "unsupported dual-stream attention contract: "
@@ -673,7 +676,7 @@ def completed_rank_shard(
         "complete": True,
         "protocol_schema": TEXT_PROTOCOL_SCHEMA,
         "task_protocol": TASK_PROTOCOLS[task],
-        "scoring_contract": TEXT_SCORING_CONTRACT,
+        "scoring_contract": scoring_contract(attention_contract, TEXT_SCORING_CONTRACT),
         "task": task,
         "rank": rank,
         "world_size": world_size,
@@ -713,7 +716,7 @@ def write_rank_shard(
         "complete": True,
         "protocol_schema": TEXT_PROTOCOL_SCHEMA,
         "task_protocol": TASK_PROTOCOLS[task],
-        "scoring_contract": TEXT_SCORING_CONTRACT,
+        "scoring_contract": scoring_contract(attention_contract, TEXT_SCORING_CONTRACT),
         "runtime_hashing_enabled": False,
         "task": task,
         "rank": rank,
@@ -762,6 +765,7 @@ def evaluate_multiple_choice_task(
     if attention_contract not in {
         "selfless_strict",
         "xlnet_content_diagonal",
+        "showo2_omni_attention",
     }:
         raise ValueError(
             "unsupported dual-stream attention contract: "

@@ -49,7 +49,8 @@ def validate_resume_contract(
     metadata: dict[str, Any],
     *,
     current_contract: dict[str, Any],
-) -> None:
+    allow_s2_infra_migration: bool = False,
+) -> list[dict[str, Any]]:
     """Validate an unhashed, human-readable continuation contract."""
 
     if metadata.get("schema") != RESUME_SCHEMA:
@@ -65,10 +66,14 @@ def validate_resume_contract(
             f"{metadata.get('config_contract_version')!r}"
         )
     if metadata.get("config_contract") != current_contract:
+        if allow_s2_infra_migration:
+            from utils.showo2_unified_protocol import validate_s2_infra_migration
+            return validate_s2_infra_migration(metadata.get("config_contract"), current_contract)
         raise RuntimeError(
             "Resume configuration differs from the checkpoint; refusing an "
             "inexact continuation."
         )
+    return []
 
 
 def validate_wsd_contract(config) -> None:

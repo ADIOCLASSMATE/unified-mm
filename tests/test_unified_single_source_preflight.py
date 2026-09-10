@@ -10,6 +10,94 @@ import scripts.validate_unified_single_source as preflight
 PROTOCOL = Path(
     "configs/protocols/unified_single_source_0p6b_100b_ascend16.yaml"
 )
+FORMAL_B_T2I_PROTOCOL = Path(
+    "configs/protocols/unified_b_t2i_only_0p6b_100b_ascend16.yaml"
+)
+MATCHED_B_PROTOCOL = Path(
+    "configs/protocols/unified_b_image_only_matched_ascend16.yaml"
+)
+
+
+def test_matched_b_image_tasks_have_unified_source_exposure_and_schedule():
+    report = preflight.validate_preflight(protocol_path=MATCHED_B_PROTOCOL, audit_assets=False)
+    protocol = OmegaConf.load(MATCHED_B_PROTOCOL)
+    base = OmegaConf.load(protocol.base_config)
+    assert report["selected_sources"] == ["i2t", "t2i"]
+    for source, run in report["runs"].items():
+        config = OmegaConf.load(protocol.single_source_runs[source].config)
+        assert config.dataset.params.image == base.dataset.params.image
+        assert config.lr_scheduler == base.lr_scheduler
+        assert config.model.image_flow_grad_checkpointing is True
+        assert config.model.image_flow_share_content is True
+        assert run["max_train_steps"] == base.training.max_train_steps == 95415
+        exposure = run["max_train_steps"] * run["batch_contract"]["physical_tokens_per_optimizer_step"]
+        assert exposure == protocol.comparison_scope.combined_cumulative_source_physical_tokens[source]
+        assert exposure == report["target_physical_tokens_per_run"] == 50024939520
+
+
+def test_matched_protocol_rejects_old_100b_image_budget(tmp_path):
+    protocol = OmegaConf.load(MATCHED_B_PROTOCOL)
+    protocol.target_physical_tokens_per_run = 100000595968
+    path = tmp_path / "wrong-budget.yaml"
+    OmegaConf.save(protocol, path)
+    with pytest.raises(ValueError, match="target_physical_tokens_per_run mismatch"):
+        preflight.validate_preflight(protocol_path=path, audit_assets=False)
+
+
+@pytest.mark.parametrize("field,value,error", [
+    ("dataset.params.image.caption_include_original", True, "image dataset"),
+    ("model.image_flow_share_content", False, "model contract"),
+    ("lr_scheduler.params.decay_steps", 47684, "WSD decay"),
+])
+def test_matched_protocol_rejects_data_infrastructure_and_scheduler_drift(
+    tmp_path, field, value, error
+):
+    protocol = OmegaConf.load(MATCHED_B_PROTOCOL)
+    config = OmegaConf.load(protocol.single_source_runs.t2i.config)
+    OmegaConf.update(config, field, value)
+    config_path = tmp_path / "wrong-t2i.yaml"
+    OmegaConf.save(config, config_path)
+    protocol.single_source_runs.t2i.config = str(config_path)
+    path = tmp_path / "protocol.yaml"
+    OmegaConf.save(protocol, path)
+    with pytest.raises(ValueError, match=error):
+        preflight.validate_preflight(protocol_path=path, source="t2i", audit_assets=False)
+
+
+def test_formal_b_t2i_uses_current_model_and_exact_physical_budget():
+    report = preflight.validate_preflight(
+        protocol_path=FORMAL_B_T2I_PROTOCOL, source="t2i", audit_assets=False
+    )
+    assert report["selected_sources"] == ["t2i"]
+    assert set(report["runs"]) == {"t2i"}
+    run = report["runs"]["t2i"]
+    assert run["flow_condition_contract"] == "backbone_xt_query_backbone_x0_content"
+    assert run["max_train_steps"] == 190736
+    assert run["batch_contract"]["logical_rows_per_optimizer_step"] == 1024
+    assert (run["max_train_steps"] * run["batch_contract"]["physical_tokens_per_optimizer_step"]
+            == report["target_physical_tokens_per_run"] == 100000595968)
+
+
+@pytest.mark.parametrize("protocol_path,wrong_condition", [
+    (FORMAL_B_T2I_PROTOCOL, "backbone_xt_shared_query_content"),
+    (PROTOCOL, "backbone_xt_query_backbone_x0_content"),
+])
+def test_protocol_identity_rejects_swapping_current_and_historical_b(
+    tmp_path, protocol_path, wrong_condition
+):
+    protocol = OmegaConf.load(protocol_path)
+    protocol.flow_condition_contract = wrong_condition
+    path = tmp_path / "wrong-condition.yaml"
+    OmegaConf.save(protocol, path)
+    with pytest.raises(ValueError, match="protocol.flow_condition_contract mismatch"):
+        preflight.validate_preflight(protocol_path=path, audit_assets=False)
+
+
+def test_formal_b_t2i_cannot_select_an_untrained_source():
+    with pytest.raises(ValueError, match="unsupported --source"):
+        preflight.validate_preflight(
+            protocol_path=FORMAL_B_T2I_PROTOCOL, source="i2t", audit_assets=False
+        )
 
 
 def test_single_source_protocol_and_configs_use_main_baseline_b():

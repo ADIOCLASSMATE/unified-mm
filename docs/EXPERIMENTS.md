@@ -1,90 +1,64 @@
-# 实验命名与定义
+# 实验定义
 
-当前正式模型只有 **A、B**，分别对应原 `A_x0`、`B_x0`。
-正文、图表和新实验说明统一写 A/B，不再附加 `_x0`、X0-content、新版或指定版。
-**C–F 均是在正式 B 上的消融**；旧 A/B 及旧分支单独归入历史实验。
+正式 A/B 对应持久 ID `a_x0` / `b_x0`，B 为基线。展示名称与分组由 [experiment_registry.json](../configs/protocols/experiment_registry.json)维护；训练目录和 checkpoint 保留原名称。
 
-## 正式 A / B
+## 架构
 
-两者都从 Qwen3-0.6B-Base 开始，使用 Selfless two-stream backbone 和
-dynamic dual-stream contextual flow head（8 层、宽 1280）。Flow query
-条件来自 backbone XT hidden，flow content 条件来自 backbone X0 hidden，
-即 `backbone_xt_query_backbone_x0_content`。这里 X0 是共同的方法定义，
-不再作为模型名称后缀。
+A/B 从 Qwen3-0.6B-Base 初始化，使用共享参数的 X0/content 与 XT/query 两流，以及 8 层、宽 1280 的 contextual flow head。Backbone 的 XT 输入为 learned mask，flow head 接收 noisy latent；flow query/content 分别由 backbone XT/X0 hidden 调制。
 
-| 项目 | A | B（基线） |
+| 设置 | A | B |
 | --- | --- | --- |
-| Backbone query attention | `sigma_kv < sigma_q` | `sigma_kv < sigma_q` |
-| Backbone content attention | `sigma_kv < sigma_q` | `sigma_kv <= sigma_q` |
-| Flow-head query attention | `sigma_kv < sigma_q` | `sigma_kv < sigma_q` |
-| Flow-head content attention | `sigma_kv < sigma_q` | `sigma_kv <= sigma_q` |
-| Backbone / flow attention contract | `selfless_strict` | `xlnet_content_diagonal` |
+| Backbone / head 的 query 可见性 | `sigma_kv < sigma_q` | `sigma_kv < sigma_q` |
+| Backbone / head 的 content 可见性 | `sigma_kv < sigma_q` | `sigma_kv <= sigma_q` |
+| Attention contract | `selfless_strict` | `xlnet_content_diagonal` |
 | 图像训练顺序 | random | random |
 
-A/B 的主比较只改变 backbone 和 flow head 的 content 对角线可见性。
-共同训练设置是 64×910B、seed 42、100B 名义文本目标、95,415 步，任务调度为
-`[climbmix, t2i, climbmix, i2t]`。详细数值及 C–F 的实现字段由
-[100B 训练合同](../configs/protocols/unified_ablation_100b_ascend64.yaml) 维护。
+文本与 caption 均按从左到右训练。图像为 256 个 16 维 KL16 latent token；位置编码使用 row/column 2D RoPE，backbone 实际基数为 10,000。Attention output gate 默认 `none`。
 
-```bash
-# 正式 A
-bash script/selfless/pretraining_unified_ablation_a_0p6b_formal_ascend64.sh
-# 正式 B
-bash script/selfless/pretraining_unified_ablation_b_0p6b_formal_ascend64.sh
-```
-
-## B 上的消融：C–F
-
-C–F 都以正式 B 为参照，只改变各自指定因素，按完整 100B 合同从相同预训练
-权重开始训练。“在 B 上”表示方法与实验设置以 B 为基线，不是从 B 的已训练
-checkpoint 续训。
-
-| 名称 | 相对 B 的改动 |
+| B 上的消融 | 改动 |
 | --- | --- |
-| C · B + 文本 AR | 文本改为单流、按物理位置 next-token AR，图像路径沿用 B |
-| D · B + Dynamic-XT | T2I 的 backbone query 接收带时间嵌入的 `x_t`，每次 ODE 速度计算刷新条件；训练 r4，完整评测选修复后的 r2 |
-| E · B + sequential | 图像训练及原生生成均按 sequential 顺序 |
-| F · B + position-wise head | 保留 B 的 backbone，flow head 换成参数量匹配的逐位置 AdaLN MLP，无跨 token attention 或 content stream |
+| C · 文本 AR | 文本使用单流 next-token 预测，图像路径沿用 B |
+| D · Dynamic-XT | Backbone query 接收 `x_t,t`，每次 ODE 速度计算刷新条件 |
+| E · sequential | 图像训练与原生生成均用顺序排列 |
+| F · position-wise head | 参数量匹配的逐位置 AdaLN MLP 替代 contextual head |
+| depth16 / depth30 | Flow head 深度由 8 增至 16 / 30 |
 
-保留结果 ID `c_on_b`、`d_on_b`、`e_on_b`、`f_on_b`。对应启动脚本为
-`script/selfless/pretraining_unified_ablation_{c,d,e,f}_on_b_0p6b_formal_ascend64.sh`。
-报告将它们归入“B 上的消融”，与旧版本区分；选择该组时同时显示 B 基线。
+A/B 与 C–F 使用 [统一训练协议](../configs/protocols/unified_ablation_100b_ascend64.yaml)，深度扩展使用 [scaling 协议](../configs/protocols/unified_b_x0_flow_head_scaling_100b_ascend64.yaml)。新训练均从基座 step 0 开始；数据、预算、学习率和产物见 [训练](TRAINING.md)。
 
-## 历史实验与辅助实验
+## 单任务对照
 
-历史实验按“历史 + 原字母 + 改动”展示，不再让旧版本占用裸名 A/B。
-此处只汇总差异；精确架构、训练任务和权重始终以各自 checkpoint/config 为准。
-
-| 历史身份 ID | 显示名称 / 定义 |
-| --- | --- |
-| `a_legacy` | 历史 A · shared-condition：严格注意力，flow query/content 共用 XT-query 条件 |
-| `b_flowdiag` | 历史 B · shared-condition / flow 对角线：backbone 和 flow content 都含对角线，共用 XT-query 条件 |
-| `b_no_flowdiag` | 历史 B · shared-condition / flow 无对角线：backbone content 含对角线，flow content 严格，共用 XT-query 条件 |
-| `c_on_a_legacy` | 历史 C · 旧 A + 文本 AR：基于 shared-condition 旧 A 的早期对照 |
-| `a_caption_only` / `b_caption_only` | 历史 A/B · caption-only：仅 I2T 训练 |
-| `a_text_only` / `b_text_only` | 历史 A/B · text-only：仅 ClimbMix 训练 |
-
-其他旧单任务配置按实际任务标记为历史对照。B 的 flow depth 16/30 实验归入
-深度扩展，1.7B LR sweep 归入历史调参；都不占用正式 A/B 的名称或默认视图。
-早期 ImageNet-only 架构研究单独见[历史结论](ABLATION_CONCLUSIONS.md)。
-
-## 名称、身份与结果的对应
-
-[实验登记表](../configs/protocols/experiment_registry.json) 是显示名称和分组的唯一来源；
-`main` 仅包含 A/B，`ablation` 包含 C–F，`legacy` 包含旧版本。
-报告构建时用登记表更新旧 manifest 的显示信息。
-`formal` purpose 表示该运行按完整实验记录，并不表示它仍是当前研究主线。
-
-| 正式名 | 已保存的结果 ID | 已保存的训练目录（`output/` 下） |
+| 实验 | 数据与预算 | 配置 |
 | --- | --- | --- |
-| A | `a_x0` | `unified-a-x0content-0p6b-100b-imagenet-split-s42-r1` |
-| B | `b_x0` | `unified-b-x0content-0p6b-100b-imagenet-split-s42-r1` |
+| I2T-only | B 的 I2T 数据与曝光；95,415 updates | [I2T](../configs/selfless/unified_b_i2t_only_matched_ascend16.yaml) |
+| T2I-only | B 的 T2I 数据与曝光；95,415 updates，RF4 | [T2I](../configs/selfless/unified_b_t2i_only_matched_ascend16.yaml) |
+| text-only | ClimbMix，100B 物理文本位置；95,368 updates | [text](../configs/selfless/unified_single_text_0p6b_100b_ascend16.yaml) |
 
-这些 ID 和目录是历史结果的关联键，保留原值；它们不是当前展示名。
-尤其不能把正式 A/B 指向不含 `x0content` 的旧 `unified-a/b-0p6b-...` 目录。
-已有 checkpoint、结果数值、冻结协议、历史报告文件名和来源校验均保留可追溯性。
+两项 image-only 使用 16 卡、每卡 batch 32、GA2、全局 1,024 图；每任务累计 50,024,939,520 个物理位置。协议为 [image-only matched](../configs/protocols/unified_b_image_only_matched_ascend16.yaml)。
 
-[评测总览](../output/evaluation/index.html) 的首页结论、指标、训练曲线和定性样例
-默认展示正式 A/B；B 上的 C–F 消融、历史实验通过筛选查看。采样扫描写作“B · CFG / Heun”或
-“B · 解码顺序”，属于同一模型的推理设置实验，不再增加模型字母。
-生成分数必须连同 CFG、步数、顺序和权重版本比较，详见[评测结构](EVALUATION_STRUCTURE.md)。
+## S2 与 SigLIP
+
+目标是检验额外语义／细节双路径在本项目架构和训练范式下是否必要。
+
+| 组 | 视觉前端 | 图像建模 |
+| --- | --- | --- |
+| B | KL16 projector | 随机序逐 latent flow |
+| B+SigLIP | SigLIP 语义分支 + projector + fusion | B 路径，语义层使用 sigma 因果可见性 |
+| S2-single | KL16 projector | 图像块 full attention，整图 flow |
+| S2-dual-siglip | SigLIP 语义分支 + projector + fusion | 与 S2-single 相同 |
+
+当前 S2 与 B+SigLIP 配置采用 B 的 unified 数据和 95,415-step 预算，从 step 0 全参数训练，语义分支 LR=2e-6。Show-o2 原流程包含语义预蒸馏、Stage-1 冻结和 Stage-2 解冻；当前变体省略前两步。
+
+详细配置和原流程见 [S2](SHOWO2_UNIFIED_ABLATION_DESIGN.md)、[B+SigLIP](B_SIGLIP_UNIFIED_ABLATION.md)，性能设置见 [S2 infra](S2_INFRA_20260910.md)。
+
+## 历史身份
+
+| ID | 方法 |
+| --- | --- |
+| `a_legacy` | 严格 attention，flow query/content 共用 XT 条件 |
+| `b_flowdiag` | Backbone/head content 含对角线，flow 共用 XT 条件 |
+| `b_no_flowdiag` | Backbone content 含对角线、head content 严格，flow 共用 XT 条件 |
+| `c_on_a_legacy` | 历史 A 加文本 AR |
+| `a_caption_only` | 历史 A 的 I2T-only |
+| `a_text_only` / `b_text_only` | 已完成的 ClimbMix 单任务对照 |
+
+早期 ImageNet 配方见 [历史实验](ABLATION_CONCLUSIONS.md)。结果选择由 [evaluation_report.json](../configs/protocols/evaluation_report.json)维护，首页使用各模型对应的 final EMA；D 使用训练 r4、修正后的完整评测 r2。

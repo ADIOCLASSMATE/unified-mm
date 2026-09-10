@@ -1,38 +1,18 @@
-# B sigma / reveal-order comparison
+# B：生成顺序比较
 
-B is the formal model defined in [EXPERIMENTS.md](EXPERIMENTS.md).
+固定 [CFG/Heun 扫描](B_SAMPLING_SWEEP.md) 的最低 FID 配方 CFG2 / Heun10，使用 B step95415 final EMA。`cfg-refinement.json` 保存 CFG 1/1.5/2/2.5/3 的邻域复核。
 
-This study fixes the minimum-FID choice from the completed CFG/Heun sweep:
-CFG 2.0, Heun 10. `cfg-refinement.json` revalidates the exact 50K results at
-CFG 1.0, 1.5, 2.0, 2.5, 3.0. The winner is interior, so the requested final-step
-±0.5 / ±1.0 neighborhood needs no duplicate computation or boundary extension.
+## 固定条件
 
-The model is the step-95415 final EMA of
-`unified-b-x0content-0p6b-100b-imagenet-split-s42-r1`. Each arm uses an independent
-16-NPU Job in the user-selected random-order language-modeling project, global
-batch 4096, ImageNet-val 50K, seed 42, canonical per-image/per-position noise,
-BF16 model, FP32 VAE and ODE integration, constant CFG, temperature 1.0,
-serialized reveal, and the backbone cache. IS has ten synset-stratified splits.
-These are validation-set comparisons, not independent holdout estimates.
+ImageNet-val 50K、seed42、canonical 图像/位置噪声、BF16 模型、FP32 VAE 与 ODE、温度1、逐位置生成、backbone cache。每组 16 NPUs，全局 batch4096；IS 用十个 synset 分层 split。调参与报告共用该验证集。
 
-## Strategies
+## 顺序
 
-Existing policies are `spatial_halton`, `sequential`, `spatial_uniform`
-(the existing center-out/checker ordering, despite its name), and `random`.
-Random permutations use the evaluator's frozen batch/rank seed rule; the
-canonical initial noise remains paired with the other arms. Changing rank or
-batch layout would change random order and requires a separate protocol.
+基础策略为 `spatial_halton`、`sequential`、`spatial_uniform`（现实现为中心向外/checker 顺序）和 `random`。random 使用 `42 + batch_idx * 1009 + rank * 1000003`；比较保持相同 ranks 和 batch 划分。
 
-The four additional policies retain the same ordered blocks of 16 Halton
-positions. At the start of each block, they query all its candidates using only
-the caption and already generated image content. The candidates cannot attend
-to one another. This is adaptive ranking within blocks, not global re-ranking
-after every token. All candidates are eventually decoded sequentially with
-fresh conditions and their original canonical noise.
+四个附加策略以 Halton 的连续 16 个位置为候选块。每块开始时，只根据 caption 和已经生成的内容评分；候选 query 彼此不可见，随后按分数逐个生成。
 
-Let `vc`, `vu` be conditional and unconditional flow velocities at the actual
-per-position initial noise `x`, with `t=0`. Let `v = vu + cfg*(vc-vu)`.
-Mean is over latent channels and all scoring arithmetic uses FP32.
+令 vc / vu 为 t=0、该位置原始噪声 x 的条件/无条件速度，`v = vu + cfg*(vc-vu)`，均值沿 latent 通道计算，评分使用 FP32。
 
 | Policy | Score / ordering |
 |---|---|
@@ -41,50 +21,19 @@ Mean is over latent channels and all scoring arithmetic uses FP32.
 | `confidence_stability` | Ascending `mean((v_next-v)^2)/(mean(v^2)+1e-8)`, where `x_next=x+0.1*v`, `t_next=0.1`, and `v_next` uses the same generated context |
 | `confidence_halton` | Both velocity probes are computed, but Halton order is retained; numerical/cache and cost control |
 
-Ties preserve original Halton order. These proxies are not calibrated confidence
-probabilities or latent log likelihoods. Agreement may prefer background or
-weakly caption-dependent positions. Stability measures a local ODE property,
-which may not predict perceptual correctness. The comparison tests these
-hypotheses without using true images to choose orders.
+平分保持 Halton 原顺序。上述分数分别测量 guidance 敏感度和局部 ODE 稳定性。
 
-The general high-confidence-first idea is informed by
-[MaskGIT](https://arxiv.org/html/2202.04200v1), which uses discrete token prediction
-probabilities. Our continuous-latent score definitions above are experimental
-adaptations, not that paper's method. Keeping spatially spread candidate blocks
-is motivated by the coverage argument in
-[Halton Scheduler](https://arxiv.org/abs/2503.17076); that paper also gives reasons
-not to assume confidence-based selection always improves FID.
+## Cache 与复现
 
-## Cache and reproducibility checks
+探测只提交上一个已完成的 Content 一次，使用其 X0 条件；候选 query 和 Euler proposal 不进入 Content cache。实际生成从原噪声重新求条件，探测不消耗 RNG。保留 64 个相同样本的 PNG、prompt、噪声及 `order_trace`。
 
-A probe commits only the previously completed content token, exactly once,
-with its X0 backbone condition. Probe candidate queries and Euler proposals
-never enter either content cache. The chosen candidates are re-evaluated when
-actually generated, so conditions include all preceding committed positions.
-Probe scoring does not consume RNG draws. CPU tests compare adaptive generation
-against an independent probe-free decode forced to use its recorded order,
-cross two block boundaries, and verify independence from training sigma order.
+CPU 对照将记录顺序交给独立 decode，检查两个以上块边界、cache 提交、RNG 和训练 sigma 独立性；16-NPU smoke 在 `dev-wjx-ascend` 上执行。
 
-Run NPU smoke only on permanent `dev-wjx-ascend`; require its saved audit before
-submission. Pass an explicit canonical shared `--cwd` to `notebook exec` because
-the account's `me` alias can point at a fileset absent from this Notebook.
-The full study re-runs Halton to reproduce the previous 50K result,
-and measures the numerical and timing effect of the probe control explicitly.
+```bash
+python3 scripts/prepare_unified_order_sweep.py   --previous-sweep <completed> --output-dir <new>
+bash <new>/launch/smoke.sh
+python3 <new>/launch/submit_unified_t2i_sweep.py   --output-dir <new> --name-prefix <unique>
+python3 scripts/report_sampling_sweep.py --output-dir <new> --watch
+```
 
-Each arm saves 64 identical selected image indices, prompts, canonical noise
-seeds, PNGs, and `order_trace` JSON containing actual ranks and proxy scores.
-The report audits these permutations, score sorting, image identities and
-decoding, checkpoint identity, precision, split coverage, and immutable inputs
-using readable file fields. No runtime hashes or third-party trackers are used.
-
-Prepare with `scripts/prepare_unified_order_sweep.py --previous-sweep <completed>
---output-dir <new>`, run its bounded `launch/smoke.sh` on the development
-Notebook, validate smoke, then submit `launch/submit_unified_t2i_sweep.py` with
-`--output-dir <new> --name-prefix <unique>`. The standard report watcher
-`scripts/report_sampling_sweep.py --output-dir <new> --watch` updates
-`output/evaluation/index.html`, PNG/PDF plots, CSV, and final audits.
-
-Potential follow-ups, separate from this frozen comparison: enlarge the
-candidate pool with equal compute controls; re-score more often; evaluate
-agreement across independent probe noises; calibrate a confidence predictor
-on a separate training subset. None should be claimed better before measured.
+复用 [采样产物结构](B_SAMPLING_SWEEP.md)。相关方法：[MaskGIT](https://arxiv.org/html/2202.04200v1)、[Halton Scheduler](https://arxiv.org/abs/2503.17076)。

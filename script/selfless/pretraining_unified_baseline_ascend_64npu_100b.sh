@@ -326,8 +326,6 @@ if [[ "${PRESERVE_MODEL_CONTRACT}" == "false" ]]; then
     "model.flow_head_attention_contract=${FLOW_HEAD_ATTENTION_CONTRACT}"
     "model.flow_condition_contract=${FLOW_CONDITION_CONTRACT}"
     "model.image_flow_batch_mul=${IMAGE_FLOW_BATCH_MUL}"
-    "model.showo_mask_schedule=cosine"
-    "model.showo_min_masking_rate=0.0"
   )
 fi
 if [[ "${ABLATION}" == "f" ]]; then

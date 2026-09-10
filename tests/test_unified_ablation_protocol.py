@@ -344,7 +344,6 @@ def test_dedicated_a_b_launchers_select_new_x0_content_arms():
         in smoke_source
     )
     assert '"training.use_gradient_checkpointing=false"' in smoke_source
-    assert 'TRAINING_OBJECTIVE="showo_mae_flow"' not in smoke_source
     assert '--ablation "${ABLATION}"' in smoke_source
     assert '--flow-condition-contract "${FLOW_CONDITION_CONTRACT}"' in smoke_source
 

@@ -84,8 +84,6 @@ def _comparable_contract(contract: dict[str, Any]) -> dict[str, Any]:
     model.setdefault(
         "dual_stream_attention_contract", "xlnet_content_diagonal"
     )
-    model.setdefault("showo_mask_schedule", "cosine")
-    model.setdefault("showo_min_masking_rate", 0.0)
     optimizer = comparable.setdefault("optimizer", {}).setdefault(
         "params", {}
     )

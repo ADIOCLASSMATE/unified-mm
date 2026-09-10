@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fail-closed preflight for the 0.6B token-matched single-source runs.
 
-The protocol is intentionally checked twice: all three run configurations are
+The protocol is intentionally checked twice: all declared run configurations are
 validated structurally on every invocation, while heavyweight dataset audits
 are performed only for the selected active source(s).  This lets a pure-text
 job remain independent of ImageNet availability, and vice versa.
@@ -37,7 +37,21 @@ DEFAULT_PROTOCOL = (
     / "configs/protocols/unified_single_source_0p6b_100b_ascend16.yaml"
 )
 SUPPORTED_SOURCES = ("climbmix", "i2t", "t2i")
+PROTOCOL_CONTRACTS = {
+    "unified_single_source_0p6b_100b_v2": (
+        SUPPORTED_SOURCES, "backbone_xt_shared_query_content"
+    ),
+    "unified_b_t2i_only_0p6b_100b_v1": (
+        ("t2i",), "backbone_xt_query_backbone_x0_content"
+    ),
+    "unified_b_image_only_matched_v1": (
+        ("i2t", "t2i"), "backbone_xt_query_backbone_x0_content"
+    ),
+}
 EXPECTED_TARGET_PHYSICAL_TOKENS = 100_000_595_968
+MATCHED_SCHEMA = "unified_b_image_only_matched_v1"
+MATCHED_STEPS = 95_415
+MATCHED_TARGET_PHYSICAL_TOKENS = MATCHED_STEPS * 524_288
 EXPECTED_WORLD_SIZE = 16
 EXPECTED_MODEL_PATH = "public/models/Qwen--Qwen3-0.6B-Base"
 
@@ -95,7 +109,12 @@ def _source_from_schedule(config: DictConfig) -> tuple[str, tuple[str, ...]]:
 
 
 def _validate_global_protocol(protocol: DictConfig) -> DictConfig:
-    _expect("protocol.schema", protocol.schema, "unified_single_source_0p6b_100b_v2")
+    schema = str(protocol.schema)
+    if schema not in PROTOCOL_CONTRACTS:
+        raise ValueError(f"unsupported protocol.schema={schema!r}")
+    run_sources, flow_condition_contract = PROTOCOL_CONTRACTS[schema]
+    matched = schema == MATCHED_SCHEMA
+    target = MATCHED_TARGET_PHYSICAL_TOKENS if matched else EXPECTED_TARGET_PHYSICAL_TOKENS
     _expect("protocol.world_size", int(protocol.world_size), EXPECTED_WORLD_SIZE)
     _expect("protocol.nodes", int(protocol.nodes), 1)
     _expect("protocol.npu_per_node", int(protocol.npu_per_node), 16)
@@ -108,7 +127,7 @@ def _validate_global_protocol(protocol: DictConfig) -> DictConfig:
     _expect(
         "protocol.target_physical_tokens_per_run",
         int(protocol.target_physical_tokens_per_run),
-        EXPECTED_TARGET_PHYSICAL_TOKENS,
+        target,
     )
     _expect("protocol.initialization", protocol.initialization, "qwen3_0p6b_base_step_zero")
     _expect("protocol.architecture_variant", protocol.architecture_variant, "selfless_contextual")
@@ -126,7 +145,7 @@ def _validate_global_protocol(protocol: DictConfig) -> DictConfig:
     _expect(
         "protocol.flow_condition_contract",
         protocol.flow_condition_contract,
-        "backbone_xt_shared_query_content",
+        flow_condition_contract,
     )
     _expect("protocol.runtime_hashing_enabled", bool(protocol.runtime_hashing_enabled), False)
     _expect("protocol.wandb_mode", protocol.wandb_mode, "disabled")
@@ -181,9 +200,9 @@ def _validate_global_protocol(protocol: DictConfig) -> DictConfig:
     _expect(
         "single-source run set",
         set(protocol.single_source_runs.keys()),
-        set(SUPPORTED_SOURCES),
+        set(run_sources),
     )
-    for source in SUPPORTED_SOURCES:
+    for source in run_sources:
         run = protocol.single_source_runs[source]
         reference = combined.source_contributions[source]
         _expect(
@@ -194,18 +213,18 @@ def _validate_global_protocol(protocol: DictConfig) -> DictConfig:
         _expect(
             f"protocol {source} target",
             int(run.actual_physical_tokens),
-            EXPECTED_TARGET_PHYSICAL_TOKENS,
+            target,
         )
         _expect(
             f"protocol {source} max*per-step",
             int(run.max_train_steps)
             * int(run.physical_tokens_per_optimizer_step),
-            EXPECTED_TARGET_PHYSICAL_TOKENS,
+            target,
         )
         _expect(
             f"protocol {source} overshoot",
             int(run.overshoot_physical_tokens),
-            EXPECTED_TARGET_PHYSICAL_TOKENS - 100_000_000_000,
+            0 if matched else target - 100_000_000_000,
         )
 
     optimizer = protocol.shared_optimizer
@@ -233,7 +252,25 @@ def _validate_global_protocol(protocol: DictConfig) -> DictConfig:
     base_path = _repo_path(protocol.base_config)
     if not base_path.is_file():
         raise FileNotFoundError(f"missing protocol base config: {base_path}")
-    return OmegaConf.load(base_path)
+    base = OmegaConf.load(base_path)
+    if matched:
+        _expect("unified B total steps", int(base.training.max_train_steps), MATCHED_STEPS)
+        _expect("combined reference steps", int(combined.max_train_steps), MATCHED_STEPS)
+        scope = protocol.comparison_scope
+        _expect("comparison mode", scope.mode, "equal_source_exposure_to_unified_b")
+        _expect("matched source exposure", bool(scope.matches_combined_source_exposure), True)
+        _expect("matched flow infrastructure", protocol.infrastructure, {
+            "image_flow_grad_checkpointing": True, "image_flow_share_content": True,
+        })
+        for source in SUPPORTED_SOURCES:
+            cumulative = MATCHED_STEPS * int(combined.source_contributions[source].physical_tokens_per_optimizer_step)
+            _expect(f"combined {source} cumulative exposure", int(scope.combined_cumulative_source_physical_tokens[source]), cumulative)
+        for source in run_sources:
+            run = protocol.single_source_runs[source]
+            _expect(f"matched {source} steps", int(run.max_train_steps), MATCHED_STEPS)
+            for key in ("warmup_steps", "decay_steps"):
+                _expect(f"matched {source} {key}", int(run[key]), int(base.lr_scheduler.params[key]))
+    return base
 
 
 def _validate_shared_model_optimizer(
@@ -243,16 +280,17 @@ def _validate_shared_model_optimizer(
     *,
     source: str,
 ) -> None:
-    # The historical single-source controls remain configuration-equivalent to
-    # their original B baseline. The combined baseline now opts into split
-    # XT/X0 conditioning, so override only that newly versioned field before
-    # comparing the otherwise identical model contracts.
+    # Each versioned protocol owns its flow condition. Historical controls keep
+    # shared XT conditioning; the formal B T2I control uses split XT/X0.
     expected_model = OmegaConf.create(
         OmegaConf.to_container(base.model, resolve=True)
     )
     expected_model.flow_condition_contract = (
         protocol.flow_condition_contract
     )
+    if str(protocol.schema) == MATCHED_SCHEMA:
+        expected_model = OmegaConf.merge(expected_model, protocol.infrastructure)
+        _expect(f"{source} image dataset", config.dataset.params.image, base.dataset.params.image)
     _expect(f"{source} model contract", config.model, expected_model)
     _expect(f"{source} optimizer contract", config.optimizer, base.optimizer)
     _expect(f"{source} model_path", config.model.model_path, EXPECTED_MODEL_PATH)
@@ -322,13 +360,14 @@ def _validate_training_runtime_contract(
     _expect(f"{source} training seed", int(training.seed), int(protocol.seed))
     _expect(f"{source} shuffle seed", int(training.dataloader_shuffle_seed), int(protocol.seed))
     _expect(f"{source} runtime hashing", bool(training.runtime_hashing_enabled), False)
-    _expect(f"{source} target physical tokens", int(training.target_physical_tokens), EXPECTED_TARGET_PHYSICAL_TOKENS)
+    target = int(protocol.target_physical_tokens_per_run)
+    _expect(f"{source} target physical tokens", int(training.target_physical_tokens), target)
     _expect(f"{source} max train steps", int(training.max_train_steps), int(run.max_train_steps))
     _expect(f"{source} formal stop", int(training.stop_after_steps), int(training.max_train_steps))
     _expect(
         f"{source} max*per-step",
         int(training.max_train_steps) * int(training.physical_tokens_per_optimizer_step),
-        EXPECTED_TARGET_PHYSICAL_TOKENS,
+        target,
     )
     _expect(f"{source} from_scratch", bool(training.from_scratch), False)
     if not _noneish(experiment.resume_from_checkpoint):
@@ -510,6 +549,7 @@ def _validate_run_contract(
     ema_eval_every = int(config.experiment.save_ema_eval_every)
     return {
         "source": source,
+        "flow_condition_contract": str(config.model.flow_condition_contract),
         "config": str(config_path),
         "job_name": str(run.job_name),
         "output_root": str(run.output_root),
@@ -747,6 +787,7 @@ def validate_preflight(
     protocol_path = _repo_path(protocol_path)
     protocol = OmegaConf.load(protocol_path)
     base = _validate_global_protocol(protocol)
+    run_sources = PROTOCOL_CONTRACTS[str(protocol.schema)][0]
     _expect(
         "formal world size",
         int(formal_world_size),
@@ -754,7 +795,7 @@ def validate_preflight(
     )
 
     configured: dict[str, tuple[Path, DictConfig]] = {}
-    for candidate_source in SUPPORTED_SOURCES:
+    for candidate_source in run_sources:
         path = _repo_path(protocol.single_source_runs[candidate_source].config)
         if not path.is_file():
             raise FileNotFoundError(
@@ -762,7 +803,7 @@ def validate_preflight(
             )
         configured[candidate_source] = (path, OmegaConf.load(path))
 
-    # Structural validation always covers all three configs, so a shared
+    # Structural validation always covers all declared configs, so a shared
     # target or architecture drift cannot pass merely by selecting one job.
     run_reports = {
         candidate_source: _validate_run_contract(
@@ -790,15 +831,15 @@ def validate_preflight(
             )
         selected_sources = [
             candidate_source
-            for candidate_source in SUPPORTED_SOURCES
+            for candidate_source in run_sources
             if known_paths[candidate_source] in selected_paths
         ]
     else:
-        selected_sources = list(SUPPORTED_SOURCES)
+        selected_sources = list(run_sources)
 
     if source is not None:
         source = str(source).strip().lower()
-        if source not in SUPPORTED_SOURCES:
+        if source not in run_sources:
             raise ValueError(f"unsupported --source={source!r}")
         if config_paths and selected_sources != [source]:
             raise ValueError(

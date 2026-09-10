@@ -44,6 +44,7 @@ def build_optimizer_and_scheduler(model, config, logger):
             flow_lr=flow_lr,
             projector_lr=projector_lr,
             special_token_lr=special_token_lr,
+            semantic_lr=float(optimizer_config.get("semantic_learning_rate", backbone_lr)),
         )
         key = (learning_rate, weight_decay)
         grouped.setdefault(key, []).append(param)
@@ -60,6 +61,13 @@ def build_optimizer_and_scheduler(model, config, logger):
         f"weight_decay={global_weight_decay:g}, "
         f"flow_weight_decay={flow_weight_decay:g}"
     )
+    if optimizer_role_numel.get("semantic_pretrained", 0):
+        logger.info(
+            "SigLIP optimizer: pretrained_parameters=%d, pretrained_lr=%g; "
+            "new semantic input/fusion modules use projector_lr=%g",
+            optimizer_role_numel["semantic_pretrained"],
+            float(optimizer_config.get("semantic_learning_rate", backbone_lr)), projector_lr,
+        )
     tied_embedding = model.lm_head.weight is model.model.embed_tokens.weight
     if not tied_embedding:
         raise RuntimeError(
@@ -74,6 +82,7 @@ def build_optimizer_and_scheduler(model, config, logger):
                 "tied_lm_head_embedding",
                 "image_projector",
                 "flow_head",
+                "semantic_pretrained",
             )
         )
         + "; lm_head/embed_tokens tied=true; special_token_learning_rate "
