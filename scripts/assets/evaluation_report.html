@@ -18,6 +18,9 @@ nav{position:sticky;top:0;background:rgba(255,255,255,.97);border-bottom:1px sol
 @media(max-width:1000px){.summary-grid{grid-template-columns:1fr}.metric-findings{grid-template-columns:1fr}.summary-card.wide{grid-column:auto}}
 @media(max-width:780px){.section-head{display:block}.back-overview{display:inline-block;margin-top:5px}.summary-card{padding:18px}.summary-card .card-heading{display:block}.abstract{padding:20px}.subnav a{font-size:13px;padding:7px 10px}.sweep-pair{grid-template-columns:1fr}.metrics-controls{padding:3px 14px}.summary-card .model-name{min-width:165px}}
 #metrics,#matrix-table{max-height:none}
+#sources{overflow-wrap:anywhere}
+.dataset-comparison td{min-width:190px;max-width:560px}.dataset-comparison td:first-child{min-width:145px;font-weight:600}.dataset-bar{display:flex;height:27px;border-radius:7px;overflow:hidden;margin:14px 0;background:var(--line)}.dataset-bar span{min-width:1px}.dataset-legend{display:flex;gap:10px 20px;flex-wrap:wrap;font-size:13px;margin-bottom:16px}.dataset-key{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:7px}.dataset-path{display:grid;grid-template-columns:230px minmax(0,1fr) auto;gap:14px;padding:13px 0;border-bottom:1px solid var(--line);align-items:start}.dataset-path:last-child{border-bottom:0}.dataset-path code{font-size:12px;overflow-wrap:anywhere;white-space:normal}.dataset-path small{display:block}.dataset-path button{font-size:12px;padding:4px 10px}.dataset-analysis td{min-width:180px;max-width:580px}.dataset-inventory h3{margin-top:24px}.dataset-inventory .box h3:first-child{margin-top:0}
+@media(max-width:780px){.dataset-path{grid-template-columns:minmax(0,1fr) auto}.dataset-path>strong{grid-column:1/-1}.dataset-comparison td{min-width:220px}}
 </style>
 </head>
 <body>
@@ -132,9 +135,13 @@ nav{position:sticky;top:0;background:rgba(255,255,255,.97);border-bottom:1px sol
   <div class="pagination"><button id="previous">上一页</button><span id="page-label"></span><button id="next">下一页</button></div>
 </section>
 <section class="panel" id="sources" hidden>
-  <div class="section-head"><div><div class="section-kicker">05 / DATA & PROTOCOLS</div><h2>数据集来源与合成协议</h2></div><a class="back-overview" href="#overview">返回研究总览 ↑</a></div><p class="note">训练、验证、正式评测和网页样本分别列出；生成模型、数据版本和实际采样方式按保存证据记录。</p>
+  <div class="section-head"><div><div class="section-kicker">05 / DATA & PROTOCOLS</div><h2>消融数据协议与 200 万补充图像计划</h2></div><a class="back-overview" href="#overview">返回研究总览 ↑</a></div><p class="note">当前计划：完整 ImageNet train 底座之外，再准备至少 200 万张去重、512px 预处理并验收的原图；各来源配额是起点，额外合格图可以保留；优先复用 caption / prompt。下面分别记录目标配额、旧消融协议和 9 月 12 日首轮实际产物；计划数不代表已经下载或发布。</p>
+  <div class="dataset-inventory" id="non-imagenet-2m-plan"></div>
+  <details class="box" id="historical-data-protocol"><summary><strong>此前消融与 9 月 12 日首轮数据：实际分布、协议和路径</strong></summary><p class="note">这里保留历史数据审计。其中的 sol 合成要求与滚动补图流程属于首轮协议；当前执行方案以上方 9 月 13 日计划为准。</p>
   <div class="box conclusion" id="dataset-summary"></div>
-  <h3>训练与验证数据</h3><div class="scroll provenance-table" id="training-data-table"></div>
+  <div class="dataset-inventory" id="dataset-inventory"></div>
+  </details>
+  <h3>旧消融 · 训练与验证数据明细</h3><div class="scroll provenance-table" id="training-data-table"></div>
   <div class="box" id="synthesis-protocols"></div>
   <h3>评测数据集与网页样本</h3><div class="scroll provenance-table" id="evaluation-data-table"></div>
   <div class="box" id="provenance-audit"></div>

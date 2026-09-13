@@ -85,15 +85,14 @@ def test_production_config_records_final_training_contract():
     assert config.evaluation.batch_size_per_npu == 256
 
 
-def test_real_stats_loader_requires_canonical_imagenet_val_contract(tmp_path):
-    path = tmp_path / "stats.pt"
+def _write_real_stats(path, dtype=torch.float32, image_size=256):
     torch.save(
         {
             "schema": "imagenet_val_inception_feature_moments_v2",
             "stats": {
                 "count": 50_000,
-                "sum": torch.zeros(2, dtype=torch.float32),
-                "outer_sum": torch.eye(2, dtype=torch.float32),
+                "sum": torch.tensor([1.000000001, 0.0], dtype=dtype),
+                "outer_sum": torch.eye(2, dtype=dtype),
             },
             "metadata": {
                 "source": {
@@ -104,20 +103,59 @@ def test_real_stats_loader_requires_canonical_imagenet_val_contract(tmp_path):
                 "feature": {
                     "feature": 2,
                     "extractor": "torch-fidelity-inception-v3-compat",
-                    "accumulation_dtype": "torch.float32",
+                    "accumulation_dtype": str(dtype),
                 },
                 "image_transform": {
-                    "resize": 256,
+                    "resize": image_size,
                     "interpolation": "bicubic",
-                    "center_crop": 256,
+                    "center_crop": image_size,
                     "color_mode": "RGB",
                 },
             },
         },
         path,
     )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("image_size", [256, 512])
+def test_real_stats_loader_requires_canonical_imagenet_val_contract(tmp_path, dtype, image_size):
+    path = tmp_path / "stats.pt"
+    _write_real_stats(path, dtype=dtype, image_size=image_size)
     payload = evaluator.load_shared_original_real_stats(
         str(path),
         fid_feature=2,
+        image_size=image_size,
     )
     assert payload["stats"]["count"] == 50_000
+    assert payload["stats"]["sum"].dtype == dtype
+    moments = evaluator.shared_feature_moments(payload, feature=2, device="cpu")
+    assert torch.equal(moments.sum, payload["stats"]["sum"].double())
+    if dtype == torch.float64:
+        assert moments.sum[0] > 1.0
+
+
+@pytest.mark.parametrize("field", ["sum", "outer_sum"])
+def test_real_stats_loader_rejects_misreported_precision(tmp_path, field):
+    path = tmp_path / "stats.pt"
+    _write_real_stats(path, dtype=torch.float64, image_size=512)
+    payload = torch.load(path, weights_only=True)
+    payload["stats"][field] = payload["stats"][field].float()
+    torch.save(payload, path)
+    with pytest.raises(ValueError, match="dtype does not match"):
+        evaluator.load_shared_original_real_stats(str(path), fid_feature=2, image_size=512)
+
+
+def test_real_stats_loader_still_rejects_wrong_resolution(tmp_path):
+    path = tmp_path / "stats.pt"
+    _write_real_stats(path, dtype=torch.float64, image_size=512)
+    with pytest.raises(ValueError, match="resize"):
+        evaluator.load_shared_original_real_stats(str(path), fid_feature=2, image_size=256)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_real_stats_loader_rejects_low_precision_accumulation(tmp_path, dtype):
+    path = tmp_path / "stats.pt"
+    _write_real_stats(path, dtype=dtype, image_size=512)
+    with pytest.raises(ValueError, match="unsupported.*accumulation_dtype"):
+        evaluator.load_shared_original_real_stats(str(path), fid_feature=2, image_size=512)

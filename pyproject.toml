@@ -32,6 +32,7 @@ dependencies = [
     "transformers>=5.7.0",
     "wandb>=0.26.1",
     "webdataset>=1.0.2",
+    "httpx[http2]>=0.28.1,<0.29",
 ]
 
 # Ascend torch_npu uses PyTorch's CPU wheel as its PrivateUse1 host runtime.

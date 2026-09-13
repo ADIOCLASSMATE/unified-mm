@@ -1,0 +1,230 @@
+{
+  "schema": "unified_b_non_imagenet_quota_plan_v1",
+  "updated_at": "2026-09-13",
+  "status": "source_selection_plan_not_a_dataset_release",
+  "target_unique_non_imagenet_images": 2000000,
+  "imagenet_train_base": 1281167,
+  "combined_target_before_imagenet_exclusions": 3281167,
+  "existing_non_imagenet_release_images": 105322,
+  "existing_images_count_inside_target": true,
+  "quota_unit": "unique_original_images_after_global_dedup_512px_and_acceptance",
+  "quota_policy": "initial_coverage_targets_not_caps_keep_qualified_surplus_and_control_training_with_sampling_weights",
+  "image_size": 512,
+  "image_tokens": 1024,
+  "latent_channels": 16,
+  "posterior_storage_channels": 32,
+  "image_sequence_length": 2048,
+  "text_tokens_max": 960,
+  "climbmix": "unchanged",
+  "download_policy": "select_valuable_candidates_with_headroom_finish_download_and_512px_acceptance_before_bulk_api_do_not_stop_acceptance_at_source_targets",
+  "network_policy": "per_process_direct_only_preserve_codex_proxy_and_global_routes",
+  "current_download_state": "previous_full_source_job_paused_ranges_preserved",
+  "bulk_synthesis_started": false,
+  "document": "docs/B_2M_NON_IMAGENET_DATA_PLAN_20260913.md",
+  "evidence_root": "public/data_preparation/unified_b_corners_api_v3/quota_2m_20260913",
+  "image_root": "public/datasets/unified_image_pool_512_v3",
+  "text_root": "public/datasets/unified_image_text_512_api_v3",
+  "sources": [
+    {
+      "id": "pixmo_cap",
+      "name": "PixMo-Cap train",
+      "target": 500000,
+      "url": "https://huggingface.co/datasets/allenai/pixmo-cap",
+      "selection": "完整 train 元数据分层；优先多主体、动作、属性组合；限制近似商品图、单主体和重复模板。先给 Points/OCR 保留原图，剩余身份才计入本桶。",
+      "reuse": "优先原有人工描述整理的 caption；通过 512px 对齐检查后同文用于 I2T/T2I。",
+      "synthesize": "只补缺失的关键关系/属性；过长且无法安全分句的文本才调用 API 压缩。",
+      "constraint": "全量 717,042 标注行对应 716,551 个唯一 URL，与 Points 仅 181 个完全相同 URL；不同 URL 的内容重复及 512px 可用率仍需审计。50 万是起点，非上限。"
+    },
+    {
+      "id": "openimages_relations_narratives",
+      "name": "Open Images 关系 + Localized Narratives",
+      "target": 300000,
+      "url": "https://google.github.io/localized-narratives/",
+      "selection": "建议约 10 万真实对象间关系图 + 20 万叙述场景图；关系类型、主客体、位置和属性分桶，抑制 at/wears 等常见项。",
+      "reuse": "按 Open Images ID 连接人工 Localized Narratives caption、现有 sol 文本及可用框/关系标注。",
+      "synthesize": "仅给没有完整 caption 的关系图补描述，或从已验证关系补一条聚焦文本。",
+      "constraint": "本地完整 CSV：568,539 张含关系/属性图，其中 RelationshipLabel != is 的原图仅 126,368 张；30 万不能都称为关系真值图。"
+    },
+    {
+      "id": "pixmo_points",
+      "name": "PixMo-Points train",
+      "target": 180000,
+      "url": "https://huggingface.co/datasets/allenai/pixmo-points",
+      "selection": "按 1、2、3、4、5–10、10+、可见性与可辨认程度分桶；尺寸只用实际框/检测字段，点坐标本身不当作目标尺寸。",
+      "reuse": "保留人工 referring expression/count/points，按同一原图连接已有 caption；Cap 仅有很少直接同 URL 对应，其他缺失项优先用可靠标注转写。",
+      "synthesize": "缺 caption 才看图补全；准确 count + referent 可直接组成聚焦正描述，不需要 LLM 猜数量。",
+      "constraint": "全量 2,376,222 标注行对应 228,080 个唯一 URL；与 Cap 完全相同 URL 仅 181 个，不假设多数 Points 可直接复用 Cap caption。内容去重/512px 后实数另报。"
+    },
+    {
+      "id": "anyword3m",
+      "name": "AnyWord-3M / AnyText2 更新标注",
+      "target": 350000,
+      "url": "https://modelscope.cn/datasets/iic/AnyWord-3M/summary",
+      "selection": "中文 20 万、英文 15 万；按招牌、包装、海报、多行文字分层，基于最终 512px 字符可读性筛选。",
+      "reuse": "复用原 caption、文字串与区域；优先核对发布的 AnyText2 新版 JSON。旧 BLIP-2 caption 和自动 OCR 不视为人工真值。",
+      "synthesize": "明确可读且已核对的文字先用规则接入描述；文字与载体/位置绑定缺失或已有描述冲突时才补标。",
+      "constraint": "COCO-Text 等派生来源须回溯原图并排除 B 评测；不下载 AnyText benchmark 充作训练图。"
+    },
+    {
+      "id": "journeydb_style",
+      "name": "JourneyDB train 风格精选（条件池）",
+      "target": 300000,
+      "url": "https://huggingface.co/datasets/JourneyDB/JourneyDB",
+      "selection": "插画、动漫、3D、幻想、复杂构图分层；按原始 prompt 聚类限制相似变体，跨分片抽取。",
+      "reuse": "原 prompt/描述作候选，清理生成参数后检查真实目标图；不能默认生成器画出了全部要求。",
+      "synthesize": "只有 prompt 与实际图有明确差异、或缺乏图像描述时才修订。",
+      "constraint": "官方仓库 gated=auto；另发现 BLIP3o 公开预训练分片，但它是重新打包且含重复提示，原始 train 身份映射尚需核对，不作为已核实的 30 万精选。",
+      "fallback": "若入口或 train 映射无法落实，优先用 MONET synthetic 的同风格候选补位；额外合格风格图可以保留，记录实际来源，不受 30 万上限约束。"
+    },
+    {
+      "id": "wikiart",
+      "name": "WikiArt",
+      "target": 70000,
+      "url": "https://huggingface.co/datasets/huggan/wikiart",
+      "selection": "全 72 个图像分片，按风格、题材、作者平衡，清理重复扫描与画框占比过大的图。",
+      "reuse": "复用风格/题材/作者元数据及已完成的合格 sol 文本；这些分类标签本身不是完整 caption。",
+      "synthesize": "没有现成完整描述的画作需要视觉模型补主体、构图、媒介与笔触。",
+      "constraint": "发布规模 81,444 图；7 万目标留余量有限。数据卡明确研究用途；源图条款与 caption 来源分别保留。"
+    },
+    {
+      "id": "generated_composition",
+      "name": "BLIP3o-60k + ShareGPT-4o-Image T2I",
+      "target": 80000,
+      "url": "https://huggingface.co/datasets/BLIP3o/BLIP3o-60k",
+      "selection": "建议 BLIP3o 4.5 万 + ShareGPT T2I 3.5 万；覆盖动作、文字、物体组合和设计，先剔除测试 prompt 及近重复。",
+      "reuse": "优先原有图文配对；一个忠实的描述可服务两个训练方向，任务前缀由 loader 添加。",
+      "synthesize": "只修正未实现的数量、位置、文字、风格等要求；无需每图另写同义 I2T/T2I。",
+      "constraint": "ShareGPT 的 T2I 为 45,717 条，46,539 条编辑数据不计入；BLIP3o viewer 的 7,103 文本行不是全部图像数，应按 tar 成员统计。"
+    },
+    {
+      "id": "textcaps_docci",
+      "name": "TextCaps + DOCCI train",
+      "target": 30000,
+      "url": "https://google.github.io/docci/",
+      "selection": "接近完整使用合格 train；先保留此稀缺桶，再给 Open Images/OCR 通用桶分配身份。",
+      "reuse": "优先人工 caption；同原图可补接 TextOCR-GPT4V 和 DIM caption，保留原作者。",
+      "synthesize": "只有 512px 后关键信息不可见/冲突或现有文本确实缺失时才修订。",
+      "constraint": "TextCaps train 21,953 + DOCCI train 9,647，合计原始上限 31,600，去重和质检后可能不足 3 万；缺额单列并由同类详细/OCR 描述图补位。",
+      "access_note": "本轮旧官方 TextCaps train JSON 直连返回 403，需落实官方可用元数据入口或有来源映射的镜像；不能据此认定全部 TextCaps 不可下载。DOCCI 文本和 split 已本地核实。"
+    },
+    {
+      "id": "structured_graphics",
+      "name": "DIM 已配 caption 的 PixMo-Docs / ChartQA train",
+      "target": 40000,
+      "url": "https://github.com/showlab/DIM/blob/main/data/T2I_DATASET.md",
+      "selection": "约 3 万简单图表/表格/图解 + 1 万 ChartQA；只用最终 512px 可读的 train，复杂整页文档受限。",
+      "reuse": "DIM 提供 PixMo-Docs 109,142、ChartQA 15,389 条 caption 候选，按原始 ID 连接图像并再次限定 train；不默认全都合格。",
+      "synthesize": "缺文本时优先从 CoSyn 的 data/code 或 ChartQA 表格约束构造事实，再按需语言化；QA 不直接当全图 caption。",
+      "constraint": "4 万占 200 万起始基线的 2%；实际比例随合格量更新。DIM 只提供 caption 元数据，不提供原图，过长 caption 须做完整语句选择或约束压缩。"
+    },
+    {
+      "id": "curated_real_scenes",
+      "name": "MONET 的 CC12M 精选分支 10 万 + PD3M 5 万",
+      "target": 150000,
+      "url": "https://huggingface.co/datasets/jasperai/monet",
+      "selection": "按前述桶缺失的主题补位；MONET 仅扫描 cc12m 分支的必要列和候选分片，PD3M 再按题材平衡。",
+      "reuse": "优先已有多模型 caption / PD3M caption；不重新从原始 CC12M 全部 URL 开始。",
+      "synthesize": "只修复缺失或不可用的文字。MONET / CC12M 获取不顺时优先使用 LLaVA-ReCap-CC3M；有价值的额外合格项可保留。",
+      "constraint": "MONET 是筛选去重重描述库，但 parquet 图为 384px 缩略图，训练须读完整图像；其 SANA latent 不能替代本项目 KL16。PD3M 是审美精选，不是关系/计数专项精选。"
+    }
+  ],
+  "curated_options": [
+    {
+      "name": "MONET",
+      "url": "https://huggingface.co/datasets/jasperai/monet",
+      "decision": "优先采用 cc12m 分支；synthetic 作为风格条件池备用",
+      "detail": "来源子目录、现成多模型 caption、去重簇与检测字段已经提供；不扫描或下载整个约 1 亿图仓库。"
+    },
+    {
+      "name": "DIM-T2I",
+      "url": "https://github.com/showlab/DIM/blob/main/data/T2I_DATASET.md",
+      "decision": "优先下载图表 / TextOCR 对应的轻量 caption 文件",
+      "detail": "只增加文本，不增加原图数；原图仍从上游获取，按 ID 与 split 连接。"
+    },
+    {
+      "name": "PD3M",
+      "url": "https://huggingface.co/datasets/Spawning/PD3M",
+      "decision": "先准备约 5 万，合格补题材图片可追加",
+      "detail": "PD12M 中约 330 万审美精选，caption/URL/尺寸/哈希已备；不让审美分挤掉计数难图。"
+    },
+    {
+      "name": "TextOCR-GPT4V",
+      "url": "https://huggingface.co/datasets/jimmycarter/textocr-gpt4v",
+      "decision": "复用 caption 层，原图不额外计数",
+      "detail": "有图像描述、文字描述和合并 caption；按原始 TextOCR train 身份过滤，模型 OCR 输出仍需核对。"
+    },
+    {
+      "name": "BLIP3o-60k / ShareGPT-4o-Image",
+      "url": "https://github.com/FreedomIntelligence/ShareGPT-4o-Image",
+      "decision": "8 万为起始目标；合格 T2I 可以超过该数",
+      "detail": "已有生成图与 prompt；原配对仍可能有约束未实现，编辑子集与测试 prompt 不混入。"
+    },
+    {
+      "name": "LLaVA-ReCap-CC3M",
+      "url": "https://huggingface.co/datasets/lmms-lab/LLaVA-ReCap-CC3M",
+      "decision": "通用场景的备用或增量入口",
+      "detail": "约 286 万已重描述图像可直接获取；这是重描述库，不等于全部为 corner-case 精选。"
+    },
+    {
+      "name": "CoSyn-400K",
+      "url": "https://huggingface.co/datasets/allenai/CoSyn-400K",
+      "decision": "结构化图形备用，优先复用 data/code",
+      "detail": "PixMo-Docs 作者推荐的更新版本；其现成 QA、代码、源数据有利于核对，但不能自动当作现有 caption 训练文本。"
+    },
+    {
+      "name": "Recap-DataComp-1B",
+      "url": "https://huggingface.co/datasets/UCSC-VLAA/Recap-DataComp-1B",
+      "decision": "本轮不设配额",
+      "detail": "当前 default / condition_diverse_topk 均为 940,890,257 train 行；没有核实到官方 corner-case 小精选，preview 1,000 行不算精选训练库。"
+    }
+  ],
+  "text_policy": {
+    "priority": [
+      "reuse_exact",
+      "normalize_without_new_facts",
+      "render_verified_annotations",
+      "api_fill_or_repair"
+    ],
+    "reuse_same_caption_for_i2t_and_t2i": true,
+    "reuse_original_generator_and_text_hash": true,
+    "force_two_separate_api_generations": false,
+    "force_minimum_word_count": false,
+    "preserve_original_ocr_language": true,
+    "target_reuse_rate": null,
+    "expected_api_image_count": null,
+    "explanation": "Actual reuse/call counts require a source join and final-view audit. Source counts are not token or task-exposure weights."
+  },
+  "quality_policy": {
+    "gpt6": "one_time_stratified_preflight_visual_review",
+    "sol_per_item_generation_or_review": false,
+    "qwen_route": "SII qwen3.8-max via test_api.py URL/key; OpenAI-format vision diagnostic succeeded, exact-512 paired quality qualification still pending",
+    "deepseek_route": "SII deepseek-v4-pro-0813 returned image unavailable on multiple valid image requests; no vision-teacher approval; text-only transformation remains a separate possible test",
+    "bulk_model_selected": null,
+    "cpu_audits": [
+      "split_and_parent_identity",
+      "exact_and_near_duplicate_exclusion",
+      "benchmark_image_and_prompt_exclusion",
+      "image_decode_and_512_geometry",
+      "source_annotation_alignment",
+      "text_schema_and_token_budget",
+      "raw_response_and_text_provenance"
+    ],
+    "warning": "Automatic structural checks and source reputation do not prove per-image semantic correctness."
+  },
+  "minimum_unique_non_imagenet_images": 2000000,
+  "target_is_minimum": true,
+  "source_targets_are_hard_caps": false,
+  "accepted_pool_hard_cap": null,
+  "surplus_policy": "Keep additional qualified unique images, especially reliable existing captions and scarce capabilities. Report actual source counts; initial source targets are coverage references, not uniform sampling weights or download-all instructions.",
+  "allocation_policy": "Unique originals assigned once for source accounting; scarce annotations take precedence; all compatible captions and labels retained; no acceptance cap at source target.",
+  "source_identity_audits": {
+    "pixmo_url_union": {
+      "path": "public/data_preparation/unified_b_corners_api_v3/quota_2m_20260913/pixmo_url_union_audit.json",
+      "cap_unique_urls": 716551,
+      "points_unique_urls": 228080,
+      "exact_url_intersection": 181,
+      "url_union": 944450,
+      "is_accepted_image_count": false
+    }
+  }
+}

@@ -34,3 +34,5 @@ poster_delivery/
 # Ascend/CANN runtime and JIT artifacts
 /kernel_meta/
 /fusion_result.json
+
+test_api.py

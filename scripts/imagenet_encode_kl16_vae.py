@@ -1,13 +1,16 @@
 """Cache scaled KL16 VAE posterior mean/std for ImageNet.
 
-Each shard contains one FP16 tensor with shape ``[N, 256, 32]``.  The last
+Each shard contains one FP16 tensor with shape ``[N, (image_size/16)^2, 32]``. The last
 dimension is ``concat(scaled_mean, scaled_std)``.  Training can therefore draw
 fresh posterior samples without running the VAE or evaluating exp(logvar).
 """
 
 import argparse
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from collections.abc import Sequence
@@ -19,8 +22,27 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from tqdm import tqdm
 
+from utils.image_shard_io import read_image_bytes
+from utils.kl16_layout import kl16_layout
+
 POSTERIOR_CACHE_FORMAT = "imagenet_kl16_scaled_posterior_v1"
 POSTERIOR_STATS_LAYOUT = "scaled_mean_then_scaled_std"
+
+
+@contextmanager
+def exclusive_shard_writer(path: Path, *, blocking: bool = True):
+    """Serialize cache reuse checks and writes across independent encoders."""
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    with lock_path.open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        except BlockingIOError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
 
 
 def sha256_file(path: Path) -> str:
@@ -119,6 +141,9 @@ def validate_reusable_shard(
     vae_module_sha256: str | None,
     source_manifest_sha256: str | None,
     source_image_root: str | None,
+    image_size: int = 256,
+    frozen_views: bool = False,
+    verify_view_hashes: bool = False,
 ) -> None:
     payload = torch.load(
         str(path),
@@ -130,7 +155,8 @@ def validate_reusable_shard(
     image_ids = payload.get("img_ids")
     metadata = payload.get("metadata", {})
     expected_ids = torch.tensor([sample[0] for sample in samples], dtype=torch.int64)
-    expected_shape = (len(samples), 256, 32)
+    side, image_tokens = kl16_layout(image_size)
+    expected_shape = (len(samples), image_tokens, 32)
     if not torch.is_tensor(stats) or tuple(stats.shape) != expected_shape:
         raise RuntimeError(
             f"existing shard cannot be reused; shape={getattr(stats, 'shape', None)}, "
@@ -148,6 +174,9 @@ def validate_reusable_shard(
         "vae_module_sha256": vae_module_sha256,
         "source_manifest_sha256": source_manifest_sha256,
         "source_image_root": source_image_root,
+        "image_size": image_size,
+        "posterior_shape": [side, side, 32],
+        "token_shape": [image_tokens, 32],
     }
     for field, expected in expected_metadata.items():
         if metadata.get(field) != expected:
@@ -155,6 +184,10 @@ def validate_reusable_shard(
                 f"existing shard metadata mismatch for {field}: "
                 f"{metadata.get(field)!r} != {expected!r}: {path}"
             )
+    if bool(metadata.get("frozen_views", False)) != frozen_views:
+        raise RuntimeError(f"existing shard preprocessing mode mismatch: {path}")
+    if verify_view_hashes and not metadata.get("source_view_hashes_verified", False):
+        raise RuntimeError(f"existing shard has no verified frozen-view hashes: {path}")
     for start in range(0, stats.shape[0], 512):
         chunk = stats[start : start + 512]
         if not bool(torch.isfinite(chunk).all()) or bool((chunk[..., 16:] < 0).any()):
@@ -168,8 +201,13 @@ class ImagePathDataset(Dataset):
         self,
         samples: Sequence[tuple[int, Path, str | None]],
         image_size: int,
+        frozen_views: bool = False,
+        expected_view_hashes: dict[int, str] | None = None,
     ):
         self.samples = list(samples)
+        self.image_size = image_size
+        self.frozen_views = frozen_views
+        self.expected_view_hashes = expected_view_hashes
         self.transform = transforms.Compose(
             [
                 transforms.Resize(
@@ -187,7 +225,13 @@ class ImagePathDataset(Dataset):
 
     def __getitem__(self, idx: int):
         img_id, path, synset = self.samples[idx]
-        with Image.open(path) as image:
+        data = read_image_bytes(path)
+        if self.expected_view_hashes is not None:
+            if hashlib.sha256(data).hexdigest() != self.expected_view_hashes[img_id]:
+                raise ValueError(f"frozen view SHA256 changed: {path}")
+        with Image.open(io.BytesIO(data)) as image:
+            if self.frozen_views and image.size != (self.image_size, self.image_size):
+                raise ValueError(f"frozen view has unexpected size {image.size}: {path}")
             tensor = self.transform(image.convert("RGB"))
         return img_id, tensor, str(path), synset or ""
 
@@ -320,6 +364,10 @@ def main() -> None:
     parser.add_argument("--vae_module_root", default="public/code/mar")
     parser.add_argument("--cache_shard_dir", required=True)
     parser.add_argument("--image_size", type=int, default=256)
+    parser.add_argument("--frozen_views", action="store_true",
+                        help="Require already processed exact-size teacher views.")
+    parser.add_argument("--verify_view_hashes", action="store_true",
+                        help="Verify each frozen image against the manifest SHA256 before encoding.")
     parser.add_argument("--image_extension", default="jpg")
     parser.add_argument("--scaling_factor", type=float, default=0.2325)
     parser.add_argument("--batch_size", type=int, default=512)
@@ -334,6 +382,8 @@ def main() -> None:
     parser.add_argument("--num_shards", type=int, default=1)
     parser.add_argument("--shard_index", type=int, default=0)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--skip_locked", action="store_true",
+                        help="Leave shards owned by another encoder to that writer.")
     parser.add_argument("--max_images", type=int, default=-1)
     parser.add_argument("--start_img_id", type=int, default=1)
     parser.add_argument("--manifest_jsonl", default=None)
@@ -344,11 +394,31 @@ def main() -> None:
         help="Do not calculate file digests while preparing the cache.",
     )
     args = parser.parse_args()
-
+    if (args.source_mode == "manifest_jsonl" and args.manifest_jsonl
+            and Path(args.manifest_jsonl).resolve() == Path(args.source_manifest_jsonl).resolve()):
+        raise ValueError("output manifest must not overwrite the source manifest")
     if args.num_shards < 1:
         raise ValueError("--num_shards must be >= 1")
     if args.shard_index < 0 or args.shard_index >= args.num_shards:
         raise ValueError("--shard_index must be in [0, num_shards)")
+    cache_shard_dir = Path(args.cache_shard_dir)
+    cache_shard_dir.mkdir(parents=True, exist_ok=True)
+    shard_path = cache_shard_dir / (
+        f"shard-{args.shard_index:05d}-of-{args.num_shards:05d}.pt"
+    )
+    with exclusive_shard_writer(shard_path, blocking=not args.skip_locked) as acquired:
+        if not acquired:
+            print(f"Skipped busy posterior shard: {shard_path}")
+            return
+        encode_shard(args, shard_path)
+
+
+def encode_shard(args, shard_path: Path) -> None:
+    if args.verify_view_hashes and (not args.frozen_views or args.source_mode != "manifest_jsonl"):
+        raise ValueError("--verify_view_hashes requires --frozen_views and manifest_jsonl input")
+    manifest_digest = (sha256_file(Path(args.source_manifest_jsonl))
+                       if args.source_mode == "manifest_jsonl" and not args.no_hash else None)
+    side, image_tokens = kl16_layout(args.image_size)
 
     vae_path = Path(args.vae_path)
     if not vae_path.exists():
@@ -397,11 +467,6 @@ def main() -> None:
         for index, sample in enumerate(samples)
         if index % args.num_shards == args.shard_index
     ]
-    cache_shard_dir = Path(args.cache_shard_dir)
-    cache_shard_dir.mkdir(parents=True, exist_ok=True)
-    shard_path = cache_shard_dir / (
-        f"shard-{args.shard_index:05d}-of-{args.num_shards:05d}.pt"
-    )
     if shard_path.exists() and not args.overwrite:
         source_manifest_sha256 = (
             sha256_file(Path(args.source_manifest_jsonl))
@@ -418,12 +483,20 @@ def main() -> None:
             vae_module_sha256=vae_module_sha256,
             source_manifest_sha256=source_manifest_sha256,
             source_image_root=args.source_image_root,
+            image_size=args.image_size,
+            frozen_views=args.frozen_views,
+            verify_view_hashes=args.verify_view_hashes,
         )
         print(f"Validated and reused posterior cache shard: {shard_path}")
         return
 
     device = resolve_device(args.device)
     vae_dtype = resolve_vae_dtype(args.vae_dtype, device)
+    if device.type == "npu" and vae_dtype == torch.float32:
+        # The NPU convolution default allows HF32 even for FP32 tensors.
+        # Preserve the CPU FP32 cache contract when banks mix device types.
+        torch.npu.conv.allow_hf32 = False
+        torch.npu.matmul.allow_hf32 = False
     torch.manual_seed(args.seed + args.shard_index)
     if device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -438,7 +511,18 @@ def main() -> None:
     for parameter in vae.parameters():
         parameter.requires_grad_(False)
 
-    dataset = ImagePathDataset(samples, args.image_size)
+    expected_hashes = None
+    if args.verify_view_hashes:
+        wanted = {sample[0] for sample in samples}
+        expected_hashes = {}
+        with Path(args.source_manifest_jsonl).open() as handle:
+            for line in handle:
+                row = json.loads(line)
+                if int(row["img_id"]) in wanted:
+                    expected_hashes[int(row["img_id"])] = row["view_sha256"]
+        if set(expected_hashes) != wanted:
+            raise ValueError("missing frozen-view hashes in source manifest")
+    dataset = ImagePathDataset(samples, args.image_size, args.frozen_views, expected_hashes)
     loader_kwargs = {}
     if args.num_workers > 0:
         loader_kwargs["prefetch_factor"] = args.prefetch_factor
@@ -455,7 +539,7 @@ def main() -> None:
     )
 
     # One large tensor is much faster to merge and mmap than per-image files.
-    posterior_stats = torch.empty((len(samples), 256, 32), dtype=torch.float16)
+    posterior_stats = torch.empty((len(samples), image_tokens, 32), dtype=torch.float16)
     cache_img_ids = torch.empty((len(samples),), dtype=torch.long)
     encoded = 0
     progress = tqdm(total=len(samples), desc="Caching KL16 posterior", unit="img")
@@ -470,14 +554,14 @@ def main() -> None:
             batch_stats = torch.cat((posterior.mean, posterior.std), dim=1).mul_(
                 args.scaling_factor
             )
-            if tuple(batch_stats.shape[1:]) != (32, 16, 16):
+            if tuple(batch_stats.shape[1:]) != (32, side, side):
                 raise ValueError(
-                    "KL16 posterior must have shape [B, 32, 16, 16], got "
+                    f"KL16 posterior must have shape [B, 32, {side}, {side}], got "
                     f"{tuple(batch_stats.shape)}"
                 )
             batch_stats = (
                 batch_stats.permute(0, 2, 3, 1)
-                .reshape(-1, 256, 32)
+                .reshape(-1, image_tokens, 32)
                 .to(device="cpu", dtype=torch.float16)
             )
             batch_size = int(batch_stats.shape[0])
@@ -489,6 +573,8 @@ def main() -> None:
 
     if encoded != len(samples):
         raise RuntimeError(f"Encoded {encoded} images, expected {len(samples)}")
+    if manifest_digest is not None and sha256_file(Path(args.source_manifest_jsonl)) != manifest_digest:
+        raise RuntimeError("source manifest changed during VAE encoding")
     metadata = {
         "format": POSTERIOR_CACHE_FORMAT,
         "stats_layout": POSTERIOR_STATS_LAYOUT,
@@ -500,11 +586,7 @@ def main() -> None:
         "source_manifest_jsonl": (
             args.source_manifest_jsonl if args.source_mode == "manifest_jsonl" else None
         ),
-        "source_manifest_sha256": (
-            sha256_file(Path(args.source_manifest_jsonl))
-            if args.source_mode == "manifest_jsonl" and not args.no_hash
-            else None
-        ),
+        "source_manifest_sha256": manifest_digest,
         "source_image_root": args.source_image_root,
         "imagenet_train_dir": (
             args.imagenet_train_dir if args.source_mode == "imagenet_train" else None
@@ -516,10 +598,14 @@ def main() -> None:
         "vae_checkpoint_sha256": vae_checkpoint_sha256,
         "device_type": device.type,
         "vae_dtype": str(vae_dtype).removeprefix("torch."),
+        "npu_conv_allow_hf32": bool(torch.npu.conv.allow_hf32) if device.type == "npu" else None,
+        "npu_matmul_allow_hf32": bool(torch.npu.matmul.allow_hf32) if device.type == "npu" else None,
         "scaling_factor": args.scaling_factor,
         "image_size": args.image_size,
-        "posterior_shape": [16, 16, 32],
-        "token_shape": [256, 32],
+        "frozen_views": args.frozen_views,
+        "source_view_hashes_verified": args.verify_view_hashes,
+        "posterior_shape": [side, side, 32],
+        "token_shape": [image_tokens, 32],
         "storage_dtype": "float16",
         "runtime_hashing_enabled": not args.no_hash,
     }

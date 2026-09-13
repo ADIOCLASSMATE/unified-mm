@@ -12,6 +12,7 @@
 | 首选整节点 quota | `16,128,1024`，提交时按平台可用配额选择 |
 | 优先级 | 6 |
 | 永久开发机 | `dev-wjx-ascend`，16 卡 |
+| 开发机当前镜像 | `dev-wjx-ascend:v-1.4`（与 Job 首选镜像分别记录） |
 | 大模型新架构项目上限 | 256 张并发 Ascend 卡 |
 
 | 实验 | Project |
@@ -28,9 +29,12 @@
 | 仓库 | `/inspire/sj-ssd3/global_user/wanjiaxin-253108030048/code/unified-mm` |
 | 共享用户根目录 | `/inspire/sj-ssd3/global_user/wanjiaxin-253108030048` |
 | `public` | 指向共享用户根目录 |
+| 本地 ImageNet 原图 | `public/dataset/imagenet/v1` |
 | ImageNet latent | `public/datasets/imagenet_full` |
 | Caption / T2I 文本 | `public/datasets/imagenet1k_synthetic_v1` |
 | 可定位文本索引 | `public/datasets/imagenet1k_synthetic_v1/indexed/train/manifest.json` |
+| 新 B512 合成图文数据 | `public/datasets/unified_image_text_512_sol_v1`，与消融数据分开 |
+| 新 B512 图片及 VAE 缓存 | `public/datasets/unified_image_pool_512_v1`，与合成文本分开 |
 | Qwen 基座 | `public/models/Qwen--Qwen3-0.6B-Base` |
 | SigLIP | `public/models/google--siglip-so400m-patch14-384` |
 | 训练状态 | `output/<run>/` |
@@ -48,11 +52,15 @@ Container path: /inspire/dataset/imagenet/v1
 
 挂载信息记录在 Job 的 `dataset_info`。
 
+仓库的 `public/dataset/imagenet/v1` 已有共享盘原图副本；图文准备优先读取该目录。旧 manifest 中的 `/inspire/dataset/imagenet/v1` 是平台挂载路径，当前 Notebook 缺少该挂载不代表原图不存在。
+
 ## 提交与观察
 
 CLI 参数以 `inspire <command> --help` 为准。每次提交先查询项目、配额、镜像、节点和活跃任务，再执行 dry-run，核对规格后提交。节点排除列表使用当前资源组中的有效节点名。
 
 Notebook 和平台域名直连；命令级清理代理：
+
+Codex 所在 CPU Notebook 的全局 mihomo 服务必须保持运行。仅清理需要直连的命令/客户端环境，不调用全局 `clashctl off`；SII 模型与图像下载同样使用独立直连传输。
 
 ```bash
 env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \

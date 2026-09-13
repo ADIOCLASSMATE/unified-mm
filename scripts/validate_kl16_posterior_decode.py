@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 
@@ -53,6 +54,10 @@ def main() -> None:
         weights_only=True,
     )
     stats = payload["posterior_stats"][args.row].float()
+    side = math.isqrt(stats.shape[0])
+    if side * side != stats.shape[0] or stats.shape[1] != 32:
+        raise ValueError(f"invalid square KL16 posterior: {tuple(stats.shape)}")
+    image_size = side * 16
     image_id = int(payload["img_ids"][args.row].item())
     mean = stats[..., :16]
     std = stats[..., 16:]
@@ -69,7 +74,7 @@ def main() -> None:
     for parameter in vae.parameters():
         parameter.requires_grad_(False)
     latent = (
-        mean.reshape(16, 16, 16)
+        mean.reshape(side, side, 16)
         .permute(2, 0, 1)
         .unsqueeze(0)
         .to(device=device, dtype=dtype)
@@ -79,7 +84,7 @@ def main() -> None:
         decoded = vae.decode(latent).float()
     if device.type == "npu":
         torch.npu.synchronize(device)
-    if tuple(decoded.shape) != (1, 3, 256, 256) or not bool(
+    if tuple(decoded.shape) != (1, 3, image_size, image_size) or not bool(
         torch.isfinite(decoded).all()
     ):
         raise RuntimeError(f"invalid VAE decode: shape={tuple(decoded.shape)}")

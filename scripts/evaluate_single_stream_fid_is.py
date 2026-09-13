@@ -123,12 +123,15 @@ EVALUATOR_RNG_CONTRACT = {
 def canonical_image_flow_initial_noise(
     evaluation_seed: int,
     global_sample_index: int,
+    grid_side: int = CANONICAL_IMAGE_GRID_SIDE,
 ) -> torch.Tensor:
     global_sample_index = int(global_sample_index)
     if global_sample_index < 0:
         raise ValueError(
             f"global_sample_index must be nonnegative, got {global_sample_index}"
         )
+    if int(grid_side) < 1:
+        raise ValueError("grid_side must be positive")
     sample_seed = (
         int(evaluation_seed) + global_sample_index
     ) % EVALUATOR_RNG_SEED_MODULUS
@@ -136,8 +139,8 @@ def canonical_image_flow_initial_noise(
     generator.manual_seed(sample_seed)
     return torch.randn(
         (
-            CANONICAL_IMAGE_GRID_SIDE,
-            CANONICAL_IMAGE_GRID_SIDE,
+            int(grid_side),
+            int(grid_side),
             CANONICAL_IMAGE_LATENT_DIM,
         ),
         generator=generator,
@@ -150,6 +153,7 @@ def build_canonical_initial_noise_bank(
     global_sample_indices: list[int],
     *,
     evaluation_seed: int,
+    grid_side: int = CANONICAL_IMAGE_GRID_SIDE,
 ) -> tuple[torch.Tensor, list[dict[str, object]]]:
     if not global_sample_indices:
         raise ValueError("global_sample_indices must be nonempty")
@@ -160,7 +164,7 @@ def build_canonical_initial_noise_bank(
         )
     canonical = torch.stack(
         [
-            canonical_image_flow_initial_noise(evaluation_seed, global_index)
+            canonical_image_flow_initial_noise(evaluation_seed, global_index, grid_side)
             for global_index in normalized_indices
         ],
         dim=0,
@@ -177,7 +181,7 @@ def build_canonical_initial_noise_bank(
     ]
     flattened = canonical.reshape(
         int(canonical.shape[0]),
-        CANONICAL_IMAGE_GRID_SIDE * CANONICAL_IMAGE_GRID_SIDE,
+        int(grid_side) * int(grid_side),
         CANONICAL_IMAGE_LATENT_DIM,
     )
     return flattened, records
@@ -1643,12 +1647,12 @@ def resolve_inception_weights_path(path: str) -> str | None:
 def shared_feature_moments(payload, *, feature: int, device) -> FeatureMoments:
     stats = payload["stats"]
     count = int(stats["count"])
-    feature_sum = torch.as_tensor(stats["sum"], dtype=torch.float64, device=device)
+    dtype = metric_accumulation_dtype(device)
+    feature_sum = torch.as_tensor(stats["sum"], dtype=dtype).to(device=device)
     outer_sum = torch.as_tensor(
         stats["outer_sum"],
-        dtype=torch.float64,
-        device=device,
-    )
+        dtype=dtype,
+    ).to(device=device)
     if tuple(feature_sum.shape) != (int(feature),):
         raise ValueError(
             f"shared real feature sum shape={tuple(feature_sum.shape)}; "
@@ -1670,6 +1674,7 @@ def load_shared_original_real_stats(
     path: str,
     *,
     fid_feature: int,
+    image_size: int = 256,
 ):
     stats_path = Path(path)
     if not stats_path.is_file():
@@ -1719,16 +1724,12 @@ def load_shared_original_real_stats(
             feature_metadata.get("extractor"),
             "torch-fidelity-inception-v3-compat",
         ),
-        "accumulation_dtype": (
-            feature_metadata.get("accumulation_dtype"),
-            "torch.float32",
-        ),
-        "resize": (transform_metadata.get("resize"), 256),
+        "resize": (transform_metadata.get("resize"), int(image_size)),
         "interpolation": (
             transform_metadata.get("interpolation"),
             "bicubic",
         ),
-        "center_crop": (transform_metadata.get("center_crop"), 256),
+        "center_crop": (transform_metadata.get("center_crop"), int(image_size)),
         "color_mode": (transform_metadata.get("color_mode"), "RGB"),
     }
     if source_metadata.get("split") not in {"val", "validation"}:
@@ -1739,8 +1740,22 @@ def load_shared_original_real_stats(
                 f"ImageNet-val real-stat metadata mismatch for {field}: "
                 f"{actual!r} != {expected!r}"
             )
+    recorded_dtype = feature_metadata.get("accumulation_dtype")
+    accumulation_dtype = {
+        "torch.float32": torch.float32,
+        "torch.float64": torch.float64,
+    }.get(recorded_dtype)
+    if accumulation_dtype is None:
+        raise ValueError(
+            f"unsupported ImageNet-val real-stat accumulation_dtype: {recorded_dtype!r}"
+        )
     for name in ("sum", "outer_sum"):
         tensor = payload["stats"][name]
+        if not isinstance(tensor, torch.Tensor) or tensor.dtype != accumulation_dtype:
+            raise ValueError(
+                f"ImageNet-val real-stat {name} dtype does not match "
+                f"accumulation_dtype={recorded_dtype!r}"
+            )
         if not bool(torch.isfinite(tensor).all()):
             raise ValueError(f"ImageNet-val real-stat {name} contains NaN/Inf")
     return payload
@@ -2049,14 +2064,19 @@ def main(*, model_loader=None):
     side = int(image_tokens ** 0.5)
     if side * side != image_tokens:
         raise ValueError(f"image_tokens_per_img={image_tokens} is not a square grid")
+    evaluator_rng_contract = {
+        **EVALUATOR_RNG_CONTRACT,
+        "canonical_shape": [side, side, CANONICAL_IMAGE_LATENT_DIM],
+        "flattening": f"row_major_[{side},{side},16]_to_[{image_tokens},16]",
+    }
     if canonical_pairing_enabled:
         canonical_shape = (
-            CANONICAL_IMAGE_GRID_SIDE,
-            CANONICAL_IMAGE_GRID_SIDE,
+            side,
+            side,
             CANONICAL_IMAGE_LATENT_DIM,
         )
         expected_canonical_shape = tuple(
-            EVALUATOR_RNG_CONTRACT["canonical_shape"]
+            evaluator_rng_contract["canonical_shape"]
         )
         if canonical_shape != expected_canonical_shape:
             raise ValueError(
@@ -2083,6 +2103,7 @@ def main(*, model_loader=None):
     shared_real_payload = load_shared_original_real_stats(
         real_stats_path,
         fid_feature=int(args.fid_feature),
+        image_size=side * 16,
     )
     shared_real_count = int(shared_real_payload["stats"]["count"])
     formal_protocol = is_formal_flow_protocol(
@@ -2428,6 +2449,7 @@ def main(*, model_loader=None):
             initial_noise_bank, noise_records = build_canonical_initial_noise_bank(
                 selected_global_indices,
                 evaluation_seed=int(args.seed),
+                grid_side=side,
             )
             local_noise_manifest_records.extend(noise_records)
             local_eval_sample_manifest_records.extend(
@@ -2704,7 +2726,7 @@ def main(*, model_loader=None):
             "checkpoint_generation": checkpoint_generation_contract(model.config),
             "full_image_refresh_each_velocity": is_s2,
             "image_generation_order_applicable": not is_s2,
-            "evaluator_rng_contract": EVALUATOR_RNG_CONTRACT,
+            "evaluator_rng_contract": evaluator_rng_contract,
             "canonical_initial_noise_enabled": bool(canonical_pairing_enabled),
             "backbone_attention": {
                 "dual_stream_attention_contract": attention_contract,

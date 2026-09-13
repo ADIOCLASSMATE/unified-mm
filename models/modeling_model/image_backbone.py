@@ -51,6 +51,8 @@ def validate_image_data_layout(config: Any) -> tuple[int, int]:
     params = _get(dataset, "params") if dataset is not None else None
     if params is None:
         return model_tokens, model_latent_dim
+    # UnifiedMixedDataset nests image settings alongside the text sources.
+    params = _get(params, "image", params)
 
     data_tokens = int(
         _get(params, "image_tokens_per_img", model_tokens)

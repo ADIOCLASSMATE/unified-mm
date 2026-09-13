@@ -117,12 +117,13 @@ function renderResearchOverview(){
 
  const provenance=D.data_provenance;
  const dataRows=[
-  ['图像训练 / 验证','ImageNet-1K','1,281,167 / 50,000 张'],
+  ['旧消融图像训练 / 验证','ImageNet-1K','1,281,167 / 50,000 张 · 256px'],
   ['I2T 训练 caption','Qwen3.6 + MiniMax-M3','每图 3 + 3 条'],
   ['T2I prompt / 验证 caption','gpt-5.6-luna',`每图 ${provenance.styles.length} 风格 / 验证固定描述`],
-  ['纯文本','ClimbMix','100 个本地分片']
+  ['当前大规模训练计划','已有 caption / prompt 优先；SII API 仅补缺','完整 ImageNet + 至少 200 万非 ImageNet 原图目标 · 512px'],
+  ['两套共用纯文本','ClimbMix','100 个本地分片']
  ].map(row=>row.map(esc));
- const dataNote=`<strong>训练与验证文本的来源分别记录。</strong> Original caption 来自 <a href="${esc(provenance.original_caption.url)}">${esc(provenance.original_caption.dataset)}</a>，当前 I2T 训练排除 original。合成模型、保存的协议、提示模板与缺失证据均可追溯；新增纯文本子集的独立性单独说明。`;
+ const dataNote=`<strong>非 ImageNet 图库至少 200 万张，各来源配额为起点，合格图可超过；尚未完成。</strong> 当前优先确定来源，复用已有 caption / prompt，缺失或错误样本再由通过前置验收的 SII API 处理；不逐图调用 sol。旧消融成绩、9 月 12 日首轮已验收产物与本次目标配额分别记录，ClimbMix 沿用现有语料。`;
 
  $('research-sections').innerHTML=
   summaryCard('01 / 当前主线','正式 A / B 评测','matrix',summaryTable(['模型','FID ↓ · CFG 2.0','IS ↑ · CFG 2.0','文本八项均分 ↑','ImageNet Top-1 ↑'],modelRows),modelNote,'<a href="#matrix">完整评测指标与历史消融 →</a><a href="#qualitative/t2i">同输入样例 →</a>',true)+

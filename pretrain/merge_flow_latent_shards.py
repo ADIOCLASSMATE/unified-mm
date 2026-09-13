@@ -8,6 +8,9 @@ from pathlib import Path
 import torch
 from tqdm import tqdm
 
+from utils.kl16_layout import kl16_layout
+from utils.sharded_posterior import SCHEMA as SHARD_INDEX_SCHEMA
+
 POSTERIOR_CACHE_FORMAT = "imagenet_kl16_scaled_posterior_v1"
 POSTERIOR_STATS_LAYOUT = "scaled_mean_then_scaled_std"
 
@@ -47,21 +50,31 @@ def validate_stats(path: Path, posterior_stats: torch.Tensor) -> None:
             raise ValueError(f"posterior std is negative in {path} at row {start}")
 
 
-def main() -> None:
+def main(argv=None) -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--shard_dir", required=True)
     parser.add_argument("--output_path", required=True)
     parser.add_argument("--manifest_jsonl", default=None)
     parser.add_argument("--mmap", action="store_true")
+    parser.add_argument("--index_only", action="store_true",
+                        help="Publish a JSON shard index; avoid copying TB-scale posterior tensors.")
+    parser.add_argument("--row_index_path", default=None,
+                        help="With --index_only, store the binary row map outside the text publication.")
     parser.add_argument(
         "--no_hash",
         action="store_true",
         help="Do not calculate VAE, manifest, or output file digests.",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     shard_dir = Path(args.shard_dir)
     output_path = Path(args.output_path)
+    if args.index_only and output_path.suffix != ".json":
+        raise ValueError("--index_only requires a .json output_path")
+    if args.row_index_path and not args.index_only:
+        raise ValueError("--row_index_path requires --index_only")
+    if args.row_index_path and Path(args.row_index_path).suffix != ".pt":
+        raise ValueError("--row_index_path requires a .pt file separate from the JSON index")
     shard_paths = sorted(shard_dir.glob("shard-*-of-*.pt"))
     if not shard_paths:
         raise FileNotFoundError(f"No shard-*-of-*.pt files found in {shard_dir}")
@@ -75,7 +88,7 @@ def main() -> None:
         payload = torch.load(
             str(path),
             map_location="cpu",
-            mmap=args.mmap,
+            mmap=args.mmap or args.index_only,
             weights_only=True,
         )
         metadata = payload.get("metadata", {})
@@ -85,8 +98,9 @@ def main() -> None:
             raise ValueError(f"Unexpected stats layout in {path}: {metadata}")
         posterior_stats = payload["posterior_stats"]
         img_ids = payload["img_ids"]
+        _, image_tokens = kl16_layout(metadata["image_size"])
         if posterior_stats.ndim != 3 or tuple(posterior_stats.shape[1:]) != (
-            256,
+            image_tokens,
             32,
         ):
             raise ValueError(
@@ -135,6 +149,10 @@ def main() -> None:
         "storage_dtype",
         "vae_dtype",
         "runtime_hashing_enabled",
+        "frozen_views",
+        "source_view_hashes_verified",
+        "token_shape",
+        "posterior_shape",
     )
     reference_metadata = source_metadata[0]
     for metadata in source_metadata[1:]:
@@ -145,10 +163,8 @@ def main() -> None:
                     f"{reference_metadata.get(field)!r} != {metadata.get(field)!r}"
                 )
 
-    posterior_stats = torch.cat(stats_parts, dim=0)
     img_ids = torch.cat(id_parts, dim=0)
     order = torch.argsort(img_ids)
-    posterior_stats = posterior_stats[order].contiguous()
     img_ids = img_ids[order].contiguous()
     if img_ids.numel() and bool(torch.any(img_ids[1:] <= img_ids[:-1])):
         raise ValueError("Merged cache img_ids are not unique and increasing")
@@ -173,11 +189,14 @@ def main() -> None:
         "format": POSTERIOR_CACHE_FORMAT,
         "stats_layout": POSTERIOR_STATS_LAYOUT,
         "stats_are_scaled": True,
-        "num_images": int(posterior_stats.shape[0]),
-        "image_tokens_per_img": 256,
+        "num_images": int(img_ids.numel()),
+        "image_size": int(reference_metadata["image_size"]),
+        "frozen_views": bool(reference_metadata.get("frozen_views", False)),
+        "source_view_hashes_verified": bool(reference_metadata.get("source_view_hashes_verified", False)),
+        "image_tokens_per_img": image_tokens,
         "image_latent_dim": 16,
         "posterior_stats_dim": 32,
-        "storage_dtype": str(posterior_stats.dtype).removeprefix("torch."),
+        "storage_dtype": "float16",
         "vae": "mar-kl16",
         "vae_checkpoint": str(vae_checkpoint),
         "vae_checkpoint_sha256": (
@@ -203,6 +222,31 @@ def main() -> None:
         )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    if args.index_only:
+        if output_path.exists():
+            raise FileExistsError(f"use a new output path for immutable publication: {output_path}")
+        row_parts = [
+            torch.stack((torch.full((len(ids),), shard, dtype=torch.int64), torch.arange(len(ids))), dim=1)
+            for shard, ids in enumerate(id_parts)
+        ]
+        row_path = Path(args.row_index_path).resolve() if args.row_index_path else output_path.with_suffix(".rows.pt")
+        if row_path.exists():
+            raise FileExistsError(f"use a new path for the immutable row index: {row_path}")
+        row_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_rows = row_path.with_suffix(".pt.tmp")
+        torch.save({"img_ids": img_ids, "shard_rows": torch.cat(row_parts)[order]}, temporary_rows)
+        temporary_rows.replace(row_path)
+        temporary_path.write_text(json.dumps({
+            "schema": SHARD_INDEX_SCHEMA,
+            "row_index": str(row_path) if args.row_index_path else row_path.name,
+            "shards": [str(path.resolve()) for path in shard_paths],
+            "token_shape": [image_tokens, 32],
+            "metadata": metadata,
+        }, indent=2) + "\n")
+        temporary_path.replace(output_path)
+        print(f"Indexed {len(shard_paths)} shards / {len(img_ids)} images: {output_path}")
+        return
+    posterior_stats = torch.cat(stats_parts, dim=0)[order].contiguous()
     torch.save(
         {
             "posterior_stats": posterior_stats,

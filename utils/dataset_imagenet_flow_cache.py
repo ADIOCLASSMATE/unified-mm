@@ -26,6 +26,7 @@ from torch.utils.data import Dataset
 
 from utils.imagenet_flow_batching import collate_imagenet_flow_cache
 from utils.imagenet_synthetic_text_index import ImageNetSyntheticTextIndex
+from utils.sharded_posterior import load_sharded_posterior
 
 
 DEFAULT_CAPTION_PREFIX = "Generate an image matching this description:"
@@ -77,7 +78,7 @@ class ImageNetFlowCacheDataset(Dataset):
         # Memory-map the merged posterior cache so distributed ranks and
         # persistent workers reuse OS pages instead of copying the full
         # ImageNet tensor into every process.
-        obj = torch.load(
+        obj = load_sharded_posterior(self.cache_path) if self.cache_path.suffix == ".json" else torch.load(
             str(self.cache_path),
             map_location="cpu",
             mmap=True,

@@ -129,6 +129,46 @@ def _randomize_flow_output(model):
         final.linear.bias.normal_(0.0, 0.1)
 
 
+@pytest.mark.parametrize("task", ["t2i", "i2t"])
+def test_b_512_grid_forward_backward(task):
+    config = _config("xlnet_content_diagonal", condition_contract=X0_CONTENT_FLOW_CONDITION_CONTRACT)
+    config.image_tokens_per_img = 1024
+    config.image_latent_dim = 16
+    config.max_position_embeddings = 2048
+    config.image_flow_batch_mul = 1
+    model = Qwen3ForCausalLM(config).train()
+    _randomize_flow_output(model)
+    is_i2t = task == "i2t"
+    suffix = [12, 5, 9] if is_i2t else [12, 9]
+    ids = torch.tensor([[3, 11] + [8] * 1024 + suffix])
+    length = ids.shape[1]
+    types = torch.tensor([[0, 2] + [1] * 1024 + [2] + [0] * (len(suffix) - 1)], dtype=torch.uint8)
+    if is_i2t:
+        sigma = torch.arange(length).float().unsqueeze(0)
+    else:
+        sigma = torch.tensor([[0., 1.] + list(range(4, 1028)) + [2., 3.]])
+    positions = torch.full((1, length), -1, dtype=torch.long)
+    positions[:, 2:1026] = torch.arange(1024)
+    labels = torch.full_like(ids, -100)
+    if is_i2t:
+        labels[:, -2:] = ids[:, -2:]
+    result = model(
+        X0_input_ids=ids, labels=labels,
+        attention_mask=get_selfless_mask(sigma, length, "cpu"),
+        content_attention_mask=get_selfless_mask(sigma, length, "cpu", include_diagonal=True),
+        token_types=types, image_latents=torch.randn(1, length, 16),
+        image_local_positions=positions, image_span_table=torch.tensor([[0, 0, 2, 1026, 0]]),
+        image_loss_mask=types.eq(1) if not is_i2t else torch.zeros_like(types, dtype=torch.bool),
+        flow_sigma=sigma, compute_text_loss=is_i2t, compute_image_loss=not is_i2t,
+        return_logits=False,
+    )
+    assert bool(torch.isfinite(result.loss))
+    result.loss.backward()
+    gradients = [p.grad for p in model.parameters() if p.grad is not None]
+    assert gradients and all(bool(torch.isfinite(g).all()) for g in gradients)
+    assert any(bool(g.ne(0).any()) for g in gradients)
+
+
 @pytest.mark.parametrize("checkpointing", [False, True])
 @pytest.mark.parametrize("attention_contract", ["selfless_strict", "xlnet_content_diagonal"])
 def test_shared_content_rf_batch_preserves_loss_and_all_gradients(
