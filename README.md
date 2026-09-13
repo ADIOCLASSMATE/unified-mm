@@ -7,7 +7,7 @@
 | 内容 | 入口 |
 | --- | --- |
 | 实验定义、配置与训练预算 | [实验](docs/EXPERIMENTS.md) · [训练](docs/TRAINING.md) |
-| 数据集与合成文本 | [数据](docs/DATA.md) |
+| 数据集与合成文本 | [旧消融数据](docs/DATA.md) · [当前 B512 合成流程](docs/DATA_SYNTHESIS.md) |
 | 指标、样例与训练曲线 | [评测总览](output/evaluation/index.html) |
 | 评测命令与输出位置 | [评测](docs/EVALUATION_STRUCTURE.md) |
 | 平台、资源与共享路径 | [Inspire](INSPIRE.md) |

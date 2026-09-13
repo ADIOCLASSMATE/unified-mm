@@ -33,8 +33,11 @@
 | ImageNet latent | `public/datasets/imagenet_full` |
 | Caption / T2I 文本 | `public/datasets/imagenet1k_synthetic_v1` |
 | 可定位文本索引 | `public/datasets/imagenet1k_synthetic_v1/indexed/train/manifest.json` |
-| 新 B512 合成图文数据 | `public/datasets/unified_image_text_512_sol_v1`，与消融数据分开 |
-| 新 B512 图片及 VAE 缓存 | `public/datasets/unified_image_pool_512_v1`，与合成文本分开 |
+| 当前 B512 复用 / SII 文本发布根目录 | `public/datasets/unified_image_text_512_api_v3`，至少 200 万目标尚未完成 |
+| 当前 B512 图片及 VAE 缓存 | `public/datasets/unified_image_pool_512_v3` |
+| 当前下载 / 合成状态 | `public/data_preparation/unified_b_corners_api_v3` |
+| 9 月 12 日首轮图文数据（可复用历史） | `public/datasets/unified_image_text_512_sol_v1` |
+| 9 月 12 日首轮图片及 VAE 缓存 | `public/datasets/unified_image_pool_512_v1`，与合成文本分开 |
 | Qwen 基座 | `public/models/Qwen--Qwen3-0.6B-Base` |
 | SigLIP | `public/models/google--siglip-so400m-patch14-384` |
 | 训练状态 | `output/<run>/` |

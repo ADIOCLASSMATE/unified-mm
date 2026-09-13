@@ -1,0 +1,60 @@
+{
+  "schema": "b512_reuse_sii_fallback_runtime_v1",
+  "image_size": 512,
+  "image_tokens": 1024,
+  "text_tokens_max": 960,
+  "minimum_images": 2000000,
+  "source_targets_are_caps": false,
+  "source_plan": "configs/protocols/unified_b_non_imagenet_2m_v1.json",
+  "tokenizer": "public/models/Qwen--Qwen3-0.6B-Base",
+  "state_root": "public/data_preparation/unified_b_corners_api_v3/synthesis",
+  "image_root": "public/datasets/unified_image_pool_512_v3",
+  "text_root": "public/datasets/unified_image_text_512_api_v3",
+  "require_closed_downloads": true,
+  "require_qualification_for_bulk": true,
+  "reuse": {
+    "allow_full_frame_human_captions": true,
+    "allow_curated_captions": true,
+    "require_readability_for_ocr": true,
+    "same_caption_both_tasks": true,
+    "minimum_words": null
+  },
+  "sii": {
+    "protocol": "openai_chat",
+    "vision_models": [
+      "qwen3.8-max"
+    ],
+    "text_only_models": [
+      "deepseek-v4-pro-0813"
+    ],
+    "max_attempts": 3,
+    "concurrency_start": 16,
+    "concurrency_max": 128,
+    "rpm": 1200,
+    "tpm": 6000000,
+    "max_tokens": 3200,
+    "timeout_seconds": 180,
+    "http2": false,
+    "tls_maximum_version": "TLSv1_2",
+    "request_options": {},
+    "retry_base_seconds": 2,
+    "retry_max_seconds": 60,
+    "circuit_failures": 5,
+    "circuit_seconds": 30
+  },
+  "codex_fallback": {
+    "enabled": true,
+    "executable": "codex",
+    "model": "gpt-5.6-sol",
+    "reasoning_effort": "low",
+    "max_attempts": 1,
+    "concurrency": 2,
+    "max_items_per_run": 128,
+    "timeout_seconds": 300,
+    "trigger": "item_sii_attempts_exhausted"
+  },
+  "sii_environment": {
+    "api_key": "SII_API_KEY",
+    "base_url": "SII_BASE_URL"
+  }
+}

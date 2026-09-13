@@ -26,8 +26,8 @@ import httpx
 from PIL import Image
 import pyarrow.parquet as pq
 
-from scripts.distill_b512_codex import atomic_json, dumps, file_sha, sha
-from scripts.synthesize_image_text import ImageArchives
+from data_synthesis.io import atomic_json, dumps, file_sha, sha
+from data_synthesis.io import ImageArchives
 from utils.direct_network import check_direct_routes, direct_ssl_context
 
 

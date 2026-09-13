@@ -1,4 +1,4 @@
-"""Independent direct-download and 512px preparation services feeding Codex batches."""
+"""Independent direct-download and 512px preparation services feeding frozen synthesis cohorts."""
 
 import argparse
 import asyncio
@@ -14,8 +14,8 @@ import sqlite3
 import time
 from urllib.parse import urlparse
 
-from scripts.synthesize_image_text import DirectDownloader, ImageArchives
-from scripts.distill_b512_codex import atomic_json, dumps, file_sha, sha
+from data_synthesis.io import DirectDownloader, ImageArchives
+from data_synthesis.io import atomic_json, cohort_id, dumps, file_sha, sha
 from utils.direct_network import check_direct_routes
 from utils.image_shard_io import read_image_bytes
 from utils.image_text_preprocessing import prepare_view
@@ -245,6 +245,7 @@ async def bounded_download(client, row, timeout, direct_dns_hosts=()):
 async def download_service(args):
     check_direct_routes()
     root, images = Path(args.root).resolve(), Path(args.image_root).resolve()
+    cohort = cohort_id(root)
     db, lock = connection(root, "download")
     db.executescript("""CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY,sha TEXT);
         CREATE TABLE IF NOT EXISTS tasks(key TEXT PRIMARY KEY,row_json TEXT,status TEXT DEFAULT 'pending',
@@ -293,7 +294,7 @@ async def download_service(args):
             return
         if archives:
             archives.close()
-        batch_id = f"supply-{serial:06d}"
+        batch_id = f"supply-{cohort}-{serial:06d}"
         manifest = {"batch_id": batch_id, "rows": batch_rows, "records": len(batch_rows), "closed_at": time.time()}
         db.execute("INSERT INTO batches(id,manifest_json) VALUES (?,?)", (batch_id, dumps(manifest)))
         for row in batch_rows:
@@ -347,7 +348,7 @@ async def download_service(args):
                     for line in path.open():
                         row = json.loads(line)
                         key = sha((row["source"] + ":" + row["source_id"]).encode())
-                        capability = row.get("capabilities", ["relation"])[0]
+                        capability = (row.get("capabilities") or ["general"])[0]
                         family = capability if capability in families else "ocr" if capability == "text" else "relation"
                         db.execute("INSERT OR IGNORE INTO tasks(key,row_json,family,host) VALUES (?,?,?,?)",
                                    (key, dumps(row), family, download_host(row)))
@@ -405,7 +406,7 @@ async def download_service(args):
                         reference = row["local_path"]
                     else:
                         if archives is None:
-                            archives = ImageArchives(images / "raw_supply" / f"supply-{serial:06d}")
+                            archives = ImageArchives(images / "raw_supply" / cohort / f"supply-{serial:06d}")
                         reference = archives.add(key + ".original", data)
                     batch_rows.append({"key": key, "row": row, "reference": reference, "sha256": sha(data)})
                 except Exception as exc:
@@ -449,6 +450,14 @@ async def download_service(args):
 async def prepare_service(args):
     from utils.image_near_duplicates import NearDuplicateIndex
     root, images, farm_root = (Path(v).resolve() for v in (args.root, args.image_root, args.farm_root))
+    cohort = cohort_id(root)
+    farm_root.mkdir(parents=True, exist_ok=True)
+    owner = farm_root / "prepare_owner.json"
+    with owner.with_suffix(".lock").open("a") as ownership:
+        fcntl.flock(ownership, fcntl.LOCK_EX)
+        if owner.exists() and json.loads(owner.read_text())["source_supply"] != str(root):
+            raise ValueError("use a separate preparation inbox root for each source cohort")
+        atomic_json(owner, {"source_supply": str(root)})
     db, lock = connection(root, "prepare")
     db.execute("CREATE TABLE IF NOT EXISTS batches(id TEXT PRIMARY KEY,status TEXT,records INTEGER,excluded INTEGER)")
     near = NearDuplicateIndex(args.near_exclude_index)
@@ -472,7 +481,7 @@ async def prepare_service(args):
                 if marker.exists():
                     manifest = json.loads(marker.read_text())
                 else:
-                    archives = ImageArchives(images / "prepared_supply" / batch_id)
+                    archives = ImageArchives(images / "prepared_supply" / cohort / batch_id)
                     tasks = sqlite3.connect(output / "state.sqlite3")
                     tasks.execute("CREATE TABLE IF NOT EXISTS tasks(key TEXT PRIMARY KEY,row TEXT,status TEXT,view TEXT,raw TEXT,result TEXT,error TEXT)")
                     accepted, rejected = 0, []
@@ -495,7 +504,7 @@ async def prepare_service(args):
                     archives.close()
                     tasks.commit()
                     tasks.close()
-                    atomic_json(output / "run.json", {"contract": {"routing_policy": "prepare_only_for_codex", "image_size": 512,
+                    atomic_json(output / "run.json", {"contract": {"routing_policy": "prepare_only_before_reuse_sii_fallback", "image_size": 512,
                         "source_batch": str(raw_path), "source_batch_sha256": file_sha(raw_path), "benchmark_index": str(near.root)}})
                     manifest = {"batch_id": batch_id, "source_run": str(output), "records": accepted,
                         "candidate_records": len(batch["rows"]), "rejections": rejected,

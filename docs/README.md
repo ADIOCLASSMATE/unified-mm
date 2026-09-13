@@ -8,7 +8,8 @@
 | A/B、C–F、only与规模实验定义 | [实验](EXPERIMENTS.md) |
 | 训练预算、启动、恢复、checkpoint | [训练](TRAINING.md) |
 | 语料、caption、latent与索引 | [数据](DATA.md) |
-| B 大规模训练的数据缺口与合成方案 | [I2T / T2I 数据建议（2026-09-11）](B_DATA_SCALING_RECOMMENDATION_20260911.md) |
+| 当前数据合成入口、连接配置、复用与失败兜底 | [DATA_SYNTHESIS](DATA_SYNTHESIS.md) |
+| B 大规模训练的数据缺口与合成方案（历史诊断） | [I2T / T2I 数据建议（2026-09-11）](B_DATA_SCALING_RECOMMENDATION_20260911.md) |
 | 当前大规模数据选择：非 ImageNet 至少 200 万图，优先复用文本 | [来源、精选资源与复用协议（2026-09-13）](B_2M_NON_IMAGENET_DATA_PLAN_20260913.md) |
 | 512px Codex sol 首轮合成与独立目录（历史） | [9 月 12 日首轮图文流水线](B_CODEX_IMAGE_SYNTHESIS_20260912.md) |
 | 图片来源与旧 Qwen → Codex 方案记录 | [历史图文合成方案](B_IMAGE_TEXT_SYNTHESIS_V1_20260911.md) |

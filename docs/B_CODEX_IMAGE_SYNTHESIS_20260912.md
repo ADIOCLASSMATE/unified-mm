@@ -1,5 +1,7 @@
 **B 512px：Codex CLI 直接合成**
 
+> 历史记录：本文描述当时的协议和实际产物。当前执行以 [DATA_SYNTHESIS.md](DATA_SYNTHESIS.md) 为准：复用优先、SII 补缺纠错、重试耗尽后才用 Codex CLI；连接信息只从 SII 环境变量或静态 shell rc export 读取。
+
 首轮已于 2026-09-13 05:39 UTC 完成：205,755 对图文（新生成 186,890 对，原样复用并核验
 18,865 对），全量文本、图像/缓存、I2T/T2I 训练加载器及独立 50,000 张验证集验收全部通过。
 最终目录为 `public/datasets/unified_image_text_512_sol_v1/releases/sol_100k_plus_corners_v1/`；
@@ -25,7 +27,7 @@ faithful_photo 候选，必要时重写，并重新计算 1,024-token posterior�
 ClimbMix 沿用现有语料；具体权重及大模型训练预算尚未冻结。
 
 2026-09-12，按用户新指令停用 Qwen API 合成。当前入口是
-`scripts/distill_b512_codex.py`：现有 Codex CLI，显式指定
+`scripts/legacy/distill_b512_codex.py`：现有 Codex CLI，显式指定
 `gpt-5.6-sol` 和 `model_reasoning_effort="low"`。每次调用附上已经完整解码的
 512×512 RGB 图片，一次产出每图一对 I2T/T2I；旧合成文本只有重新验图通过才原样复用，
 保留原作者模型来源。直接生成的文本不标记为经过独立教师二次评判。
@@ -286,7 +288,7 @@ posterior `[50000,1024,32]`、固定验证 latent、loss mask、padding，以及
 `posterior_publication/job_status.json`。恢复命令为：
 
 ```bash
-uv run python -m scripts.distill_b512_codex run \
+uv run python -m scripts.legacy.distill_b512_codex run \
   --root public/data_preparation/unified_b_512_sol_v1
 ```
 

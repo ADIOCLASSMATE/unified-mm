@@ -1,38 +1,27 @@
 #!/usr/bin/env python3
-"""Paired, resumable image-grounded probes of the user's SII model routes."""
-from __future__ import annotations
-
+"""Bounded real-image probes through the same shell-configured SII client as production."""
 import argparse
 import asyncio
-from dataclasses import replace
+import copy
 import hashlib
 import io
 import json
-import os
 from pathlib import Path
 import re
 import time
 
-from anthropic import AsyncAnthropic
-import httpx
 from PIL import Image
-
-from utils.direct_network import direct_ssl_context
+from data_synthesis.clients import SIIClient
+from data_synthesis.config import DEFAULT_CONFIG, load_config, load_sii_settings, fingerprint
+from data_synthesis.contract import CONTRACT_HASH, parse_pair
+from data_synthesis.io import atomic_json
 from utils.image_shard_io import read_image_bytes
-from utils.image_text_teacher import QwenGenerator, SCHEMA, load_qwen_settings
 
 REPO = Path(__file__).resolve().parents[1]
 PUBLIC = (REPO / "public").resolve()
 ROOT = PUBLIC / "data_preparation/unified_b_corners_api_v3/model_selection_20260913"
-IMAGES = PUBLIC / "datasets/unified_image_pool_512_v1/api_model_selection_v3"
+IMAGES = PUBLIC / "datasets/unified_image_pool_512_v3/api_model_selection"
 MODELS = ("qwen3.8-max", "deepseek-v4-pro-0813")
-
-
-def atomic_json(path, data):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
-    tmp.replace(path)
 
 
 def prepare(root, per_group=4):
@@ -93,113 +82,59 @@ def prepare(root, per_group=4):
     return items
 
 
-def parsed_result(raw, image_id):
-    import jsonschema
-    text = raw["output_text"].strip()
-    if text.startswith("```json\n") and text.endswith("\n```"):
-        text = text[8:-4]
-    elif text.startswith("```\n") and text.endswith("\n```"):
-        text = text[4:-4]
-    value = json.loads(text)
-    jsonschema.validate(value, SCHEMA)
-    assert value["image_id"] == image_id
-    assert raw["status"] == "completed"
-    return value
-
-
 async def run(args):
-    # These environment edits only affect this child process. Keep mihomo and
-    # the parent Codex connection untouched; transport also bypasses proxy env.
-    for key in list(os.environ):
-        if key.lower() in {"http_proxy", "https_proxy", "all_proxy", "ftp_proxy", "socks_proxy", "no_proxy"}:
-            os.environ.pop(key)
-    os.environ.update(NO_PROXY="*", no_proxy="*")
-    root = args.root.resolve()
-    samples = prepare(root)
+    from transformers import AutoTokenizer
+    config = load_config(args.config)
+    settings = load_sii_settings()
+    tokenizer = AutoTokenizer.from_pretrained(config["tokenizer"], local_files_only=True)
+    args.root.mkdir(parents=True, exist_ok=True)
+    samples = prepare(args.root)
     if args.mode == "smoke":
-        samples = [next(row for row in samples if row["group"] == group)
-                   for group in ("english_text", "painting")]
-    settings = load_qwen_settings(REPO / "test_api.py")
-    if args.thinking == "disabled":
-        settings = replace(settings, thinking={"type": "disabled"})
-    settings = replace(settings, max_tokens=args.max_tokens)
-    request_contract = {"transport": args.transport, "thinking": settings.thinking,
-                        "max_tokens": settings.max_tokens, "prompt_version": "b512-paired-pilot-v3"}
-    atomic_json(root / "protocol.json", {
-        "models": list(MODELS), "api_example": str(REPO / "test_api.py"),
-        "credential_source": "AST-read original SII key/URL; key never persisted", "proxy": "disabled_per_process",
-        "image_size": 512, "image_tokens_training": 1024, "requested_thinking": settings.thinking,
-        "max_tokens": settings.max_tokens, "quality_reviewer": "GPT-6 in the current Codex session, real image inspection",
-        "audit_mode": "strict transport, schema and provenance; one-time visual selection review",
-        "full_corpus_per_item_sol_review": False, "pilot_images": 32,
-        "production_allowed": False,
-        "request_contract": request_contract,
-    })
-    lock = asyncio.Semaphore(args.concurrency)
-    generators = {model: QwenGenerator(replace(settings, model=model), rpm=6000, tpm=20000000,
-                                       connections=args.concurrency) for model in args.models}
-    if args.transport != "native-curl":
-        for generator in generators.values():
-            await generator.close()
-            transport = httpx.AsyncClient(
-                trust_env=False, proxy=None, verify=direct_ssl_context(),
-                http2=args.transport == "pooled-http2", follow_redirects=False,
-                limits=httpx.Limits(max_connections=args.concurrency, max_keepalive_connections=args.concurrency),
-                timeout=httpx.Timeout(300, connect=15),
-            )
-            generator.client = AsyncAnthropic(base_url=settings.base_url, api_key=settings.api_key,
-                                               max_retries=0, http_client=transport)
-
+        samples = [next(s for s in samples if s["group"] == group) for group in ("english_text", "painting")]
+    policy = {"contract_hash": CONTRACT_HASH, "runtime_sha256": fingerprint(config), "image_size": 512,
+              "credential_source": "SII_API_KEY/SII_BASE_URL", "proxy": False, "models": args.models,
+              "production_allowed": False, "visual_review_completed": False}
+    atomic_json(args.root / "protocol.json", policy)
+    semaphore = asyncio.Semaphore(args.concurrency)
+    clients = {}
+    for model in args.models:
+        api = copy.deepcopy(config["sii"])
+        api["vision_models"] = [model]  # Explicit diagnostic, not a production qualification.
+        clients[model] = SIIClient(settings, api)
     async def one(model, sample):
-        path = root / "responses" / model / (sample["id"] + ".json")
+        path = args.root / "responses" / model / (sample["id"] + ".json")
         if path.exists():
-            prior = json.loads(path.read_text())
-            if prior.get("request_succeeded") and prior.get("request_contract") == request_contract:
+            old = json.loads(path.read_text())
+            if old.get("policy") == policy and old.get("schema_passed") and old.get("view_sha256") == sample["view_sha256"]:
                 return
-            archive = path.parent / "attempts" / (sample["id"] + f"-{time.time_ns()}.json")
-            archive.parent.mkdir(exist_ok=True)
-            path.replace(archive)
-        async with lock:
-            started = time.time()
-            output = {"requested_model": model, "sample_id": sample["id"], "group": sample["group"],
-                      "view_sha256": sample["view_sha256"], "started_at": started,
-                      "request_contract": request_contract}
-            try:
-                image_path = Path(sample["image_path"])
-                raw = await generators[model].generate(sample["id"], image_path.read_bytes(), image_path.suffix[1:])
-                raw["transport"] = args.transport
-                output.update(raw=raw, request_succeeded=True)
-                try:
-                    output.update(parsed=parsed_result(raw, sample["id"]), schema_passed=True)
-                except Exception as exc:
-                    output.update(schema_passed=False, schema_error=f"{type(exc).__name__}: {str(exc)[:500]}")
-            except Exception as exc:
-                message = str(exc).replace(settings.api_key, "[REDACTED]")
-                output.update(request_succeeded=False, error_type=type(exc).__name__, error=message[:1600])
-                causes = []
-                cause = exc.__cause__
-                while cause is not None and len(causes) < 4:
-                    causes.append(type(cause).__name__ + ": " + str(cause).replace(settings.api_key, "[REDACTED]")[:1000])
-                    cause = cause.__cause__
-                output["error_causes"] = causes
-            output["seconds"] = round(time.time() - started, 3)
-            atomic_json(path, output)
-            print(json.dumps({k: output[k] for k in ("requested_model", "sample_id", "group", "request_succeeded", "seconds")}
-                             | {"schema_passed": output.get("schema_passed"), "error": output.get("error")}, ensure_ascii=False), flush=True)
+            target = path.parent / "attempts" / (sample["id"] + f"-{time.time_ns()}.json")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            path.replace(target)
+        item = {"key": sample["id"], "row": {}, "view": {"source_path": sample["image_path"], "view_sha256": sample["view_sha256"]}}
+        async with semaphore:
+            raw = await clients[model].generate(item, 1)
+        output = {"policy": policy, "requested_model": model, "sample_id": sample["id"], "group": sample["group"],
+                  "view_sha256": sample["view_sha256"], "raw": raw, "request_succeeded": raw["status"] == "completed"}
+        atomic_json(path, output)  # Durable raw response before parsing / acceptance.
+        try:
+            output.update(parsed=parse_pair(raw, sample["id"], tokenizer), schema_passed=True)
+        except Exception as exc:
+            output.update(schema_passed=False, error=settings.redact(str(exc))[:500])
+        atomic_json(path, output)
+        print(json.dumps({k:output[k] for k in ("requested_model","sample_id","schema_passed")}), flush=True)
     try:
-        await asyncio.gather(*(one(model, sample) for sample in samples for model in args.models))
+        await asyncio.gather(*(one(m,s) for m in args.models for s in samples))
     finally:
-        await asyncio.gather(*(generator.close() for generator in generators.values()))
+        await asyncio.gather(*(client.close() for client in clients.values()))
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("smoke", "pilot"))
-    parser.add_argument("--root", type=Path, default=ROOT)
-    parser.add_argument("--models", nargs="+", choices=MODELS, default=list(MODELS))
-    parser.add_argument("--concurrency", type=int, default=4)
-    parser.add_argument("--transport", choices=("native-curl", "pooled-http1", "pooled-http2"), default="pooled-http1")
-    parser.add_argument("--thinking", choices=("example", "disabled"), default="example")
-    parser.add_argument("--max-tokens", type=int, default=3200)
-    args = parser.parse_args()
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("mode", choices=("smoke","pilot"))
+    parser.add_argument("--root",type=Path,default=ROOT)
+    parser.add_argument("--config",type=Path,default=DEFAULT_CONFIG)
+    parser.add_argument("--models",nargs="+",default=["qwen3.8-max"])
+    parser.add_argument("--concurrency",type=int,default=4)
+    args=parser.parse_args()
+    if args.concurrency<1:parser.error("concurrency must be positive")
     asyncio.run(run(args))

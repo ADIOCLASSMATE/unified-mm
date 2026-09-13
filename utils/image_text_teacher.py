@@ -1,6 +1,5 @@
-"""Qwen generates pairs; Codex/sol judges and replaces only rejected pairs."""
+"""Historical Qwen/sol contracts for old releases; current clients are in data_synthesis."""
 
-import ast
 import asyncio
 import base64
 from dataclasses import dataclass, field
@@ -96,29 +95,6 @@ normal outputs should be much shorter, following the pair contract below.
 """ + PROMPT
 
 
-def _literal(node, variables):
-    if isinstance(node, ast.Name) and node.id in variables:
-        return _literal(variables[node.id], {})
-    if isinstance(node, ast.Call) and ast.unparse(node.func) in {"os.getenv", "os.environ.get"}:
-        if not 1 <= len(node.args) <= 2 or node.keywords:
-            raise ValueError("API example environment getters must use literal positional arguments")
-        name = _literal(node.args[0], variables)
-        default = _literal(node.args[1], variables) if len(node.args) == 2 else None
-        return os.environ.get(name, default)
-    if isinstance(node, ast.Subscript) and ast.unparse(node.value) == "os.environ":
-        return os.environ[_literal(node.slice, variables)]
-    if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or):
-        for value in node.values:
-            result = _literal(value, variables)
-            if result:
-                return result
-        return result
-    try:
-        return ast.literal_eval(node)
-    except (ValueError, TypeError):
-        raise ValueError("SII API example settings must be literals or environment-variable lookups") from None
-
-
 @dataclass(frozen=True)
 class QwenSettings:
     base_url: str
@@ -133,41 +109,11 @@ class QwenSettings:
                 "thinking": self.thinking, "proxy": "disabled"}
 
 
-def load_qwen_settings(example: str | Path, *, require_api_key=True) -> QwenSettings:
-    """Read explicit SDK settings without importing or executing test_api.py."""
-    tree = ast.parse(Path(example).read_text())
-    variables = {target.id: node.value for node in tree.body if isinstance(node, ast.Assign)
-                 for target in node.targets if isinstance(target, ast.Name)}
-    clients, requests = [], []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        name = ast.unparse(node.func)
-        values = {kw.arg: kw.value for kw in node.keywords if kw.arg}
-        if name in {"Anthropic", "AsyncAnthropic", "anthropic.Anthropic", "anthropic.AsyncAnthropic"}:
-            clients.append(values)
-        if name.endswith(".messages.create") and "model" in values:
-            requests.append(values)
-    if len(clients) != 1 or len(requests) != 1:
-        raise ValueError("API example must contain one Anthropic client and one messages.create request")
-    client, request = clients[0], requests[0]
-    base_url = _literal(client["base_url"], variables)
-    api_key = _literal(client["api_key"], variables) if require_api_key else ""
-    model = _literal(request["model"], variables)
-    max_tokens = int(_literal(request["max_tokens"], variables))
-    thinking = _literal(request["thinking"], variables) if "thinking" in request else {"type": "disabled"}
-    if model != PRIMARY_MODEL:
-        raise ValueError(f"expected the requested primary model {PRIMARY_MODEL}")
-    url = httpx.URL(base_url)
-    if url.scheme not in {"http", "https"} or not url.host or url.username or url.password or url.query:
-        raise ValueError("Qwen base URL must be an HTTP(S) endpoint without embedded credentials/query")
-    if require_api_key and (not isinstance(api_key, str) or not api_key):
-        raise ValueError("Qwen API key is missing")
-    if not isinstance(thinking, dict):
-        raise ValueError("invalid Qwen thinking settings")
-    if max_tokens <= 0 or (thinking.get("type") == "enabled" and not 0 < int(thinking["budget_tokens"]) < max_tokens):
-        raise ValueError("invalid Qwen output/thinking budget")
-    return QwenSettings(str(base_url), api_key or "", model, max_tokens, thinking)
+def load_qwen_settings(example=None, *, require_api_key=True) -> QwenSettings:
+    """Legacy model settings with current shell credentials; example is never read."""
+    from data_synthesis.config import load_sii_settings
+    settings = load_sii_settings(require_key=require_api_key)
+    return QwenSettings(settings.base_url, settings.api_key)
 
 
 class RequestPacer:

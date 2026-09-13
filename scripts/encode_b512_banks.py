@@ -14,7 +14,7 @@ import sys
 import time
 
 from scripts.prepare_b512_posterior_bank import prepare_bank
-from scripts.synthesize_image_text import atomic_json
+from data_synthesis.io import atomic_json
 
 
 def run_plan(path):

@@ -11,7 +11,7 @@ import pytest
 
 from scripts import recover_b512_pixmo_images as mirror
 from scripts import supply_b512_images as supply
-from scripts.distill_b512_codex import atomic_json, dumps, file_sha, sha
+from data_synthesis.io import atomic_json, dumps, file_sha, sha
 
 
 def fixture_image(tmp_path):

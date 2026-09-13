@@ -10,7 +10,7 @@ import time
 from PIL import Image
 import pytest
 
-from scripts import distill_b512_codex as farm
+from scripts.legacy import distill_b512_codex as farm
 
 
 class Tokenizer:

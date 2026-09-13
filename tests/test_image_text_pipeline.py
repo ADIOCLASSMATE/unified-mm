@@ -9,7 +9,7 @@ from pathlib import Path
 from PIL import Image
 import pytest
 
-from scripts.synthesize_image_text import (
+from scripts.legacy.synthesize_image_text import (
     DirectDownloader, ImageArchives, export_training, run_pipeline, validate_pair,
 )
 from utils.image_shard_io import read_image_bytes
@@ -215,7 +215,7 @@ def args_for(tmp_path):
 
 
 def test_prepare_resume_dedup_and_export_share_exact_teacher_pixels(tmp_path, monkeypatch):
-    monkeypatch.setattr("scripts.synthesize_image_text.check_direct_routes", lambda: ["test-loopback"])
+    monkeypatch.setattr("scripts.legacy.synthesize_image_text.check_direct_routes", lambda: ["test-loopback"])
     args = args_for(tmp_path)
     first = asyncio.run(run_pipeline(args))
     assert first == {"prepared": 1, "excluded": 1, "duplicate": 1}
@@ -247,7 +247,7 @@ def test_prepare_resume_dedup_and_export_share_exact_teacher_pixels(tmp_path, mo
 
 
 def test_received_response_survives_parser_failure(tmp_path, monkeypatch):
-    monkeypatch.setattr("scripts.synthesize_image_text.check_direct_routes", lambda: [])
+    monkeypatch.setattr("scripts.legacy.synthesize_image_text.check_direct_routes", lambda: [])
     args = args_for(tmp_path)
     args.prepare_only = False
     teacher = Teacher()
@@ -255,7 +255,7 @@ def test_received_response_survives_parser_failure(tmp_path, monkeypatch):
     # A recoverable parser error also leaves the raw response durably recorded.
     def fail_parse(*_):
         raise ValueError("bad parser")
-    monkeypatch.setattr("scripts.synthesize_image_text.parse_judgement", fail_parse)
+    monkeypatch.setattr("scripts.legacy.synthesize_image_text.parse_judgement", fail_parse)
     assert asyncio.run(run_pipeline(args, teacher, Tokenizer(), generator))["failed"] == 1
     import sqlite3
     db = sqlite3.connect(tmp_path / "run/state.sqlite3")
@@ -264,14 +264,14 @@ def test_received_response_survives_parser_failure(tmp_path, monkeypatch):
     db.close()
     # Retry reparses received results without another model call by default.
     args.retry_failed = True
-    monkeypatch.setattr("scripts.synthesize_image_text.parse_judgement", parse_judgement)
+    monkeypatch.setattr("scripts.legacy.synthesize_image_text.parse_judgement", parse_judgement)
     assert asyncio.run(run_pipeline(args, teacher, Tokenizer(), generator))["ready"] == 1
     assert len(teacher.calls) == len(generator.calls) == 1
 
 
 @pytest.mark.parametrize("bad_json", [False, True])
 def test_rejected_qwen_pair_is_replaced_in_the_same_final_call(tmp_path, monkeypatch, bad_json):
-    monkeypatch.setattr("scripts.synthesize_image_text.check_direct_routes", lambda: [])
+    monkeypatch.setattr("scripts.legacy.synthesize_image_text.check_direct_routes", lambda: [])
     args = args_for(tmp_path)
     args.prepare_only = False
     generator, teacher = Generator(bad_json=bad_json), Teacher("replace")
@@ -289,7 +289,7 @@ def test_rejected_qwen_pair_is_replaced_in_the_same_final_call(tmp_path, monkeyp
 @pytest.mark.parametrize("always_invalid", [False, True])
 def test_bad_teacher_replacement_retries_only_that_image_once(tmp_path, monkeypatch, always_invalid):
     import sqlite3
-    monkeypatch.setattr("scripts.synthesize_image_text.check_direct_routes", lambda: [])
+    monkeypatch.setattr("scripts.legacy.synthesize_image_text.check_direct_routes", lambda: [])
     args = args_for(tmp_path)
     rows = []
     for color in ["red", "green"]:
@@ -330,7 +330,7 @@ def test_bad_teacher_replacement_retries_only_that_image_once(tmp_path, monkeypa
 
 def test_teacher_timeout_retry_keeps_received_qwen_response(tmp_path, monkeypatch):
     import sqlite3
-    monkeypatch.setattr("scripts.synthesize_image_text.check_direct_routes", lambda: [])
+    monkeypatch.setattr("scripts.legacy.synthesize_image_text.check_direct_routes", lambda: [])
     args = args_for(tmp_path)
     args.prepare_only = False
 
@@ -357,7 +357,7 @@ def test_teacher_timeout_retry_keeps_received_qwen_response(tmp_path, monkeypatc
 
 
 def test_final_rejection_and_network_failure_never_bypass_teacher(tmp_path, monkeypatch):
-    monkeypatch.setattr("scripts.synthesize_image_text.check_direct_routes", lambda: [])
+    monkeypatch.setattr("scripts.legacy.synthesize_image_text.check_direct_routes", lambda: [])
     args = args_for(tmp_path)
     args.prepare_only = False
     generator, teacher = Generator(error=OSError("network unavailable")), Teacher()
@@ -375,7 +375,7 @@ def test_legacy_reuse_does_not_hide_a_qwen_service_outage(tmp_path, monkeypatch,
     import hashlib
     import sqlite3
 
-    monkeypatch.setattr("scripts.synthesize_image_text.check_direct_routes", lambda: [])
+    monkeypatch.setattr("scripts.legacy.synthesize_image_text.check_direct_routes", lambda: [])
     args = args_for(tmp_path)
     args.prepare_only = False
     args.judge_batch_size = 1
@@ -447,10 +447,11 @@ def test_legacy_reuse_does_not_hide_a_qwen_service_outage(tmp_path, monkeypatch,
         assert db.execute("SELECT count(*) FROM tasks WHERE status='ready' AND json_extract(result,'$.reused_unchanged')=1").fetchone()[0] >= 32
 
 
-def test_example_is_read_without_execution_or_secret_publication(tmp_path, monkeypatch):
+def test_legacy_example_is_ignored_and_only_shell_credentials_are_read(tmp_path, monkeypatch):
     monkeypatch.delenv("QWEN_API_KEY", raising=False)
     monkeypatch.delenv("QWEN_BASE_URL", raising=False)
-    monkeypatch.setenv("EXAMPLE_KEY", "test-secret")
+    monkeypatch.setenv("SII_API_KEY", "test-secret")
+    monkeypatch.setenv("SII_BASE_URL", "https://environment.example.invalid/")
     example = tmp_path / "example.py"
     example.write_text('import os\nfrom anthropic import Anthropic\n'
         'client = Anthropic(base_url="https://example.invalid/", api_key=os.getenv("EXAMPLE_KEY"))\n'
@@ -459,6 +460,7 @@ def test_example_is_read_without_execution_or_secret_publication(tmp_path, monke
         'raise AssertionError("this example must never be executed")\n')
     settings = load_qwen_settings(example)
     assert settings.api_key == "test-secret"
+    assert settings.base_url == "https://environment.example.invalid/"
     assert settings.max_tokens == 3200 and settings.thinking["budget_tokens"] == 1600
     assert "test-secret" not in repr(settings) + json.dumps(settings.public_contract())
 
@@ -561,7 +563,7 @@ def test_sii_fenced_json_retains_the_actual_candidate():
 
 
 def test_reuse_keeps_original_models_and_stores_images_separately(tmp_path, monkeypatch):
-    monkeypatch.setattr("scripts.synthesize_image_text.check_direct_routes", lambda: [])
+    monkeypatch.setattr("scripts.legacy.synthesize_image_text.check_direct_routes", lambda: [])
     args = args_for(tmp_path)
     rows = [json.loads(line) for line in Path(args.manifest).read_text().splitlines()]
     row = rows[0]
@@ -586,7 +588,7 @@ def test_reuse_keeps_original_models_and_stores_images_separately(tmp_path, monk
 
 
 def test_publication_deduplicates_partitions_and_builds_global_ids(tmp_path, monkeypatch):
-    monkeypatch.setattr("scripts.synthesize_image_text.check_direct_routes", lambda: [])
+    monkeypatch.setattr("scripts.legacy.synthesize_image_text.check_direct_routes", lambda: [])
     partitions = []
     for name in ("a", "b"):
         directory = tmp_path / name
@@ -624,7 +626,7 @@ def test_publication_deduplicates_partitions_and_builds_global_ids(tmp_path, mon
 
 
 def test_parallel_teachers_share_one_batch_assembler(tmp_path, monkeypatch):
-    monkeypatch.setattr("scripts.synthesize_image_text.check_direct_routes", lambda: [])
+    monkeypatch.setattr("scripts.legacy.synthesize_image_text.check_direct_routes", lambda: [])
     args = args_for(tmp_path)
     rows = []
     for color in ["red", "green", "blue", "yellow"]:
@@ -648,7 +650,7 @@ def test_parallel_teachers_share_one_batch_assembler(tmp_path, monkeypatch):
 def test_benchmark_near_duplicates_are_excluded_before_model_calls(tmp_path, monkeypatch):
     from utils.image_near_duplicates import perceptual_hashes, write_index
     import sqlite3
-    monkeypatch.setattr("scripts.synthesize_image_text.check_direct_routes", lambda: [])
+    monkeypatch.setattr("scripts.legacy.synthesize_image_text.check_direct_routes", lambda: [])
     args = args_for(tmp_path)
     benchmark = tmp_path / "benchmark-index"
     values = perceptual_hashes(pixels((1024, 1024)))

@@ -1,5 +1,7 @@
 **历史方案：B 512px Qwen 合成、Codex sol low 终审与补写**
 
+> 历史记录：本文描述当时的协议和实际产物。当前执行以 [DATA_SYNTHESIS.md](DATA_SYNTHESIS.md) 为准：复用优先、SII 补缺纠错、重试耗尽后才用 Codex CLI；连接信息只从 SII 环境变量或静态 shell rc export 读取。
+
 2026-09-12 更新：用户已要求停用 Qwen API，改由现有 Codex CLI 的 GPT-5.6-sol low
 直接高并发合成。当前队列、目录和验收以
 [Codex 直接合成方案](B_CODEX_IMAGE_SYNTHESIS_20260912.md)为准。下文保留旧方案与历史实验记录，
@@ -65,7 +67,7 @@
 
 **每张图如何合成与终审**
 
-默认每张图由 **qwen3.8-27b 一次生成 1 条 I2T caption + 1 条 T2I prompt**，先提高不同图片覆盖。配置静态读取仓库根目录的 `test_api.py`，不导入或执行该文件：使用 SII 的 Anthropic Messages 协议、文件中的 SII URL 与 `SII_API_KEY`，以及当前 `max_tokens=3200`、`thinking={type: enabled, budget_tokens: 1600}`。URL/key 严格来自该文件，不使用官方 Qwen 端点或其他环境变量覆盖；模型名固定为 SII 服务中的 `qwen3.8-27b`。不把 Qwen 的 thinking 块写成训练标签。SII 有时给 JSON 加 Markdown 围栏，解析器只移除完整外层围栏，不因这种格式差异要求 sol 重写。
+历史默认每张图由 **qwen3.8-27b 一次生成 1 条 I2T caption + 1 条 T2I prompt**，使用 SII Anthropic Messages，`max_tokens=3200`、`thinking={type: enabled, budget_tokens: 1600}`。旧版从 `test_api.py` 解析配置的行为已经删除；包括保留的历史工具在内，连接信息现在只从 `SII_API_KEY` / `SII_BASE_URL` 环境变量或静态 bashrc/zshrc export 读取，不使用官方 Qwen 端点。历史 Qwen thinking 块没有写成训练标签；完整外层 JSON 围栏可由解析器移除。当前生产模型路由见本文顶部链接。
 
 | 字段 | 内容约定 |
 | --- | --- |
@@ -153,7 +155,7 @@ SII 的 Anthropic SDK 通过自定义传输层调用本机 curl，明确设置 `
 
 启动时只读检查 Linux 路由中的已知隧道接口（tun/tap/wg/tailscale/ppp 等），发现时停止；这能检测可见接口，不能证明任意基础网络都没有透明转发。不会启用 VPN、代理镜像或改写用户全局网络配置。直连失败就记录失败并等待补跑。
 
-Codex 终审使用现有 CLI 的登录和连接方式，不把 Qwen API 密钥放进提示、输出清单或命令行，并从 Codex 子进程环境移除 `SII_API_KEY`；保留 Codex 所需的代理与登录。本轮不修改 Codex 的全局认证与网络设置。服务保持运行和 API 直连已在同一轮真实调用中同时成立。对同一组失败图片的原生/Python 传输、HTTP/1.1/HTTP/2 和思考预算对照没有证明某个参数能稳定解决断流，生产继续沿用 `test_api.py` 的原配置。
+Codex 终审使用现有 CLI 的登录和连接方式，不把 Qwen API 密钥放进提示、输出清单或命令行，并从 Codex 子进程环境移除 `SII_API_KEY`；保留 Codex 所需的代理与登录。本轮不修改 Codex 的全局认证与网络设置。服务保持运行和 API 直连已在同一轮真实调用中同时成立。对同一组失败图片的原生/Python 传输、HTTP/1.1/HTTP/2 和思考预算对照没有证明某个参数能稳定解决断流，当时继续沿用其既有协议参数。这是历史诊断结论；当前连接入口和 TLS 参数以 [DATA_SYNTHESIS.md](DATA_SYNTHESIS.md) 为准。
 
 **512×512 对训练和缓存的适配目标**
 
@@ -184,25 +186,25 @@ Codex 终审使用现有 CLI 的登录和连接方式，不把 Qwen API 密钥�
 
 旧 ImageNet 只选合成 caption 和 `faithful_photo` T2I，核对原图 SHA256，再让 sol 对照新的 512px 视图终审。通过后原样保留两段文本和各自模型来源；若不符则由 sol 当场补写。旧图可按原生短边至少 224px 入选并放大到 512px，记录 `upsampled`，不声称获得新的细节；新增图库默认要求原生短边至少 512px。
 
-[流水线脚本](../scripts/synthesize_image_text.py) 接收已筛选的候选清单。每行字段为 `source`、`source_id`、`url`（或本地 `local_path`），可带 `parent_id`、`split`、`capabilities` 和 EXIF 归一坐标系下的 `required_boxes: [[x0,y0,x1,y1], ...]`。来源元数据需要先转换成该清单，脚本不自动申请图库权限或抓取站点目录。
+[流水线脚本](../scripts/legacy/synthesize_image_text.py) 接收已筛选的候选清单。每行字段为 `source`、`source_id`、`url`（或本地 `local_path`），可带 `parent_id`、`split`、`capabilities` 和 EXIF 归一坐标系下的 `required_boxes: [[x0,y0,x1,y1], ...]`。来源元数据需要先转换成该清单，脚本不自动申请图库权限或抓取站点目录。
 
 排除文件每行一个 `source:id` 或图片 SHA256，包含正式评测原图身份。空文件不能证明无评测重叠；实际任务还在预处理和发布时使用上述 pHash 索引排除跨来源近重复，其检测范围不等于全部语义派生图。
 
 ```bash
 # 仓库根目录；只下载并固定视图，不调用任一模型，也不要求 API 密钥。
-PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" .venv/bin/python scripts/synthesize_image_text.py run \
+PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" .venv/bin/python scripts/legacy/synthesize_image_text.py run \
   --manifest /data/candidates.jsonl --exclude /data/benchmark_exclusions.txt \
-  --output public/data_preparation/unified_b_512_v2/runs/production --image-root public/datasets/unified_image_pool_512_v1/production --qwen-example test_api.py --prepare-only
+  --output public/data_preparation/unified_b_512_v2/runs/production --image-root public/datasets/unified_image_pool_512_v1/production --prepare-only
 
-# 静态读取 test_api.py；现有 SII_API_KEY 环境变量和 Codex 登录均在本机使用。
+# 历史工具也只读取 SII_API_KEY / SII_BASE_URL 环境变量或静态 shell rc export。
 # 复用上一命令下载/处理的图片，Qwen 合成，Codex sol low 终审与条件补写。
-PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" .venv/bin/python scripts/synthesize_image_text.py run \
+PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" .venv/bin/python scripts/legacy/synthesize_image_text.py run \
   --manifest /data/candidates.jsonl --exclude /data/benchmark_exclusions.txt \
-  --output public/data_preparation/unified_b_512_v2/runs/production --image-root public/datasets/unified_image_pool_512_v1/production --qwen-example test_api.py \
+  --output public/data_preparation/unified_b_512_v2/runs/production --image-root public/datasets/unified_image_pool_512_v1/production \
   --download-workers 32 --per-host 8 --cpu-workers 8 --qwen-workers 4 \
   --teacher-workers 4 --judge-batch-size 4 --rpm 30 --tpm 600000
 
-PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" .venv/bin/python scripts/synthesize_image_text.py export \
+PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" .venv/bin/python scripts/legacy/synthesize_image_text.py export \
   --run public/data_preparation/unified_b_512_v2/runs/production --output public/datasets/unified_image_text_512_v1/train
 
 # 单个 VAE shard 示例，完成 0..63 的全部 shard 后再发布 posterior 索引。

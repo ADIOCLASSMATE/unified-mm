@@ -2629,7 +2629,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     capabilities = subparsers.add_parser(
-        "capabilities", help="print known test_api.py model capabilities"
+        "capabilities", help="print historical SII model capabilities"
     )
     capabilities.set_defaults(func=None)
 

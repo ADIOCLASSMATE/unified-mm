@@ -29,6 +29,11 @@ def audit_publication(dataset, *, image_root=None, tokenizer=None, require_poste
     root = Path(dataset).resolve()
     image_root = Path(image_root).resolve() if image_root else None
     publication = json.loads((root / "publication.json").read_text())
+    if publication.get("pipeline") == "b512-reuse-sii-fallback-v1":
+        if tokenizer is None:
+            raise ValueError("current publications require tokenizer validation")
+        from data_synthesis.publication import audit
+        return audit(root, tokenizer=tokenizer, require_posterior=require_posterior, image_root=image_root)
     allowed_runs = {r["path"] for r in publication["source_runs"]}
     for path in root.rglob("*"):
         require(path.suffix.lower() not in {
@@ -103,22 +108,7 @@ def audit_publication(dataset, *, image_root=None, tokenizer=None, require_poste
     posterior = None
     posterior_index = root / "posterior_index.json"
     if require_posterior or posterior_index.exists():
-        import torch
-        from pretrain.merge_flow_latent_shards import POSTERIOR_CACHE_FORMAT, POSTERIOR_STATS_LAYOUT
-        from utils.sharded_posterior import load_sharded_posterior
-        cached = load_sharded_posterior(posterior_index)
-        stats, ids, meta = cached["posterior_stats"], cached["img_ids"], cached["metadata"]
-        require(meta["format"] == POSTERIOR_CACHE_FORMAT and meta["stats_layout"] == POSTERIOR_STATS_LAYOUT
-                and meta["stats_are_scaled"] is True, "unsupported posterior cache contract")
-        require(meta["manifest_sha256"] == manifest_digest, "posterior index refers to a different publication")
-        require(torch.equal(ids, torch.arange(1, count + 1)), "posterior/publication IDs differ")
-        require(stats.shape == (count, 1024, 32) and meta["frozen_views"], "posterior is not a frozen 512px cache")
-        for i in torch.argsort(stats.shard_rows[:, 0], stable=True).tolist():
-            value = stats[i]
-            require(bool(torch.isfinite(value).all()) and not bool((value[..., 16:] < 0).any()),
-                    f"invalid posterior for image {i + 1}")
-        posterior = {"index": str(posterior_index), "shape": list(stats.shape), "all_rows_verified": True,
-                     "source_view_hashes_verified_at_encoding": bool(meta.get("source_view_hashes_verified"))}
+        posterior = audit_posterior(root, count, manifest_digest)
     return {
         "audited_at": datetime.now(timezone.utc).isoformat(), "dataset": str(root),
         "verified_images": count, "all_rgb_512": True, "all_source_and_view_sha256_verified": True,
@@ -130,6 +120,27 @@ def audit_publication(dataset, *, image_root=None, tokenizer=None, require_poste
         "i2t_generators": dict(generators), "decisions_by_source": dict(decisions),
         "note": "Checks identity and publication contracts; teacher approval and selection buckets are not independent factual-accuracy measurements.",
     }
+
+
+def audit_posterior(root, count, manifest_digest):
+    posterior_index = Path(root) / "posterior_index.json"
+    import torch
+    from pretrain.merge_flow_latent_shards import POSTERIOR_CACHE_FORMAT, POSTERIOR_STATS_LAYOUT
+    from utils.sharded_posterior import load_sharded_posterior
+    cached = load_sharded_posterior(posterior_index)
+    stats, ids, meta = cached["posterior_stats"], cached["img_ids"], cached["metadata"]
+    require(meta["format"] == POSTERIOR_CACHE_FORMAT and meta["stats_layout"] == POSTERIOR_STATS_LAYOUT
+            and meta["stats_are_scaled"] is True, "unsupported posterior cache contract")
+    require(meta["manifest_sha256"] == manifest_digest, "posterior index refers to a different publication")
+    require(torch.equal(ids, torch.arange(1, count + 1)), "posterior/publication IDs differ")
+    require(stats.shape == (count, 1024, 32) and meta["frozen_views"], "posterior is not a frozen 512px cache")
+    for i in torch.argsort(stats.shard_rows[:, 0], stable=True).tolist():
+        value = stats[i]
+        require(bool(torch.isfinite(value).all()) and not bool((value[..., 16:] < 0).any()),
+                f"invalid posterior for image {i + 1}")
+    posterior = {"index": str(posterior_index), "shape": list(stats.shape), "all_rows_verified": True,
+                 "source_view_hashes_verified_at_encoding": bool(meta.get("source_view_hashes_verified"))}
+    return posterior
 
 
 def main():

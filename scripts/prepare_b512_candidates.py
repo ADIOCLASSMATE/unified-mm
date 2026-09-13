@@ -100,6 +100,13 @@ def pixmo_candidates(parquet, count, revision, seed, allowed_hosts=frozenset(), 
             row = {"source": "pixmo_cap", "source_id": identity, "url": url, "split": "train",
                    "metadata_revision": revision, "min_short_side": 512,
                    "capabilities": [bucket], "selection_bucket": bucket}
+            if item.get("caption"):
+                from data_synthesis.sources import caption_candidate
+                row["caption_candidates"] = [caption_candidate(
+                    row, item["caption"], author="allenai/pixmo-cap", kind="human_caption",
+                    provenance={"dataset": "allenai/pixmo-cap", "revision": revision,
+                                "field": "caption", "shard": str(parquet)})]
+            row["view_policy"] = "fit_pad"
             if item.get("image_sha256"):
                 row["expected_source_sha256"] = item["image_sha256"]
             visits[bucket] += 1
@@ -210,7 +217,7 @@ def openimages_candidates(csv_path, count, seed, excluded_ids=frozenset()):
 def wikiart_candidates(parquet, source_archive, count, revision, seed, excluded_ids=frozenset()):
     """Extract embedded images once, then select across upstream numeric style IDs."""
     import pyarrow.parquet as pq
-    from scripts.synthesize_image_text import ImageArchives, digest_file
+    from data_synthesis.io import ImageArchives, digest_file
     if not source_archive:
         raise ValueError("WikiArt extraction requires a separate image archive directory")
     archive_root = Path(source_archive).resolve()

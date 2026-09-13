@@ -12,7 +12,7 @@ import subprocess
 import sys
 import time
 
-from scripts.distill_b512_codex import atomic_json, file_sha
+from data_synthesis.io import atomic_json, file_sha
 from scripts.encode_b512_supply import freeze_bank
 
 

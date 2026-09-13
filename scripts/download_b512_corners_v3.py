@@ -16,7 +16,6 @@ import os
 from pathlib import Path
 import sqlite3
 import time
-from urllib.parse import quote, urlencode
 
 import httpx
 
@@ -41,72 +40,30 @@ def digest(path, algorithm="sha256"):
         return hashlib.file_digest(handle, algorithm).hexdigest()
 
 
-def init_catalogue(root):
+def init_catalogue(root, catalogue_path=None):
+    """Load an explicitly selected, immutable archive scope, without source expansion."""
+    root.mkdir(parents=True, exist_ok=True)
     destination = root / "archive_catalogue.json"
-    if destination.exists():
-        return json.loads(destination.read_text())
-    discovery = root / "source_discovery"
-    files = []
-    for repo, family, include in (
-        ("allenai/pixmo-cap", "pixmo_cap", lambda name: name.startswith("data/train-")),
-        ("allenai/pixmo-points", "pixmo_points", lambda name: name.startswith("data/train-")),
-        ("huggan/wikiart", "wikiart", lambda name: name.startswith("data/train-") or name == "dataset_infos.json"),
-        ("ahmed-masry/ChartQA", "chartqa", lambda name: name == "ChartQA Dataset.zip"),
-    ):
-        info = json.loads((discovery / (repo.replace("/", "_") + ".json")).read_text())
-        for entry in info["siblings"]:
-            name = entry["rfilename"]
-            if name != "README.md" and not include(name):
-                continue
-            path = POOL / "source_archives" / family / Path(name).name
-            # Reuse verified original bytes; do not duplicate large old archives.
-            candidates = [PUBLIC / "datasets/unified_image_pool_512_v1/source_archives" /
-                          ("pixmo" if family == "pixmo_cap" else family) / Path(name).name]
-            if family == "pixmo_cap" and name.endswith("00000-of-00004.parquet"):
-                candidates.append(PUBLIC / "data_preparation/unified_b_512_v2/sources/pixmo_train_00000.parquet")
-            if family == "wikiart" and name.endswith("00000-of-00072.parquet"):
-                candidates.append(PUBLIC / "data_preparation/unified_b_512_v2/sources/wikiart_train_00000.parquet")
-            existing = next((p for p in candidates if p.is_file() and p.stat().st_size == entry["size"]), None)
-            files.append({"id": family + ":" + name, "source": family, "upstream_path": name,
-                          "url": f"https://huggingface.co/datasets/{repo}/resolve/{info['sha']}/{quote(name)}",
-                          "revision": info["sha"], "bytes": entry["size"],
-                          "sha256": entry.get("lfs", {}).get("sha256"),
-                          "path": str(existing or path), "reuse_existing": bool(existing)})
-    anyword = json.loads((discovery / "anyword.json").read_text())
-    for entry in anyword["Data"]["Files"]:
-        if entry["Type"] != "blob" or entry["Path"].startswith("."):
-            continue
-        name = entry["Path"]
-        files.append({"id": "anyword3m:" + name, "source": "anyword3m", "upstream_path": name,
-                      "url": "https://modelscope.cn/api/v1/datasets/iic/AnyWord-3M/repo?" +
-                             urlencode({"Revision": entry["Revision"], "FilePath": name}),
-                      "revision": entry["Revision"], "bytes": entry["Size"], "sha256": entry["Sha256"],
-                      "path": str(POOL / "source_archives/anyword3m" / name), "reuse_existing": False})
-    docci = json.loads((discovery / "docci_files.json").read_text())
-    if {r["filename"] for r in docci} != {"docci_images.tar.gz", "docci_descriptions.jsonlines", "docci_metadata.jsonlines"}:
-        raise ValueError("DOCCI object discovery is incomplete")
-    for entry in docci:
-        if not entry["revision"]:
-            raise ValueError("GCS object generation must be frozen")
-        md5 = next((part.strip()[4:] for part in entry.get("md5", "").split(",")
-                    if part.strip().startswith("md5=")), None)
-        files.append({"id": "docci:" + entry["filename"], "source": "docci",
-                      "upstream_path": entry["filename"], "url": entry["url"] + "?generation=" + entry["revision"],
-                      "revision": entry["revision"], "bytes": entry["bytes"], "md5_base64": md5,
-                      "path": str(POOL / "source_archives/docci" / entry["filename"]), "reuse_existing": False})
-    for source, path in (
-        ("openimages_relationships", PUBLIC / "data_preparation/unified_b_512_v2/sources/openimages_train_relationships.csv"),
-        ("textocr", PUBLIC / "datasets/unified_image_pool_512_v1/source_archives/textocr/TextOCR_0.1_train.json"),
-    ):
-        files.append({"id": source + ":" + path.name, "source": source, "upstream_path": path.name,
-                      "path": str(path), "bytes": path.stat().st_size, "sha256": digest(path),
-                      "revision": "frozen_local_sha256", "reuse_existing": True, "url": None})
-    value = {"version": "b512-corners-download-first-v3", "created_at": time.time(),
-             "imagenet_included": False, "random_sample_cap": None,
-             "proxy": "disabled_per_process", "files": files,
-             "declared_bytes": sum(r["bytes"] for r in files),
-             "scope_note": "Complete declared train sources; DOCCI/ChartQA distribution archives also contain held-out splits, excluded at indexing. URL-backed PixMo/OpenImages/TextOCR images require the separate image download receipt."}
-    atomic_json(destination, value)
+    if catalogue_path:
+        value = json.loads(Path(catalogue_path).read_text())
+        if destination.exists() and json.loads(destination.read_text()) != value:
+            raise ValueError("archive catalogue changed; use a new cohort root")
+    elif destination.exists():
+        value = json.loads(destination.read_text())
+    else:
+        raise ValueError("provide --catalogue with selected pinned source objects; full-library expansion is retired")
+    seen = set()
+    if not value.get("files"):
+        raise ValueError("archive catalogue must contain explicit objects")
+    for row in value["files"]:
+        if (row["id"] in seen or not Path(row["path"]).is_absolute() or row["bytes"] < 1
+                or not row.get("revision")):
+            raise ValueError("archive objects need unique IDs, absolute paths, positive lengths and pinned revisions")
+        seen.add(row["id"])
+    if value.get("declared_bytes") != sum(row["bytes"] for row in value["files"]):
+        raise ValueError("archive catalogue byte total differs from its declared scope")
+    if not destination.exists():
+        atomic_json(destination, value)
     return value
 
 
@@ -215,12 +172,8 @@ async def fetch_file(client, row, range_workers, progress):
 
 async def run(args):
     check_direct_routes()
-    for key in list(os.environ):
-        if key.lower() in {"http_proxy", "https_proxy", "all_proxy", "ftp_proxy", "socks_proxy", "no_proxy"}:
-            os.environ.pop(key)
-    os.environ.update(NO_PROXY="*", no_proxy="*")
     root = args.root.resolve()
-    catalogue = init_catalogue(root)
+    catalogue = init_catalogue(root, args.catalogue)
     if args.command == "init":
         print(json.dumps({"objects": len(catalogue["files"]), "declared_bytes": catalogue["declared_bytes"]}))
         return
@@ -299,6 +252,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("init", "download"))
     parser.add_argument("--root", type=Path, default=ROOT)
+    parser.add_argument("--catalogue", type=Path, help="Explicit selected archive catalogue; no automatic full-source expansion")
     parser.add_argument("--files", type=int, default=8)
     parser.add_argument("--ranges", type=int, default=4)
     args = parser.parse_args()

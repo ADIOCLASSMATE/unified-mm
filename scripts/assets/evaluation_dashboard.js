@@ -123,7 +123,7 @@ function renderResearchOverview(){
   ['当前大规模训练计划','已有 caption / prompt 优先；SII API 仅补缺','完整 ImageNet + 至少 200 万非 ImageNet 原图目标 · 512px'],
   ['两套共用纯文本','ClimbMix','100 个本地分片']
  ].map(row=>row.map(esc));
- const dataNote=`<strong>非 ImageNet 图库至少 200 万张，各来源配额为起点，合格图可超过；尚未完成。</strong> 当前优先确定来源，复用已有 caption / prompt，缺失或错误样本再由通过前置验收的 SII API 处理；不逐图调用 sol。旧消融成绩、9 月 12 日首轮已验收产物与本次目标配额分别记录，ClimbMix 沿用现有语料。`;
+ const dataNote=`<strong>非 ImageNet 图库至少 200 万张，各来源配额为起点，合格图可超过；尚未完成。</strong> 当前优先确定来源，复用已有 caption / prompt，缺失或错误样本再由通过前置验收的 SII API 处理；不逐图调用 sol，仅在 SII 单图重试耗尽后由 Codex CLI 有界兜底。旧消融成绩、9 月 12 日首轮已验收产物与本次目标配额分别记录，ClimbMix 沿用现有语料。`;
 
  $('research-sections').innerHTML=
   summaryCard('01 / 当前主线','正式 A / B 评测','matrix',summaryTable(['模型','FID ↓ · CFG 2.0','IS ↑ · CFG 2.0','文本八项均分 ↑','ImageNet Top-1 ↑'],modelRows),modelNote,'<a href="#matrix">完整评测指标与历史消融 →</a><a href="#qualitative/t2i">同输入样例 →</a>',true)+

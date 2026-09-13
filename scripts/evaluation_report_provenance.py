@@ -95,6 +95,12 @@ def collect_provenance(repo: Path, root: Path):
             **plan, "document_href": os.path.relpath(document, root),
             "config_href": os.path.relpath(plan_path, root),
         }
+        from data_synthesis.config import load_config
+        runtime_path = repo / plan["runtime_config"]
+        result["non_imagenet_2m_plan"].update(
+            runtime=load_config(runtime_path),
+            runtime_href=os.path.relpath(runtime_path, root),
+            pipeline_document_href=os.path.relpath(repo / plan["pipeline_document"], root))
         if "large_scale_data_protocol" in result:
             result["large_scale_data_protocol"]["superseded_by"] = "non_imagenet_2m_plan"
     return result
@@ -136,7 +142,9 @@ def export_provenance(root: Path, data: dict, write):
     if plan:
         lines[2:2] = ["## 2026-09-13 当前计划：ImageNet 之外至少 200 万原图，优先复用文本", "",
             f"**目标至少 {plan['target_unique_non_imagenet_images']:,} 张非 ImageNet 合格原图**，200 万基线加 ImageNet 原始 train 为 {plan['combined_target_before_imagenet_exclusions']:,} 张。已有 {plan['existing_non_imagenet_release_images']:,} 张非 ImageNet 首轮产物计入该目标；目标尚未实现。各来源配额不是上限，有价值的额外合格项继续保留，训练分布通过采样权重控制。", "",
-            "先按能力分桶并连接已有 caption/prompt，再完成候选下载、去重与 512px 验收；仅缺失或错误样本调用 SII API。合格 caption 可以同时作为 I2T/T2I 文本，不逐图调用 sol 生成或审核。", "",
+            "先按能力分桶并连接已有 caption/prompt，再完成候选下载、去重与 512px 验收；仅缺失或错误样本调用 SII API。合格 caption 可以同时作为 I2T/T2I 文本，不逐图调用 sol 生成或审核；Codex CLI 仅在单图 SII 尝试上限后作有界兜底。", "",
+            "连接只从环境变量或 bashrc/zshrc 的静态 SII_API_KEY / SII_BASE_URL export 读取，不读取 test_api.py。SII 使用 P-256 / TLS 1.2 / HTTP/1.1 独立直连池，Codex 保留其代理环境。代码已切换到 data_synthesis/，旧实现保存在 scripts/legacy/。", "",
+            f"[当前操作入口与恢复/发布协议](../{plan['pipeline_document_href']}) · [运行配置：并发、重试与兜底预算](../{plan['runtime_href']})", "",
             "| 非 ImageNet 来源归属 | 起始合格原图目标，非上限 | 文本处理 |", "| --- | ---: | --- |",
             *[f"| {row['name']} | {row['target']:,} | {row['reuse']} |" for row in plan["sources"]], "",
             "原图互斥归属，多种标注可共存；不足时以同能力候选补位并记录变更，超过配额的优质图可以继续保留。JourneyDB 保留条件池，模型 512px 前置质量验收尚未完成；上一版全来源下载已暂停并保留断点。", "",

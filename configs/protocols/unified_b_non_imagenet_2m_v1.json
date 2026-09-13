@@ -197,7 +197,7 @@
   "quality_policy": {
     "gpt6": "one_time_stratified_preflight_visual_review",
     "sol_per_item_generation_or_review": false,
-    "qwen_route": "SII qwen3.8-max via test_api.py URL/key; OpenAI-format vision diagnostic succeeded, exact-512 paired quality qualification still pending",
+    "qwen_route": "SII qwen3.8-max; credentials only SII_API_KEY/SII_BASE_URL environment or literal bashrc/zshrc exports; pooled direct P-256/TLS1.2/HTTP1.1, certificate verification on; full 512px paired qualification pending",
     "deepseek_route": "SII deepseek-v4-pro-0813 returned image unavailable on multiple valid image requests; no vision-teacher approval; text-only transformation remains a separate possible test",
     "bulk_model_selected": null,
     "cpu_audits": [
@@ -209,7 +209,9 @@
       "text_schema_and_token_budget",
       "raw_response_and_text_provenance"
     ],
-    "warning": "Automatic structural checks and source reputation do not prove per-image semantic correctness."
+    "warning": "Automatic structural checks and source reputation do not prove per-image semantic correctness.",
+    "codex_fallback": "Only after persisted per-item SII attempt limit; gpt-5.6-sol low via existing Codex CLI, bounded attempts/concurrency/run budget in runtime config; no routine per-item generation/review",
+    "sii_credentials": "SII_API_KEY/SII_BASE_URL only; never read test_api.py"
   },
   "minimum_unique_non_imagenet_images": 2000000,
   "target_is_minimum": true,
@@ -226,5 +228,9 @@
       "url_union": 944450,
       "is_accepted_image_count": false
     }
-  }
+  },
+  "runtime_config": "configs/data_synthesis/b512_sii_v1.json",
+  "pipeline_document": "docs/DATA_SYNTHESIS.md",
+  "pipeline_entry": "python -m scripts.synthesize_image_text",
+  "implementation_status": "reuse_sii_bounded_fallback_implemented; bulk_data_and_visual_qualification_pending"
 }

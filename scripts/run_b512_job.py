@@ -10,7 +10,7 @@ import signal
 import subprocess
 import time
 
-from scripts.synthesize_image_text import atomic_json
+from data_synthesis.io import atomic_json
 
 
 def run_job(path):

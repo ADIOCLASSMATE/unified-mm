@@ -12,7 +12,7 @@ import subprocess
 import sys
 import time
 
-from scripts.distill_b512_codex import atomic_json, dumps, file_sha
+from data_synthesis.io import atomic_json, cohort_id, dumps, file_sha
 
 
 def freeze_bank(source, output):
@@ -113,7 +113,7 @@ def run(args):
                 worked = True
                 bank = freeze_bank(marker.parent, work)
                 if bank["records"]:
-                    destination = images / "vae_supply" / batch_id
+                    destination = images / "vae_supply" / cohort_id(source) / batch_id
                     destination.mkdir(parents=True, exist_ok=True)
                     commands = [
                         [sys.executable, "scripts/imagenet_encode_kl16_vae.py", "--source_mode", "manifest_jsonl",
