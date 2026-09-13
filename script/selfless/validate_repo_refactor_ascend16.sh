@@ -37,7 +37,7 @@ for refactor_driver_library in /usr/local/Ascend/driver/lib64/driver \
 done
 if [[ "${REFACTOR_STAGE}" == infra ]]; then
   TORCH_DEVICE_BACKEND_AUTOLOAD=0 .venv/bin/python -m pytest -q \
-    tests/test_caption_farm.py tests/test_caption_farm_lock.py tests/test_checkpoint_transaction.py \
+    tests/test_checkpoint_transaction.py \
     tests/test_checkpoint_retention.py tests/test_sharded_ema.py tests/test_scheduled_combined_loader.py \
     --basetemp="${REFACTOR_REPORT_ROOT}/pytest" --tb=short > "${REFACTOR_REPORT_ROOT}/pytest.log" 2>&1
   .venv/bin/python -m torch.distributed.run --standalone --nproc_per_node=16 \

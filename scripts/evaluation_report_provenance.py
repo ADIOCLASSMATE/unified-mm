@@ -38,17 +38,15 @@ def collect_provenance(repo: Path, root: Path):
             for entry in row["evidence"]:
                 if not (root / entry["path"]).is_file():
                     raise FileNotFoundError(entry["label"])
-    qwen = json.loads((repo / "configs/caption_farm/imagenet1k_qwen36_35b_a3b_fp8.json").read_text())
     t2i = json.loads((repo / "public/datasets/imagenet1k_synthetic_v1/t2i/manifest.json").read_text())
     captions = json.loads((repo / "public/datasets/imagenet1k_synthetic_v1/captions/manifest.json").read_text())
-    result.update(qwen_protocol=qwen["caption"], styles=t2i["styles"], caption_manifest=captions,
+    result.update(styles=t2i["styles"], caption_manifest=captions,
                   minimax_template=build_caption_prompt(3, 32, 60, "{class_hint}"),
                   audit_path="data-provenance/audit.json" if audit else None,
                   audit={k: v for k, v in audit.items() if k != "files"} if audit else None,
                   document="data-provenance/README.md")
     result["protocol_links"] = [{"label": label, "path": os.path.relpath(repo / path, root)} for label, path in (
-        ("Qwen 三个提示模板与采样配置", "configs/caption_farm/imagenet1k_qwen36_35b_a3b_fp8.json"),
-        ("Qwen 实际图像请求实现", "caption_farm/worker.py"),
+        ("Qwen 历史提示模板、采样参数与图像输入协议", "configs/protocols/evaluation_data_sources.json"),
         ("MiniMax 三字幕模板与校验实现", "scripts/distill_imagenet_captions.py"),
         ("T2I 发布 manifest / 12 风格", "public/datasets/imagenet1k_synthetic_v1/t2i/manifest.json"),
         ("train/val 对齐审计", "public/datasets/imagenet1k_synthetic_v1/alignment/audit_report.json"),

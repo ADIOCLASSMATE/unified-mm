@@ -47,12 +47,6 @@ python3 scripts/audit_evaluation_data_provenance.py
 python3 scripts/build_evaluation_report.py
 ```
 
-## 历史 caption 队列
+## 历史字幕协议
 
-入口为 `scripts/imagenet_qwen_caption_farm.py`，配置为 `configs/caption_farm/imagenet1k_qwen36_35b_a3b_fp8.json`。该配置保留历史HDD路径；发布目标由 `output.published_jsonl` 指定。按实际队列目录查询状态：
-
-```bash
-PYTHONPATH=. .venv/bin/python scripts/imagenet_qwen_caption_farm.py queue status --run-dir <run-dir>
-```
-
-队列采用单机多进程 `flock`、任务 lease 和原子提交；每图三个 Qwen slot。发布条件为 3,843,501 slot 完成，输出 1,281,167 行。实现见 [维护说明](REPO_REFACTOR_20260909.md)。
+旧本地 Qwen 字幕调度代码、配置与测试已移除。旧消融的三个提示模板、采样参数和图像输入方式保存在 [evaluation_data_sources.json](../configs/protocols/evaluation_data_sources.json) 的 `qwen_protocol` / `qwen_protocol_evidence` 中，供评测页面追溯已发布字幕；训练继续通过上面的资产索引读取数据。新增数据使用 [DATA_SYNTHESIS.md](DATA_SYNTHESIS.md) 中的当前入口。

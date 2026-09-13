@@ -106,8 +106,33 @@
       "evidence": ["docs/OFFICIAL_T2I_BENCHMARKS.md"]
     }
   ],
+  "qwen_protocol": {
+    "captions_per_image": 3,
+    "prompt_version": "qwen36-imagenet-visual-detail-v1",
+    "system_prompt": "You are a precise image captioner. Return only one fluent English caption, without a title, prefix, markdown, or analysis. Describe only details that are visually supported by the image.",
+    "prompt_variants": [
+      "Write one concrete English caption of roughly {target_min_words}-{target_max_words} words. Identify the main visible subject, its appearance and pose, the surrounding scene, spatial relationships, lighting, color, and other useful visual details. Vary the wording naturally.",
+      "Describe this image in one information-dense English caption of about {target_min_words}-{target_max_words} words. Focus on distinctive visual attributes, action or posture, background context, composition, texture, and lighting. Use natural wording and output only the caption.",
+      "Produce a single detailed English caption, approximately {target_min_words}-{target_max_words} words long. Ground every phrase in the visible image, covering the principal object or animal, notable colors and shapes, setting, viewpoint, and relevant nearby elements. Do not add commentary."
+    ],
+    "target_min_words": 32,
+    "target_max_words": 60,
+    "max_output_tokens": 128,
+    "temperature": 0.8,
+    "top_p": 0.9,
+    "top_k": 40,
+    "presence_penalty": 1.0
+  },
+  "qwen_protocol_evidence": {
+    "scope": "历史 ImageNet 消融字幕协议快照，仅用于数据来源说明；不作为当前合成运行配置。",
+    "model_repository": "Qwen/Qwen3.6-35B-A3B-FP8",
+    "source_commit": "ffbacd9328d9e60eb7d8f064963c5b9a6dc5591d",
+    "source_config_sha256": "f79bddfb05f38e8af76b2788d1d392bea3e90ad73edc70eac4c9c4329986c3ed",
+    "image_input": "历史实现通过 data URL 发送原图全幅；默认超过最长边 1024 或 1024×1024 像素时等比缩小并编码 JPEG，不按训练 VAE 的中心裁剪视野截取。运行时可覆盖限制，此记录不是逐条历史请求快照。",
+    "runtime_removed": true
+  },
   "synthesis_notes": {
-    "qwen": "每图三个独立 caption slot；本地 vLLM 加载完整 FP8 权重，输入实际图像。下方保留仓库 system prompt 与三个变体。发布数据逐条记录模型名与 prompt_version；采样数值来自对应仓库配置。",
+    "qwen": "每图三个独立 caption slot；当时本地 vLLM 加载完整 FP8 权重，输入实际图像。下方保留历史 system prompt 与三个变体。发布数据逐条记录模型名与 prompt_version；采样数值来自保留的协议快照，旧调度实现已移除。",
     "minimax": "MiniMax-M3 通过图像输入 API 一次输出恰好三条英文 caption，协议 imagenet_multicap_en_v1；三个重点为主体外观、空间构图、场景与摄影背景。要求可见证据、自然完整句子、避免不支持的身份/意图/计数。当前源码默认 temperature=0.8、建议 32–60 词、max_tokens=1400；历史请求参数快照未随七字幕数据发布，不能把当前默认值当作逐次请求证明。类名 hint 可选，原始运行是否开启尚未证实。",
     "t2i": "全量记录的生成者为 gpt-5.6-luna，reasoning_effort=low，prompt_version=imagenet1k_codex_visual_t2i_en_v2。每图输出 visual_description、subject_evidence、scene、source_composition、source_lighting 与固定 12 风格 prompts。faithful_photo 对齐原图；其余风格允许更改渲染、光照或构图，可从保存样本直接检查。完整合成指令正文、temperature/top_p 未随当前导出保留，不能从版本号还原。"
   }

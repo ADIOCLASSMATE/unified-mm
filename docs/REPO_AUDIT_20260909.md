@@ -10,7 +10,7 @@
 | 临时实验发现 | smoke/debug/replay 被纳入正式定性集合 | 共用实验身份与临时用途过滤 |
 | caption 锁所有权 | 过期旧持有者可删除新持有者的锁 | 单机多进程改用 POSIX flock |
 
-对应入口：[权重加载](../utils/image_generation_io.py)、[checkpoint](../utils/training_checkpoint.py)、[评测来源](../utils/evaluation_model_source.py)、[实验身份](../utils/experiment_registry.py)、[caption 锁](../caption_farm/io.py)。
+对应入口：[权重加载](../utils/image_generation_io.py)、[checkpoint](../utils/training_checkpoint.py)、[评测来源](../utils/evaluation_model_source.py)、[实验身份](../utils/experiment_registry.py)。表中 caption 锁属于当日修复记录，旧字幕调度实现已于 2026-09-13 移除。
 
 当日修复前 CPU 回归666 passed / 2 skipped；第一轮修复后686 passed / 2 skipped，耗时75.06秒。日志位于 `output/repo-audit/20260909/pytest-after-fixes.log`。后续完整开发机回归706 passed / 2 skipped，详见实施记录。
 

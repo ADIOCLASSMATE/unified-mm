@@ -5,5 +5,5 @@ cd "${CHECK_REPO_ROOT}"
 export PYTHONPATH="${CHECK_REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 TORCH_COMPILE_DISABLE=1
 export TORCH_DEVICE_BACKEND_AUTOLOAD=0
-ruff check caption_farm data_synthesis models utils pretrain scripts tests
+ruff check data_synthesis models utils pretrain scripts tests
 .venv/bin/python -m pytest -q tests "$@"

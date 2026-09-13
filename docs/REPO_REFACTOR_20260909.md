@@ -2,6 +2,8 @@
 
 完成 checkpoint 事务、caption 单机互斥、评测公共库、实验身份和训练/生成职责拆分。问题来源见 [审查记录](REPO_AUDIT_20260909.md)。
 
+本文记录当日实现与验证结果。旧本地 Qwen 字幕调度模块已于 2026-09-13 移除，当前数据入口见 [DATA_SYNTHESIS.md](DATA_SYNTHESIS.md)。
+
 ## 模块职责
 
 | 模块 | 职责 |
@@ -23,7 +25,7 @@
 
 checkpoint 使用独立暂存目录；所有 rank 写完模型/优化器、RNG、数据游标、EMA 后写 completed v2 文件清单，发布成功再轮换。文件阶段错误向各 rank 传播；raw/EMA 配对发布支持回滚。恢复先检查完成标记和文件清单。
 
-caption `DirectoryLock` 使用 POSIX flock，适用单机多进程。父进程 fork 后，子进程关闭继承 FD 时不释放父锁；`stale_seconds` 仅保留调用兼容。锁文件持续保留。旧目录锁迁移在相关 worker 停止后进行。
+当日 caption `DirectoryLock` 改用 POSIX flock，适用单机多进程。父进程 fork 后，子进程关闭继承 FD 时不释放父锁；`stale_seconds` 当时仅保留调用兼容。该实现现已随旧字幕调度模块移除。
 
 实验注册表为 `configs/protocols/experiment_registry.json`；新 run 将 `experiment.identity` 与实际任务 schedule 写入 `experiment_identity.json`。未知任务显示“训练任务未记录”。
 
