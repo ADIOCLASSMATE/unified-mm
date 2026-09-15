@@ -111,6 +111,8 @@ class TrainingImageGenerator:
         profile = self.profile
         joint = getattr(model.config, "architecture_variant", None) == "selfless_joint_dit"
         method = "Z" if joint else "B + S2-single modulation"
+        if joint and getattr(model.config, "joint_dit_head_type", "s2") == "b_single_stream":
+            method = "Z + B head (single stream)"
         image_order, generation_order = ("joint", "joint") if joint else ("random", "spatial_halton")
         rank, world = (dist.get_rank(), dist.get_world_size()) if _distributed() else (0, 1)
         directory = Path(output_dir) / "validation_generation" / f"step-{step}"

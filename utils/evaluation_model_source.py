@@ -269,6 +269,10 @@ def _apply_checkpoint_model_contract(config, saved_model, *, label: str) -> None
                 config.model[field] = value
     if saved_architecture == "selfless_joint_dit":
         valid_flow_head_contract = flow_head_attention_contract == "joint_bidirectional"
+        head_type = saved_model.get("joint_dit_head_type", "s2")
+        if head_type not in {"s2", "b_single_stream"}:
+            raise ValueError(f"{label} has invalid joint_dit_head_type={head_type!r}")
+        config.model.joint_dit_head_type = head_type
         for field in ("image_flow_solver", "image_input_noise_strength"):
             config.model[field] = saved_model[field]
         for field, value in saved_model.items():

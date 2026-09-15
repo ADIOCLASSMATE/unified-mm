@@ -12,7 +12,7 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from utils.joint_dit_protocol import CONFIG, RUN
+from utils.joint_experiments import joint_experiment_protocol
 
 
 def run(command, path):
@@ -21,7 +21,8 @@ def run(command, path):
         subprocess.run(command, stdout=stream, stderr=subprocess.STDOUT, check=True)
 
 
-def generation(checkpoint, weights, output):
+def generation(checkpoint, weights, output, experiment="z"):
+    protocol = joint_experiment_protocol(experiment)
     import torch
     import torch_npu  # noqa: F401
     from omegaconf import OmegaConf
@@ -35,7 +36,7 @@ def generation(checkpoint, weights, output):
         raise RuntimeError("Run this smoke on the fixed 16-NPU development Notebook")
     torch.npu.set_device(0)
     device = torch.device("npu", 0)
-    config = OmegaConf.load(ROOT / CONFIG)
+    config = OmegaConf.load(ROOT / protocol.CONFIG)
     source = resolve_evaluation_model_source(checkpoint) if weights == "ema" else None
     if source:
         configure_model_source(config, source)
@@ -44,6 +45,9 @@ def generation(checkpoint, weights, output):
     model, tokenizer = load_model_tokenizer(config, model_dtype=torch.bfloat16)
     load_report = load_model_source_weights(model, source) if source else {"kind": "current"}
     model.to(device).eval()
+    expected_head = "b_single_stream" if experiment == "z-b" else "s2"
+    if getattr(model.config, "joint_dit_head_type", "s2") != expected_head:
+        raise RuntimeError("Checkpoint restored the wrong flow-head implementation")
     count = 0
     state = model.state_dict()
     with safe_open(str(checkpoint / "model.safetensors"), framework="pt", device="cpu") as saved:
@@ -104,13 +108,14 @@ def generation(checkpoint, weights, output):
     (output / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
 
 
-def validation_lifecycle(output, label):
+def validation_lifecycle(output, label, experiment="z"):
     """Use the production validation coordinator twice, then resume training."""
     from scripts.launch_z import launch_plan
+    protocol = joint_experiment_protocol(experiment)
     from utils.evaluation_paths import training_validation_root
     from utils.training_checkpoint import _validate_checkpoint_complete
 
-    plan = launch_plan(smoke=True, label=label, steps=5, environment={})
+    plan = launch_plan(smoke=True, label=label, steps=5, environment={}, experiment=experiment)
     run_root = Path(plan["output_root"])
     if (run_root / "config.yaml").exists():
         raise FileExistsError(f"Validation smoke must start fresh: {run_root}")
@@ -141,20 +146,22 @@ def validation_lifecycle(output, label):
             trace = row["trace"]
             if (trace["backbone_calls"], trace["flow_head_calls"]) != (1, 20) or trace["solver"] != "heun":
                 raise RuntimeError("Unexpected Z validation generation call counts")
+            if trace.get("flow_head_type", "s2") != ("b_single_stream" if experiment == "z-b" else "s2"):
+                raise RuntimeError("Validation used the wrong flow-head implementation")
             if not (directory / f"validation_generation/step-{step}" / row["image"]).is_file():
                 raise FileNotFoundError(row["image"])
         reports.append(whole)
     _validate_checkpoint_complete(run_root / "checkpoint-5", expected_global_step=5)
-    run([sys.executable, "scripts/launch_z.py", "--smoke", "--label", label, "--steps", "6",
+    run([sys.executable, "scripts/launch_z.py", "--experiment", experiment, "--smoke", "--label", label, "--steps", "6",
          "--resume-from-checkpoint", str(run_root / "checkpoint-5")], output / "resume.log")
     resumed = json.loads((run_root / "training_runtime_metrics.json").read_text())
     if resumed["run_start_global_step"] != 5 or resumed["global_step"] != 6 or not math.isfinite(resumed["last_logged_loss"]):
         raise RuntimeError("Checkpoint resume after validation failed")
     _validate_checkpoint_complete(run_root / "checkpoint-6", expected_global_step=6)
     for weights, directory in (("current", "hf_model-final"), ("ema", "hf_model-final-ema")):
-        run([sys.executable, "scripts/smoke_z.py", "--checkpoint", str(run_root / directory),
+        run([sys.executable, "scripts/smoke_z.py", "--experiment", experiment, "--checkpoint", str(run_root / directory),
              "--weights", weights, "--output-dir", str(output / weights)], output / f"{weights}.log")
-    (output / "report.json").write_text(json.dumps(dict(passed=True, method="Z", run=RUN,
+    (output / "report.json").write_text(json.dumps(dict(passed=True, method=protocol.expected_config().experiment.identity.label, run=protocol.RUN,
         run_root=str(run_root), world_size=16, validation_steps=[2, 4],
         images_per_validation=16, fixed_prompts_and_noise=True, raw_and_ema_generation=True,
         solver="heun", steps=10, head_calls=20, image_input_noise_strength=0.01,
@@ -168,23 +175,26 @@ def main():
     parser.add_argument("--label", default="r1")
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--weights", choices=("current", "ema"), default="ema")
+    parser.add_argument("--experiment", choices=("z", "z-b"), default="z")
     parser.add_argument("--validation", action="store_true", help="Train five steps with full validation at 2 and 4, then resume to 6")
     args = parser.parse_args()
+    experiment = args.experiment
+    protocol = joint_experiment_protocol(experiment)
     output = args.output_dir.resolve()
     output.mkdir(parents=True, exist_ok=True)
     if args.validation:
         if args.checkpoint:
             parser.error("--validation and --checkpoint cannot be combined")
-        validation_lifecycle(output, args.label)
+        validation_lifecycle(output, args.label, experiment)
         return
     if args.checkpoint:
-        generation(args.checkpoint.resolve(), args.weights, output)
+        generation(args.checkpoint.resolve(), args.weights, output, experiment)
         return
     from scripts.launch_z import launch_plan
-    plan = launch_plan(smoke=True, label=args.label, steps=12, environment={})
+    plan = launch_plan(smoke=True, label=args.label, steps=12, environment={}, experiment=experiment)
     run_root = Path(plan["output_root"])
-    run([sys.executable, "scripts/launch_z.py", "--smoke", "--label", args.label, "--steps", "12"], output / "train.log")
-    run([sys.executable, "scripts/launch_z.py", "--smoke", "--label", args.label,
+    run([sys.executable, "scripts/launch_z.py", "--experiment", experiment, "--smoke", "--label", args.label, "--steps", "12"], output / "train.log")
+    run([sys.executable, "scripts/launch_z.py", "--experiment", experiment, "--smoke", "--label", args.label,
          "--steps", "14", "--resume-from-checkpoint", str(run_root / "checkpoint-12")], output / "resume.log")
     runtime = json.loads((run_root / "training_runtime_metrics_step-12-to-14.json").read_text())
     if (runtime["global_step"] != 14 or runtime["run_start_global_step"] != 12 or runtime["world_size"] != 16
@@ -193,9 +203,9 @@ def main():
     if not (run_root / "checkpoint-14/checkpoint_complete.json").is_file():
         raise FileNotFoundError("Missing complete resumed checkpoint")
     for weight, directory in (("current", "hf_model-final"), ("ema", "hf_model-final-ema")):
-        run([sys.executable, "scripts/smoke_z.py", "--checkpoint", str(run_root / directory),
+        run([sys.executable, "scripts/smoke_z.py", "--experiment", experiment, "--checkpoint", str(run_root / directory),
             "--weights", weight, "--output-dir", str(output / weight)], output / f"{weight}.log")
-    (output / "report.json").write_text(json.dumps(dict(passed=True, run=RUN, run_root=str(run_root),
+    (output / "report.json").write_text(json.dumps(dict(passed=True, run=protocol.RUN, run_root=str(run_root),
         fresh_steps=12, resumed_steps=14, runtime=runtime, raw_and_ema_generation=True), indent=2) + "\n")
     (output / "SMOKE_PASSED").write_text("passed\n")
 

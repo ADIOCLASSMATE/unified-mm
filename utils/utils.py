@@ -225,7 +225,7 @@ def load_model_tokenizer(
         )
 
     multimodal_config_keys = (
-        "joint_dit_head_dim", "joint_dit_intermediate",
+        "joint_dit_head_dim", "joint_dit_intermediate", "joint_dit_head_type",
         "b_siglip_path", "b_siglip_width", "b_siglip_intermediate", "b_siglip_heads",
         "b_siglip_depth", "b_siglip_gradient_checkpointing", "b_siglip_initialization_seed",
         "b_siglip_visibility_contract",
@@ -316,6 +316,8 @@ def load_model_tokenizer(
             "image_flow_solver", "image_input_noise_strength", "training_image_sigma_order",
         }:
             value = getattr(model_config, key)
+        elif key == "joint_dit_head_type" and source_has_image_flow and architecture_variant == "selfless_joint_dit":
+            value = getattr(model_config, key, "s2")
         elif key.startswith(("s2_", "b_siglip_", "joint_dit_")) and source_has_image_flow:
             value = getattr(model_config, key, None)
         elif key == "flow_head_attention_contract" and source_has_image_flow:

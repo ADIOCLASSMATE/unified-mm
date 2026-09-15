@@ -46,6 +46,7 @@
 | [B+SigLIP](B_SIGLIP_UNIFIED_ABLATION.md) | 实现、参数与infra |
 | [S2 infra](S2_INFRA_20260910.md) | RF4、checkpointing、吞吐和恢复验证 |
 | [Z](Z_EXPERIMENT.md) | 同图 sigma 相同、双流 backbone 一次前向、单流 DiT 联合去噪，Heun10（20 次 head） |
+| [Z + B 单流 head](Z_B_HEAD_EXPERIMENT.md) | B 的完整层与初始化，单流双向注意力，backbone 条件 + t 进入 AdaLN |
 
 ## 表征研究
 

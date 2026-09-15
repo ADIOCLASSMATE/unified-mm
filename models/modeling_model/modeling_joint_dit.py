@@ -20,6 +20,7 @@ from .modeling_showo2_unified import (
     Showo2FlowHead, attention_from_allowed, _prepared_mask, _checkpoint,
 )
 from .image_flow_loss_positionwise import PositionwiseFlowLoss
+from .image_flow_loss_joint_b import JointSingleStreamBHead
 
 
 class JointDiTConfig(Qwen3Config):
@@ -123,7 +124,10 @@ class JointDiTFlowLoss(PositionwiseFlowLoss):
     """Whole-image RF objective; B's outer forward supplies the four MC draws."""
     def __init__(self, config):
         nn.Module.__init__(self)
-        self.net = JointDiT(config)
+        head_type = getattr(config, "joint_dit_head_type", "s2")
+        if head_type not in {"s2", "b_single_stream"}:
+            raise ValueError(f"Unknown joint_dit_head_type={head_type!r}")
+        self.net = JointSingleStreamBHead(config) if head_type == "b_single_stream" else JointDiT(config)
         self.in_channels = int(config.image_latent_dim)
         self.image_tokens_per_img = int(config.image_tokens_per_img)
         self.num_sampling_steps = int(config.image_flow_num_sampling_steps)
@@ -306,6 +310,7 @@ class JointDiTForCausalLM(Qwen3ForCausalLM):
         side = math.isqrt(self.config.image_tokens_per_img)
         output = generated.reshape(len(spans), side, side, dim).permute(0, 3, 1, 2)
         trace = {**head_trace, "generation_mode": "joint_dit_full_image_flow", "order_strategy": "joint",
+            "flow_head_type": getattr(self.config, "joint_dit_head_type", "s2"),
                  "backbone_calls": 1, "backbone_kv_cache_enabled": False,
                  "backbone_condition_cached": True, "backbone_streams": 2, "flow_head_streams": 1,
                  "cfg_batched": paired, "cfg": float(flow_cfg),

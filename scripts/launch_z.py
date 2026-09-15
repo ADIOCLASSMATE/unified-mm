@@ -14,12 +14,14 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from omegaconf import OmegaConf
-from utils.joint_dit_protocol import CONFIG, RUN, validate_joint_dit_config
+from utils.joint_experiments import joint_experiment_protocol
 
 
-def launch_plan(*, smoke, label, steps, environment, resume=None):
-    config = OmegaConf.load(ROOT / CONFIG)
-    contract = validate_joint_dit_config(config)
+def launch_plan(*, smoke, label, steps, environment, resume=None, experiment="z"):
+    protocol = joint_experiment_protocol(experiment)
+    config_path, run_name = protocol.CONFIG, protocol.RUN
+    config = OmegaConf.load(ROOT / config_path)
+    contract = protocol.validate_joint_dit_config(config)
     if not re.fullmatch(r"[a-z0-9-]+", label) or not 2 <= steps <= 100:
         raise ValueError("Smoke requires a lowercase/digit/hyphen label and 2..100 steps")
     machines, world = (1, 16) if smoke else (4, 64)
@@ -33,7 +35,7 @@ def launch_plan(*, smoke, label, steps, environment, resume=None):
         if not 0 <= rank < 4 or nodes != 4 or platform_processes not in (0, 16):
             raise ValueError("Formal training requires PET_NODE_RANK=0..3, PET_NNODES=4, "
                              f"PET_NPROC_PER_NODE=0 or 16; got {rank=}, {nodes=}, {platform_processes=}")
-    project = f"{RUN}-smoke-{label}" if smoke else RUN
+    project = f"{run_name}-smoke-{label}" if smoke else run_name
     output = ROOT / config.experiment.output_dir / project
     audit = output / "prelaunch_audit" / f"node-{rank}"
     resume_step = 0
@@ -60,7 +62,7 @@ def launch_plan(*, smoke, label, steps, environment, resume=None):
             raise ValueError("Formal training requires the platform master address and port")
         command += ["--main_process_ip", address, "--main_process_port", port,
                     "--rdzv_backend", "static", "--same_network"]
-    command += ["pretrain/train_selfless_flow.py", f"config={CONFIG}",
+    command += ["pretrain/train_selfless_flow.py", f"config={config_path}",
                 f"experiment.project={project}", f"experiment.name={project}",
                 f"experiment.resume_from_checkpoint={resume or 'none'}"]
     if smoke:
@@ -70,6 +72,8 @@ def launch_plan(*, smoke, label, steps, environment, resume=None):
             "experiment.val_every=0", "experiment.save_every=1000000000",
             "experiment.checkpoint_milestone_every=0", "experiment.save_ema_eval_every=0"]
     preflight = [sys.executable, "scripts/validate_z.py", "--require-npu-count", "16"]
+    if experiment != "z":
+        preflight += ["--experiment", experiment]
     if rank == 0:
         preflight.append("--assets")
     return dict(contract=contract, smoke=smoke, world_size=world, rank=rank,
@@ -85,10 +89,11 @@ def main():
     parser.add_argument("--steps", type=int, default=12)
     parser.add_argument("--resume-from-checkpoint")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--experiment", choices=("z", "z-b"), default="z")
     args = parser.parse_args()
     os.chdir(ROOT)
     plan = launch_plan(smoke=args.smoke, label=args.label, steps=args.steps,
-                       environment=dict(os.environ), resume=args.resume_from_checkpoint)
+                       environment=dict(os.environ), resume=args.resume_from_checkpoint, experiment=args.experiment)
     if args.dry_run:
         print(json.dumps(plan, ensure_ascii=False, indent=2))
         return
