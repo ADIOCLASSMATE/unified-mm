@@ -234,17 +234,6 @@ def _apply_checkpoint_model_contract(config, saved_model, *, label: str) -> None
             # The separate flow-head mask contract is restored below.
             config.model[field] = str(saved_value)
             continue
-        if (
-            field == "image_flow_width"
-            and saved_architecture == "positionwise_flow_head_on_b"
-        ):
-            if int(saved_value) != 1936:
-                raise ValueError(
-                    f"{label} ablation-F image_flow_width must be 1936, "
-                    f"got {saved_value!r}"
-                )
-            config.model[field] = int(saved_value)
-            continue
         if field in {"image_flow_width", "image_flow_depth"}:
             # Model capacity belongs to the checkpoint. The shared evaluation
             # YAML supplies dataset/scoring defaults for every scaling arm.
@@ -330,9 +319,12 @@ def _apply_checkpoint_model_contract(config, saved_model, *, label: str) -> None
         )
     config.model.flow_condition_contract = flow_condition_contract
     if saved_architecture == "positionwise_flow_head_on_b":
+        # F scales against the contextual B head at the same depth. Restore
+        # that budget along with capacity; model construction validates the
+        # actual MLP parameter count against the saved 0.5% tolerance.
         expected_f_fields = {
             "positionwise_reference_flow_width": 1280,
-            "positionwise_reference_flow_depth": 8,
+            "positionwise_reference_flow_depth": config.model.image_flow_depth,
             "positionwise_max_parameter_relative_error": 0.005,
         }
         for field, expected in expected_f_fields.items():

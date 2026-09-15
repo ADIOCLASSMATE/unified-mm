@@ -43,6 +43,8 @@ from utils.evaluation_model_source import (  # noqa: E402
     resolve_evaluation_model_source,
 )
 from utils.utils import get_selfless_mask, load_model_tokenizer  # noqa: E402
+from utils.evaluation.aro import ARO_TASKS, CONDITIONAL_SCORE, update_aro_metrics
+from utils.image_token_order import halton_image_positions
 
 
 DEFAULT_CONFIG = Path("configs/selfless/unified_baseline_100b_ascend_64npu.yaml")
@@ -410,6 +412,17 @@ def build_image_sigma(
 ) -> list[int]:
     if order == "sequential":
         return list(range(int(image_tokens)))
+    if order in {"halton", "spatial_halton", "spatial_halton_shifted"}:
+        shift = (0.0, 0.0)
+        if order == "spatial_halton_shifted":
+            generator = torch.Generator(device="cpu").manual_seed(int(seed))
+            shift = tuple(torch.rand(2, generator=generator, dtype=torch.float64).tolist())
+        positions = halton_image_positions(int(image_tokens), math.isqrt(int(image_tokens)), shift)
+        # sigma is rank at each physical position, the inverse of reveal order.
+        ranks = [0] * int(image_tokens)
+        for rank, position in enumerate(positions):
+            ranks[position] = rank
+        return ranks
     if order != "random":
         raise ValueError(f"unknown image sigma order: {order}")
     generator = torch.Generator(device="cpu")
@@ -861,6 +874,7 @@ def build_prediction_rows(
                 {
                     "candidate_index": candidate_index,
                     "text": candidate,
+                    CONDITIONAL_SCORE: conditional_score,
                     DEBIASED_SCORE: debiased_score,
                     "estimated_language_prior_log_score": language_prior,
                     "token_count": int(next(iter(token_counts))),
@@ -1301,6 +1315,8 @@ def summarize_task(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
         "whatsup_controlled_spatial",
     }:
         metrics["categories"] = category_metrics(rows)
+    if rows[0].get("task") in ARO_TASKS:
+        metrics = update_aro_metrics(metrics, rows)
     return {"kind": kind, "metrics": metrics}
 
 

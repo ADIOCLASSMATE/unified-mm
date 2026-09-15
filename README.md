@@ -6,6 +6,7 @@
 
 | 内容 | 入口 |
 | --- | --- |
+| 统一多模态预测的观察与双流设计动机 | [设计动机](docs/DUAL_STREAM_DESIGN_MOTIVATION.md) |
 | 实验定义、配置与训练预算 | [实验](docs/EXPERIMENTS.md) · [训练](docs/TRAINING.md) |
 | 数据集与合成文本 | [旧消融数据](docs/DATA.md) · [当前 B512 合成流程](docs/DATA_SYNTHESIS.md) |
 | 指标、样例与训练曲线 | [评测总览](output/evaluation/index.html) |

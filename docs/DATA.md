@@ -1,6 +1,6 @@
 # 数据
 
-当前新增图库采用[复用优先的 B512 数据准备与合成协议](DATA_SYNTHESIS.md)：非 ImageNet 合格原图至少 200 万，来源配额非上限，SII 补缺纠错、Codex 只在失败上限后兜底。[来源/精选数据集选择](B_2M_NON_IMAGENET_DATA_PLAN_20260913.md)与[运行配置](../configs/data_synthesis/b512_sii_v1.json)分别维护。目标尚未完成；下表及下文对应已经用于正式消融的历史资产。
+当前新增图库采用[Long 主库方案](B_BLIP3O_LONG_DATA_PLAN_20260913.md)：BLIP3o Long 标称约 2,700 万条 + 160 万专项起始目标 + 完整 ImageNet，实际独立图片数待验收。图像、文本、准备状态放项目空间，posterior 缓存放 global_user；[执行协议](DATA_SYNTHESIS.md)和[运行配置](../configs/data_synthesis/b512_sii_v1.json)定义路径与断点流程。原文优先，SII 补缺纠错、Codex 只在失败上限后兜底。目标尚未完成；下表及下文对应已经用于正式消融的历史资产。
 
 ## 正式旧消融数据
 

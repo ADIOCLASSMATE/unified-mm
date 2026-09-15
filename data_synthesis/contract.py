@@ -62,6 +62,7 @@ def text_pair(image_id, text, *, observations=None, capabilities=()):
 
 
 def prompt_for(item, candidate=None, issues=()):
+    from data_synthesis.integrity import same_view_binding
     # Full annotations/authorship live in state. Never pay to resend release
     # provenance, old teacher reasoning or hundreds of alternative captions.
     if isinstance(candidate, list):
@@ -71,7 +72,7 @@ def prompt_for(item, candidate=None, issues=()):
         candidate = {"partial_hint": dumps(candidate)[:12000], "complete": False}
     facts = [{k: v for k, v in f.items() if k != "provenance"}
              for f in item["row"].get("verified_facts", [])
-             if f.get("verified") is True and f.get("view_sha256") == item["view"]["view_sha256"]]
+             if f.get("verified") is True and same_view_binding(f, item["view"], item["view"].get("hashes_computed", True))]
     data = {"image_id": item["key"], "candidate": candidate,
             "source_annotations": facts[:64], "annotations_omitted": max(0, len(facts) - 64),
             "repair_issues": list(issues)[:8]}

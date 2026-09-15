@@ -36,6 +36,7 @@ from omegaconf import OmegaConf
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from utils.evaluation.model_contracts import scoring_contract
+from utils.evaluation.aro import ARO_TASKS, CONDITIONAL_SCORE, ARO_SCORE_VARIANT
 
 from utils.evaluation_model_source import (  # noqa: E402
     add_model_source_argument,
@@ -139,7 +140,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model_dtype", choices=("bf16", "fp32"), default="bf16")
     parser.add_argument(
         "--image_sigma_order",
-        choices=("auto", "random", "sequential"),
+        choices=("auto", "random", "sequential", "spatial_halton", "spatial_halton_shifted"),
         default="auto",
     )
     parser.add_argument("--progress_every", type=int, default=50)
@@ -174,11 +175,11 @@ def main() -> None:
     if attention_contract == "showo2_omni_attention":
         image_sigma_order = "sequential"
         args.mc = 1  # Exact AR score; no image-order Monte Carlo distribution.
-    if image_sigma_order not in {"random", "sequential"}:
+    if image_sigma_order not in {"random", "sequential", "spatial_halton", "spatial_halton_shifted"}:
         raise ValueError(f"unknown image sigma order: {image_sigma_order}")
-    if int(args.mc) > 1 and image_sigma_order != "random":
+    if int(args.mc) > 1 and image_sigma_order not in {"random", "spatial_halton_shifted"}:
         raise ValueError(
-            "--mc > 1 requires random image_sigma_order; a sequential order has "
+            "--mc > 1 requires random or shifted Halton image_sigma_order; a fixed order has "
             "no image-order distribution to sample"
         )
 
@@ -275,6 +276,8 @@ def main() -> None:
             "max_length": int(args.max_length),
             "seed": int(args.seed),
             "image_sigma_order": image_sigma_order,
+            "image_order_distribution": ("halton_base2_base3_uniform_torus_shift_v1" if image_sigma_order == "spatial_halton_shifted" else "uniform_random_permutation" if image_sigma_order == "random" else "fixed"),
+            "halton_shift_rng": ("torch_cpu_float64_uniform_2d_image_order_mc_seed" if image_sigma_order == "spatial_halton_shifted" else None),
             "dual_stream_attention_contract": attention_contract,
             "scoring_contract": scoring_contract(attention_contract, LIKELIHOOD_SCORING_CONTRACT),
             "query_stream_diagonal": False,
@@ -282,7 +285,8 @@ def main() -> None:
                 attention_contract == "xlnet_content_diagonal"
             ),
             "primary_candidate_score": DEBIASED_SCORE,
-            "reported_score_variant": "language_prior_debiased_only",
+            "reported_score_variant": ARO_SCORE_VARIANT,
+            "task_primary_candidate_scores": {task: CONDITIONAL_SCORE for task in sorted(ARO_TASKS)},
             "candidate_target": "answer_or_caption_text_only_without_eos",
             "free_form_generation_required": False,
         }
@@ -361,12 +365,15 @@ def main() -> None:
                         "content_stream_diagonal": (
                             attention_contract == "xlnet_content_diagonal"
                         ),
+                        "image_sigma_order": image_sigma_order,
+                        "image_order_distribution": ("halton_base2_base3_uniform_torus_shift_v1" if image_sigma_order == "spatial_halton_shifted" else "uniform_random_permutation" if image_sigma_order == "random" else "fixed"),
                         "mc_samples": int(args.mc),
                         "mc_aggregation": "mean_loglikelihood",
                         "mc_common_random_numbers_across_candidates": True,
                         "image_order_mc_contract": ("not_applicable_full_image_ar" if attention_contract == "showo2_omni_attention" else IMAGE_ORDER_MC_CONTRACT),
                         "primary_candidate_score": DEBIASED_SCORE,
-                        "reported_score_variant": "language_prior_debiased_only",
+                        "reported_score_variant": ARO_SCORE_VARIANT,
+                        "task_primary_candidate_scores": {task: CONDITIONAL_SCORE for task in sorted(ARO_TASKS)},
                         "language_prior_alpha": LANGUAGE_PRIOR_ALPHA,
                         "language_prior_estimator": LANGUAGE_PRIOR_ESTIMATOR,
                         "language_prior_null_image_count": len(null_image_ids),

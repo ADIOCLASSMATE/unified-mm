@@ -11,6 +11,7 @@ import time
 
 from data_synthesis.clients import CodexFallback, SIIClient
 from data_synthesis.config import fingerprint, load_sii_settings
+from data_synthesis.integrity import hashing_enabled, same_view_binding, view_binding
 from data_synthesis.contract import CONTRACT_HASH, parse_pair
 from data_synthesis.io import atomic_json, dumps, sha
 from data_synthesis.reuse import choose_reuse
@@ -35,7 +36,8 @@ def qualification(config, path):
 
 def accept_raw(state, item, ident, raw, tokenizer, config):
     backend = raw["backend"]
-    if raw.get("image_id") != item["key"] or raw.get("view_sha256") != item["view"]["view_sha256"]:
+    compute_hashes = hashing_enabled(config)
+    if raw.get("image_id") != item["key"] or not same_view_binding(raw, item["view"], compute_hashes):
         raise ValueError("response/attachment provenance mismatch")
     if raw.get("contract_hash") != CONTRACT_HASH or raw.get("image_attached") is not True:
         raise ValueError("missing grounded request contract")
@@ -50,7 +52,7 @@ def accept_raw(state, item, ident, raw, tokenizer, config):
     if not all(pair["usable"].values()):
         raise ValueError("model could not provide usable paired text")
     for fact in item["row"].get("verified_facts", []):
-        if fact.get("verified") is not True or fact.get("view_sha256") != item["view"]["view_sha256"]:
+        if fact.get("verified") is not True or not same_view_binding(fact, item["view"], compute_hashes):
             continue
         if fact.get("type") == "count" and fact.get("exhaustive_for_referent") is True:
             observations = {c["entity"].casefold(): c["count"] for c in pair["observations"]["counts"]}
@@ -60,7 +62,7 @@ def accept_raw(state, item, ident, raw, tokenizer, config):
     evidence = {"pipeline": PIPELINE_VERSION, "route": backend, "attempt_id": ident,
                 "generator_models": {"i2t": model, "t2i": model}, "contract_hash": CONTRACT_HASH,
                 "api_attempts": item["api_attempts"], "codex_attempts": item["codex_attempts"],
-                "view_sha256": item["view"]["view_sha256"],
+                **view_binding(item["view"], compute_hashes),
                 "fallback_reason": item.get("error") if backend == "codex_fallback" else None,
                 "semantic_accuracy_independently_verified": False}
     state.succeed(item["key"], pair, evidence, ident)
@@ -158,7 +160,7 @@ async def run(root, config, *, tokenizer, sii=None, codex=None, max_items=None, 
             except Exception as exc:
                 return {"backend": backend, "status": "failed", "error_type": "local",
                         "error": f"{type(exc).__name__}: {str(exc)[:500]}", "image_id": item["key"],
-                        "view_sha256": item["view"]["view_sha256"], "contract_hash": CONTRACT_HASH}
+                        **view_binding(item["view"], hashing_enabled(config)), "contract_hash": CONTRACT_HASH}
 
         try:
             while True:
@@ -184,7 +186,7 @@ async def run(root, config, *, tokenizer, sii=None, codex=None, max_items=None, 
                                     issues.append(str(exc))
                             if pair is not None:
                                 state.succeed(key, pair, {"pipeline": PIPELINE_VERSION, **evidence,
-                                                         "view_sha256": item["view"]["view_sha256"], "contract_hash": CONTRACT_HASH}, commit=False)
+                                                         **view_binding(item["view"], hashing_enabled(config)), "contract_hash": CONTRACT_HASH}, commit=False)
                                 touched.add(key)
                                 counts[evidence["route"]] += 1
                                 continue

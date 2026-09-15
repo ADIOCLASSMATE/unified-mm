@@ -111,6 +111,8 @@ import sys
 checkpoint = Path(sys.argv[1]).resolve()
 root = Path(sys.argv[2])
 required = set(sys.argv[3].split(","))
+from utils.evaluation.model_contracts import validate_formal_image_order_scoring
+
 manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
 summary = json.loads((root / "summary.json").read_text(encoding="utf-8"))
 if manifest.get("complete") is not True:
@@ -120,11 +122,10 @@ if manifest.get("schema") != "selfless_multimodal_likelihood_evaluation_v5":
 if summary.get("schema") != "selfless_multimodal_likelihood_summary_v5":
     raise RuntimeError("reused benchmark summary uses an obsolete protocol")
 if manifest.get("project_formal_protocol") is not True:
-    raise RuntimeError("reused benchmark evaluation is not a formal MC64 run")
+    raise RuntimeError("reused benchmark evaluation is not a formal run")
 if summary.get("project_formal_protocol") is not True:
-    raise RuntimeError("reused benchmark summary is not a formal MC64 run")
-if int(manifest.get("mc_samples", -1)) != 64:
-    raise RuntimeError("reused benchmark evaluation does not use MC64")
+    raise RuntimeError("reused benchmark summary is not a formal run")
+validate_formal_image_order_scoring(manifest, summary.get("scoring", {}))
 if Path(manifest["checkpoint"]).resolve() != checkpoint:
     raise RuntimeError("reused benchmark evaluation belongs to another checkpoint")
 if manifest.get("runtime_hashing_enabled", True) is not False:
@@ -140,8 +141,6 @@ if scoring.get("language_prior_estimator") != "content_free_gaussian_image_logme
     raise RuntimeError("reused benchmark uses the wrong prior estimator")
 if int(scoring.get("language_prior_null_image_count", -1)) != 3:
     raise RuntimeError("reused benchmark does not use exactly three null images")
-if int(scoring.get("mc_samples", -1)) != 64:
-    raise RuntimeError("reused benchmark summary does not use MC64")
 missing = sorted(required - set(summary.get("tasks", {})))
 if missing:
     raise RuntimeError(f"reused benchmark evaluation misses retained tasks: {missing}")

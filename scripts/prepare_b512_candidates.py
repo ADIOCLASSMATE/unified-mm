@@ -17,9 +17,10 @@ from urllib.parse import urlsplit
 from PIL import Image
 
 from utils.imagenet_synthetic_text_index import ImageNetSyntheticTextIndex
+from data_synthesis.integrity import hashing_enabled
 
 
-def imagenet_candidates(public, count, seed, fresh_every=0, excluded_ids=frozenset()):
+def imagenet_candidates(public, count, seed, fresh_every=0, excluded_ids=frozenset(), *, compute_hashes=True):
     dataset = public / "datasets/imagenet1k_synthetic_v1"
     root = public / "dataset/imagenet/v1/ILSVRC/Data/CLS-LOC/train"
     index = ImageNetSyntheticTextIndex(dataset / "indexed/train/manifest.json")
@@ -61,8 +62,8 @@ def imagenet_candidates(public, count, seed, fresh_every=0, excluded_ids=frozens
                     "i2t_model": previous["model"], "t2i_model": t2i["generation"]["model"],
                     "i2t_source": previous["source"], "t2i_style": "faithful_photo",
                     "source_dataset": str(dataset.resolve()), "source_row": idx,
-                    "i2t_text_sha256": hashlib.sha256(previous["text"].encode()).hexdigest(),
-                    "t2i_text_sha256": hashlib.sha256(prompts[0]["prompt"].encode()).hexdigest(),
+                    "i2t_text_sha256": hashlib.sha256(previous["text"].encode()).hexdigest() if compute_hashes else None,
+                    "t2i_text_sha256": hashlib.sha256(prompts[0]["prompt"].encode()).hexdigest() if compute_hashes else None,
                 }
             yield row
             accepted += 1
@@ -132,7 +133,7 @@ def pixmo_candidates(parquet, count, revision, seed, allowed_hosts=frozenset(), 
             raise ValueError(f"only {accepted} PixMo candidates available, requested {count}")
 
 
-def prepare_exclusions(public, output):
+def prepare_exclusions(public, output, *, compute_hashes=True):
     identities, paths = set(), set()
     benchmarks = public / "benchmarks"
     for manifest in sorted(benchmarks.glob("*/image_manifest.jsonl")):
@@ -162,10 +163,14 @@ def prepare_exclusions(public, output):
 
     def digest(path):
         return hashlib.sha256(path.read_bytes()).hexdigest()
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        identities.update(pool.map(digest, sorted(paths)))
+    if compute_hashes:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            identities.update(pool.map(digest, sorted(paths)))
+    else:
+        identities.update("image-reference:" + str(p.resolve()) for p in paths)
     output.write_text("\n".join(sorted(identities)) + "\n")
-    return {"exclusion_entries": len(identities), "hashed_benchmark_images": len(paths)}
+    return {"exclusion_entries": len(identities), "hashed_benchmark_images": len(paths) if compute_hashes else 0,
+            "compute_hashes": compute_hashes}
 
 
 def openimages_candidates(csv_path, count, seed, excluded_ids=frozenset()):
@@ -214,7 +219,7 @@ def openimages_candidates(csv_path, count, seed, excluded_ids=frozenset()):
             raise ValueError(f"only {len(used)} Open Images relationship candidates available")
 
 
-def wikiart_candidates(parquet, source_archive, count, revision, seed, excluded_ids=frozenset()):
+def wikiart_candidates(parquet, source_archive, count, revision, seed, excluded_ids=frozenset(), *, compute_hashes=True):
     """Extract embedded images once, then select across upstream numeric style IDs."""
     import pyarrow.parquet as pq
     from data_synthesis.io import ImageArchives, digest_file
@@ -223,13 +228,15 @@ def wikiart_candidates(parquet, source_archive, count, revision, seed, excluded_
     archive_root = Path(source_archive).resolve()
     if list(archive_root.glob("*.tar")):
         raise FileExistsError("source image extraction is immutable; use another archive directory")
-    source_digest = digest_file(parquet)
+    source_digest = digest_file(parquet) if compute_hashes else None
     parquet_file = pq.ParquetFile(parquet)
     archives = ImageArchives(archive_root)
     buckets, seen = {}, set()
+    ordinal = -1
     try:
         for batch in parquet_file.iter_batches(batch_size=16):
             for item in batch.to_pylist():
+                ordinal += 1
                 data = item["image"]["bytes"]
                 if not data or len(data) > 20 << 20:
                     continue
@@ -237,14 +244,15 @@ def wikiart_candidates(parquet, source_archive, count, revision, seed, excluded_
                     width, height = image.size
                 if min(width, height) < 512 or max(width, height) / min(width, height) > 1.8:
                     continue
-                identity = hashlib.sha256(data).hexdigest()
+                identity = (hashlib.sha256(data).hexdigest() if compute_hashes
+                            else f"{revision}:{Path(parquet).stem}:{ordinal}")
                 if identity in seen or "wikiart:" + identity in excluded_ids:
                     continue
                 seen.add(identity)
                 style = int(item["style"])
                 row = {"source": "wikiart", "source_id": identity, "split": "train",
-                       "local_path": archives.add(identity + ".original", data),
-                       "expected_source_sha256": identity, "min_short_side": 512,
+                       "local_path": archives.add(identity + ".original" if compute_hashes else f"image-{ordinal:09d}.original", data),
+                       "expected_source_sha256": identity if compute_hashes else None, "min_short_side": 512,
                        "capabilities": ["style"], "selection_bucket": f"wikiart_style_{style}",
                        "metadata_repository": "huggan/wikiart", "metadata_revision": revision,
                        "metadata_parquet_sha256": source_digest,
@@ -287,6 +295,7 @@ def main():
     parser.add_argument("--pixmo-host", action="append", default=[], help="Restrict to a verified direct source host; repeat for multiple hosts.")
     parser.add_argument("--write-exclusions", action="store_true")
     args = parser.parse_args()
+    compute_hashes = hashing_enabled()
     public, output = Path(args.public).resolve(), Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=True)
     path = output / "candidates.jsonl"
@@ -301,7 +310,8 @@ def main():
                     row = json.loads(line)
                     excluded_ids.add(row["source"] + ":" + row["source_id"])
     if args.imagenet_count:
-        rows.extend(imagenet_candidates(public, args.imagenet_count, args.seed, args.imagenet_fresh_every, excluded_ids))
+        rows.extend(imagenet_candidates(public, args.imagenet_count, args.seed, args.imagenet_fresh_every, excluded_ids,
+                                       compute_hashes=compute_hashes))
     if args.pixmo_count:
         rows.extend(pixmo_candidates(args.pixmo_parquet, args.pixmo_count, args.pixmo_revision, args.seed,
                                     set(args.pixmo_host), excluded_ids))
@@ -309,15 +319,17 @@ def main():
         rows.extend(openimages_candidates(args.openimages_relationships, args.openimages_count, args.seed, excluded_ids))
     if args.wikiart_count:
         rows.extend(wikiart_candidates(args.wikiart_parquet, args.wikiart_source_archive,
-                                       args.wikiart_count, args.wikiart_revision, args.seed, excluded_ids))
+                                       args.wikiart_count, args.wikiart_revision, args.seed, excluded_ids,
+                                       compute_hashes=compute_hashes))
     path.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows))
     report = {"records": len(rows), "sources": dict(Counter(r["source"] for r in rows)),
               "selection_buckets": dict(Counter(r.get("selection_bucket", "imagenet") for r in rows)),
               "reuse_candidates": sum("reuse_pair" in r for r in rows), "seed": args.seed,
               "pixmo_allowed_hosts": args.pixmo_host, "excluded_source_ids": len(excluded_ids),
-              "public": str(public), "manifest_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+              "public": str(public), "manifest_sha256": hashlib.sha256(path.read_bytes()).hexdigest() if compute_hashes else None,
+              "manifest_bytes": path.stat().st_size, "compute_hashes": compute_hashes}
     if args.write_exclusions:
-        report.update(prepare_exclusions(public, output / "benchmark_exclusions.txt"))
+        report.update(prepare_exclusions(public, output / "benchmark_exclusions.txt", compute_hashes=compute_hashes))
     (output / "preparation.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
     print(json.dumps(report, ensure_ascii=False), flush=True)
 

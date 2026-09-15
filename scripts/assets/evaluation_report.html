@@ -18,19 +18,22 @@ nav{position:sticky;top:0;background:rgba(255,255,255,.97);border-bottom:1px sol
 @media(max-width:1000px){.summary-grid{grid-template-columns:1fr}.metric-findings{grid-template-columns:1fr}.summary-card.wide{grid-column:auto}}
 @media(max-width:780px){.section-head{display:block}.back-overview{display:inline-block;margin-top:5px}.summary-card{padding:18px}.summary-card .card-heading{display:block}.abstract{padding:20px}.subnav a{font-size:13px;padding:7px 10px}.sweep-pair{grid-template-columns:1fr}.metrics-controls{padding:3px 14px}.summary-card .model-name{min-width:165px}}
 #metrics,#matrix-table{max-height:none}
+#flow-scale-table .model-name{min-width:210px;max-width:255px}#flow-scale-table .scale-shape,#flow-scale-table .scale-parameters{white-space:nowrap}#flow-scale-table .scale-parameters{text-align:right}#flow-scale-table .scale-family-start td{border-top:2px solid #b9d9d0}#flow-scale-table thead tr:nth-child(2) th{top:47px}
 #sources{overflow-wrap:anywhere}
+.unified-findings{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:18px;margin:22px 0}.unified-finding{border:1px solid var(--line);border-top:3px solid #8b9fa3;background:#fff;border-radius:10px;padding:20px}.unified-finding h3{margin:10px 0;font-size:19px}.unified-finding.gain{border-top-color:var(--accent)}.unified-finding.cost{border-top-color:#a67535}.unified-gain{color:#12655f;font-weight:650}.unified-cost{color:#95602b;font-weight:650}#unified-metrics td:nth-child(2){min-width:185px}#unified-exposure td{white-space:nowrap}@media(max-width:900px){.unified-findings{grid-template-columns:1fr}}
+.unified-cfg-plots{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px;margin:18px 0}.unified-cfg-plots figure{margin:0;min-width:0}.unified-cfg-plots img{width:100%;height:auto}.unified-tradeoff{display:block;width:min(100%,860px);height:auto;margin:18px auto}#unified-cfg-best td{white-space:nowrap}@media(max-width:900px){.unified-cfg-plots{grid-template-columns:1fr}}
 .dataset-comparison td{min-width:190px;max-width:560px}.dataset-comparison td:first-child{min-width:145px;font-weight:600}.dataset-bar{display:flex;height:27px;border-radius:7px;overflow:hidden;margin:14px 0;background:var(--line)}.dataset-bar span{min-width:1px}.dataset-legend{display:flex;gap:10px 20px;flex-wrap:wrap;font-size:13px;margin-bottom:16px}.dataset-key{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:7px}.dataset-path{display:grid;grid-template-columns:230px minmax(0,1fr) auto;gap:14px;padding:13px 0;border-bottom:1px solid var(--line);align-items:start}.dataset-path:last-child{border-bottom:0}.dataset-path code{font-size:12px;overflow-wrap:anywhere;white-space:normal}.dataset-path small{display:block}.dataset-path button{font-size:12px;padding:4px 10px}.dataset-analysis td{min-width:180px;max-width:580px}.dataset-inventory h3{margin-top:24px}.dataset-inventory .box h3:first-child{margin-top:0}
 @media(max-width:780px){.dataset-path{grid-template-columns:minmax(0,1fr) auto}.dataset-path>strong{grid-column:1/-1}.dataset-comparison td{min-width:220px}}
 </style>
 </head>
 <body>
 <header><div class="wrap">
-  <div class="header-line"><div><div class="eyebrow">UNIFIED-MM / RESEARCH REPORT</div><h1>统一多模态模型 · 实验报告</h1><p class="muted">正式 A / B、基于 B 的 C–F 消融，以及可追溯的历史实验。</p></div>
+  <div class="header-line"><div><div class="eyebrow">UNIFIED-MM / RESEARCH REPORT</div><h1>统一多模态模型 · 实验报告</h1><p class="muted">正式 A / B、联合训练与 only 对照、基于 B 的 C–F 消融，以及可追溯的历史实验。</p></div>
     <div class="header-links"><a href="../../docs/EXPERIMENTS.md">实验定义</a><a href="summary.json">结果摘要</a><a href="README.md">目录说明</a><button id="reload">刷新页面</button></div></div>
   <div class="stats" id="stats"></div><p class="note" id="updated"></p>
 </div></header>
 <nav aria-label="评测视图"><div class="tabs">
-  <a href="#overview" class="active" data-nav="overview">研究总览</a><a href="#matrix" data-nav="matrix">模型评测</a><a href="#sampling/parameters" data-nav="sampling">采样与解码消融</a><a href="#training" data-nav="training">训练与验证 Loss</a><a href="#qualitative/t2i" data-nav="qualitative">定性样例</a><a href="#sources" data-nav="sources">数据与协议</a>
+  <a href="#overview" class="active" data-nav="overview">研究总览</a><a href="#matrix" data-nav="matrix">模型评测</a><a href="#unified-training" data-nav="unified-training">Unified 训练消融</a><a href="#sampling/parameters" data-nav="sampling">采样与解码消融</a><a href="#training" data-nav="training">训练与验证 Loss</a><a href="#qualitative/t2i" data-nav="qualitative">定性样例</a><a href="#sources" data-nav="sources">数据与协议</a>
 </div></nav>
 <main class="wrap">
 <div id="error" hidden></div>
@@ -39,22 +42,43 @@ nav{position:sticky;top:0;background:rgba(255,255,255,.97);border-bottom:1px sol
   <div class="summary-grid" id="research-sections"></div>
 </section>
 <section class="panel" id="matrix" hidden>
-  <div class="section-head"><div><div class="section-kicker">01 / MODEL COMPARISON</div><h2>正式 A / B · 评测指标</h2><p class="note">默认比较正式 A / B；可切换 B 上的 C–F 消融或历史实验。每列保留自己的评测协议和原始结果链接。</p></div><a class="back-overview" href="#overview">返回研究总览 ↑</a></div>
+  <div class="section-head"><div><div class="section-kicker">01 / MODEL COMPARISON</div><h2>模型评测指标</h2><p class="note">默认比较正式 A / B；可切换 B 上的 C–F 消融、B / S2 对照或历史实验。每列保留自己的评测协议和原始结果链接。ARO Relation / Attribution 已统一为含文本先验的条件似然评分。</p></div><a class="back-overview" href="#overview">返回研究总览 ↑</a></div>
   <div class="metrics-controls"><div class="toolbar">
     <label>指标组 <select id="metric-group"><option value="overview">综合指标</option><option value="generation">图像生成</option><option value="text">文本八任务</option><option value="understanding">图像理解</option><option value="coco">COCO 检索</option><option value="flickr">Flickr30K 检索</option><option value="diagnostics">验证诊断</option></select></label>
     <label>生成协议 <select id="metric-protocol"><option value="cfg2">CFG 2.0 · Heun 10 · 原生顺序</option><option value="cfg3p5">CFG 3.5 · Heun 10 · 原生顺序</option></select></label>
-    <label>模型范围 <select id="metric-scope"><option value="main">正式 A / B</option><option value="ablation">B 上的消融（C–F）</option><option value="legacy">历史消融</option><option value="formal">全部已有评测指标</option><option value="all">全部已登记模型</option></select></label>
+    <label>模型范围 <select id="metric-scope"><option value="main">正式 A / B</option><option value="ablation">B 上的消融（C–F）</option><option value="showo2">B / S2 对照</option><option value="legacy">历史消融</option><option value="formal">全部已有评测指标</option><option value="all">全部已登记模型</option></select></label>
   </div></div>
   <p class="note" id="metric-protocol-note"></p><div class="metric-findings" id="metric-findings"></div>
   <div class="scroll metrics-scroll" id="metrics"></div>
   <p class="note">绿色为当前模型范围内的列最优，不代表统计显著；缺失项保留 —。点击分数查看原始结果。</p>
   <div class="box conclusion" id="model-metric-conclusion"></div>
-  <details class="protocol-details"><summary>各评测指标的协议与比较范围</summary><p class="note">图像生成使用各模型的 step-95415 final EMA、ImageNet-val 50K、seed 42；E 按训练约定使用 sequential，其余使用 Halton。CFG=2.0 来自 B 的参数扫描，尚未对其他模型单独调参。生成协议切换只影响 FID / IS 列。</p><p class="note">文本八项均分为内部跨任务摘要。ImageNet 分类、COCO / Flickr30K 检索与图文组合任务使用各自冻结协议；图文组合任务中随机顺序模型使用 MC64，E 使用确定性 MC1。MMBench circular 与 SEED 为内部消融指标。GenEval、DPG-Bench、MJHQ 官方评分单独保留，未完成项不补入本表。</p><p class="note">历史验证诊断列为最终评测保存的图文 loss，不是逐步训练曲线。IS 的 ± 为十个按类别分层 split 的标准差。</p></details>
-  <div class="content-links"><a href="#sampling/cross-model">查看跨模型采样与换序实验 →</a><a href="#training">查看训练与验证曲线 →</a><a href="#sources">查看数据与完整协议 →</a></div>
+  <div class="box" id="s2-cfg-sweep" hidden></div>
+  <details class="protocol-details"><summary>各评测指标的协议与比较范围</summary><p class="note">图像生成使用各模型的 step-95415 final EMA、ImageNet-val 50K、seed 42；S2 使用整图 flow；E 按训练约定使用 sequential，其他模型使用 Halton。CFG=2.0 来自 B 的参数扫描，尚未对其他模型单独调参。生成协议切换只影响 FID / IS 列。</p><p class="note">文本八项均分为内部跨任务摘要。ImageNet 分类、COCO / Flickr30K 检索与图文组合任务使用各自冻结协议；图文组合任务中随机顺序模型使用 MC64，E 使用确定性 MC1；S2 使用整图可见的 next-token AR 确定性评分（MC1），不进行图像顺序采样。ARO 使用平均 token log P(文本 | 图像)，保留文本先验，以全部样本的严格胜率汇总，平局不计正确。MMBench circular 与 SEED 为内部消融指标。GenEval、DPG-Bench、MJHQ 官方评分单独保留，未完成项不补入本表。</p><p class="note">历史验证诊断列为最终评测保存的图文 loss，不是逐步训练曲线。IS 的 ± 为十个按类别分层 split 的标准差。</p></details>
+  <div class="content-links"><a href="#sampling/cross-model">查看跨模型采样与换序实验 →</a><a href="unified-b-x0content-0p6b/sweeps/understanding-order-20260915-r1/comparison/index.html">B：Random / Halton 理解评测对照 →</a><a href="unified-b-x0content-0p6b/sweeps/understanding-halton-mc64-20260915-r1/comparison/index.html">B：64 个随机平移 Halton 理解对照 →</a><a href="#training">查看训练与验证曲线 →</a><a href="#sources">查看数据与完整协议 →</a></div>
+</section>
+<section class="panel" id="unified-training" hidden>
+  <div class="section-head"><div><div class="section-kicker">02 / UNIFIED TRAINING ABLATION</div><h2>Unified 训练消融 · 联合训练是否更好？</h2><p class="note">将 ClimbMix 纯文本、ImageNet I2T 和 T2I 一起训练为一个 B 模型，分别与只训练相应任务的三个 only 模型比较。</p></div><a class="back-overview" href="#overview">返回研究总览 ↑</a></div>
+  <p class="note" id="unified-coverage"></p>
+  <div class="unified-findings" id="unified-findings"></div>
+  <div class="experiment-conclusion" id="unified-conclusion"></div>
+  <div class="box"><h3>训练对照 · 对应任务的数据曝光量</h3><p class="note">单位：十亿物理位置（包括 padding）；悬停可查看精确数量。每个 only 对照使用 B 对应任务的数据，I2T / T2I 的累计曝光量精确匹配；纯文本约为 100B。联合 B 的总曝光量约为 200.10B，各 only 的预算见下表。</p><div class="scroll" id="unified-exposure"></div></div>
+  <div class="box" id="unified-cfg-sweep"><h3>图像生成 · B 与 T2I-only 的 CFG sweep</h3><p class="note" id="unified-cfg-protocol"></p>
+    <div class="unified-cfg-plots" id="unified-cfg-plots"></div>
+    <div class="content-links" id="unified-cfg-downloads"></div>
+    <div class="experiment-conclusion" id="unified-cfg-conclusion"></div>
+    <h3>各自选择 CFG 后的最优结果</h3><p class="note">最低 FID 和最高 IS 分别选优；它们可能来自不同 CFG，不合并为同一个工作点。扫描未完成时只汇总已测点。</p><div class="scroll" id="unified-cfg-best"></div>
+    <details class="protocol-details"><summary>FID / IS 权衡曲线 · 点旁数字为 CFG</summary><div id="unified-cfg-tradeoff"></div></details>
+    <h3>相同 CFG 下的逐点比较</h3><p class="note">Δ 为 B − T2I-only。缺失分数留空，折线不会跨过未测档位。IS 阴影和表格中的 ± 为十个类别分层 split 的标准差，不是置信区间。</p><div class="scroll" id="unified-cfg-matrix"></div>
+  </div>
+  <div class="metrics-controls"><div class="toolbar"><label>查看指标 <select id="unified-metric-group"><option value="overview">核心结果</option><option value="understanding">视觉理解</option><option value="generation">图像生成</option><option value="text">文本八任务</option><option value="retrieval">双向检索明细</option><option value="diagnostics">内部诊断</option></select></label><label>生成 CFG <select id="unified-cfg"></select></label><span class="spacer"></span><a id="unified-download" download="unified-training-ablation.json">下载完整对照 JSON →</a></div></div>
+  <p class="note" id="unified-metric-note"></p>
+  <div class="scroll" id="unified-metrics"></div>
+  <p class="note">差值统一为联合 B − only；FID 越低越好，其余指标越高越好。绿色标记本项较优值；点击分数查看原始评测。各任务分别比较，不计算混合文本、理解与生成的总分。</p>
+  <details class="protocol-details"><summary>训练配方、评测设置与结论范围</summary><p>I2T / T2I-only 使用修正后的 B-matched 配方：B 的架构和对应任务数据、95,415 步、每任务 50,024,939,520 个物理位置，从相同基座初始化；单任务训练保留完整单任务目标。这是对应任务曝光量匹配的配方对照，B 的总训练数据量与每个 only 不同。</p><p>text-only 沿用历史 B 文本单任务对照，文本 attention 与评分协议一致，未使用的 flow 分支与正式 B 有差别。文本曝光量为 100,000,595,968，B 为 100,049,879,040，差约 0.049%。</p><p>生成按 CFG=1.0–6.0、间隔 0.5 分别对照，使用相同的 ImageNet-val 50K 参考、10-step Heun、Halton、seed 42 和逐样本固定初始噪声；模型 BF16，VAE / 积分 FP32。B 与 T2I-only 的生成全局 batch 分别为 4096 / 2048。分类、检索及组合理解采用各自一致的评分协议；组合理解为 MC64，ARO 保留文本先验。MMBench / SEED 单列内部诊断。</p><p>结果来自单次训练种子。它说明当前配方的性能取舍，不提供多种子显著性结论；也尚未拆分纯文本与 T2I 各自对理解的贡献。</p><div class="content-links"><a href="../../configs/protocols/unified_b_image_only_matched_ascend16.yaml">Image-only 训练协议 →</a><a href="../../docs/EXPERIMENTS.md">实验定义 →</a><a href="selection.json">结果选取 →</a></div></details>
 </section>
 <section class="panel" id="sampling" hidden>
-  <div class="section-head"><div><div class="section-kicker">02 / SAMPLING ABLATIONS</div><h2>采样与解码消融</h2><p class="note">按实验变量查看结果：先调整 CFG 与采样步数，再固定参数比较解码策略，最后检查换序效果能否推广到其他模型。</p></div><a class="back-overview" href="#overview">返回研究总览 ↑</a></div>
-  <div class="subnav" aria-label="采样实验分类"><a href="#sampling/parameters" data-sampling="parameters">CFG / 采样步数</a><a href="#sampling/strategies" data-sampling="strategies">B 解码策略</a><a href="#sampling/cross-model" data-sampling="cross-model">跨模型采样与换序</a></div>
+  <div class="section-head"><div><div class="section-kicker">03 / SAMPLING &amp; HEAD SCALE ABLATIONS</div><h2>采样与解码消融</h2><p class="note">按实验变量查看 CFG、采样步数、解码顺序，以及相同采样设置下的 flow head 规模效应。</p></div><a class="back-overview" href="#overview">返回研究总览 ↑</a></div>
+  <div class="subnav" aria-label="采样实验分类"><a href="#sampling/parameters" data-sampling="parameters">CFG / 采样步数</a><a href="#sampling/d-cfg" data-sampling="d-cfg">D CFG sweep</a><a href="#sampling/strategies" data-sampling="strategies">B 解码策略</a><a href="#sampling/cross-model" data-sampling="cross-model">跨模型采样与换序</a><a href="#sampling/flow-head-scale" data-sampling="flow-head-scale">Flow head scale 消融</a></div>
 <article class="sampling-pane" id="sampling-parameters" data-pane="parameters">
   <h3 class="experiment-heading">CFG 与采样步数 · B</h3>
   <div class="experiment-conclusion" id="sweep-conclusion"></div>
@@ -67,6 +91,10 @@ nav{position:sticky;top:0;background:rgba(255,255,255,.97);border-bottom:1px sol
     <p class="prompt-text" id="sweep-prompt"></p><div class="sweep-pair" id="sweep-pair"></div>
   </div>
   <p class="note">这些分数用于验证集上的采样参数选择；跨模型的固定协议指标见“模型评测”。</p>
+</article>
+<article class="sampling-pane" id="sampling-d-cfg" data-pane="d-cfg" hidden>
+  <h3 class="experiment-heading">D · CFG sweep 与 B 对照</h3>
+  <div class="box" id="d-cfg-sweep"><p>正在读取 D 的 CFG 扫描结果…</p></div>
 </article>
 <article class="sampling-pane" id="sampling-strategies" data-pane="strategies" hidden>
   <h3 class="experiment-heading">解码策略 · 固定 B 与采样参数</h3>
@@ -95,9 +123,27 @@ nav{position:sticky;top:0;background:rgba(255,255,255,.97);border-bottom:1px sol
     <p class="note">每组保留相同的 64 个验证集样本。顺序图反映实际解码 trace，悬停可查看位置、揭示步和分数。BF16 的探测计算可能产生少量数值差异；单次固定种子的分数差异不代表统计显著。</p>
   </div>
 </article>
+<article class="sampling-pane" id="sampling-flow-head-scale" data-pane="flow-head-scale" hidden>
+  <h3 class="experiment-heading">Flow head scale 消融 · B / F</h3>
+  <div class="experiment-conclusion" id="flow-scale-conclusion"></div>
+  <p class="note">B 使用 contextual flow head，固定宽度 1280，将深度从 8 扩展至 16、30；F 使用逐位置共享 AdaLN 残差 MLP，不含跨 token attention，各档 head 参数量与 B 对齐（误差 &lt; 0.5%）。表中并列相同 CFG 下的结果。</p>
+  <p class="note" id="flow-scale-coverage"></p>
+  <details class="protocol-details" open><summary>各规模的 CFG sweep · FID / IS</summary>
+    <div class="toolbar"><label>Head 类型 <select id="flow-scale-family"><option value="b">B · Contextual</option><option value="f">F · Position-wise MLP</option></select></label></div>
+    <p class="note" id="flow-scale-cfg-protocol"></p>
+    <div class="sweep-plots" id="flow-scale-cfg-plots"></div>
+    <div class="content-links" id="flow-scale-cfg-downloads"></div>
+    <p class="note">下表分别列出各模型已测档位中的最低 FID 与最高 IS，它们可能对应不同 CFG。未完成的扫描不代表全范围最优；缺失档位在曲线上留空，IS 阴影为十个分层 split 的标准差。</p>
+    <div class="scroll" id="flow-scale-cfg-best"></div>
+  </details>
+  <div class="scroll" id="flow-scale-table"></div>
+  <p class="note">绿色为同类 head、同一 CFG 下已测规模中的最优值，至少有两个规模完成才标色。IS 的 ± 为十个按类别分层 split 的标准差。未完成评测的分数留空；点击已有分数查看原始指标。</p>
+  <p class="note" id="flow-scale-pending"></p>
+  <details class="protocol-details"><summary>训练预算、参数匹配与评测协议</summary><p>B / F 各档从 Qwen3-0.6B-Base 初始化，沿用相同的混合数据、loss 权重与学习率配方，训练目标为 95,415 steps。这里的 scale 指 flow head 容量变化；F 的宽度随档位调整以匹配对应 B 的参数预算。</p><p>已完成评测统一采用 step-95415 final EMA、ImageNet-val 50K、seed 42、Halton、10-step Heun、恒定 CFG，以及逐样本固定初始噪声。模型为 BF16，VAE 与 flow 积分为 FP32。B depth 8 与 F depth 8 的生成全局 batch 为 4096，B depth 16 / 30 为 2048；评分协议和真实图像参考一致。当前为单训练种子、单评测种子，小幅差异不代表统计显著。</p><div class="content-links"><a href="../../configs/protocols/unified_b_x0_flow_head_scaling_100b_ascend64.yaml">B scaling 训练协议 →</a><a href="../../configs/protocols/unified_f_on_b_flow_head_scaling_100b_ascend64.yaml">F scaling 训练协议 →</a><a href="selection.json">结果选取与来源 →</a></div></details>
+</article>
 </section>
 <section class="panel" id="training" hidden>
-  <div class="section-head"><div><div class="section-kicker">03 / TRAINING DYNAMICS</div><h2>训练与验证 Loss · 默认正式 A / B</h2><p class="note" id="loss-coverage"></p></div><a class="back-overview" href="#overview">返回研究总览 ↑</a></div>
+  <div class="section-head"><div><div class="section-kicker">04 / TRAINING DYNAMICS</div><h2>训练与验证 Loss · 默认正式 A / B</h2><p class="note" id="loss-coverage"></p></div><a class="back-overview" href="#overview">返回研究总览 ↑</a></div>
   <div class="box"><div class="toolbar" id="loss-presets"></div><div class="selectors loss-selectors" id="loss-selectors"></div>
     <div class="toolbar loss-toolbar">
       <label>曲线 <select id="loss-split"><option value="both">训练 + 验证</option><option value="train">仅训练</option><option value="validation">仅验证</option></select></label>
@@ -125,17 +171,18 @@ nav{position:sticky;top:0;background:rgba(255,255,255,.97);border-bottom:1px sol
   <h3>全部验证记录 · 末次原始 loss</h3><p class="note">每个值对应模型自身的末次验证步数；缺失项以 — 表示，单任务日志中的无目标零值也保持空白。权重类型依据该实验保存的训练配置，目标数与 seed 来自原始验证记录。CSV 保留每个点的原文件路径。</p><div class="scroll metrics-scroll" id="loss-validation-inventory"></div>
 </section>
 <section class="panel" id="qualitative" hidden>
-  <div class="section-head"><div><div class="section-kicker">04 / QUALITATIVE COMPARISON</div><h2>定性样例 · 逐样本对照</h2></div><a class="back-overview" href="#overview">返回研究总览 ↑</a></div>
+  <div class="section-head"><div><div class="section-kicker">05 / QUALITATIVE COMPARISON</div><h2>定性样例 · 逐样本对照</h2></div><a class="back-overview" href="#overview">返回研究总览 ↑</a></div>
   <div class="subnav" aria-label="定性任务"><a href="#qualitative/t2i" data-task="t2i">T2I · 图像生成</a><a href="#qualitative/i2t" data-task="i2t">I2T · 图像描述</a><a href="#qualitative/text" data-task="text">纯文本续写</a></div>
   <h3 id="gallery-title"></h3><p class="note" id="gallery-note"></p>
-  <div class="toolbar"><button data-preset="main">正式 A / B</button><button data-preset="ablation">B 上的消融（C–F）</button><button data-preset="legacy">历史消融</button><button data-preset="all">全部模型</button><span class="note" id="selected-count"></span></div>
+  <p class="note" id="gallery-speed" hidden></p>
+  <div class="toolbar"><button data-preset="main">正式 A / B</button><button data-preset="showo2">B / S2</button><button data-preset="ablation">B 上的消融（C–F）</button><button data-preset="legacy">历史消融</button><button data-preset="all">全部模型</button><span class="note" id="selected-count"></span></div>
   <div class="selectors" id="model-selectors"></div>
   <div class="toolbar"><input type="search" id="sample-search" placeholder="搜索提示词、样本 ID 或类别" aria-label="搜索样本"><select id="sample-group" aria-label="样本组"></select><select id="sample-mode" aria-label="采样方式"></select><label>每页 <select id="page-size"><option>8</option><option>16</option><option>32</option><option value="10000">全部</option></select></label></div>
   <div class="scroll gallery-scroll" id="gallery"></div>
   <div class="pagination"><button id="previous">上一页</button><span id="page-label"></span><button id="next">下一页</button></div>
 </section>
 <section class="panel" id="sources" hidden>
-  <div class="section-head"><div><div class="section-kicker">05 / DATA & PROTOCOLS</div><h2>消融数据协议与 200 万补充图像计划</h2></div><a class="back-overview" href="#overview">返回研究总览 ↑</a></div><p class="note">当前计划：完整 ImageNet train 底座之外，再准备至少 200 万张去重、512px 预处理并验收的原图；各来源配额是起点，额外合格图可以保留；优先复用 caption / prompt。下面分别记录目标配额、旧消融协议和 9 月 12 日首轮实际产物；计划数不代表已经下载或发布。</p>
+  <div class="section-head"><div><div class="section-kicker">06 / DATA & PROTOCOLS</div><h2>消融数据协议与 200 万补充图像计划</h2></div><a class="back-overview" href="#overview">返回研究总览 ↑</a></div><p class="note">当前计划：完整 ImageNet train 底座之外，再准备至少 200 万张去重、512px 预处理并验收的原图；各来源配额是起点，额外合格图可以保留；优先复用 caption / prompt。下面分别记录目标配额、旧消融协议和 9 月 12 日首轮实际产物；计划数不代表已经下载或发布。</p>
   <div class="dataset-inventory" id="non-imagenet-2m-plan"></div>
   <details class="box" id="historical-data-protocol"><summary><strong>此前消融与 9 月 12 日首轮数据：实际分布、协议和路径</strong></summary><p class="note">这里保留历史数据审计。其中的 sol 合成要求与滚动补图流程属于首轮协议；当前执行方案以上方 9 月 13 日计划为准。</p>
   <div class="box conclusion" id="dataset-summary"></div>
@@ -161,6 +208,7 @@ const D=JSON.parse(document.getElementById('report-data').textContent);
 const $=id=>document.getElementById(id);
 const esc=value=>String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const mainModelIds=new Set(D.models.filter(m=>m.group==='main').map(m=>m.id));
+const qualitativeModels=D.models.filter(m=>m.qualitative_available!==false);
 const state={tab:'overview',task:'t2i',selected:new Set(mainModelIds),page:0};
 const lookup=new Map(D.records.map(r=>[[r.model,r.task,r.sample_id,r.task==='t2i'?r.seed:r.task==='text'?r.decoding:''].join('|'),r]));
 function setupTask(){
@@ -168,17 +216,24 @@ function setupTask(){
  const titles={t2i:'图像生成 · 同提示、同噪声种子',i2t:'图像描述 · 同一图像输入',text:'文本续写 · 同一前缀'};
  const notes={t2i:'每模型 64 个提示 × 2 个 seed；可按 ImageNet、简单主体或组合提示筛选。点击图片查看原图。',i2t:'每模型 64 个输入。左列为实际输入 latent 的 VAE 重建；参考描述未输入模型。',text:'每模型 32 个前缀 × 2 种解码。展示全部续写，包含中文与域外诊断。'};
  $('gallery-title').textContent=titles[task];$('gallery-note').textContent=notes[task];
+ if(task==='t2i'){
+  const cfg=D.qualitative_contract?.model_cfg??{};
+  $('gallery-note').textContent+=` Heun 10 步；默认 CFG=${D.qualitative_contract?.cfg??3.5}。`+Object.entries(cfg).map(([id,value])=>`${D.models.find(m=>m.id===id)?.label??id} CFG=${value}。`).join('');
+ }
+ $('gallery-speed').hidden=task!=='t2i'||!D.qualitative_speed;
+ if(D.qualitative_speed)$('gallery-speed').innerHTML=`<a href="${esc(D.qualitative_speed)}/speed.html">B CFG=2.0 / S2-single CFG=1.5：生成速度与原始计时</a> · <a href="${esc(D.qualitative_speed)}/index.html">查看这两档 CFG 的完整配对样例</a>`;
+ if(D.generation_capacity)$('gallery-speed').innerHTML+=` · <a href="${esc(D.generation_capacity)}/index.html">接近显存上限的 batch 与吞吐对照</a>`;
  $('sample-search').value='';const groups=[...new Set(D.samples[task].map(r=>r.group))];
  $('sample-group').innerHTML='<option value="">全部样本组</option>'+groups.map(g=>`<option>${esc(g)}</option>`).join('');
  const modes=task==='t2i'?[[42,'Seed 42'],[43,'Seed 43']]:task==='text'?[['greedy','Greedy'],['sample','Temperature 0.8']]:[];
  $('sample-mode').hidden=!modes.length;$('sample-mode').innerHTML='<option value="">全部方式</option>'+modes.map(([v,t])=>`<option value="${v}">${t}</option>`).join('');
 }
 function renderSelectors(){
- $('model-selectors').innerHTML=D.models.map(m=>`<label class="chip"><input type="checkbox" value="${esc(m.id)}" ${state.selected.has(m.id)?'checked':''}>${esc(m.label)}</label>`).join('');
+ $('model-selectors').innerHTML=qualitativeModels.map(m=>`<label class="chip"><input type="checkbox" value="${esc(m.id)}" ${state.selected.has(m.id)?'checked':''}>${esc(m.label)}</label>`).join('');
  $('model-selectors').querySelectorAll('input').forEach(el=>el.addEventListener('change',()=>{el.checked?state.selected.add(el.value):state.selected.delete(el.value);renderGallery()}));
 }
 function renderGallery(){
- const task=state.task,models=D.models.filter(m=>state.selected.has(m.id));$('selected-count').textContent=`当前对照 ${models.length} / ${D.models.length} 个模型`;
+ const task=state.task,models=qualitativeModels.filter(m=>state.selected.has(m.id));$('selected-count').textContent=`当前对照 ${models.length} / ${qualitativeModels.length} 个模型`;
  const search=$('sample-search').value.toLowerCase(),group=$('sample-group').value,mode=$('sample-mode').value;
  let rows=D.samples[task].filter(r=>(!group||r.group===group)&&(!search||[r.id,r.group,r.prompt,r.reference].join(' ').toLowerCase().includes(search)));
  rows=rows.flatMap(r=>(task==='t2i'?[42,43]:task==='text'?['greedy','sample']:['']).filter(m=>!mode||String(m)===mode).map(m=>({row:r,mode:m})));
@@ -301,13 +356,14 @@ function initialize(){
  $('qualitative-protocol').textContent=`${D.qualitative_models} 个 final EMA；每模型 ${D.samples.t2i.length*2} 张 T2I、${D.samples.i2t.length} 个 I2T、${D.samples.text.length*2} 条文本续写。固定样本与成对噪声，全部输出保留。`;
  $('artifact-links').innerHTML=D.artifacts.map(a=>`<a class="artifact" href="${esc(a.path)}">${esc(a.label)}<small>${esc(a.path)}</small></a>`).join('');
  $('folder-links').innerHTML=D.folders.map(a=>`<a class="artifact" href="${esc(a.path)}">${esc(a.label)}</a>`).join('');
- $('model-sources').innerHTML=D.models.map(m=>`<details><summary>${esc(m.label)} · step ${m.source.global_step} · ${esc(m.status)}</summary><p><code>${esc(m.checkpoint)}</code></p><p class="note">${esc(m.architecture)} · backbone ${esc(m.backbone_attention)} · flow ${esc(m.flow_attention)} · ${esc(m.flow_condition)}</p>${m.notes.map(n=>`<p class="note">${esc(n)}</p>`).join('')}${m.selected_root?`<p><a href="${esc(m.selected_root)}/">原始评测目录</a></p>`:''}<p><a href="${esc(D.qualitative_root)}/models/${esc(m.id)}/">定性输出与权重载入校验</a></p></details>`).join('');
+ $('model-sources').innerHTML=D.models.map(m=>`<details><summary>${esc(m.label)} · step ${m.source.global_step} · ${esc(m.status)}</summary><p><code>${esc(m.checkpoint)}</code></p><p class="note">${esc(m.architecture)} · backbone ${esc(m.backbone_attention)} · flow ${esc(m.flow_attention)} · ${esc(m.flow_condition)}</p>${m.notes.map(n=>`<p class="note">${esc(n)}</p>`).join('')}${m.selected_root?`<p><a href="${esc(m.selected_root)}/">原始评测目录</a></p>`:''}${m.qualitative_available!==false?`<p><a href="${esc(D.qualitative_root)}/models/${esc(m.id)}/">定性输出与权重载入校验</a></p>`:'<p class="note">尚未收录固定输入的配对定性样例。</p>'}</details>`).join('');
  window.addEventListener('hashchange',()=>showTab(location.hash.slice(1)));
- document.querySelectorAll('[data-preset]').forEach(b=>b.addEventListener('click',()=>{const ids=D.models.filter(m=>inModelGroup(m,b.dataset.preset)).map(m=>m.id);state.selected=new Set(ids);renderSelectors();renderGallery()}));
- for(const id of ['metric-group','metric-protocol','metric-scope'])$(id).addEventListener('change',renderMetrics);$('reload').addEventListener('click',()=>location.reload());
+ document.querySelectorAll('[data-preset]').forEach(b=>b.addEventListener('click',()=>{const ids=qualitativeModels.filter(m=>inModelGroup(m,b.dataset.preset)).map(m=>m.id);state.selected=new Set(ids);renderSelectors();renderGallery()}));
+ for(const id of ['metric-group','metric-protocol','metric-scope'])$(id).addEventListener('change',()=>{if(id==='metric-scope'&&$('metric-scope').value==='showo2')$('metric-protocol').value='cfg3p5';renderMetrics()});$('reload').addEventListener('click',()=>location.reload());
  for(const id of ['sample-search','sample-group','sample-mode','page-size'])$(id).addEventListener(id==='sample-search'?'input':'change',()=>{state.page=0;renderGallery()});
  $('previous').addEventListener('click',()=>{state.page--;renderGallery()});$('next').addEventListener('click',()=>{state.page++;renderGallery()});
- renderMetrics();renderResearchOverview();renderSelectors();renderSweep();renderOrder();renderCrossModel();initializeLoss();renderProvenance();
+ renderMetrics();renderResearchOverview();renderSelectors();renderSweep();renderOrder();renderCrossModel();renderFlowHeadScale();renderUnifiedTraining();initializeLoss();renderProvenance();renderDCfgSweep();
+ setInterval(()=>{if(state.tab==='matrix'&&$('metric-scope').value==='showo2')renderS2CfgSweep();if(location.hash==='#sampling/d-cfg')renderDCfgSweep()},60000);
  showTab(location.hash.slice(1),{scroll:Boolean(location.hash)});
 }
 try{initialize()}catch(error){$('error').hidden=false;$('error').textContent='报告显示失败：'+error.message;throw error}

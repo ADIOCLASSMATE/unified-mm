@@ -108,7 +108,10 @@ standard_cross_dataset_retrieval:
 official_hard_negative_and_compositional_benchmarks:
   runner: scripts/evaluate_multimodal_likelihood_benchmarks.py
   scoring: language_prior_debiased_mean_token_loglikelihood
-  reported_score_variant: language_prior_debiased_only
+  reported_score_variant: conditional_aro_debiased_other_tasks
+  task_primary_candidate_scores:
+    aro_vg_relation: conditional_mean_token_loglikelihood
+    aro_vg_attribution: conditional_mean_token_loglikelihood
   language_prior_alpha: 1.0
   language_prior_estimator: content_free_gaussian_image_logmeanexp
   language_prior_null_images: 3
@@ -166,5 +169,6 @@ removed_from_protocol:
 outputs:
   per_sample_scores: true
   per_category_scores: true
-  image_text_matching_score_variant: language_prior_debiased_only
+  image_text_matching_score_variant: conditional_aro_debiased_other_tasks
+  aro_primary_candidate_score: conditional_mean_token_loglikelihood
   no_hashes: true

@@ -290,7 +290,7 @@ def test_repeated_climbmix_saves_no_inactive_image_cursor(tmp_path):
 
 def test_nonbaseline_multi_source_schedule_is_rejected():
     config = _config()
-    config.dataset.params.schedule = ["t2i", "i2t"]
+    config.dataset.params.schedule = ["climbmix", "t2i"]
     with pytest.raises(ValueError, match="frozen combined baseline"):
         ScheduledCombinedLoader(
             config=config,
@@ -304,6 +304,73 @@ def test_nonbaseline_multi_source_schedule_is_rejected():
                 ),
             },
         )
+
+
+def _image_joint_loader():
+    config = _config()
+    config.dataset.params.schedule = ["t2i", "i2t"]
+    del config.dataset.params.sources.climbmix
+    return ScheduledCombinedLoader(
+        config=config,
+        tokenizer=FakeTokenizer(),
+        image_loaders={
+            source: DataLoader(FakeImageDataset(source), batch_size=None)
+            for source in ("t2i", "i2t")
+        },
+    ).prepare_with_accelerator(FakeAccelerator())
+
+
+def test_image_joint_order_and_resume_without_climbmix(tmp_path, monkeypatch):
+    def reject_climbmix(*args, **kwargs):
+        raise AssertionError("image joint training must never initialize ClimbMix")
+
+    monkeypatch.setattr(combined_dataloaders, "ClimbMixOnlineBatchDataset", reject_climbmix)
+    loader = _image_joint_loader()
+    iterator = iter(loader)
+    batches = [next(iterator) for _ in range(6)]
+    assert [batch["source_name"] for batch in batches] == ["t2i", "i2t"] * 3
+    assert [batch["item"] for batch in batches] == [0, 0, 1, 1, 2, 2]
+    assert loader._text_dataset is None and loader._text_loader is None
+    assert loader.climbmix_shard_paths == ()
+    loader.save_state(tmp_path, FakeAccelerator(), global_step=3)
+    state = torch.load(tmp_path / "data_state_rank_00000.pt", weights_only=False)
+    assert "climbmix" not in state
+    assert set(state["image_sources"]) == {"t2i", "i2t"}
+    resumed = _image_joint_loader()
+    resumed.load_state(tmp_path, FakeAccelerator(), global_step=3)
+    resumed_iterator = iter(resumed)
+    expected = [next(iterator) for _ in range(6)]
+    actual = [next(resumed_iterator) for _ in range(6)]
+    assert actual == expected
+    assert [batch["dataset_epoch"] for batch in actual] == [0, 0, 1, 1, 1, 1]
+
+
+def test_image_joint_builder_shares_images_and_pairs_validation(monkeypatch):
+    config = _config()
+    config.dataset.params.schedule = ["t2i", "i2t"]
+    del config.dataset.params.sources.climbmix
+    dataset = FakeCaptionValidationDataset()
+    train = DataLoader(Subset(dataset, list(range(4))), batch_size=1)
+    validation = DataLoader(Subset(dataset, list(range(4))), batch_size=1)
+    calls = []
+
+    def build_source(config, tokenizer, source):
+        calls.append(source)
+        return train, validation
+
+    monkeypatch.setattr(combined_dataloaders, "_build_image_source", build_source)
+    joint, paired_validation = combined_dataloaders.build_unified_mixed_dataloaders(
+        config, FakeTokenizer()
+    )
+    assert calls == ["t2i"]
+    t2i = joint.image_loaders["t2i"].dataset.dataset
+    i2t = joint.image_loaders["i2t"].dataset.dataset
+    assert t2i is dataset and i2t is not t2i
+    assert i2t.caption_sequence_modes == ("i2t",)
+    assert i2t._epoch_state.data_ptr() != t2i._epoch_state.data_ptr()
+    assert i2t.text_cache == {} and i2t.sequence_cache == {}
+    assert len(paired_validation.dataset) == 8
+    assert {paired_validation.dataset[i]["task_mode"] for i in range(8)} == {"t2i", "i2t"}
 
 
 def test_scheduled_pad_collator_cycles_and_fails_without_advancing():

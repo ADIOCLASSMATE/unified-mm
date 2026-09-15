@@ -132,6 +132,38 @@ def prepare(args):
     custom = read_json(repo / PROMPT_CONFIG)
     assert len(custom["t2i"]) == len(custom["text"]) == 32
     models = model_inventory(repo)
+    if args.models:
+        requested = set(args.models.split(","))
+        models = [spec for spec in models if spec["id"] in requested]
+        if {spec["id"] for spec in models} != requested:
+            raise ValueError("requested final EMA models are missing")
+    if args.reference_gallery:
+        reference = args.reference_gallery.resolve()
+        manifest = read_json(reference / "manifest.json")
+        if read_json(reference / "COMPLETED.json").get("complete") is not True:
+            raise ValueError("reference gallery must be complete")
+        root.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(reference / "inputs", root / "inputs")
+        shutil.copyfile(reference / "i2t_latents.pt", root / "i2t_latents.pt")
+        manifest.update(models=models, created_at=utc_now(), repo_root=str(repo),
+                        reference_gallery=str(reference))
+        overrides = json.loads(args.model_cfg)
+        if set(overrides) - {spec["id"] for spec in models}:
+            raise ValueError("CFG override references an unselected model")
+        if any(not 0 < float(value) < 100 for value in overrides.values()):
+            raise ValueError("invalid CFG override")
+        manifest["contract"]["model_cfg"] = overrides
+        manifest["contract"]["model_generation"] = {
+            spec["id"]: {"use_cache": spec["backbone_attention"] != "showo2_omni_attention",
+                         "image_order": "whole_image" if spec["backbone_attention"] == "showo2_omni_attention" else "checkpoint_native"}
+            for spec in models}
+        manifest["contract"]["timing"] = {"warmup_batches": 1, "measured_repeats": args.timing_repeats,
+            "batch_size_per_device": 8, "scope": "synchronized model.generate including device transfer; excludes VAE and PNG IO",
+            "aggregation": "per-device latency and throughput; independent workers, not measured cluster throughput"}
+        write_json(root / "manifest.json", manifest)
+        print(json.dumps({"prepared": str(root), "models": [m["id"] for m in models],
+                          "reference_gallery": str(reference)}), flush=True)
+        return
     source_manifest = jsonl(repo / "public/datasets/imagenet_full/manifest_val.jsonl")
     if len(source_manifest) != 50000 or any(x["split"] != "val" for x in source_manifest):
         raise ValueError("expected held-out ImageNet validation manifest")
@@ -305,6 +337,15 @@ def event(root, rank, **payload):
     print(json.dumps(value, ensure_ascii=False), flush=True)
 
 
+def validate_generation_trace(trace, *, use_cache, task):
+    if trace.get("backbone_kv_cache_enabled") is not use_cache:
+        raise RuntimeError("generation cache differs from the model contract")
+    if not use_cache:
+        expected = "showo2_full_image_flow" if task == "t2i" else "showo2_text_ar"
+        if trace.get("generation_mode") != expected:
+            raise RuntimeError(f"expected S2 generation mode: {expected}")
+
+
 def preflight(args):
     root = args.output_dir.resolve()
     manifest = read_json(root / "manifest.json")
@@ -377,6 +418,8 @@ def run(args):
             weights["full_checkpoint_value_check"] = check_loaded_values(model, spec["checkpoint"])
         write_json(model_root / "load_reports" / f"rank-{rank:02d}.json", weights)
         model.to(device).eval()
+        use_cache = spec["backbone_attention"] != "showo2_omni_attention"
+        flow_cfg = float(manifest["contract"].get("model_cfg", {}).get(spec["id"], manifest["contract"]["cfg"]))
         order = str(getattr(model.config, "training_image_sigma_order", "random"))
         if order != spec["image_order"]:
             raise RuntimeError("checkpoint order changed after preparation")
@@ -411,9 +454,8 @@ def run(args):
                 torch.manual_seed(seed)
                 torch.npu.manual_seed(seed)
                 output, trace = model.generate("text", input_ids=prefix_ids, max_new_tokens=min(256, args.smoke_token_limit or 256),
-                    temperature=temperature, eos_token_id=stops, use_cache=True, return_trace=True)
-                if trace.get("backbone_kv_cache_enabled") is not True:
-                    raise RuntimeError("text generation cache disabled")
+                    temperature=temperature, eos_token_id=stops, use_cache=use_cache, return_trace=True)
+                validate_generation_trace(trace, use_cache=use_cache, task="text")
                 decoded = decode_suffix(tokenizer, output[0, prefix_ids.shape[1]:].cpu().tolist(), stops)
                 mode = "greedy" if temperature == 0 else "sample"
                 write_json(model_root / "text" / f"{row['id']}-{mode}.json", {"sample_id": row["id"],
@@ -431,33 +473,67 @@ def run(args):
                      for row, (idx, seed) in zip(rows, selected)]
             batch = collate_imagenet_flow_cache(items, pad_to_length=512)
             noise = torch.stack([noise_for(idx, seed) for idx, seed in selected])
-            started = time.monotonic()
-            latents, trace = model.generate("t2i", input_ids=batch["input_ids"].to(device),
+            def generate_images():
+                return model.generate("t2i", input_ids=batch["input_ids"].to(device),
                 token_types=batch["token_types"].to(device), sigma=batch["sigma"].to(device),
                 spans=[(b, item["image_start"], item["image_start"] + 256) for b, item in enumerate(items)],
-                image_latent_dim=16, initial_noise_bank=noise, flow_temperature=1.0, flow_cfg=3.5,
+                image_latent_dim=16, initial_noise_bank=noise, flow_temperature=1.0, flow_cfg=flow_cfg,
                 flow_cfg_schedule="constant", flow_solver="heun", flow_num_steps=10, parallel_rate=1,
                 order_strategy="sequential" if order == "sequential" else "spatial_halton",
-                use_cache=True, return_trace=True)
-            torch.npu.synchronize()
-            seconds = time.monotonic() - started
-            if latents is None or not bool(torch.isfinite(latents).all()) or trace.get("backbone_kv_cache_enabled") is not True:
-                raise RuntimeError("invalid T2I generation or disabled cache")
+                use_cache=use_cache, return_trace=True)
+            timing = manifest["contract"].get("timing", {})
+            repeats = int(timing.get("measured_repeats", 1))
+            if offset == 0 and timing.get("warmup_batches", 0):
+                warmup, warmup_trace = generate_images()
+                torch.npu.synchronize()
+                validate_generation_trace(warmup_trace, use_cache=use_cache, task="t2i")
+                del warmup
+            timings = []
+            for repeat in range(repeats):
+                torch.npu.synchronize()
+                started = time.monotonic()
+                generated, trace = generate_images()
+                torch.npu.synchronize()
+                timings.append(time.monotonic() - started)
+                validate_generation_trace(trace, use_cache=use_cache, task="t2i")
+                if generated is None or not bool(torch.isfinite(generated).all()):
+                    raise RuntimeError("invalid T2I generation")
+                if repeat == 0:
+                    latents = generated
+                del generated
+            seconds = timings[0]
+            trace = {key: value for key, value in trace.items()
+                     if value is None or isinstance(value, (str, int, float, bool))}
+            decode_seconds, save_seconds = 0., 0.
             for begin in range(0, len(rows), 4):
+                torch.npu.synchronize()
+                started = time.monotonic()
                 decoded = decode_latents(vae, latents[begin:begin + 4].float(), 0.2325)
+                torch.npu.synchronize()
+                decode_seconds += time.monotonic() - started
                 for j in range(len(decoded)):
                     at = begin + j
                     row, (idx, seed) = rows[at], selected[at]
                     name = f"{row['id']}-s{seed}"
                     image_path = model_root / "t2i" / f"{name}.png"
+                    started = time.monotonic()
                     save_png(decoded[j], image_path)
+                    save_seconds += time.monotonic() - started
                     write_json(image_path.with_suffix(".json"), {"sample_id": row["id"], "model": spec["id"],
                         "prompt": row["prompt"], "serialized_prompt": f"{T2I_PREFIX} {row['prompt']}",
                         "seed": seed, "noise_seed": seed + 1000003 * idx, "image": str(image_path.relative_to(root)),
-                        "order_strategy": "sequential" if order == "sequential" else "spatial_halton",
+                        "order_strategy": trace.get("order_strategy", "sequential" if order == "sequential" else "spatial_halton"),
+                        "cfg": flow_cfg, "trace": trace,
                         "generation_seconds_in_batch": seconds, "rank": rank,
                         "latent_std": float(latents[at].float().std().item()),
                         "pixel_std": float(decoded[j].float().std().item())})
+            write_json(model_root / "timing" / f"rank-{rank:02d}-batch-{offset // 8:03d}.json", {
+                "model": spec["id"], "rank": rank, "world_size": world, "batch_size": len(rows),
+                "samples": [{"id": row["id"], "seed": seed} for row, (_, seed) in zip(rows, selected)],
+                "cfg": flow_cfg, "solver": "heun", "steps": 10,
+                "generation_seconds": timings, "vae_decode_seconds": decode_seconds,
+                "png_save_seconds": save_seconds, "trace": trace, "timing_contract": timing,
+                "torch_version": torch.__version__, "torch_npu_version": torch_npu.__version__})
             event(root, rank, model=spec["id"], stage="t2i_batch_complete", count=offset + len(selected), seconds=seconds)
         del model, tokenizer
         gc.collect()
@@ -505,11 +581,14 @@ def render(args):
     body = [f"<!doctype html><html lang='zh-CN'><meta charset='utf-8'><meta name='viewport' content='width=device-width'><title>Unified-MM 生成质量对照</title><style>{css}</style>",
             "<h1>Unified-MM · T2I / I2T / 纯文本生成对照</h1>",
             f"<p>{len(models)} 个 final EMA；每模型 128 张 T2I、64 个 I2T、64 条文本续写。状态：{'全部完成' if complete else '生成中，缺项留空'}。</p>",
-            "<p>固定样本及成对噪声，所有输出保留，无质量筛选。10 步 Heun / CFG 3.5 / BF16 模型 / FP32 VAE。E 使用 sequential，其余 spatial_halton；顺序是模型合同的一部分。这里只做定性展示，不代表正式 benchmark 分数。</p>",
+            f"<p>固定样本及成对噪声，所有输出保留，无质量筛选。10 步 Heun / 默认 CFG 3.5 / BF16 模型 / FP32 VAE。模型 CFG 覆盖：{esc(manifest.get('contract', {}).get('model_cfg', {}))}。S2 使用整图 flow，E 使用 sequential，其余 spatial_halton。这里只做定性展示，不代表正式 benchmark 分数。</p>",
             "<p>I2T 显示<strong>模型实际输入 latent 的 VAE 重建图</strong>；COCO/Flickr 可展开原图。参考描述仅用于人工对照，未输入模型。纯文本使用基座续写格式、greedy 与温度 0.8（无 top-k/top-p）；中文与组合提示含域外诊断。</p>",
             "<nav><a href='#t2i'>T2I</a> · <a href='#i2t'>I2T</a> · <a href='#text'>纯文本</a> · <a href='#inventory'>模型与进度</a> · <a href='manifest.json'>完整协议/来源</a> · <a href='results.jsonl'>原始结果 JSONL</a></nav>",
+            "<p><a href='speed.html'>B / S2 图像生成速度与原始计时</a></p>" if (root / "speed.html").exists() else "",
             "<div class='controls'><button onclick='selectModels(false)'>正式 A / B</button><button onclick='selectModels(true)'>全部模型（含历史）</button></div><div class='controls'>"]
     main_ids = {spec["id"] for spec in models if spec["group"] == "main"}
+    if {spec["id"] for spec in models} == {"b_x0", "s2_single"}:
+        main_ids = {"b_x0", "s2_single"}
     for spec in models:
         body.append(f"<label><input class='model-toggle' type='checkbox' checked data-main='{int(spec['id'] in main_ids)}' value='{esc(spec['id'])}' onchange='toggleModel(this)'>{esc(spec['label'])}</label>")
     body.append("</div>")
@@ -590,6 +669,7 @@ def render(args):
         archive = root / "unified-generation-gallery.zip"
         temporary = archive.with_suffix(".tmp.zip")
         paths = [root / name for name in ("index.html", "README.md", "manifest.json", "summary.json", "results.jsonl", "COMPLETED.json", "preflight.json")]
+        paths += [root / name for name in ("speed.html", "speed.json", "speed.csv") if (root / name).is_file()]
         paths += sorted(p for folder in ("models", "inputs") for p in (root / folder).rglob("*") if p.is_file())
         with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as bundle:
             for path in paths:
@@ -604,12 +684,17 @@ def main():
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--models", default="")
+    parser.add_argument("--reference-gallery", type=Path, help="reuse completed gallery's frozen inputs")
+    parser.add_argument("--model-cfg", default="{}", help="JSON mapping of model IDs to CFG values")
+    parser.add_argument("--timing-repeats", type=int, default=3)
     parser.add_argument("--limit", type=int, default=0, help="per-rank bounded generation for a development smoke only")
     parser.add_argument("--smoke-token-limit", type=int, default=0, help="development smoke only; never use in the full run")
     parser.add_argument("--require-complete", action="store_true")
     args = parser.parse_args()
     if args.limit < 0 or args.smoke_token_limit < 0:
         parser.error("smoke limits must be non-negative")
+    if args.timing_repeats < 1:
+        parser.error("timing repeats must be positive")
     {"prepare": prepare, "preflight": preflight, "run": run, "render": render}[args.action](args)
 
 

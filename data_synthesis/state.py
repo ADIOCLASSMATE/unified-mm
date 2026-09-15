@@ -12,6 +12,7 @@ import uuid
 from data_synthesis.config import fingerprint
 from data_synthesis.contract import CONTRACT_HASH
 from data_synthesis.io import dumps, sha
+from data_synthesis.integrity import hashing_enabled
 
 
 class State:
@@ -35,7 +36,7 @@ class State:
               CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
               CREATE TABLE IF NOT EXISTS items(
                 key TEXT PRIMARY KEY, identity TEXT NOT NULL UNIQUE,
-                source_sha256 TEXT NOT NULL UNIQUE, view_sha256 TEXT NOT NULL UNIQUE,
+                source_sha256 TEXT UNIQUE, view_sha256 TEXT UNIQUE,
                 row_json TEXT NOT NULL, view_json TEXT NOT NULL, status TEXT NOT NULL,
                 api_attempts INTEGER NOT NULL DEFAULT 0, codex_attempts INTEGER NOT NULL DEFAULT 0,
                 retry_at REAL NOT NULL DEFAULT 0, attempt_id TEXT, result_json TEXT,
@@ -47,7 +48,8 @@ class State:
                 raw_gzip BLOB, raw_sha256 TEXT, result_sha256 TEXT, error TEXT);
               CREATE INDEX IF NOT EXISTS attempt_item ON attempts(item_key,backend,number);
               CREATE TABLE IF NOT EXISTS admissions(
-                id TEXT PRIMARY KEY, path TEXT NOT NULL, sha256 TEXT NOT NULL, rows INTEGER NOT NULL);
+                id TEXT PRIMARY KEY, path TEXT NOT NULL, sha256 TEXT, rows INTEGER NOT NULL);
+              CREATE TABLE IF NOT EXISTS image_aliases(alias TEXT PRIMARY KEY,item_key TEXT NOT NULL);
               CREATE TABLE IF NOT EXISTS exclusions(
                 identity TEXT PRIMARY KEY, reason TEXT NOT NULL, row_json TEXT NOT NULL);
               CREATE TABLE IF NOT EXISTS phashes(part INTEGER,bucket INTEGER,value TEXT,item_key TEXT,
@@ -78,7 +80,8 @@ class State:
         from data_synthesis.sources import prompt_hash
         if not hasattr(self, "_prompt_exclusions"):
             self._prompt_exclusions = set(self.meta("excluded_prompt_hashes", []))
-        if any(prompt_hash(pair[task]) in self._prompt_exclusions for task in ("i2t", "t2i")):
+        enabled = hashing_enabled(self.meta("config", {}))
+        if any(prompt_hash(pair[task], compute_hashes=enabled) in self._prompt_exclusions for task in ("i2t", "t2i")):
             raise ValueError("text overlaps an excluded evaluation test prompt")
 
     def counts(self):
@@ -102,7 +105,8 @@ class State:
     def receive(self, ident, raw):
         encoded = dumps(raw).encode()
         self.db.execute("UPDATE attempts SET status='received',raw_gzip=?,raw_sha256=?,finished_at=? WHERE id=?",
-                        (gzip.compress(encoded, compresslevel=1), sha(encoded), time.time(), ident))
+                        (gzip.compress(encoded, compresslevel=1),
+                         sha(encoded) if hashing_enabled(self.meta("config", {})) else None, time.time(), ident))
         self.db.commit()  # Raw provider response is durable BEFORE validation.
 
     def raw(self, ident):
@@ -110,7 +114,7 @@ class State:
         if not row or row[0] is None:
             return None
         data = gzip.decompress(row[0])
-        if sha(data) != row[1]:
+        if hashing_enabled(self.meta("config", {})) and sha(data) != row[1]:
             raise ValueError("raw attempt checksum mismatch")
         return json.loads(data)
 
@@ -119,7 +123,7 @@ class State:
                         (dumps(pair), dumps(evidence), key))
         if ident:
             self.db.execute("UPDATE attempts SET status='succeeded',result_sha256=?,error=NULL WHERE id=?",
-                            (sha(dumps(pair).encode()), ident))
+                            (sha(dumps(pair).encode()) if hashing_enabled(self.meta("config", {})) else None, ident))
         if commit:
             self.db.commit()
 

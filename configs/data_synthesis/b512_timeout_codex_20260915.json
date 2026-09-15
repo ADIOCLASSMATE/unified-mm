@@ -1,0 +1,15 @@
+{
+  "version": "b512-consecutive-timeouts-codex-v1",
+  "authorized_by": "user",
+  "user_instructions": ["反复超时的直接用codex cli进行", "调用GPT-5.6-sol low"],
+  "parent_root": "/inspire/sj-ssd3/project/high-dimensionaldata/wanjiaxin-253108030048/unified-mm-b512/preparation/synthesis/reuse_first_20260915",
+  "parent_contract": "b512-reuse-first-targeted-deepseek-v2",
+  "model": "gpt-5.6-sol",
+  "reasoning_effort": "low",
+  "consecutive_timeouts": 2,
+  "concurrency": 8,
+  "max_attempts": 1,
+  "timeout_seconds": 300,
+  "executable": "codex",
+  "compute_hashes": false
+}

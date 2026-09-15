@@ -279,6 +279,7 @@ def test_mc_prediction_uses_mean_loglikelihood_and_records_dispersion():
     assert first[DEBIASED_SCORE] == 0.5
     assert second[DEBIASED_SCORE] == -0.5
     assert first["estimated_language_prior_log_score"] == -2.0
+    assert first["conditional_mean_token_loglikelihood"] == -1.5
     assert first["conditional_mc_mean_token_loglikelihood_std"] == 0.5
     assert "normalized_loglikelihood" not in first
     assert "loglikelihood" not in first
@@ -334,6 +335,24 @@ def test_pairwise_ranking_reports_strict_tie_instead_of_index_tie_break_win():
         "median_margin": 0.0,
     }
     assert metrics["primary_metric"] == "language_prior_debiased_pairwise.win_rate"
+
+
+def test_aro_summary_retains_prior_while_sugarcrepe_stays_debiased():
+    candidates = [score(2.0), score(1.0)]
+    candidates[0]["conditional_mean_token_loglikelihood"] = -6.0
+    candidates[1]["conditional_mean_token_loglikelihood"] = -4.0
+    row = classification_row(0, 1, candidates)
+    row["kind"] = "pairwise_caption_ranking"
+    for task in ("aro_vg_relation", "aro_vg_attribution"):
+        row["task"] = task
+        metrics = summarize_task([row])["metrics"]
+        assert metrics["primary_metric"] == "conditional_pairwise.win_rate"
+        assert metrics["conditional_pairwise"]["win_rate"] == 1.0
+        assert metrics["language_prior_debiased_pairwise"]["win_rate"] == 0.0
+    row["task"] = "sugarcrepe"
+    metrics = summarize_task([row])["metrics"]
+    assert metrics["primary_metric"] == "language_prior_debiased_pairwise.win_rate"
+    assert metrics["language_prior_debiased_pairwise"]["win_rate"] == 0.0
 
 
 def test_mmbench_strict_circular_metric_requires_every_rotation():

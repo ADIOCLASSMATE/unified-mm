@@ -1,0 +1,37 @@
+schema: unified_b_image_joint_matched_v1
+config: configs/selfless/unified_b_t2i_i2t_matched_ascend32.yaml
+reference: configs/protocols/unified_b_image_only_matched_ascend16.yaml
+platform_project: 随机序语言建模-统一自回归与掩码扩散的随机顺序生成框架
+initialization: qwen3_0p6b_base_step_zero
+world_size: 32
+nodes: 2
+npu_per_node: 16
+source_schedule: [t2i, i2t]
+climbmix_loaded: false
+gradient_accumulation_steps: 2
+per_rank_micro_batch: 32
+padded_sequence_length: 512
+global_rows_per_task_per_optimizer_step: 1024
+physical_positions_per_task_per_optimizer_step: 524288
+physical_positions_per_optimizer_step: 1048576
+max_train_steps: 95415
+cumulative_physical_positions:
+  t2i: 50024939520
+  i2t: 50024939520
+  climbmix: 0
+  total: 100049879040
+comparison_scope:
+  matches_b_image_task_exposure: true
+  matches_b_optimizer_updates_and_lr_schedule: true
+  matches_b_total_compute: false
+  matches_b_source_gradient_fraction: false
+  objective: mean_of_two_active_task_losses
+  lambda_text: 0.05
+  lambda_image: 1.0
+  note: >-
+    GA2 averages T2I and I2T; each has twice its fraction in B's four-slot GA4.
+    This follows the existing only controls' active-task normalization.
+    Removing ClimbMix halves physical positions; it does not replace them with
+    extra image examples or inherit ClimbMix exposure from a trained checkpoint.
+runtime_hashing_enabled: false
+wandb_mode: disabled

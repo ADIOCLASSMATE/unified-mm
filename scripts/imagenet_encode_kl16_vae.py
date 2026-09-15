@@ -144,6 +144,7 @@ def validate_reusable_shard(
     image_size: int = 256,
     frozen_views: bool = False,
     verify_view_hashes: bool = False,
+    source_manifest_jsonl: str | None = None,
 ) -> None:
     payload = torch.load(
         str(path),
@@ -188,6 +189,12 @@ def validate_reusable_shard(
         raise RuntimeError(f"existing shard preprocessing mode mismatch: {path}")
     if verify_view_hashes and not metadata.get("source_view_hashes_verified", False):
         raise RuntimeError(f"existing shard has no verified frozen-view hashes: {path}")
+    if source_manifest_jsonl is not None and source_manifest_sha256 is None:
+        expected_path = Path(source_manifest_jsonl).resolve()
+        if Path(metadata.get("source_manifest_jsonl") or "").resolve() != expected_path:
+            raise RuntimeError(f"existing shard manifest reference changed: {path}")
+        if metadata.get("source_manifest_bytes", expected_path.stat().st_size) != expected_path.stat().st_size:
+            raise RuntimeError(f"existing shard manifest length changed: {path}")
     for start in range(0, stats.shape[0], 512):
         chunk = stats[start : start + 512]
         if not bool(torch.isfinite(chunk).all()) or bool((chunk[..., 16:] < 0).any()):
@@ -486,6 +493,7 @@ def encode_shard(args, shard_path: Path) -> None:
             image_size=args.image_size,
             frozen_views=args.frozen_views,
             verify_view_hashes=args.verify_view_hashes,
+            source_manifest_jsonl=args.source_manifest_jsonl if args.source_mode == "manifest_jsonl" else None,
         )
         print(f"Validated and reused posterior cache shard: {shard_path}")
         return
@@ -587,6 +595,7 @@ def encode_shard(args, shard_path: Path) -> None:
             args.source_manifest_jsonl if args.source_mode == "manifest_jsonl" else None
         ),
         "source_manifest_sha256": manifest_digest,
+        "source_manifest_bytes": Path(args.source_manifest_jsonl).stat().st_size if args.source_mode == "manifest_jsonl" else None,
         "source_image_root": args.source_image_root,
         "imagenet_train_dir": (
             args.imagenet_train_dir if args.source_mode == "imagenet_train" else None

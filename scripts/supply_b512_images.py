@@ -15,15 +15,16 @@ import time
 from urllib.parse import urlparse
 
 from data_synthesis.io import DirectDownloader, ImageArchives
-from data_synthesis.io import atomic_json, cohort_id, dumps, file_sha, sha
+from data_synthesis.io import atomic_json, dumps, file_sha, pin_cohort_id, sha
+from data_synthesis.integrity import hashing_enabled
 from utils.direct_network import check_direct_routes
 from utils.image_shard_io import read_image_bytes
 from utils.image_text_preprocessing import prepare_view
 
 
-def prepare_one(reference, row):
+def prepare_one(reference, row, compute_hashes=True):
     data = read_image_bytes(reference)
-    if row.get("expected_source_sha256") and sha(data) != row["expected_source_sha256"]:
+    if compute_hashes and row.get("expected_source_sha256") and sha(data) != row["expected_source_sha256"]:
         raise ValueError("source image hash mismatch")
     # Keep all countable entities and text in the frame. Relation boxes still
     # constrain the crop; unusually wide relation scenes use full-frame padding.
@@ -31,16 +32,17 @@ def prepare_one(reference, row):
     if {"counting", "ocr", "text"} & set(row.get("capabilities", [])):
         selected["view_policy"] = "fit_pad"
     try:
-        return prepare_view(data, selected, include_phashes=True)
+        return prepare_view(data, selected, include_phashes=compute_hashes, compute_hashes=compute_hashes)
     except ValueError as exc:
         if row.get("required_boxes_normalized") and "square crop cannot retain" in str(exc):
             selected["view_policy"] = "fit_pad"
-            return prepare_view(data, selected, include_phashes=True)
+            return prepare_view(data, selected, include_phashes=compute_hashes, compute_hashes=compute_hashes)
         raise
 
 
 def candidates(args):
     from scripts.prepare_b512_candidates import openimages_candidates, pixmo_candidates, wikiart_candidates
+    compute_hashes = getattr(args, "compute_hashes", hashing_enabled())
     root = Path(args.root).resolve()
     output = root / "candidates"
     output.mkdir(parents=True, exist_ok=True)
@@ -63,14 +65,14 @@ def candidates(args):
         def wiki_rows():
             try:
                 yield from wikiart_candidates(source, Path(args.image_root) / "source_extracts" / args.prefix,
-                                               count, args.revision, 20260915, excluded)
+                                               count, args.revision, 20260915, excluded, compute_hashes=compute_hashes)
             except ValueError as exc:
                 if "WikiArt" not in str(exc) or "available" not in str(exc):
                     raise
         rows = wiki_rows()
     else:
         payload = json.loads(source.read_text())
-        text_source_digest = file_sha(source)
+        text_source_digest = file_sha(source) if compute_hashes else None
         def text_rows():
             annotations = payload["anns"]
             for identity, info in payload["imgs"].items():
@@ -95,7 +97,7 @@ def candidates(args):
                        "selection_annotation": {"readable_words": visible[:32], "annotation_size": [w, h]}}
         rows = text_rows()
     part, buffered, counts = 0, [], Counter()
-    source_digest = file_sha(source)
+    source_digest = file_sha(source) if compute_hashes else None
 
     def flush():
         nonlocal part, buffered
@@ -125,7 +127,7 @@ def candidates(args):
             flush()
     flush()
     atomic_json(root / (args.prefix + ".candidate_status.json"), {"state": "completed", "pid": os.getpid(),
-                "parts": part, "counts": dict(counts), "updated_at": time.time()})
+                "parts": part, "counts": dict(counts), "updated_at": time.time(), "compute_hashes": compute_hashes})
     print(dumps({"prefix": args.prefix, "parts": part, "counts": dict(counts)}), flush=True)
 
 
@@ -148,7 +150,7 @@ def retryable_download_error(error):
     return any(s in text for s in ("transport", "temporarily", "http 429", "http 5"))
 
 
-def validate_recovered_images(db, path, image_root):
+def validate_recovered_images(db, path, image_root, *, compute_hashes=True):
     """Bind downloaded mirror bytes to existing candidates before publication."""
     value = json.loads(Path(path).read_text())
     if value.get("schema") != "b512.image_recovery.v1":
@@ -163,7 +165,8 @@ def validate_recovered_images(db, path, image_root):
             raise ValueError("recovery is outside the frozen download candidates")
         row = json.loads(current[0])
         if (row["source"] != "pixmo_cap" or row["source_id"] != item["source_id"]
-                or row["url"] != item["original_url"] or sha(dumps(row).encode()) != item["candidate_sha256"]):
+                or row["url"] != item["original_url"]
+                or (compute_hashes and sha(dumps(row).encode()) != item["candidate_sha256"])):
             raise ValueError("recovered candidate identity changed")
         if current[1] == "downloaded":
             continue
@@ -174,13 +177,14 @@ def validate_recovered_images(db, path, image_root):
         # Verified mirror renditions can be larger than the direct-download
         # default. Match the recovery CLI's explicit maximum byte allowance.
         data = read_image_bytes(reference, max_bytes=128 << 20)
-        if sha(data) != item["sha256"] or (row.get("expected_source_sha256") and sha(data) != row["expected_source_sha256"]):
+        if compute_hashes and (sha(data) != item["sha256"] or (row.get("expected_source_sha256") and sha(data) != row["expected_source_sha256"])):
             raise ValueError("recovered image hash mismatch")
         mirror = item["mirror"]
         if mirror.get("proxy") is not False or mirror.get("rendition") != "huggingface_viewer_full_size_jpeg_or_png":
             raise ValueError("unrecognized mirror transport provenance")
         row.update(download_transport="direct_huggingface_dataset_mirror", mirror_provenance=mirror)
-        result.append({"key": item["key"], "row": row, "reference": reference, "sha256": item["sha256"],
+        result.append({"key": item["key"], "row": row, "reference": reference,
+                       "sha256": item.get("sha256") if compute_hashes else None, "hashes_computed": compute_hashes,
                        "recovered_from_status": current[1], "previous_attempts": current[2]})
     return result
 
@@ -242,10 +246,38 @@ async def bounded_download(client, row, timeout, direct_dns_hosts=()):
         raise ValueError("direct image transport exceeded the request deadline") from None
 
 
+def canonicalize_download_paths(db, root):
+    """Keep one imported-file record when an old root becomes a symlink.
+
+    Only mutable control-table keys change; sealed candidate bytes, image IDs,
+    batch contents and original references remain untouched.
+    """
+    root = Path(root).resolve()
+    for table, digest_column in (("files", "sha"), ("recovery_imports", "sha256")):
+        rows = list(db.execute(f"SELECT path,{digest_column} FROM {table}"))
+        for old, digest in rows:
+            current = str(Path(old).resolve())
+            if current == old:
+                continue
+            if not Path(current).is_relative_to(root):
+                raise ValueError("relocated imported file is outside its supply cohort")
+            known = db.execute(f"SELECT {digest_column} FROM {table} WHERE path=?", (current,)).fetchone()
+            if known:
+                if known[0] != digest:
+                    raise ValueError("relocated imported-file hashes conflict")
+                db.execute(f"DELETE FROM {table} WHERE path=?", (old,))
+            else:
+                db.execute(f"UPDATE {table} SET path=? WHERE path=?", (current, old))
+    db.commit()
+
+
 async def download_service(args):
+    if (Path(args.root).resolve() / "downloads.stopped.json").exists():
+        raise RuntimeError("Downloads were closed by the user; use a new explicitly authorized source cohort")
     check_direct_routes()
     root, images = Path(args.root).resolve(), Path(args.image_root).resolve()
-    cohort = cohort_id(root)
+    cohort = pin_cohort_id(root)
+    compute_hashes = getattr(args, "compute_hashes", True)
     db, lock = connection(root, "download")
     db.executescript("""CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY,sha TEXT);
         CREATE TABLE IF NOT EXISTS tasks(key TEXT PRIMARY KEY,row_json TEXT,status TEXT DEFAULT 'pending',
@@ -253,6 +285,7 @@ async def download_service(args):
         CREATE TABLE IF NOT EXISTS batches(id TEXT PRIMARY KEY,manifest_json TEXT,published INTEGER DEFAULT 0);
         CREATE TABLE IF NOT EXISTS recovery_imports(path TEXT PRIMARY KEY,sha256 TEXT,records INTEGER,imported_at REAL);
     """)
+    canonicalize_download_paths(db, root)
     if "family" not in {r[1] for r in db.execute("PRAGMA table_info(tasks)")}:
         db.execute("ALTER TABLE tasks ADD COLUMN family TEXT")
     if "host" not in {r[1] for r in db.execute("PRAGMA table_info(tasks)")}:
@@ -313,8 +346,8 @@ async def download_service(args):
                 continue
             if len(list(raw_root.glob("*.json"))) - len(list((root / "prepared_batches").glob("*/batch.json"))) >= 32:
                 break
-            digest = file_sha(path)
-            rows = validate_recovered_images(db, path, images)
+            digest = file_sha(path) if compute_hashes else None
+            rows = validate_recovered_images(db, path, images, compute_hashes=compute_hashes)
             keys = {row["key"] for row in rows}
             for task, (key, _, _, host, _) in list(active.items()):
                 if key in keys:
@@ -340,11 +373,12 @@ async def download_service(args):
         while True:
             now = time.time()
             if now - last_scan >= 5:
+                imported_batches = 0
                 for path in sorted((root / "candidates").glob("*.jsonl")):
                     known = db.execute("SELECT sha FROM files WHERE path=?", (str(path),)).fetchone()
                     if known:
                         continue
-                    digest = file_sha(path)
+                    digest = file_sha(path) if compute_hashes else None
                     for line in path.open():
                         row = json.loads(line)
                         key = sha((row["source"] + ":" + row["source_id"]).encode())
@@ -353,6 +387,11 @@ async def download_service(args):
                         db.execute("INSERT OR IGNORE INTO tasks(key,row_json,family,host) VALUES (?,?,?,?)",
                                    (key, dumps(row), family, download_host(row)))
                     db.execute("INSERT INTO files VALUES (?,?)", (str(path), digest))
+                    imported_batches += 1
+                    # Large annotation corpora must not hold up first image
+                    # requests or starve in-flight streams during intake.
+                    if imported_batches >= 4:
+                        break
                 db.commit()
                 await import_recoveries()
                 last_scan = now
@@ -400,7 +439,7 @@ async def download_service(args):
                     data = task.result()
                     if host in direct_dns_hosts:
                         row.update(download_transport="curl_direct_doh", dns_resolver="https://dns.alidns.com/dns-query")
-                    if row.get("expected_source_sha256") and sha(data) != row["expected_source_sha256"]:
+                    if compute_hashes and row.get("expected_source_sha256") and sha(data) != row["expected_source_sha256"]:
                         raise ValueError("source SHA mismatch")
                     if row.get("local_path"):
                         reference = row["local_path"]
@@ -408,7 +447,9 @@ async def download_service(args):
                         if archives is None:
                             archives = ImageArchives(images / "raw_supply" / cohort / f"supply-{serial:06d}")
                         reference = archives.add(key + ".original", data)
-                    batch_rows.append({"key": key, "row": row, "reference": reference, "sha256": sha(data)})
+                    batch_rows.append({"key": key, "row": row, "reference": reference,
+                                       "sha256": sha(data) if compute_hashes else None,
+                                       "hashes_computed": compute_hashes, "bytes": len(data)})
                 except Exception as exc:
                     wave_attempts = attempts - attempt_base
                     retry = retryable_download_error(exc) and wave_attempts < 4
@@ -422,6 +463,7 @@ async def download_service(args):
             if now - last_status >= 10:
                 counts = dict(db.execute("SELECT status,count(*) FROM tasks GROUP BY status"))
                 atomic_json(root / "download_status.json", {"state": "running", "pid": os.getpid(), "counts": counts,
+                            "compute_hashes": compute_hashes,
                             "workers": args.workers, "per_host": args.per_host, "active": len(active),
                             "active_hosts": dict(host_active), "raw_batches": serial, "direct_proxy": False,
                             "direct_dns_hosts": sorted(direct_dns_hosts), "direct_dns_rps": direct_dns_rps, "updated_at": now})
@@ -436,6 +478,7 @@ async def download_service(args):
                         and not db.execute("SELECT 1 FROM tasks WHERE status IN ('pending','running') LIMIT 1").fetchone()):
                     atomic_json(root / "download.closed.json", {"batches": serial, "completed_at": time.time()})
                     atomic_json(root / "download_status.json", {"state": "completed", "pid": os.getpid(),
+                        "compute_hashes": compute_hashes,
                         "counts": dict(db.execute("SELECT status,count(*) FROM tasks GROUP BY status")),
                         "workers": args.workers, "per_host": args.per_host, "active": 0, "raw_batches": serial,
                         "direct_proxy": False, "updated_at": time.time()})
@@ -450,17 +493,18 @@ async def download_service(args):
 async def prepare_service(args):
     from utils.image_near_duplicates import NearDuplicateIndex
     root, images, farm_root = (Path(v).resolve() for v in (args.root, args.image_root, args.farm_root))
-    cohort = cohort_id(root)
+    cohort = pin_cohort_id(root)
+    compute_hashes = getattr(args, "compute_hashes", True)
     farm_root.mkdir(parents=True, exist_ok=True)
     owner = farm_root / "prepare_owner.json"
     with owner.with_suffix(".lock").open("a") as ownership:
         fcntl.flock(ownership, fcntl.LOCK_EX)
-        if owner.exists() and json.loads(owner.read_text())["source_supply"] != str(root):
+        if owner.exists() and Path(json.loads(owner.read_text())["source_supply"]).resolve() != root:
             raise ValueError("use a separate preparation inbox root for each source cohort")
         atomic_json(owner, {"source_supply": str(root)})
     db, lock = connection(root, "prepare")
     db.execute("CREATE TABLE IF NOT EXISTS batches(id TEXT PRIMARY KEY,status TEXT,records INTEGER,excluded INTEGER)")
-    near = NearDuplicateIndex(args.near_exclude_index)
+    near = NearDuplicateIndex(args.near_exclude_index) if compute_hashes else None
     exclude = set(Path(args.exclude).read_text().splitlines())
     pool = ProcessPoolExecutor(max_workers=args.workers, mp_context=multiprocessing.get_context("spawn"))
     inbox = farm_root / "input_queue"
@@ -485,17 +529,18 @@ async def prepare_service(args):
                     tasks = sqlite3.connect(output / "state.sqlite3")
                     tasks.execute("CREATE TABLE IF NOT EXISTS tasks(key TEXT PRIMARY KEY,row TEXT,status TEXT,view TEXT,raw TEXT,result TEXT,error TEXT)")
                     accepted, rejected = 0, []
-                    futures = [loop.run_in_executor(pool, prepare_one, row["reference"], row["row"]) for row in batch["rows"]]
+                    futures = [loop.run_in_executor(pool, prepare_one, row["reference"], row["row"], compute_hashes) for row in batch["rows"]]
                     for entry, future in zip(batch["rows"], futures):
                         row, key = entry["row"], entry["key"]
                         try:
                             pixels, view = await future
-                            if f"{row['source']}:{row['source_id']}" in exclude or view["source_sha256"] in exclude:
+                            if f"{row['source']}:{row['source_id']}" in exclude or (compute_hashes and view["source_sha256"] in exclude):
                                 raise ValueError("benchmark identity/hash exclusion")
-                            match = near.lookup(view["perceptual_hashes"])
+                            match = near.lookup(view["perceptual_hashes"]) if near else None
                             if match:
                                 raise ValueError("benchmark perceptual overlap: " + dumps(match))
                             view.update(original_ref=entry["reference"], source_path=archives.add(key + "." + view["extension"], pixels))
+                            view.update(view_id=view["source_path"], image_id=key)
                             tasks.execute("INSERT OR REPLACE INTO tasks VALUES (?,?,'prepared',?,NULL,NULL,NULL)", (key, dumps(row), dumps(view)))
                             accepted += 1
                         except Exception as exc:
@@ -505,19 +550,26 @@ async def prepare_service(args):
                     tasks.commit()
                     tasks.close()
                     atomic_json(output / "run.json", {"contract": {"routing_policy": "prepare_only_before_reuse_sii_fallback", "image_size": 512,
-                        "source_batch": str(raw_path), "source_batch_sha256": file_sha(raw_path), "benchmark_index": str(near.root)}})
+                        "source_batch": str(raw_path), "source_batch_sha256": file_sha(raw_path) if compute_hashes else None,
+                        "source_batch_bytes": raw_path.stat().st_size, "compute_hashes": compute_hashes,
+                        "benchmark_index": str(near.root) if near else None}})
                     manifest = {"batch_id": batch_id, "source_run": str(output), "records": accepted,
                         "candidate_records": len(batch["rows"]), "rejections": rejected,
-                        "state_sha256": file_sha(output / "state.sqlite3"), "closed_at": time.time()}
+                        "state_sha256": file_sha(output / "state.sqlite3") if compute_hashes else None,
+                        "state_bytes": (output / "state.sqlite3").stat().st_size,
+                        "compute_hashes": compute_hashes, "closed_at": time.time()}
                     atomic_json(marker, manifest)
                 atomic_json(inbox / (batch_id + ".json"), {"batch_id": batch_id, "source_run": str(output),
                     "records": manifest["records"], "state_sha256": manifest["state_sha256"], "batch_manifest": str(marker),
-                    "batch_manifest_sha256": file_sha(marker)})
+                    "batch_manifest_sha256": file_sha(marker) if compute_hashes else None,
+                    "state_bytes": (output / "state.sqlite3").stat().st_size,
+                    "batch_manifest_bytes": marker.stat().st_size, "compute_hashes": compute_hashes})
                 db.execute("INSERT OR REPLACE INTO batches VALUES (?,'completed',?,?)", (
                     batch_id, manifest["records"], manifest["candidate_records"] - manifest["records"]))
                 db.commit()
                 totals = db.execute("SELECT count(*),coalesce(sum(records),0),coalesce(sum(excluded),0) FROM batches").fetchone()
                 atomic_json(root / "prepare_status.json", {"state": "running", "pid": os.getpid(),
+                    "compute_hashes": compute_hashes, "perceptual_hashes": compute_hashes,
                     "batches": totals[0], "prepared": totals[1], "rejected": totals[2], "workers": args.workers,
                     "last_batch": batch_id, "updated_at": time.time()})
                 print(dumps({"batch_id": batch_id, "prepared": manifest["records"], "total": totals[1]}), flush=True)
@@ -527,6 +579,7 @@ async def prepare_service(args):
                     atomic_json(inbox / "closed.json", {"source_supply": str(root), "batches": expected, "completed_at": time.time()})
                     totals = db.execute("SELECT count(*),coalesce(sum(records),0),coalesce(sum(excluded),0) FROM batches").fetchone()
                     atomic_json(root / "prepare_status.json", {"state": "completed", "pid": os.getpid(),
+                        "compute_hashes": compute_hashes, "perceptual_hashes": compute_hashes,
                         "batches": totals[0], "prepared": totals[1], "rejected": totals[2],
                         "workers": args.workers, "updated_at": time.time()})
                     break
@@ -559,12 +612,13 @@ def main():
     prep = sub.add_parser("prepare")
     prep.add_argument("--workers", type=int, default=2)
     prep.add_argument("--farm-root", required=True)
-    prep.add_argument("--near-exclude-index", required=True)
+    prep.add_argument("--near-exclude-index")
     prep.add_argument("--exclude", required=True)
     for command in (choose, down, prep):
         command.add_argument("--root", required=True)
         command.add_argument("--image-root", required=True)
     args = parser.parse_args()
+    args.compute_hashes = hashing_enabled()
     if args.command == "download" and (args.workers < 1 or args.per_host < 1 or args.request_timeout <= 0 or args.direct_dns_rps <= 0):
         parser.error("download workers, per-host limit and timeout must be positive")
     if args.command == "candidates":

@@ -29,6 +29,9 @@ def _benchmark(task, records, value):
                 "language_prior_debiased_pairwise": {"win_rate": value},
             }
         )
+    if task.startswith("aro_vg_"):
+        metrics.update({"primary_metric": "conditional_pairwise.win_rate",
+                        "conditional_pairwise": {"win_rate": value}})
     if task == "sugarcrepe":
         metrics["categories"] = {
             "add_att": {
@@ -152,8 +155,9 @@ def _native_summary(checkpoint, step):
         },
         "selection_contract": {
             "imagenet_validation_images": 50_000,
+            "aro_primary_candidate_score": "conditional_mean_token_loglikelihood",
             "image_text_matching_score_variant": (
-                "language_prior_debiased_mean_token_loglikelihood_only"
+                "conditional_aro_debiased_other_tasks"
             ),
             "language_prior_alpha": 1.0,
             "dense_retrieval_language_prior_estimator": (

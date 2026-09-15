@@ -60,6 +60,12 @@ def test_matrix_report_rejects_missing_duplicate_and_wrong_checkpoint_arms(tmp_p
 
     result = render()[0]
     assert result["completed"] == 0 and result["conclusion"] is None
+    selection["models"]["s2_single"] = {}
+    assert render()[0]["total"] == 5  # New evaluations do not change a frozen study's coverage.
+    del selection["models"]["b_x0"]
+    with pytest.raises(ValueError, match="unselected"):
+        render()
+    selection["models"]["b_x0"] = {}
     for mutation in [state["tasks"][:-1], [*state["tasks"][:-1], state["tasks"][0]]]:
         with pytest.raises(ValueError, match="coverage"):
             render({**state, "tasks": mutation})

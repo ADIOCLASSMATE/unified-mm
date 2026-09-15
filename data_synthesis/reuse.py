@@ -5,6 +5,7 @@ from jsonschema import ValidationError
 
 from data_synthesis.contract import parse_pair, text_pair
 from data_synthesis.io import dumps, sha
+from data_synthesis.integrity import hashing_enabled, same_view_binding, view_reference
 
 
 def full_frame(view):
@@ -17,21 +18,27 @@ def normalize(text):
     return text.replace("\r\n", "\n").strip()
 
 
-def aligned(candidate, item, policy):
+def aligned(candidate, item, policy, *, compute_hashes=True):
     row, view = item["row"], item["view"]
     if candidate.get("image_identity") not in ({item["identity"]} | set(row.get("identity_aliases", []))):
         return False, "caption is not joined to this original image identity"
-    if candidate.get("view_sha256"):
+    if not compute_hashes and candidate.get("kind") == "accepted_pair":
+        if candidate.get("view_id") == view_reference(view):
+            return True, "previously_accepted_image_reference"
+        return False, "accepted caption is not bound to this image reference"
+    if compute_hashes and candidate.get("view_sha256"):
         if candidate["view_sha256"] != view["view_sha256"]:
             return False, "caption belongs to a different frozen view"
         if candidate.get("kind") == "accepted_pair":
             return True, "exact_previously_accepted_view"
-    if candidate.get("source_sha256") and candidate["source_sha256"] != view["source_sha256"]:
+    if compute_hashes and candidate.get("source_sha256") and candidate["source_sha256"] != view["source_sha256"]:
         return False, "caption original-image hash differs"
     if not full_frame(view):
         return False, "crop requires text realignment"
     if {"ocr", "text", "chart", "document"} & set(row.get("capabilities", [])):
-        if policy["require_readability_for_ocr"] and row.get("readability_view_sha256") != view["view_sha256"]:
+        readable = (row.get("readability_view_sha256") == view["view_sha256"] if compute_hashes
+                    else row.get("readability_view_id") == view_reference(view))
+        if policy["require_readability_for_ocr"] and not readable:
             return False, "final-view text readability has not been checked"
     kind = candidate.get("kind")
     allowed = ((kind == "human_caption" and policy["allow_full_frame_human_captions"])
@@ -42,12 +49,13 @@ def aligned(candidate, item, policy):
 
 
 def choose_reuse(item, tokenizer, config):
+    compute_hashes = hashing_enabled(config)
     issues, candidates = [], item["row"].get("caption_candidates", [])
     for candidate in candidates:
         if not isinstance(candidate, dict) or not candidate.get("author") or not candidate.get("provenance"):
             issues.append("caption lacks original author or provenance")
             continue
-        okay, reason = aligned(candidate, item, config["reuse"])
+        okay, reason = aligned(candidate, item, config["reuse"], compute_hashes=compute_hashes)
         if not okay:
             issues.append(reason)
             continue
@@ -73,13 +81,14 @@ def choose_reuse(item, tokenizer, config):
             continue
         changed = texts != original
         evidence = {"route": "normalize" if changed else "reuse", "alignment": reason,
-                    "source_candidate": candidate, "source_candidate_sha256": sha(dumps(candidate).encode()),
-                    "original_text_sha256": {k: sha(v.encode()) for k, v in original.items()},
+                    "source_candidate": candidate,
+                    "source_candidate_sha256": sha(dumps(candidate).encode()) if compute_hashes else None,
+                    "original_text_sha256": {k: sha(v.encode()) if compute_hashes else None for k, v in original.items()},
                     "generator_models": {k: (candidate.get("generator_models") or {}).get(k, candidate["author"]) for k in texts},
                     "transforms": ["normalize_line_endings_and_outer_whitespace"] if changed else [],
                     "semantic_accuracy_independently_verified": False}
         return pair, evidence, issues
-    rendered = render_verified_facts(item)
+    rendered = render_verified_facts(item, compute_hashes=compute_hashes)
     if rendered:
         pair, used = rendered
         try:
@@ -93,11 +102,11 @@ def choose_reuse(item, tokenizer, config):
     return None, None, list(dict.fromkeys(issues)) or ["no reusable caption or verified final-view facts"]
 
 
-def render_verified_facts(item):
+def render_verified_facts(item, *, compute_hashes=True):
     observations = {"counts": [], "relations": [], "visible_text": []}
     sentences, used = [], []
     for fact in item["row"].get("verified_facts", []):
-        if (fact.get("verified") is not True or fact.get("view_sha256") != item["view"]["view_sha256"]
+        if (fact.get("verified") is not True or not same_view_binding(fact, item["view"], compute_hashes)
                 or not fact.get("provenance")):
             continue
         kind = fact.get("type")

@@ -15,6 +15,7 @@ from PIL import Image
 from data_synthesis.clients import frozen_pixels
 from data_synthesis.io import atomic_json, dumps, file_sha, sha, training_image_id
 from data_synthesis.state import State
+from data_synthesis.integrity import hashing_enabled, view_reference
 from utils.image_near_duplicates import NearDuplicateIndex, perceptual_hashes
 from utils.imagenet_synthetic_text_index import ImageNetSyntheticTextIndex
 
@@ -73,13 +74,14 @@ def release_rows(root):
                     kind="accepted_pair", provenance={"release": str(root), "row": offset, "original": provenance},
                     i2t=caption["captions"][0]["text"], t2i=prompt["model_result"]["prompts"][0]["prompt"],
                     view_sha256=view["view_sha256"], source_sha256=view["source_sha256"],
+                    view_id=view_reference(view),
                     generator_models=models, observations=view.get("observations"))]
                 yield row, view
     finally:
         index.close()
 
 
-def ingest_candidates(manifest, supply_root, prefix):
+def ingest_candidates(manifest, supply_root, prefix, *, compute_hashes=True):
     """Publish immutable bounded input batches for independent download/preparation."""
     if not prefix or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for c in prefix):
         raise ValueError("candidate prefix must be a simple unique name")
@@ -87,7 +89,7 @@ def ingest_candidates(manifest, supply_root, prefix):
     if (root / "candidates.closed.json").exists() or (root / "download.closed.json").exists():
         raise ValueError("download scope is closed; start a new supply cohort")
     source = Path(manifest).resolve()
-    digest = file_sha(source)
+    digest = file_sha(source) if compute_hashes else None
     output = root / "candidates"
     output.mkdir(parents=True, exist_ok=True)
     part, pending, count, unique = 0, [], 0, 0
@@ -141,7 +143,9 @@ def ingest_candidates(manifest, supply_root, prefix):
         finally:
             db.close()
     atomic_json(root / f"{prefix}.candidate_status.json", {"state": "completed", "parts": part,
-                "records": unique, "input_rows": count, "input_sha256": digest, "source_targets_are_caps": False})
+                "records": unique, "input_rows": count, "input_sha256": digest,
+                "input_bytes": source.stat().st_size, "compute_hashes": compute_hashes,
+                "source_targets_are_caps": False})
     return {"records": unique, "input_rows": count, "parts": part}
 
 
@@ -160,16 +164,19 @@ def merge_candidate_rows(old, row):
     return merged
 
 
-def seal_candidates(supply_root):
+def seal_candidates(supply_root, *, compute_hashes=True):
     root = Path(supply_root).resolve()
     paths = sorted((root / "candidates").glob("*.jsonl"))
     if not paths:
         raise ValueError("no candidate batches to seal")
-    files = {p.name: file_sha(p) for p in paths}
+    files = {p.name: file_sha(p) if compute_hashes else None for p in paths}
+    sizes = {p.name: p.stat().st_size for p in paths}
     marker = root / "candidates.closed.json"
     if marker.exists():
         previous = json.loads(marker.read_text())
-        if previous.get("file_sha256") != files:
+        if ((compute_hashes and previous.get("file_sha256") != files)
+                or set(previous.get("file_sha256", {})) != set(files)
+                or (previous.get("file_sizes") is not None and previous["file_sizes"] != sizes)):
             raise ValueError("sealed candidate files changed")
         return previous
     # Duplicate identities across independent intakes must be joined explicitly;
@@ -191,16 +198,18 @@ def seal_candidates(supply_root):
                 db.commit()
         finally:
             db.close()
-    result = {"files": len(files), "file_sha256": files, "records": records, "closed_at": time.time()}
+    result = {"files": len(files), "file_sha256": files, "file_sizes": sizes,
+              "compute_hashes": compute_hashes, "records": records, "closed_at": time.time()}
     atomic_json(marker, result)
     return result
 
 
-def prompt_hash(text):
-    return sha(" ".join(unicodedata.normalize("NFKC", text).casefold().split()).encode())
+def prompt_hash(text, *, compute_hashes=True):
+    normalized = " ".join(unicodedata.normalize("NFKC", text).casefold().split())
+    return sha(normalized.encode()) if compute_hashes else normalized
 
 
-def excluded_prompts(path):
+def excluded_prompts(path, *, compute_hashes=True):
     result = set()
     if path:
         with Path(path).open() as handle:
@@ -212,7 +221,7 @@ def excluded_prompts(path):
                 text = value.get("prompt") if isinstance(value, dict) else value
                 if not isinstance(text, str) or not text.strip():
                     raise ValueError("excluded prompts must be text lines or JSON strings / {prompt: text}")
-                result.add(prompt_hash(text))
+                result.add(prompt_hash(text, compute_hashes=compute_hashes))
     return result
 
 
@@ -246,6 +255,10 @@ def _near_corpus(db, values, pixels):
 
 
 def freeze(root, config, *, prepared=(), releases=(), inbox=None, exclude=None, near_index=None, exclude_prompts=None, pilot=False):
+    if not hashing_enabled(config):
+        from data_synthesis.sources_no_hash import freeze_no_hash
+        return freeze_no_hash(root, config, prepared=prepared, releases=releases, inbox=inbox,
+                              exclude=exclude, exclude_prompts=exclude_prompts, pilot=pilot)
     sources = [("prepared", Path(p).resolve()) for p in prepared] + [("release", Path(p).resolve()) for p in releases]
     inboxes = ([inbox] if isinstance(inbox, (str, Path)) else inbox) or []
     for entry in inboxes:

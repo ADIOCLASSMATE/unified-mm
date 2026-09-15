@@ -35,6 +35,7 @@ class ImageBackboneQuery:
     use_x0_content_condition: bool
     confidence_order: bool
     debug_finite: bool
+    cache_position_map: torch.Tensor | None = None
 
     def __call__(
         self,
@@ -119,17 +120,21 @@ class ImageBackboneQuery:
                 (branch_repeats, *([1] * (value.ndim - 1)))
             )
 
-        key_sigma_for_mask = key_sigma
-        key_valid_for_mask = key_valid
-        key_is_image_for_mask = key_is_target_image
+        visible_length = cache.visible_length
+        key_sigma_for_mask = key_sigma[:, :visible_length]
+        key_valid_for_mask = key_valid[:, :visible_length]
+        key_is_image_for_mask = key_is_target_image[:, :visible_length]
+        cache_indices = (query_indices if self.cache_position_map is None else
+                         torch.gather(self.cache_position_map, 1, query_indices))
         if branch_repeats > 1:
+            cache_indices = repeat_rows(cache_indices)
             query_indices = repeat_rows(query_indices)
             query_sigma = repeat_rows(query_sigma)
             content_queries = repeat_rows(content_queries)
             query_valid = repeat_rows(query_valid)
-            key_sigma_for_mask = repeat_rows(key_sigma)
-            key_valid_for_mask = repeat_rows(key_valid)
-            key_is_image_for_mask = repeat_rows(key_is_target_image)
+            key_sigma_for_mask = repeat_rows(key_sigma_for_mask)
+            key_valid_for_mask = repeat_rows(key_valid_for_mask)
+            key_is_image_for_mask = repeat_rows(key_is_image_for_mask)
 
         attention_mask = model._build_generation_cache_mask(
             key_sigma=key_sigma_for_mask,
@@ -137,7 +142,7 @@ class ImageBackboneQuery:
             key_is_target_image=key_is_image_for_mask,
             query_sigma=query_sigma,
             query_valid=query_valid,
-            query_positions=query_indices,
+            query_positions=cache_indices,
             content_query_mask=content_queries,
             image_uncond_rows=image_uncond_rows,
             content_self_diagonal=content_self_diagonal,
@@ -181,7 +186,7 @@ class ImageBackboneQuery:
             position_ids=query_position_ids,
             past_key_values=cache,
             use_cache=not cache_read_only,
-            cache_position=query_indices,
+            cache_position=cache_indices,
             cache_read_only=cache_read_only,
             cache_write_prefix=(None if cache_read_only else 1),
             token_types=query_token_types,

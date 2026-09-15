@@ -178,14 +178,9 @@ def main() -> None:
             generation = json.loads(
                 generation_path.read_text(encoding="utf-8")
             )
-            if (
-                generation.get("generation_entry") != "model.generate"
-                or generation.get("use_cache") is not True
-            ):
-                raise RuntimeError(
-                    "held-out image generation did not use the unified "
-                    "cached entry"
-                )
+            from utils.evaluation.model_contracts import validate_image_generation_report
+
+            validate_image_generation_report(generation, attention_contract)
         else:
             generation = None
         payload = {

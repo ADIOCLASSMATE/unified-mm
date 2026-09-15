@@ -150,7 +150,7 @@ def test_pretraining_native_evaluation_never_calculates_content_hashes():
         "language_prior_debiased_mean_token_loglikelihood"
     )
     assert protocol.outputs.image_text_matching_score_variant == (
-        "language_prior_debiased_only"
+        "conditional_aro_debiased_other_tasks"
     )
 
     evaluator = Path("scripts/evaluate_imagenet_pretraining_native.py").read_text(

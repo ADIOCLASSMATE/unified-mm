@@ -1,16 +1,37 @@
 {
   "schema": "unified_evaluation_report_selection_v1",
-  "matrix_sweeps": [{"root": "ablation-matrix/cfg2-heun10-order-20260909-r1"}],
-  "qualitative": "qualitative/unified-all-final-ema-20260908-r1",
-  "order_sweeps": [{"model": "b_x0", "root": "unified-b-x0content-0p6b/sweeps/order-20260908-r1"}],
-  "sampling_sweeps": [{
-    "model": "b_x0",
-    "label": "B · CFG / Heun 参数扫描",
-    "root": "unified-b-x0content-0p6b/sweeps/cfg-heun-20260908-r1"
-  }],
+  "matrix_sweeps": [
+    {
+      "root": "ablation-matrix/cfg2-heun10-order-20260909-r1"
+    }
+  ],
+  "qualitative": "qualitative/unified-all-final-ema-with-s2-20260915-r1",
+  "order_sweeps": [
+    {
+      "model": "b_x0",
+      "root": "unified-b-x0content-0p6b/sweeps/order-20260908-r1"
+    }
+  ],
+  "sampling_sweeps": [
+    {
+      "model": "b_x0",
+      "label": "B · CFG / Heun 参数扫描",
+      "root": "unified-b-x0content-0p6b/sweeps/cfg-heun-20260908-r1"
+    }
+  ],
   "models": {
-    "b_x0": {"root": "unified-b-x0content-0p6b/checkpoints/step-95415-ema-native-full-20260906-r1"},
-    "b_flowdiag": {"root": "unified-b-flowdiag-0p6b/final-ema-native-full-20260907-r1"},
+    "s2_single": {
+      "root": "unified-s2-single-0p6b/final-ema-20260914-r4",
+      "run": "unified-s2-single-0p6b-100b-imagenet-split-s42-r1",
+      "checkpoint_step": 95415,
+      "note": "S2-single final FP32 EMA；生成采用整图 flow、CFG=3.5、Heun=10；文本及图文候选使用确定性 next-token AR 评分（MC1）。r4 复用同 checkpoint 的 r1 文本八任务结果。"
+    },
+    "b_x0": {
+      "root": "unified-b-x0content-0p6b/checkpoints/step-95415-ema-native-full-20260906-r1"
+    },
+    "b_flowdiag": {
+      "root": "unified-b-flowdiag-0p6b/final-ema-native-full-20260907-r1"
+    },
     "b_no_flowdiag": {
       "root": "unified-b-0p6b/final-ema-v9-20260902",
       "layout": "v9",
@@ -18,14 +39,310 @@
       "alias_evidence": "unified-b-0p6b/historical-control-identity.json",
       "note": "旧结果部分来源字段保留重命名前的 B 路径；该组属于 flow 无对角线控制组，身份依据已单独保留。"
     },
-    "a_x0": {"root": "unified-a-x0content-0p6b/checkpoints/step-95415-ema-native-full-20260907-r1"},
-    "a_legacy": {"root": "unified-a-0p6b/final-ema-v9-20260902", "layout": "v9"},
-    "c_on_b": {"root": "unified-c-on-b-x0content-0p6b/checkpoints/step-95415-ema-native-full-20260908-r1"},
+    "a_x0": {
+      "root": "unified-a-x0content-0p6b/checkpoints/step-95415-ema-native-full-20260907-r1"
+    },
+    "a_legacy": {
+      "root": "unified-a-0p6b/final-ema-v9-20260902",
+      "layout": "v9"
+    },
+    "c_on_b": {
+      "root": "unified-c-on-b-x0content-0p6b/checkpoints/step-95415-ema-native-full-20260908-r1"
+    },
     "d_on_b": {
       "root": "unified-d-on-b-0p6b/checkpoints/step-95415-ema-native-full-20260908-r2",
       "note": "只读取修复后的 r2；旧 r1 图像评测已失效。"
     },
-    "e_on_b": {"root": "unified-e-on-b-x0content-0p6b/checkpoints/step-95415-ema-native-full-20260907-r1", "note": "原生 sequential 图像顺序；图文顺序为确定性 MC1。"},
-    "f_on_b": {"root": "unified-f-on-b-0p6b/checkpoints/step-95415-ema-native-full-20260905-r1"}
+    "e_on_b": {
+      "root": "unified-e-on-b-x0content-0p6b/checkpoints/step-95415-ema-native-full-20260907-r1",
+      "note": "原生 sequential 图像顺序；图文顺序为确定性 MC1。"
+    },
+    "f_on_b": {
+      "root": "unified-f-on-b-0p6b/checkpoints/step-95415-ema-native-full-20260905-r1"
+    }
+  },
+  "unified_training_ablation": {
+    "baseline": "b_x0",
+    "generation_cfg_values": [
+      1.0,
+      1.5,
+      2.0,
+      2.5,
+      3.0,
+      3.5,
+      4.0,
+      4.5,
+      5.0,
+      5.5,
+      6.0
+    ],
+    "generation_baseline_sources": {
+      "1.0": "unified-b-x0content-0p6b/sweeps/cfg-heun-20260908-r1/arms/cfg-1.0-heun-010/metrics.json",
+      "2.0": "unified-b-x0content-0p6b/sweeps/cfg-heun-20260908-r1/arms/cfg-2.0-heun-010/metrics.json",
+      "3.5": "unified-b-x0content-0p6b/checkpoints/step-95415-ema-native-full-20260906-r1/core/t2i-fid-is/metrics.json",
+      "1.5": "unified-b-x0content-0p6b/sweeps/cfg-heun-20260908-r1/arms/cfg-1.5-heun-010/metrics.json",
+      "2.5": "unified-b-x0content-0p6b/sweeps/cfg-heun-20260908-r1/arms/cfg-2.5-heun-010/metrics.json",
+      "3.0": "unified-b-x0content-0p6b/sweeps/cfg-heun-20260908-r1/arms/cfg-3.0-heun-010/metrics.json",
+      "4.0": "unified-b-x0content-0p6b/sweeps/cfg-heun-20260908-r1/arms/cfg-4.0-heun-010/metrics.json",
+      "4.5": "unified-b-x0content-0p6b/sweeps/cfg-heun-20260908-r1/arms/cfg-4.5-heun-010/metrics.json",
+      "5.0": "unified-b-x0content-0p6b/sweeps/cfg-heun-20260908-r1/arms/cfg-5.0-heun-010/metrics.json",
+      "5.5": "unified-b-x0content-0p6b/sweeps/cfg-heun-20260908-r1/arms/cfg-5.5-heun-010/metrics.json",
+      "6.0": "unified-b-x0content-0p6b/sweeps/cfg-heun-20260908-r1/arms/cfg-6.0-heun-010/metrics.json"
+    },
+    "baseline_physical_positions": {
+      "text": 100049879040,
+      "i2t": 50024939520,
+      "t2i": 50024939520
+    },
+    "controls": [
+      {
+        "id": "b_i2t_only_matched",
+        "label": "I2T-only",
+        "run": "unified-b-x0content-0p6b-i2t-only-bmatched-s42-r1",
+        "checkpoint_step": 95415,
+        "task": "understanding",
+        "source": "unified-b-i2t-only-bmatched-0p6b/final-ema-20260913-r1/pretraining_native_understanding_summary.json",
+        "physical_positions": {
+          "text": 0,
+          "i2t": 50024939520,
+          "t2i": 0
+        }
+      },
+      {
+        "id": "b_t2i_only_matched",
+        "label": "T2I-only",
+        "run": "unified-b-x0content-0p6b-t2i-only-bmatched-s42-r1",
+        "checkpoint_step": 95415,
+        "task": "generation",
+        "source": "unified-b-t2i-only-bmatched-0p6b/final-ema-20260913-r1/metrics.json",
+        "cfg_sources": {
+          "1.0": "unified-b-t2i-only-bmatched-0p6b/sweeps/cfg-1-2-20260914-r1/arms/cfg-1.0-heun-010/metrics.json",
+          "2.0": "unified-b-t2i-only-bmatched-0p6b/sweeps/cfg-1-2-20260914-r1/arms/cfg-2.0-heun-010/metrics.json",
+          "3.5": "unified-b-t2i-only-bmatched-0p6b/final-ema-20260913-r1/metrics.json",
+          "1.5": "unified-b-t2i-only-bmatched-0p6b/sweeps/cfg-1-6-20260914-r2/arms/cfg-1.5-heun-010/metrics.json",
+          "2.5": "unified-b-t2i-only-bmatched-0p6b/sweeps/cfg-1-6-20260914-r2/arms/cfg-2.5-heun-010/metrics.json",
+          "3.0": "unified-b-t2i-only-bmatched-0p6b/sweeps/cfg-1-6-20260914-r2/arms/cfg-3.0-heun-010/metrics.json",
+          "4.0": "unified-b-t2i-only-bmatched-0p6b/sweeps/cfg-1-6-20260914-r2/arms/cfg-4.0-heun-010/metrics.json",
+          "4.5": "unified-b-t2i-only-bmatched-0p6b/sweeps/cfg-1-6-20260914-r2/arms/cfg-4.5-heun-010/metrics.json",
+          "5.0": "unified-b-t2i-only-bmatched-0p6b/sweeps/cfg-1-6-20260914-r2/arms/cfg-5.0-heun-010/metrics.json",
+          "5.5": "unified-b-t2i-only-bmatched-0p6b/sweeps/cfg-1-6-20260914-r2/arms/cfg-5.5-heun-010/metrics.json",
+          "6.0": "unified-b-t2i-only-bmatched-0p6b/sweeps/cfg-1-6-20260914-r2/arms/cfg-6.0-heun-010/metrics.json"
+        },
+        "physical_positions": {
+          "text": 0,
+          "i2t": 0,
+          "t2i": 50024939520
+        }
+      },
+      {
+        "id": "b_text_only",
+        "label": "text-only",
+        "run": "unified-b-0p6b-text-only-100bphys-s42-r1",
+        "checkpoint_step": 95368,
+        "task": "text",
+        "source": "unified-b-text-only-0p6b/final-ema-20260910-r1/summary.json",
+        "physical_positions": {
+          "text": 100000595968,
+          "i2t": 0,
+          "t2i": 0
+        }
+      }
+    ]
+  },
+  "flow_head_scale": {
+    "cfg_values": [
+      1.0,
+      1.5,
+      2.0,
+      2.5,
+      3.0,
+      3.5,
+      4.0,
+      4.5,
+      5.0,
+      5.5,
+      6.0
+    ],
+    "models": [
+      {
+        "id": "b_x0",
+        "run": "unified-b-x0content-0p6b-100b-imagenet-split-s42-r1",
+        "label": "B",
+        "family": "b",
+        "architecture": "contextual_dual_stream",
+        "depth": 8,
+        "width": 1280,
+        "head_parameters": 164072976,
+        "total_parameters": 761189904,
+        "training_status": "complete",
+        "metrics": {
+          "1.0": "unified-b-x0content-0p6b/sweeps/cfg-heun-20260908-r1/arms/cfg-1.0-heun-010/metrics.json",
+          "1.5": "unified-b-x0content-0p6b/sweeps/cfg-heun-20260908-r1/arms/cfg-1.5-heun-010/metrics.json",
+          "2.0": "unified-b-x0content-0p6b/sweeps/cfg-heun-20260908-r1/arms/cfg-2.0-heun-010/metrics.json",
+          "2.5": "unified-b-x0content-0p6b/sweeps/cfg-heun-20260908-r1/arms/cfg-2.5-heun-010/metrics.json",
+          "3.0": "unified-b-x0content-0p6b/sweeps/cfg-heun-20260908-r1/arms/cfg-3.0-heun-010/metrics.json",
+          "3.5": "unified-b-x0content-0p6b/sweeps/cfg-heun-20260908-r1/arms/cfg-3.5-heun-010/metrics.json",
+          "4.0": "unified-b-x0content-0p6b/sweeps/cfg-heun-20260908-r1/arms/cfg-4.0-heun-010/metrics.json",
+          "4.5": "unified-b-x0content-0p6b/sweeps/cfg-heun-20260908-r1/arms/cfg-4.5-heun-010/metrics.json",
+          "5.0": "unified-b-x0content-0p6b/sweeps/cfg-heun-20260908-r1/arms/cfg-5.0-heun-010/metrics.json",
+          "5.5": "unified-b-x0content-0p6b/sweeps/cfg-heun-20260908-r1/arms/cfg-5.5-heun-010/metrics.json",
+          "6.0": "unified-b-x0content-0p6b/sweeps/cfg-heun-20260908-r1/arms/cfg-6.0-heun-010/metrics.json"
+        }
+      },
+      {
+        "id": "b_x0_flowdepth16",
+        "run": "unified-b-x0content-flowdepth16-0p6b-100b-imagenet-split-s42-r1",
+        "label": "B · flow head · depth 16",
+        "family": "b",
+        "architecture": "contextual_dual_stream",
+        "depth": 16,
+        "width": 1280,
+        "head_parameters": 321543696,
+        "total_parameters": 918660624,
+        "training_status": "complete",
+        "metrics": {
+          "1.0": "unified-b-x0content-flowdepth16-0p6b/sweeps/cfg-1-2-20260913-r1/arms/cfg-1.0-heun-010/metrics.json",
+          "1.5": "unified-b-x0content-flowdepth16-0p6b/sweeps/cfg-1-6-20260914-r1/arms/cfg-1.5-heun-010/metrics.json",
+          "2.0": "unified-b-x0content-flowdepth16-0p6b/sweeps/cfg-1-2-20260913-r1/arms/cfg-2.0-heun-010/metrics.json",
+          "2.5": "unified-b-x0content-flowdepth16-0p6b/sweeps/cfg-1-6-20260914-r1/arms/cfg-2.5-heun-010/metrics.json",
+          "3.0": "unified-b-x0content-flowdepth16-0p6b/sweeps/cfg-1-6-20260914-r1/arms/cfg-3.0-heun-010/metrics.json",
+          "3.5": "unified-b-x0content-flowdepth16-0p6b/final-ema-20260913-r3/core/t2i-fid-is/metrics.json",
+          "4.0": "unified-b-x0content-flowdepth16-0p6b/sweeps/cfg-1-6-20260914-r1/arms/cfg-4.0-heun-010/metrics.json",
+          "4.5": "unified-b-x0content-flowdepth16-0p6b/sweeps/cfg-1-6-20260914-r1/arms/cfg-4.5-heun-010/metrics.json",
+          "5.0": "unified-b-x0content-flowdepth16-0p6b/sweeps/cfg-1-6-20260914-r1/arms/cfg-5.0-heun-010/metrics.json",
+          "5.5": "unified-b-x0content-flowdepth16-0p6b/sweeps/cfg-1-6-20260914-r1/arms/cfg-5.5-heun-010/metrics.json",
+          "6.0": "unified-b-x0content-flowdepth16-0p6b/sweeps/cfg-1-6-20260914-r1/arms/cfg-6.0-heun-010/metrics.json"
+        }
+      },
+      {
+        "id": "b_x0_flowdepth30",
+        "run": "unified-b-x0content-flowdepth30-0p6b-100b-imagenet-split-s42-r1",
+        "label": "B · flow head · depth 30",
+        "family": "b",
+        "architecture": "contextual_dual_stream",
+        "depth": 30,
+        "width": 1280,
+        "head_parameters": 597117456,
+        "total_parameters": 1194234384,
+        "training_status": "complete",
+        "metrics": {
+          "1.0": "unified-b-x0content-flowdepth30-0p6b/sweeps/cfg-1-2-3p5-20260913-r1/arms/cfg-1.0-heun-010/metrics.json",
+          "1.5": "unified-b-x0content-flowdepth30-0p6b/sweeps/cfg-1-6-20260914-r1/arms/cfg-1.5-heun-010/metrics.json",
+          "2.0": "unified-b-x0content-flowdepth30-0p6b/sweeps/cfg-1-2-3p5-20260913-r1/arms/cfg-2.0-heun-010/metrics.json",
+          "2.5": "unified-b-x0content-flowdepth30-0p6b/sweeps/cfg-1-6-20260914-r1/arms/cfg-2.5-heun-010/metrics.json",
+          "3.0": "unified-b-x0content-flowdepth30-0p6b/sweeps/cfg-1-6-20260914-r1/arms/cfg-3.0-heun-010/metrics.json",
+          "3.5": "unified-b-x0content-flowdepth30-0p6b/sweeps/cfg-1-2-3p5-20260913-r1/arms/cfg-3.5-heun-010/metrics.json",
+          "4.0": "unified-b-x0content-flowdepth30-0p6b/sweeps/cfg-1-6-20260914-r1/arms/cfg-4.0-heun-010/metrics.json",
+          "4.5": "unified-b-x0content-flowdepth30-0p6b/sweeps/cfg-1-6-20260914-r1/arms/cfg-4.5-heun-010/metrics.json",
+          "5.0": "unified-b-x0content-flowdepth30-0p6b/sweeps/cfg-1-6-20260914-r1/arms/cfg-5.0-heun-010/metrics.json",
+          "5.5": "unified-b-x0content-flowdepth30-0p6b/sweeps/cfg-1-6-20260914-r1/arms/cfg-5.5-heun-010/metrics.json",
+          "6.0": "unified-b-x0content-flowdepth30-0p6b/sweeps/cfg-1-6-20260914-r1/arms/cfg-6.0-heun-010/metrics.json"
+        }
+      },
+      {
+        "id": "f_on_b",
+        "run": "unified-f-on-b-0p6b-100b-imagenet-split-s42-r1",
+        "label": "F · position-wise head",
+        "family": "f",
+        "architecture": "positionwise_adaln_mlp",
+        "depth": 8,
+        "width": 1936,
+        "head_parameters": 163828208,
+        "total_parameters": 760945136,
+        "training_status": "complete",
+        "metrics": {
+          "1.0": "unified-f-on-b-0p6b/sweeps/cfg-1-20260914-r1/arms/cfg-1.0-heun-010/metrics.json",
+          "2.0": "ablation-matrix/cfg2-heun10-order-20260909-r1/arms/f-on-b-halton/metrics.json",
+          "3.5": "unified-f-on-b-0p6b/checkpoints/step-95415-ema-native-full-20260905-r1/core/t2i-fid-is/metrics.json"
+        }
+      },
+      {
+        "id": "f_on_b_flowdepth16",
+        "run": "unified-f-on-b-flowdepth16-0p6b-100b-imagenet-split-s42-r1",
+        "label": "F · position-wise head · depth 16",
+        "family": "f",
+        "architecture": "positionwise_adaln_mlp",
+        "depth": 16,
+        "width": 1960,
+        "head_parameters": 321655616,
+        "total_parameters": 918772544,
+        "training_status": "running",
+        "metrics": {}
+      },
+      {
+        "id": "f_on_b_flowdepth30",
+        "run": "unified-f-on-b-flowdepth30-0p6b-100b-imagenet-split-s42-r1",
+        "label": "F · position-wise head · depth 30",
+        "family": "f",
+        "architecture": "positionwise_adaln_mlp",
+        "depth": 30,
+        "width": 1968,
+        "head_parameters": 595579792,
+        "total_parameters": 1192696720,
+        "training_status": "running",
+        "metrics": {}
+      }
+    ]
+  },
+  "s2_cfg_sweep": {
+    "root": "unified-s2-single-0p6b/sweeps/cfg-1-6-20260915-r1",
+    "output": "comparisons/s2-single-cfg-sweep",
+    "cfg_values": [
+      1.0,
+      1.5,
+      2.0,
+      2.5,
+      3.0,
+      3.5,
+      4.0,
+      4.5,
+      5.0,
+      5.5,
+      6.0
+    ],
+    "sources": {
+      "1.0": "unified-s2-single-0p6b/sweeps/cfg-1-6-20260915-r1/arms/cfg-1.0-heun-010/metrics.json",
+      "1.5": "unified-s2-single-0p6b/sweeps/cfg-1-6-20260915-r1/arms/cfg-1.5-heun-010/metrics.json",
+      "2.0": "unified-s2-single-0p6b/sweeps/cfg-1-6-20260915-r1/arms/cfg-2.0-heun-010/metrics.json",
+      "2.5": "unified-s2-single-0p6b/sweeps/cfg-1-6-20260915-r1/arms/cfg-2.5-heun-010/metrics.json",
+      "3.0": "unified-s2-single-0p6b/sweeps/cfg-1-6-20260915-r1/arms/cfg-3.0-heun-010/metrics.json",
+      "3.5": "unified-s2-single-0p6b/final-ema-20260914-r4/core/t2i-fid-is/metrics.json",
+      "4.0": "unified-s2-single-0p6b/sweeps/cfg-1-6-20260915-r1/arms/cfg-4.0-heun-010/metrics.json",
+      "4.5": "unified-s2-single-0p6b/sweeps/cfg-1-6-20260915-r1/arms/cfg-4.5-heun-010/metrics.json",
+      "5.0": "unified-s2-single-0p6b/sweeps/cfg-1-6-20260915-r1/arms/cfg-5.0-heun-010/metrics.json",
+      "5.5": "unified-s2-single-0p6b/sweeps/cfg-1-6-20260915-r1/arms/cfg-5.5-heun-010/metrics.json",
+      "6.0": "unified-s2-single-0p6b/sweeps/cfg-1-6-20260915-r1/arms/cfg-6.0-heun-010/metrics.json"
+    }
+  },
+  "qualitative_speed": "qualitative/b-s2-single-final-ema-20260915-r1",
+  "d_cfg_sweep": {
+    "root": "unified-d-on-b-0p6b/sweeps/cfg-1-6-20260915-r1",
+    "output": "comparisons/d-cfg-sweep",
+    "cfg_values": [
+      1.0,
+      1.5,
+      2.0,
+      2.5,
+      3.0,
+      3.5,
+      4.0,
+      4.5,
+      5.0,
+      5.5,
+      6.0
+    ],
+    "sources": {
+      "1.0": "unified-d-on-b-0p6b/sweeps/cfg-1-6-20260915-r1/arms/cfg-1.0-heun-010/metrics.json",
+      "1.5": "unified-d-on-b-0p6b/sweeps/cfg-1-6-20260915-r1/arms/cfg-1.5-heun-010/metrics.json",
+      "2.0": "ablation-matrix/cfg2-heun10-order-20260909-r1/arms/d-on-b-halton/metrics.json",
+      "2.5": "unified-d-on-b-0p6b/sweeps/cfg-1-6-20260915-r1/arms/cfg-2.5-heun-010/metrics.json",
+      "3.0": "unified-d-on-b-0p6b/sweeps/cfg-1-6-20260915-r1/arms/cfg-3.0-heun-010/metrics.json",
+      "3.5": "unified-d-on-b-0p6b/checkpoints/step-95415-ema-native-full-20260908-r2/core/t2i-fid-is/metrics.json",
+      "4.0": "unified-d-on-b-0p6b/sweeps/cfg-1-6-20260915-r1/arms/cfg-4.0-heun-010/metrics.json",
+      "4.5": "unified-d-on-b-0p6b/sweeps/cfg-1-6-20260915-r1/arms/cfg-4.5-heun-010/metrics.json",
+      "5.0": "unified-d-on-b-0p6b/sweeps/cfg-1-6-20260915-r1/arms/cfg-5.0-heun-010/metrics.json",
+      "5.5": "unified-d-on-b-0p6b/sweeps/cfg-1-6-20260915-r1/arms/cfg-5.5-heun-010/metrics.json",
+      "6.0": "unified-d-on-b-0p6b/sweeps/cfg-1-6-20260915-r1/arms/cfg-6.0-heun-010/metrics.json"
+    }
   }
 }

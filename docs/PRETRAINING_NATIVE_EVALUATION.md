@@ -8,7 +8,7 @@
 | COCO 检索 | Karpathy 5K，25,010 caption | 双向 R@1/5/10 |
 | Flickr30K 检索 | Karpathy 1K，5,000 caption | 双向 R@1/5/10 |
 | SugarCrepe | 七类完整正负例 | 总体／分类别严格胜率、平局率 |
-| ARO | Relation / Attribution 完整正负例 | 严格胜率、平局率 |
+| ARO | Relation / Attribution 完整正负例；条件似然保留文本先验 | 严格胜率、平局率 |
 | MMBench / SEED | 完整候选集 | 项目内消融诊断 |
 
 COCO 中 4,990 张图各有五条 caption，十张各有六条；I2T 接受同图的全部参考 caption。ImageNet 类名按 synset 区分 `projectile` / `missile`、`sunglass` / `sunglasses`。

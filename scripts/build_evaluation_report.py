@@ -22,7 +22,11 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 from scripts.evaluation_report_training import collect_training, export_training, plot_training
 from scripts.evaluation_report_provenance import collect_provenance, export_provenance
-from utils.experiment_registry import current_presentation, presentation_sort_key
+from scripts.evaluation_report_unified import export_generation_sweep
+from scripts.evaluation_report_flow_scale import export_flow_head_sweep
+from utils.experiment_registry import current_presentation, presentation_sort_key, registered_experiments, experiment_identity, task_training_labels
+from utils.evaluation.model_contracts import S2_ATTENTION, S2_SCORING, validate_formal_image_order_scoring
+from utils.evaluation.aro import ARO_TASKS, ARO_PRIMARY
 TEXT_TASKS = ("arc_easy", "arc_challenge", "hellaswag", "piqa", "winogrande", "boolq", "openbookqa", "mmlu")
 BENCHMARKS = {"sugarcrepe": 7511, "aro_vg_relation": 23937, "aro_vg_attribution": 28748,
               "mmbench_dev_en": 4329, "seed_bench_image": 14233}
@@ -94,6 +98,40 @@ def check_checkpoint(payload, spec, selection, root):
     require(step == spec["source"]["global_step"], f"checkpoint step mismatch for {spec['id']}")
 
 
+def report_model_specs(root: Path, selection: dict, gallery_models: list[dict]) -> list[dict]:
+    """Include selected final evaluations even when the paired gallery predates them."""
+    specs = {m["id"]: {**current_presentation(m), "qualitative_available": True} for m in gallery_models}
+    registered = registered_experiments()
+    for model_id, selected in selection["models"].items():
+        if model_id in specs:
+            continue
+        run = selected.get("run")
+        require(run in registered and registered[run]["id"] == model_id,
+                f"selected metric model requires its registered run: {model_id}")
+        directory = within(root, selected["root"])
+        check_not_invalidated(directory, root)
+        evaluation = read(directory / "native_full_evaluation_summary.json")
+        require(evaluation.get("complete") is True, f"new model evaluation is incomplete: {model_id}")
+        source = evaluation["model_source"]
+        checkpoint = (REPO / "output" / run / "hf_model-final-ema").resolve()
+        require(source.get("kind") == "hf_final_ema" and source.get("floating_dtype") == "float32"
+                and Path(source["path"]).resolve() == checkpoint,
+                f"wrong final EMA source for {model_id}")
+        saved = read(checkpoint / "config.json")
+        export = read(checkpoint / "ema_export_metadata.json")
+        require(source["global_step"] == export["source_global_step"] == selected["checkpoint_step"],
+                f"checkpoint step mismatch for {model_id}")
+        identity = experiment_identity(run)
+        specs[model_id] = {"id": model_id, "label": identity["label"], "group": identity["group"],
+            "run": run, "checkpoint": str(checkpoint), "source": source,
+            "architecture": saved["architecture_variant"], "backbone_attention": saved["dual_stream_attention_contract"],
+            "flow_attention": saved.get("flow_head_attention_contract", "architecture_owned"),
+            "flow_condition": saved.get("dynamic_xt_flow_condition_contract", saved.get("flow_condition_contract", "architecture_owned")),
+            "image_order": saved.get("training_image_sigma_order", "random"),
+            "task_training": task_training_labels(identity), "qualitative_available": False}
+    return sorted(specs.values(), key=presentation_sort_key)
+
+
 def model_metrics(root: Path, spec: dict, selection: dict) -> dict:
     result = {"metrics": {}, "components": {}, "notes": [], "selected_root": selection.get("root")}
     if not selection:
@@ -149,6 +187,9 @@ def model_metrics(root: Path, spec: dict, selection: dict) -> dict:
         check_checkpoint(data, spec, selection, root)
         require(data.get("protocol", {}).get("protocol_schema") == "selfless_text_benchmark_v3",
                 f"obsolete text scoring protocol: {path}")
+        if spec.get("backbone_attention") == S2_ATTENTION:
+            require(data["protocol"].get("scoring_contract") == S2_SCORING,
+                    f"wrong S2 text scoring contract: {path}")
         if data.get("complete") is True:
             require(set(data["primary_metrics"]) == set(TEXT_TASKS), f"incomplete eight-task text result: {path}")
             for key in TEXT_TASKS:
@@ -177,7 +218,14 @@ def model_metrics(root: Path, spec: dict, selection: dict) -> dict:
         check_checkpoint(manifest, spec, selection, root)
         require(manifest.get("schema") == "selfless_multimodal_likelihood_evaluation_v5" and
                 manifest.get("project_formal_protocol") is True, f"obsolete benchmark protocol: {manifest_path}")
-        expected_mc = 1 if spec["image_order"] == "sequential" else 64
+        is_s2 = spec.get("backbone_attention") == S2_ATTENTION
+        require((manifest.get("dual_stream_attention_contract") == S2_ATTENTION) == is_s2,
+                f"benchmark architecture mismatch: {manifest_path}")
+        if is_s2:
+            benchmark_summary = read(bench_root / "summary.json")
+            expected_mc = validate_formal_image_order_scoring(manifest, benchmark_summary.get("scoring", {}))
+        else:
+            expected_mc = 1 if spec["image_order"] == "sequential" else 64
         require(manifest.get("mc_samples") == expected_mc, f"wrong image-order MC count: {manifest_path}")
     for task, count in BENCHMARKS.items():
         path = bench_root / "summaries" / f"{task}.json"
@@ -189,7 +237,7 @@ def model_metrics(root: Path, spec: dict, selection: dict) -> dict:
             require(data.get("task") == task and data.get("mc_samples") == expected_mc,
                     f"benchmark task or sampling mismatch: {path}")
             if metrics.get("records") == count:
-                key = "circular_accuracy_language_prior_debiased" if task == "mmbench_dev_en" else (
+                key = ARO_PRIMARY if task in ARO_TASKS else "circular_accuracy_language_prior_debiased" if task == "mmbench_dev_en" else (
                     "accuracy_language_prior_debiased" if task == "seed_bench_image" else "language_prior_debiased_pairwise.win_rate")
                 require(metrics.get("primary_metric") == key, f"wrong benchmark primary metric: {path}")
                 value = metrics
@@ -413,7 +461,7 @@ def matrix_sweep_data(root: Path, selection: dict, models: list):
         protocol, state = read(directory / "protocol.json"), read(directory / "state.json")
         require(protocol["schema"] == "unified_t2i_ablation_matrix_v1" and state["phase"] == "matrix",
                 "unknown ablation matrix protocol")
-        require(set(protocol["models"]) == set(selection["models"]), "matrix omits selected formal models")
+        require(set(protocol["models"]) <= set(selection["models"]), "matrix references unselected formal models")
         matrix_strategies = protocol.get("matrix_strategies", ["spatial_halton", "confidence_stability"])
         require(len(matrix_strategies) == len(set(matrix_strategies))
                 and {"spatial_halton", "confidence_stability"} <= set(matrix_strategies)
@@ -501,20 +549,317 @@ def matrix_sweep_data(root: Path, selection: dict, models: list):
     return studies
 
 
-def build(root: Path, selection_file: Path, *, plots: bool = False):
+def flow_head_scale_data(root: Path, selection: dict):
+    """Compare final EMA head capacities; unfinished training never supplies scores."""
+    selected = selection.get("flow_head_scale")
+    if not selected:
+        return None
+    root = root.resolve()
+    cfgs = selected["cfg_values"]
+    require(isinstance(cfgs, list) and cfgs
+            and all(isinstance(cfg, (int, float)) and not isinstance(cfg, bool)
+                    and math.isfinite(cfg) and cfg >= 1 for cfg in cfgs)
+            and cfgs == sorted(set(cfgs)), "flow head scale CFG coverage mismatch")
+    rows, reference = [], None
+    for model in selected["models"]:
+        spec = current_presentation(model)
+        checkpoint = REPO / "output" / spec["run"] / "hf_model-final-ema"
+        sources = dict(spec.get("metrics", {}))
+        pending = spec.get("pending_metrics", {})
+        require(set(pending) <= {str(cfg) for cfg in cfgs}, "unexpected pending scale CFG source")
+        for cfg, relative in pending.items():
+            if within(root, relative).is_file():
+                require(cfg not in sources, "duplicate scale CFG source")
+                sources[cfg] = relative
+        require(spec["training_status"] in ("complete", "running"), "unknown scale training status")
+        require(spec["training_status"] == "complete" or not sources,
+                "unfinished scale training cannot supply final scores")
+        require(set(sources) <= {str(cfg) for cfg in cfgs}, "unexpected scale CFG source")
+        row = {**spec, "checkpoint": str(checkpoint), "results": []}
+        row.pop("metrics", None)
+        row.pop("pending_metrics", None)
+        for cfg in cfgs:
+            result = {"cfg": cfg, "fid": None, "is": None, "is_std": None, "source": None}
+            relative = sources.get(str(cfg))
+            if relative:
+                path = within(root, relative)
+                check_not_invalidated(path, root)
+                data = read(path)
+                expected = {"schema": "selfless_imagenet_val_t2i_fid_is_v2",
+                            "project_formal_protocol": True, "runtime_hashing_enabled": False,
+                            "samples_requested": 50000, "samples_evaluated": 50000,
+                            "split": "val", "seed": 42, "cfg": cfg, "cfg_schedule": "constant",
+                            "flow_solver": "heun", "temperature": 1.0, "parallel_rate": 1,
+                            "backbone_kv_cache": True, "weight_source": "hf_final_ema"}
+                for key, value in expected.items():
+                    require(data.get(key) == value, f"{path}: scale {key} mismatch")
+                require(str(data.get("sampling_steps")) == "10", f"{path}: scale steps mismatch")
+                check_checkpoint(data, {**spec, "checkpoint": str(checkpoint),
+                                        "source": {"global_step": 95415}}, {}, root)
+                require(data["evaluation_model_source"]["kind"] == "hf_final_ema",
+                        f"{path}: scale requires final EMA")
+                head = data["architecture"]["flow_head"]
+                require(all(head[key] == spec[key] for key in ("depth", "width", "architecture")),
+                        f"{path}: scale head architecture mismatch")
+                require(data["parameters"]["flow_head"] == spec["head_parameters"]
+                        and data["parameters"]["total"] == spec["total_parameters"],
+                        f"{path}: scale parameter count mismatch")
+                contracts = data["implementation_contracts"]
+                require(contracts["canonical_initial_noise_enabled"] is True
+                        and contracts["paired_sample_count"] == 50000
+                        and contracts["ordered_sample_count"] == 50000, f"{path}: scale pairing incomplete")
+                precision = data["precision_protocol"]
+                require(precision["model_dtype"] == "bf16" and precision["vae_dtype"] == "fp32"
+                        and precision["flow_integrator_dtype"] == "fp32", f"{path}: scale precision mismatch")
+                metric = data["metric_protocol"]
+                require(metric["protocol_name"] == "imagenet_val_fid50k_torch_fidelity_stratified_is"
+                        and metric["reference_distribution"] == "imagenet_val_50000"
+                        and metric["is_split_assignment"] == "stratified_by_synset"
+                        and metric["is_splits"] == 10, f"{path}: scale metric protocol mismatch")
+                matched = {key: data[key] for key in ("metric_protocol", "precision_protocol",
+                                                     "real_stats_path", "real_stats_metadata")}
+                if reference is None:
+                    reference = matched
+                require(matched == reference, f"{path}: scale scoring/reference protocols differ")
+                require(set(data["strategies"]) == {"spatial_halton"}, f"{path}: scale order mismatch")
+                score = data["strategies"]["spatial_halton"]
+                require(score["count"] == 50000
+                        and data["mechanism_diagnostics"]["generated_latent_finite_rate"] == 1.0,
+                        f"{path}: scale generation incomplete")
+                values = {"fid": score["fid"], "is": score["inception_score_mean"],
+                          "is_std": score["inception_score_std"]}
+                require(all(isinstance(value, (int, float)) and not isinstance(value, bool)
+                            and math.isfinite(value) and value >= 0 for value in values.values()),
+                        f"{path}: scale score is not finite/nonnegative")
+                result.update(**values, source=str(path.relative_to(root)), global_batch=data["batch_size"])
+            row["results"].append(result)
+        row["completed"] = sum(r["source"] is not None for r in row["results"])
+        rows.append(row)
+    return {"cfg_values": cfgs, "rows": rows, "completed": sum(row["completed"] for row in rows),
+            "total": len(rows) * len(cfgs), "protocol": {
+                "checkpoint_step": 95415, "weight_source": "hf_final_ema", "samples": 50000,
+                "seed": 42, "sampling_steps": 10, "flow_solver": "heun", "strategy": "spatial_halton",
+                "canonical_initial_noise": True}}
+
+
+def unified_training_ablation_data(root: Path, selection: dict, models: list):
+    """Compare the joint recipe with each task's exposure-matched only control."""
+    selected = selection.get("unified_training_ablation")
+    if not selected:
+        return None
+    root = root.resolve()
+    baseline = next(model for model in models if model["id"] == selected["baseline"])
+    baseline_root = selection["models"][baseline["id"]]["root"]
+    baseline_paths = {
+        "understanding": "pretraining-native-understanding/pretraining_native_understanding_summary.json",
+        "generation": "core/t2i-fid-is/metrics.json",
+        "text": "core/text/summary.json",
+    }
+    rows, controls = [], []
+
+    def load(relative, spec):
+        path = within(root, relative)
+        check_not_invalidated(path, root)
+        if not path.exists():
+            return None
+        data = read(path)
+        identity = {**data, "checkpoint_step": data.get("checkpoint_step", data.get("global_step",
+                    data.get("evaluation_model_source", {}).get("global_step")))}
+        check_checkpoint(identity, spec, {}, root)
+        require(data.get("weight_source") == "hf_final_ema", f"only comparison requires final EMA: {path}")
+        return data
+
+    def equal(b, o, keys, label):
+        require(all(key in b and key in o and b[key] == o[key] for key in keys),
+                f"only comparison {label} protocol mismatch")
+
+    def add(task, key, bvalue, ovalue, bpath, opath, *, group=None, aggregate=False, label=None, cfg=None):
+        percent = key not in ("fid", "is")
+        for value in (bvalue, ovalue):
+            if value is None:
+                continue
+            require(isinstance(value, (int, float)) and not isinstance(value, bool)
+                    and math.isfinite(value) and value >= 0 and (not percent or value <= 1),
+                    f"invalid only comparison score: {key}")
+        def metric(value, path):
+            return None if value is None else {"value": value, "percent": percent, "source": path}
+        delta = None if ovalue is None else (bvalue - ovalue) * (100 if percent else 1)
+        winner = None if delta is None else "tie" if delta == 0 else (
+            "baseline" if (delta < 0 if key == "fid" else delta > 0) else "only")
+        rows.append({"task": task, "group": group or task, "key": key, "label": label or LABELS[key],
+                     "aggregate": aggregate, "lower_is_better": key == "fid",
+                     "baseline": metric(bvalue, bpath), "only": metric(ovalue, opath),
+                     "delta": delta, "winner": winner})
+        if cfg is not None:
+            rows[-1]["cfg"] = cfg
+
+    tasks = [control["task"] for control in selected["controls"]]
+    require(len(tasks) == len(set(tasks)) and set(tasks) <= set(baseline_paths), "duplicate/unknown only task")
+    for control in selected["controls"]:
+        task = control["task"]
+        bpath = baseline_root + "/" + baseline_paths[task]
+        opath = control["source"]
+        spec = {**control, "checkpoint": str(REPO / "output" / control["run"] / "hf_model-final-ema"),
+                "source": {"global_step": control["checkpoint_step"]}}
+        b, o = load(bpath, baseline), load(opath, spec)
+        require(b is not None, f"missing B reference for only comparison: {task}")
+        complete = o is not None and (o.get("complete") is True if task != "generation" else
+                                     o.get("samples_evaluated") == 50000)
+        if task != "generation":
+            require(b.get("complete") is True, f"incomplete B reference: {task}")
+        if not complete:
+            o = None
+        controls.append({**control, "checkpoint": spec["checkpoint"], "complete": complete,
+                         "completed_at": o.get("completed_at") if o else None})
+
+        if task == "text":
+            for data in (b, o):
+                if data is None:
+                    continue
+                require(set(data["primary_metrics"]) == set(TEXT_TASKS)
+                        and all(data["tasks"][key]["complete"] is True for key in TEXT_TASKS),
+                        "incomplete only text task coverage")
+                require(math.isclose(data["macro_average_primary"],
+                                     sum(data["primary_metrics"].values()) / len(TEXT_TASKS)),
+                        "only text macro differs from task mean")
+            if o:
+                equal(b, o, ("protocol",), "text")
+                for key in TEXT_TASKS:
+                    equal(b["tasks"][key], o["tasks"][key], ("samples",), key)
+            add(task, "text_macro", b["macro_average_primary"], o["macro_average_primary"] if o else None,
+                bpath, opath, aggregate=True)
+            for key in TEXT_TASKS:
+                add(task, key, b["primary_metrics"][key], o["primary_metrics"][key] if o else None, bpath, opath)
+        elif task == "understanding":
+            if o:
+                equal(b, o, ("selection_contract", "dataset_contract", "adaptation"), "understanding")
+            for data in (b, o):
+                if data is not None:
+                    require(not data["coverage"]["missing_required_tasks"], "incomplete only understanding coverage")
+            bc = b["imagenet1k_zeroshot_classification"]
+            oc = o["imagenet1k_zeroshot_classification"] if o else None
+            for data in (bc, oc):
+                if data is not None:
+                    require(data["complete_formal_target"] is True and data["records"] == 50000,
+                            "incomplete only ImageNet coverage")
+            if oc:
+                equal(bc, oc, ("scoring", "class_text_template", "classes"), "ImageNet")
+            for key, source_key in (("top1", "top_1_accuracy"), ("top5", "top_5_accuracy")):
+                add(task, key, bc[source_key], oc[source_key] if oc else None, bpath, opath)
+            for group in ("paper_compositional_benchmarks", "internal_ablation_diagnostics"):
+                for key, bm in b[group].items():
+                    om = o[group].get(key) if o else None
+                    if om:
+                        equal(bm, om, ("kind", "mc_samples", "language_prior_null_images"), key)
+                        equal(bm["metrics"], om["metrics"], ("records", "primary_metric"), key)
+                    def primary(item):
+                        if item is None:
+                            return None
+                        value = item["metrics"]
+                        for part in value["primary_metric"].split("."):
+                            value = value[part]
+                        return value
+                    add(task, key, primary(bm), primary(om), bpath, opath,
+                        group="diagnostics" if group == "internal_ablation_diagnostics" else task)
+            for dataset, prefix, count in (("mscoco_karpathy_test_5k", "coco", 5000),
+                                            ("flickr30k_karpathy_test_1k", "flickr", 1000)):
+                br = b["standard_cross_dataset_retrieval"][dataset]
+                ori = o["standard_cross_dataset_retrieval"][dataset] if o else None
+                for data in (br, ori):
+                    if data is not None:
+                        require(data["complete_formal_target"] is True and data["images"] == count,
+                                f"incomplete only retrieval: {dataset}")
+                if ori:
+                    equal(br, ori, ("scoring", "images", "captions", "split", "primary_metric"), dataset)
+                add(task, prefix + "_mr", br["mean_recall_at_1_5_10"],
+                    ori["mean_recall_at_1_5_10"] if ori else None, bpath, opath,
+                    label=("COCO-5K" if prefix == "coco" else "Flickr30K-1K") + " 检索 mR")
+                for direction, short in (("image_to_text", "i2t"), ("text_to_image", "t2i")):
+                    for k in (1, 5, 10):
+                        add(task, f"{prefix}_{short}_r{k}", br[direction][f"recall_at_{k}"],
+                            ori[direction][f"recall_at_{k}"] if ori else None, bpath, opath, group="retrieval")
+        else:
+            cfgs = selected.get("generation_cfg_values", [3.5])
+            require(isinstance(cfgs, list) and cfgs
+                    and all(isinstance(cfg, (int, float)) and not isinstance(cfg, bool)
+                            and math.isfinite(cfg) and cfg >= 1 for cfg in cfgs)
+                    and cfgs == sorted(set(cfgs)), "invalid only generation CFG coverage")
+            done_cfgs, batches = [], {}
+            for cfg in cfgs:
+                bp = selected.get("generation_baseline_sources", {}).get(str(cfg), bpath if cfg == 3.5 else None)
+                op = control.get("cfg_sources", {}).get(str(cfg), opath if cfg == 3.5 else None)
+                require(bp and op, f"missing explicit only generation CFG {cfg} source")
+                cb, co = load(bp, baseline), load(op, spec)
+                require(cb is not None, f"missing B generation CFG {cfg} reference")
+                equal(b, cb, ("schema", "metric_protocol", "precision_protocol", "split", "real_source",
+                              "real_stats_path", "real_stats_metadata", "cfg_schedule", "temperature",
+                              "parallel_rate", "backbone_kv_cache"), "generation across CFG")
+                if co and co.get("samples_evaluated") != 50000:
+                    co = None
+                for data in (cb, co):
+                    if data is None:
+                        continue
+                    require(data["samples_evaluated"] == data["samples_requested"] == 50000
+                            and data["cfg"] == cfg and str(data["sampling_steps"]) == "10"
+                            and data["flow_solver"] == "heun" and data["seed"] == 42
+                            and data["project_formal_protocol"] is True, "only generation protocol mismatch")
+                    require(data["implementation_contracts"]["canonical_initial_noise_enabled"] is True
+                            and data["strategies"]["spatial_halton"]["count"] == 50000,
+                            "only generation pairing/coverage mismatch")
+                if co:
+                    equal(cb, co, ("schema", "metric_protocol", "precision_protocol", "split", "real_source",
+                                  "real_stats_path", "real_stats_metadata", "cfg_schedule", "temperature",
+                                  "parallel_rate", "backbone_kv_cache"), "generation")
+                    done_cfgs.append(cfg)
+                bg = cb["strategies"]["spatial_halton"]
+                og = co["strategies"]["spatial_halton"] if co else None
+                for key, source_key in (("fid", "fid"), ("is", "inception_score_mean")):
+                    add(task, key, bg[source_key], og[source_key] if og else None, bp, op, cfg=cfg)
+                    if key == "is":
+                        for side, metrics in (("baseline", bg), ("only", og)):
+                            if metrics is not None:
+                                std = metrics.get("inception_score_std")
+                                require(isinstance(std, (int, float)) and not isinstance(std, bool)
+                                        and math.isfinite(std) and std >= 0, "invalid only generation IS std")
+                                rows[-1][side]["std"] = std
+                batches[str(cfg)] = {"baseline": cb["batch_size"], "only": co["batch_size"] if co else None}
+            controls[-1].update(complete=len(done_cfgs) == len(cfgs), completed_cfgs=done_cfgs,
+                                cfg_total=len(cfgs), generation_batch_sizes=batches)
+    completed = sum(control["complete"] for control in controls)
+    return {"schema": "unified_training_ablation_v1", "baseline": {
+                "id": baseline["id"], "label": "联合 B", "checkpoint": baseline["checkpoint"],
+                "checkpoint_step": baseline["source"]["global_step"],
+                "physical_positions": selected["baseline_physical_positions"]},
+            "controls": controls, "rows": rows, "completed": completed, "total": len(controls),
+            "complete": completed == len(controls), "delta_convention": "baseline_minus_only",
+            "generation_cfg_values": selected.get("generation_cfg_values", [3.5]),
+            "source": "comparisons/unified-training-ablation/comparison.json"}
+
+
+def build(root: Path, selection_file: Path, *, plots: bool = False, unified_plots: bool = False,
+          flow_scale_plots: bool = False):
     root = root.resolve()
     selection = read(selection_file)
     require(selection.get("schema") == "unified_evaluation_report_selection_v1", "unknown report selection schema")
     gallery = gallery_data(root, selection)
     models = []
-    known = {m["id"] for m in gallery["manifest"]["models"]}
-    require(set(selection["models"]) <= known, "selected metric model absent from qualitative inventory")
-    specs = [current_presentation(spec) for spec in gallery["manifest"]["models"]]
-    specs.sort(key=presentation_sort_key)
+    specs = report_model_specs(root, selection, gallery["manifest"]["models"])
     for spec in specs:
         models.append({**spec, **model_metrics(root, spec, selection["models"].get(spec["id"], {}))})
     sampling_sweeps = sampling_sweep_data(root, selection, models)
+    flow_head_scale = flow_head_scale_data(root, selection)
+    unified_training_ablation = unified_training_ablation_data(root, selection, models)
     updated = datetime.now(UTC).isoformat(timespec="seconds")
+    if flow_head_scale:
+        flow_head_scale["updated_at"] = updated
+        flow_head_scale["cfg_sweep"] = export_flow_head_sweep(
+            root, flow_head_scale, write, plots=plots or flow_scale_plots)
+    if unified_training_ablation:
+        unified_training_ablation["updated_at"] = updated
+        unified_training_ablation["generation_sweep"] = export_generation_sweep(
+            root, unified_training_ablation, write, plots=plots or unified_plots)
+        write(within(root, unified_training_ablation["source"]),
+              json.dumps(unified_training_ablation, ensure_ascii=False, indent=2) + "\n")
     provenance = collect_provenance(REPO, root)
     export_provenance(root, provenance, write)
     training = collect_training(REPO, root, models)
@@ -543,8 +888,11 @@ def build(root: Path, selection_file: Path, *, plots: bool = False):
     # current final-EMA selections used in the comparable metric table.
     folders = [{"label": p.name, "path": p.name + "/"} for p in sorted(root.iterdir()) if p.is_dir() and not p.is_symlink()]
     summary = {"schema": "unified_evaluation_report_v1", "updated_at": updated, "models": models,
-               "qualitative_root": gallery["root"], "qualitative_models": len(models),
+               "qualitative_root": gallery["root"], "qualitative_models": len(gallery["manifest"]["models"]),
                "qualitative_records": len(gallery["records"]), "images_verified": gallery["images_verified"],
+               "qualitative_contract": gallery["manifest"].get("contract", {}),
+               "qualitative_speed": selection.get("qualitative_speed"),
+               "generation_capacity": selection.get("generation_capacity"),
                "formal_models": sum(bool(m["metrics"]) for m in models),
                "formal_complete_models": sum(m["complete"] for m in models),
                "artifacts": artifacts, "folders": folders, "runtime_hashing_enabled": False,
@@ -552,12 +900,20 @@ def build(root: Path, selection_file: Path, *, plots: bool = False):
                "sampling_sweeps": sampling_sweeps,
                "order_sweeps": order_sweep_data(root, selection, models),
                "matrix_sweeps": matrix_sweep_data(root, selection, models),
+               "flow_head_scale": flow_head_scale,
+               "unified_training_ablation": unified_training_ablation,
+               "d_cfg_sweep": (read(within(root, selection["d_cfg_sweep"]["output"] + "/comparison.json"))
+                               if selection.get("d_cfg_sweep") and within(root, selection["d_cfg_sweep"]["output"] + "/comparison.json").exists() else None),
+               "s2_cfg_sweep": (read(within(root, selection["s2_cfg_sweep"]["output"] + "/comparison.json"))
+                                if selection.get("s2_cfg_sweep") and within(root, selection["s2_cfg_sweep"]["output"] + "/comparison.json").exists() else None),
                "selection": selection, "scope": "project-native suite; external official generation scorers have separate result availability"}
     data = {**summary, "training": training, "samples": gallery["samples"], "records": gallery["records"], "labels": LABELS}
     template = (REPO / "scripts/assets/evaluation_report.html").read_text(encoding="utf-8")
     require(template.count("__REPORT_EXTENSIONS__") == 1, "invalid report extension marker")
     extensions = "\n".join((REPO / "scripts/assets" / name).read_text(encoding="utf-8")
-                           for name in ("evaluation_dashboard.js", "evaluation_training.js", "evaluation_provenance.js"))
+                           for name in ("evaluation_dashboard.js", "evaluation_flow_head_scale.js",
+                                        "evaluation_unified_training.js",
+                                        "evaluation_training.js", "evaluation_provenance.js"))
     template = template.replace("__REPORT_EXTENSIONS__", extensions)
     # Generated text can contain HTML/script delimiters. It is data, never code.
     embedded = json.dumps(data, ensure_ascii=False, separators=(",", ":")).replace("<", "\\u003c").replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
@@ -574,5 +930,8 @@ if __name__ == "__main__":
     parser.add_argument("--root", type=Path, default=REPO / "output/evaluation")
     parser.add_argument("--selection", type=Path, default=REPO / "configs/protocols/evaluation_report.json")
     parser.add_argument("--plots", action="store_true", help="also refresh standalone PNG/SVG loss figures (requires Matplotlib)")
+    parser.add_argument("--unified-plots", action="store_true", help="refresh B / T2I-only CFG figures (requires Matplotlib)")
+    parser.add_argument("--flow-scale-plots", action="store_true", help="refresh flow-head scale CFG figures (requires Matplotlib)")
     args = parser.parse_args()
-    build(args.root, args.selection, plots=args.plots)
+    build(args.root, args.selection, plots=args.plots, unified_plots=args.unified_plots,
+          flow_scale_plots=args.flow_scale_plots)

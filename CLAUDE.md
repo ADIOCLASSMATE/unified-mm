@@ -20,11 +20,12 @@
 
 - 使用根目录 `.venv` 和现有 CANN 环境；共享环境变更安排在训练空闲期。
 - Codex 连接依赖当前 mihomo 服务，不执行全局 `clashctl off`。SII 图文合成和图片下载使用独立直连客户端，忽略代理环境变量；SII 连接信息只从环境变量或 bashrc/zshrc 中的静态 `SII_API_KEY` / `SII_BASE_URL` export 声明读取，禁止从 `test_api.py` 读取，不切换官方 Qwen 接口。执行命令优先使用非登录 shell，避免启动脚本改动代理状态。
-- ImageNet 原图已在 `public/dataset/imagenet/v1`。新增图片放 `public/datasets/unified_image_pool_512_v3`，文本放 `public/datasets/unified_image_text_512_api_v3`；准备状态放 `public/data_preparation/unified_b_corners_api_v3`，不写入消融数据目录。
+- ImageNet 原图已在 `public/dataset/imagenet/v1`，作为只读历史来源。新方案采用 BLIP3o Long 主库；图像、文本与准备状态分别放项目空间 `/inspire/sj-ssd3/project/high-dimensionaldata/wanjiaxin-253108030048/unified-mm-b512/{images,texts,preparation}`。新 posterior 只放 `public/datasets/unified_b512_posterior_cache`。精确路径以 `configs/data_synthesis/b512_sii_v1.json` 为准；迁移后保留旧 v3 路径的兼容链接，不重写旧清单哈希。
 - 当前图文合成遵循 [DATA_SYNTHESIS.md](docs/DATA_SYNTHESIS.md)：复用原 caption/prompt 优先，SII 补缺纠错，Codex CLI 仅在单图 SII 重试耗尽后有界兜底。非 ImageNet 至少 200 万图，各来源配额不是上限；正式批量合成先完成封闭图库和前置资格验收。SII 使用独立 P-256 / TLS 1.2 / HTTP/1.1 直连池。
 - 加入仓库到 `PYTHONPATH` 时保留原有 CANN 路径。
 - Ascend 为生产后端；设备 smoke 使用固定 `dev-wjx-ascend`。
 - Unified 运行时 hashing 和 W&B 关闭，来源、配置、进度及指标写入本地文件。
+- B512 数据准备按用户 2026-09-14 指令使用 `compute_hashes=false`：不计算图片/归档/清单/文本 SHA、MD5 或 pHash；按 ID、URL、图像引用及长度/解码连接与验收。下载、512px、文本发布和 posterior 包装入口均需遵守，历史回执只保留；见 `docs/DATA_SYNTHESIS.md`。
 - 保存、续训、EMA 和生成改动按 [训练文档](docs/TRAINING.md)验证；CPU 检查入口为 `bash script/check_repo.sh`。
 - 评测产物写入 `output/evaluation/`，训练状态写入 `output/<run>/`。
 

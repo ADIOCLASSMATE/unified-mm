@@ -74,7 +74,7 @@
       "usage": "图文组合 / hard negatives",
       "source": "SugarCrepe 官方七类扰动；ARO Visual Genome Relation / Attribution",
       "size": "7,511 / 23,937 / 28,748 条",
-      "protocol": "使用 benchmark 已发布的正负文本和对应图像，不在本项目重新合成。报告经固定空图先验校正的 pairwise win rate；随机图像顺序 MC64，E sequential 为 MC1。",
+      "protocol": "使用 benchmark 已发布的正负文本和对应图像，不在本项目重新合成。SugarCrepe 使用固定空图先验校正分数；ARO 使用含文本先验的条件似然，均报告严格 pairwise win rate，平局不计正确。随机图像顺序 MC64；E sequential 与 S2 整图 AR 为 MC1。",
       "evidence": ["public/benchmarks/selfless_multimodal_likelihood_v1/manifest.json", "docs/PRETRAINING_NATIVE_EVALUATION.md"]
     },
     {

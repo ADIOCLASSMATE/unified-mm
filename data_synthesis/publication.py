@@ -13,6 +13,7 @@ import time
 from data_synthesis.clients import frozen_pixels
 from data_synthesis.contract import CONTRACT_HASH, parse_pair
 from data_synthesis.io import atomic_json, dumps, file_sha, sha, training_image_id
+from data_synthesis.integrity import check_file_size, hashing_enabled, same_view_binding
 from data_synthesis.pipeline import PIPELINE_VERSION
 from data_synthesis.reuse import choose_reuse
 from data_synthesis.state import State
@@ -25,15 +26,20 @@ def audit(dataset, *, tokenizer, require_posterior=False, image_root=None):
     publication = json.loads((root / "publication.json").read_text())
     if publication.get("pipeline") != PIPELINE_VERSION:
         raise ValueError("not a reuse/SII/fallback publication")
-    for name, digest in publication["file_sha256"].items():
-        if file_sha(root / name) != digest:
+    compute_hashes = hashing_enabled(publication)
+    for name, digest in publication.get("file_sha256", {}).items():
+        if compute_hashes and file_sha(root / name) != digest:
             raise ValueError(f"published file checksum mismatch: {name}")
+    for name, size in publication.get("file_sizes", {}).items():
+        check_file_size(root / name, size)
     index = ImageNetSyntheticTextIndex(root / "text_index.json")
     counts, authors, sources = Counter(), Counter(), Counter()
     verified = 0
     with State(publication["state_root"], readonly=True) as state:
         state.db.execute("CREATE TEMP TABLE published_keys(key TEXT PRIMARY KEY)")
         config = state.meta("config")
+        if compute_hashes != hashing_enabled(config):
+            raise ValueError("publication hashing policy differs from frozen state")
         if state.meta("contract")["pair_contract"] != CONTRACT_HASH:
             raise ValueError("publication references a different pair contract")
         try:
@@ -47,12 +53,14 @@ def audit(dataset, *, tokenizer, require_posterior=False, image_root=None):
                     item = state.item(view["key"])
                     if item["status"] != "ready" or view["img_id"] != offset + 1 or view["split"] != "train":
                         raise ValueError("unready, misnumbered or non-train image")
-                    if view["view_sha256"] != item["view_sha256"] or view["source_sha256"] != item["source_sha256"]:
+                    if compute_hashes and (view["view_sha256"] != item["view_sha256"] or view["source_sha256"] != item["source_sha256"]):
                         raise ValueError("publication changed image identity")
                     if view["source_path"] != item["view"]["source_path"]:
                         raise ValueError("publication changed frozen image reference")
-                    frozen_pixels(item)
-                    if sha(read_image_bytes(view["original_ref"])) != view["source_sha256"]:
+                    if not same_view_binding(view, item["view"], compute_hashes):
+                        raise ValueError("publication changed view binding")
+                    frozen_pixels(item, compute_hashes=compute_hashes)
+                    if compute_hashes and sha(read_image_bytes(view["original_ref"])) != view["source_sha256"]:
                         raise ValueError("original image checksum mismatch")
                     for ref in (view["original_ref"], view["source_path"]):
                         path = Path(ref[4:].rsplit("::", 1)[0] if ref.startswith("tar:") else ref).resolve()
@@ -65,7 +73,7 @@ def audit(dataset, *, tokenizer, require_posterior=False, image_root=None):
                     route = evidence["route"]
                     if route in {"reuse", "normalize", "annotation"}:
                         replay, replay_evidence, _ = choose_reuse(item, tokenizer, config)
-                        if replay != pair or replay_evidence != {k: v for k, v in evidence.items() if k not in {"pipeline", "view_sha256", "contract_hash"}}:
+                        if replay != pair or replay_evidence != {k: v for k, v in evidence.items() if k not in {"pipeline", "view_sha256", "view_id", "contract_hash"}}:
                             raise ValueError("source caption/annotation no longer reproduces the stored result")
                         if item["api_attempts"] or item["codex_attempts"]:
                             raise ValueError("reused text unexpectedly consumed inference attempts")
@@ -74,11 +82,11 @@ def audit(dataset, *, tokenizer, require_posterior=False, image_root=None):
                         raw = state.raw(evidence["attempt_id"])
                         if not attempt or attempt["status"] != "succeeded" or attempt["item_key"] != item["key"]:
                             raise ValueError("missing successful source attempt")
-                        if (raw.get("backend") != route or raw.get("view_sha256") != item["view_sha256"]
+                        if (raw.get("backend") != route or not same_view_binding(raw, item["view"], compute_hashes)
                                 or raw.get("contract_hash") != CONTRACT_HASH or raw.get("image_attached") is not True
-                                or raw.get("prompt_sha256") != sha(raw["prompt"].encode())):
+                                or (compute_hashes and raw.get("prompt_sha256") != sha(raw["prompt"].encode()))):
                             raise ValueError("request/attachment provenance mismatch")
-                        if parse_pair(raw, item["key"], tokenizer) != pair or attempt["result_sha256"] != sha(dumps(pair).encode()):
+                        if parse_pair(raw, item["key"], tokenizer) != pair or (compute_hashes and attempt["result_sha256"] != sha(dumps(pair).encode())):
                             raise ValueError("raw provider response differs from published text")
                         if route == "sii":
                             if raw["requested_model"] not in config["sii"]["vision_models"] or raw.get("proxy") is not False:
@@ -121,19 +129,23 @@ def audit(dataset, *, tokenizer, require_posterior=False, image_root=None):
     posterior = None
     if require_posterior or (root / "posterior_index.json").exists():
         from scripts.audit_image_text_publication import audit_posterior
-        posterior = audit_posterior(root, verified, file_sha(root / "manifest.jsonl"))
-    return {"status": "passed", "audit_mode": "strict", "pipeline": PIPELINE_VERSION,
+        posterior = audit_posterior(root, verified, file_sha(root / "manifest.jsonl") if compute_hashes else None,
+                                    compute_hashes=compute_hashes)
+    return {"status": "passed", "audit_mode": "strict" if compute_hashes else "id_reference_size_decode",
+            "compute_hashes": compute_hashes, "pipeline": PIPELINE_VERSION,
             "dataset": str(root), "verified_images": verified, "records": verified,
-            "manifest_sha256": file_sha(root / "manifest.jsonl"), "posterior": posterior,
-            "all_rgb_512": True, "all_source_and_view_sha256_verified": True,
-            "all_seek_rows_verified": True, "all_reuse_text_sha_verified": True,
+            "manifest_sha256": file_sha(root / "manifest.jsonl") if compute_hashes else None,
+            "manifest_bytes": check_file_size(root / "manifest.jsonl"), "posterior": posterior,
+            "all_rgb_512": True, "all_source_and_view_sha256_verified": compute_hashes,
+            "all_image_references_verified": True,
+            "all_seek_rows_verified": True, "all_reuse_text_sha_verified": compute_hashes,
             "all_raw_responses_verified": True, "all_codex_calls_follow_sii_exhaustion": True,
             "token_budget_checked": True, "routes": dict(counts), "sources": dict(sources),
             "i2t_generators": dict(authors), "semantic_accuracy_independently_verified": False,
             "audited_at": time.time()}
 
 
-def export(root, destination, *, tokenizer, shard_records=100000):
+def export(root, destination, *, tokenizer, shard_records=250000):
     destination = Path(destination).resolve()
     if destination.exists():
         raise FileExistsError("publications are immutable; choose a new release directory")
@@ -142,6 +154,7 @@ def export(root, destination, *, tokenizer, shard_records=100000):
     temporary = None
     with State(root) as state:
         frozen = state.meta("frozen")
+        compute_hashes = hashing_enabled(state.meta("config"))
         counts = state.counts()
         if not frozen or any(n for status, n in counts.items() if status not in {"ready", "quarantined"}):
             raise ValueError("cannot publish pending, failed or partially completed source scope")
@@ -205,7 +218,9 @@ def export(root, destination, *, tokenizer, shard_records=100000):
                 "image_size": 512, "image_tokens": 1024, "state_root": str(state.root), "pilot": frozen["pilot"],
                 "quarantined_images": counts.get("quarantined", 0), "accepted_non_imagenet_images": accepted_non_imagenet,
                 "frozen_pool": frozen, "contract": state.meta("contract"),
-                "file_sha256": {p.name: file_sha(p) for p in temporary.iterdir() if p.is_file()}})
+                "compute_hashes": compute_hashes,
+                "file_sizes": {p.name: p.stat().st_size for p in temporary.iterdir() if p.is_file()},
+                "file_sha256": {p.name: file_sha(p) for p in temporary.iterdir() if p.is_file()} if compute_hashes else {}})
             # Audit using a separate read-only connection while holding the writer lock.
             report = audit(temporary, tokenizer=tokenizer)
             report["dataset"] = str(destination)

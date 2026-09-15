@@ -82,6 +82,58 @@ def test_composition_requires_unchanged_source_manifest_and_all_images(tmp_path)
         compose_index(dataset, [bank], output, row_map)
 
 
+def test_no_hash_posterior_join_uses_references_and_keeps_vae_contract(tmp_path, monkeypatch):
+    from scripts.audit_image_text_publication import audit_posterior
+
+    def no_hash_bank(name, values):
+        path, rows = make_bank(tmp_path / name, values)
+        for row in rows:
+            row.update(view_sha256=None, source_path=f"/images/{name}/{row['img_id']}.png")
+            row["view_id"] = row["source_path"]
+        manifest = path.parent / "manifest.jsonl"
+        manifest.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        index = json.loads(path.read_text())
+        index["metadata"].update(source_view_hashes_verified=False, runtime_hashing_enabled=False,
+            manifest_sha256=None, source_manifest_sha256=None, manifest_bytes=manifest.stat().st_size,
+            vae_checkpoint_sha256=None, vae_module_sha256=None,
+            vae_checkpoint="/models/kl16.ckpt", vae_module_root="/models/kl16")
+        path.write_text(json.dumps(index))
+        return path, rows
+
+    a, rows_a = no_hash_bank("a", [10, 20])
+    b, rows_b = no_hash_bank("b", [30])
+    dataset = tmp_path / "published"
+    dataset.mkdir()
+    rows = [{**row, "img_id": i + 1, "split": "train", "key": str(i)}
+            for i, row in enumerate([rows_b[0], rows_a[1], rows_a[0]])]
+    manifest = dataset / "manifest.jsonl"
+    manifest.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    (dataset / "publication.json").write_text(json.dumps({"records": 3, "compute_hashes": False,
+        "file_sizes": {"manifest.jsonl": manifest.stat().st_size}}))
+
+    def forbidden(*args):
+        raise AssertionError("unexpected manifest or bank hash")
+
+    monkeypatch.setattr("scripts.compose_b512_posterior_index.sha256_file", forbidden)
+    output, row_map = dataset / "posterior_index.json", tmp_path / "rows.pt"
+    compose_index(dataset, [a, b], output, row_map)
+    result = load_sharded_posterior(output)
+    assert result["metadata"]["identity_mapping"] == "frozen_image_reference"
+    assert result["metadata"]["manifest_sha256"] is None
+    for i, value in enumerate([30., 20., 10.]):
+        torch.testing.assert_close(result["posterior_stats"][i], torch.full((1024, 32), value, dtype=torch.float16))
+    report = audit_posterior(dataset, 3, None, compute_hashes=False)
+    assert report["all_rows_verified"] and report["source_image_references_verified"]
+    assert not report["source_view_hashes_verified_at_encoding"]
+    with pytest.raises(ValueError, match="missing posterior"):
+        compose_index(dataset, [a], dataset / "missing.json", tmp_path / "missing.pt")
+    index = json.loads(b.read_text())
+    index["metadata"]["vae_checkpoint"] = "/models/different.ckpt"
+    b.write_text(json.dumps(index))
+    with pytest.raises(ValueError, match="incompatible VAE"):
+        compose_index(dataset, [a, b], dataset / "wrong.json", tmp_path / "wrong.pt")
+
+
 def test_frozen_vae_input_checks_pixels_before_encoding(tmp_path):
     path = tmp_path / "image.png"
     Image.new("RGB", (512, 512), "red").save(path)

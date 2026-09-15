@@ -71,8 +71,8 @@ components:
         - mscoco_karpathy_test_5k
         - flickr30k_karpathy_test_1k
         - sugarcrepe
-        - aro_vg_relation
-        - aro_vg_attribution
+      aro_primary_candidate_score: conditional_mean_token_loglikelihood
+      aro_language_prior_included: true
       dense_candidate_estimator: candidate_image_logmeanexp
       hard_negative_estimator: content_free_gaussian_image_logmeanexp
       hard_negative_null_images: 3

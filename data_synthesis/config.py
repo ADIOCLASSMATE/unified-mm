@@ -81,6 +81,8 @@ def load_config(path=DEFAULT_CONFIG):
 def validate_config(c):
     if c.get("schema") != SCHEMA:
         raise ValueError("unknown synthesis runtime schema")
+    if not isinstance(c.get("compute_hashes", True), bool):
+        raise ValueError("compute_hashes must be boolean")
     if (c.get("image_size"), c.get("image_tokens"), c.get("text_tokens_max")) != (512, 1024, 960):
         raise ValueError("B512 requires 512px, 1024 image tokens and a 960 text-token budget")
     if c.get("minimum_images", 0) < 1 or c.get("source_targets_are_caps") is not False:
@@ -99,6 +101,9 @@ def validate_config(c):
             raise ValueError(f"SII {k} must be positive")
     if api["concurrency_start"] > api["concurrency_max"]:
         raise ValueError("SII start concurrency exceeds ceiling")
+    if c.get("review_mode") == "reuse_first_targeted":
+        if not 1 <= c.get("routing_workers", 0) <= 64 or not c.get("prepared_selection"):
+            raise ValueError("reuse-first requires 1..64 local workers and a fixed prepared selection")
     if fallback["model"] != "gpt-5.6-sol" or fallback["reasoning_effort"] != "low":
         raise ValueError("Codex fallback explicitly uses gpt-5.6-sol / low")
     if fallback["max_attempts"] < 1 or fallback["concurrency"] < 1 or fallback["max_items_per_run"] < 1:

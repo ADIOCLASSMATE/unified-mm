@@ -14,6 +14,7 @@ from transformers import AutoTokenizer
 
 from utils.imagenet_flow_batching import collate_imagenet_flow_cache
 from utils.imagenet_flow_dataloaders import _build_cache_dataset
+from data_synthesis.integrity import check_file_size, hashing_enabled
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -28,9 +29,11 @@ def audit_training_loaders(dataset, publication_audit, output, config_path):
     config_path = Path(config_path).resolve()
     config = OmegaConf.load(config_path)
     audit = json.loads(Path(publication_audit).read_text())
+    compute_hashes = hashing_enabled(audit)
     assert Path(audit["dataset"]).resolve() == release, "publication audit belongs to another release"
     assert audit["posterior"]["all_rows_verified"], "full posterior audit must finish first"
-    assert audit["posterior"]["source_view_hashes_verified_at_encoding"]
+    assert (audit["posterior"]["source_view_hashes_verified_at_encoding"] if compute_hashes
+            else audit["posterior"]["source_image_references_verified"])
     assert Path(audit["posterior"]["index"]).resolve() == release / "posterior_index.json"
     assert config.model.image_tokens_per_img == 1024
     assert config.model.image_latent_dim == 16
@@ -41,7 +44,8 @@ def audit_training_loaders(dataset, publication_audit, output, config_path):
         for mode in ("i2t", "t2i")
     }
     assert all(size > 0 for size in batch_sizes.values())
-    manifest_sha = hashlib.sha256((release / "manifest.jsonl").read_bytes()).hexdigest()
+    manifest_sha = hashlib.sha256((release / "manifest.jsonl").read_bytes()).hexdigest() if compute_hashes else None
+    manifest_bytes = check_file_size(release / "manifest.jsonl", audit.get("manifest_bytes"))
     assert manifest_sha == audit["manifest_sha256"]
     count = int(audit["verified_images"])
     assert count > 0
@@ -126,14 +130,17 @@ def audit_training_loaders(dataset, publication_audit, output, config_path):
     new_i2t, new_t2i = datasets["i2t"][0], datasets["t2i"][0]
     assert torch.equal(new_i2t["image_latents"], new_t2i["image_latents"])
     assert not torch.equal(old_latents, new_i2t["image_latents"])
-    assert hashlib.sha256((release / "manifest.jsonl").read_bytes()).hexdigest() == manifest_sha
+    if compute_hashes:
+        assert hashlib.sha256((release / "manifest.jsonl").read_bytes()).hexdigest() == manifest_sha
+    check_file_size(release / "manifest.jsonl", manifest_bytes)
     report = {
         "audited_at": datetime.now(timezone.utc).isoformat(),
         "dataset": str(release.resolve()),
         "manifest_sha256": manifest_sha,
+        "manifest_bytes": manifest_bytes, "compute_hashes": compute_hashes,
         "training_configuration": str(config_path),
-        "configuration_sha256": hashlib.sha256(config_path.read_bytes()).hexdigest(),
-        "audit_script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "configuration_sha256": hashlib.sha256(config_path.read_bytes()).hexdigest() if compute_hashes else None,
+        "audit_script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest() if compute_hashes else None,
         "publication_audit": str(Path(publication_audit).resolve()),
         "training_config_mutated": False,
         "tokenizer": str((REPO / config.model.model_path).resolve()),

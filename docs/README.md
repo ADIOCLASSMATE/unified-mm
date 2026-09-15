@@ -5,10 +5,12 @@
 | 内容 | 主文档 |
 | --- | --- |
 | 安装与常用命令 | [项目首页](../README.md) |
+| 从统一多模态预测方式的观察到双流设计 | [双流架构的设计动机](DUAL_STREAM_DESIGN_MOTIVATION.md) |
 | A/B、C–F、only与规模实验定义 | [实验](EXPERIMENTS.md) |
 | 训练预算、启动、恢复、checkpoint | [训练](TRAINING.md) |
 | 语料、caption、latent与索引 | [数据](DATA.md) |
 | 当前数据合成入口、连接配置、复用与失败兜底 | [DATA_SYNTHESIS](DATA_SYNTHESIS.md) |
+| Long 原文复用、专项补缺与定向 DeepSeek 修复 | [复用优先 2026-09-15](B_REUSE_FIRST_20260915.md) |
 | B 大规模训练的数据缺口与合成方案（历史诊断） | [I2T / T2I 数据建议（2026-09-11）](B_DATA_SCALING_RECOMMENDATION_20260911.md) |
 | 当前大规模数据选择：非 ImageNet 至少 200 万图，优先复用文本 | [来源、精选资源与复用协议（2026-09-13）](B_2M_NON_IMAGENET_DATA_PLAN_20260913.md) |
 | 512px Codex sol 首轮合成与独立目录（历史） | [9 月 12 日首轮图文流水线](B_CODEX_IMAGE_SYNTHESIS_20260912.md) |
@@ -75,3 +77,5 @@
 | [运行索引](archive/IMAGENET_EXECUTION_NOTES.md) | 历史硬件与80/400-epoch T2I入口 |
 
 当前配置集中在项目入口各页；历史文档保留当时的配方、指标和产物路径。
+
+- [B512 Long 主库与分离存储](B_BLIP3O_LONG_DATA_PLAN_20260913.md)：完整 Long 下载、专项补充、项目空间图文与 global_user posterior 缓存。

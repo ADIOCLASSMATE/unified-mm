@@ -6,6 +6,7 @@ from pathlib import Path
 
 from data_synthesis.config import DEFAULT_CONFIG, load_config, load_sii_settings
 from data_synthesis.io import dumps
+from data_synthesis.integrity import hashing_enabled
 
 
 def main(argv=None):
@@ -30,7 +31,7 @@ def main(argv=None):
     down.add_argument("--request-timeout", type=float, default=90)
     prep.add_argument("--root", help="Synthesis root receiving sealed view batches")
     prep.add_argument("--exclude", required=True)
-    prep.add_argument("--near-exclude-index", required=True)
+    prep.add_argument("--near-exclude-index")
     freeze = sub.add_parser("freeze", help="Join all closed inputs, deduplicate and freeze the accepted image pool")
     freeze.add_argument("--root")
     freeze.add_argument("--inbox", action="append", default=[], help="Repeat for multiple completed download cohorts")
@@ -40,9 +41,10 @@ def main(argv=None):
     freeze.add_argument("--near-exclude-index")
     freeze.add_argument("--exclude-prompts")
     freeze.add_argument("--pilot", action="store_true", help="Explicit small development pool, never a production release")
-    run = sub.add_parser("run", help="Reuse first, SII repair, then bounded Codex fallback after retry exhaustion")
+    run = sub.add_parser("run", help="Current reuse-first local routing and targeted SII repair")
     run.add_argument("--root")
     run.add_argument("--qualification", type=Path)
+    run.add_argument("--selection", type=Path)
     run.add_argument("--max-items", type=int)
     run.add_argument("--tokenizer")
     status = sub.add_parser("status")
@@ -56,7 +58,7 @@ def main(argv=None):
     export.add_argument("--root")
     export.add_argument("--output", required=True)
     export.add_argument("--tokenizer")
-    export.add_argument("--shard-records", type=int, default=100000)
+    export.add_argument("--shard-records", type=int, help="Defaults to runtime export_shard_records")
     audit = sub.add_parser("audit")
     audit.add_argument("--dataset", required=True)
     audit.add_argument("--tokenizer")
@@ -73,13 +75,15 @@ def main(argv=None):
                  "protocol": config["sii"]["protocol"], "models": config["sii"]["vision_models"], "proxy": False}
     elif args.command == "ingest":
         from data_synthesis.sources import ingest_candidates
-        value = ingest_candidates(args.manifest, args.supply_root, args.prefix)
+        value = ingest_candidates(args.manifest, args.supply_root, args.prefix,
+                                  compute_hashes=hashing_enabled(config))
     elif args.command == "seal-candidates":
         from data_synthesis.sources import seal_candidates
-        value = seal_candidates(args.supply_root)
+        value = seal_candidates(args.supply_root, compute_hashes=hashing_enabled(config))
     elif args.command in {"download", "prepare"}:
         from scripts.supply_b512_images import download_service, prepare_service
         args.image_root = args.image_root or config["image_root"]
+        args.compute_hashes = hashing_enabled(config)
         args.root = args.supply_root
         if args.workers < 1:
             parser.error("workers must be positive")
@@ -87,7 +91,7 @@ def main(argv=None):
             from data_synthesis.sources import seal_candidates
             if not (Path(args.supply_root) / "candidates.closed.json").is_file():
                 parser.error("seal-candidates before starting the current download cohort")
-            seal_candidates(args.supply_root)  # Recheck immutable file hashes on resume.
+            seal_candidates(args.supply_root, compute_hashes=args.compute_hashes)
             args.direct_dns_hosts, args.direct_dns_host, args.direct_dns_rps = [], [], 2.0
             if args.per_host < 1 or args.request_timeout <= 0:
                 parser.error("per-host and timeout must be positive")
@@ -101,16 +105,25 @@ def main(argv=None):
         value = freeze_pool(root, config, prepared=args.prepared_run, releases=args.release, inbox=args.inbox,
                             exclude=args.exclude, near_index=args.near_exclude_index, exclude_prompts=args.exclude_prompts, pilot=args.pilot)
     elif args.command == "status":
-        from data_synthesis.state import State
-        with State(root, readonly=True) as state:
-            value = {"counts": state.counts(), "frozen_pool": state.meta("frozen"), "scheduler": state.meta("scheduler")}
+        if config.get("review_mode") == "reuse_first_targeted":
+            value = json.loads((Path(root) / "status.json").read_text())
+        else:
+            from data_synthesis.state import State
+            with State(root, readonly=True) as state:
+                value = {"counts": state.counts(), "frozen_pool": state.meta("frozen"), "scheduler": state.meta("scheduler")}
+    elif args.command == "run" and config.get("review_mode") == "reuse_first_targeted":
+        from data_synthesis.reuse_farm import run as run_reuse
+        if args.max_items is not None:
+            parser.error("use a separate fixed selection for a bounded reuse-first test")
+        value = asyncio.run(run_reuse(root, config, args.selection or config["prepared_selection"],
+            args.qualification or Path(root) / "user_acceptance.json"))
     elif args.command == "quarantine-failed":
         from data_synthesis.state import State
         with State(root, config) as state:
             value = state.quarantine_failed(config)
     elif args.command == "prepare-bank":
         from scripts.prepare_b512_posterior_bank import prepare_bank
-        value = prepare_bank(root, args.output)
+        value = prepare_bank(root, args.output, compute_hashes=hashing_enabled(config))
     else:
         from transformers import AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained(args.tokenizer or config["tokenizer"], local_files_only=True)
@@ -120,7 +133,9 @@ def main(argv=None):
                                             qualification_path=args.qualification))
         elif args.command == "export":
             from data_synthesis.publication import export as export_text
-            value = export_text(root, args.output, tokenizer=tokenizer, shard_records=args.shard_records)
+            value = export_text(root, args.output, tokenizer=tokenizer,
+                                shard_records=(args.shard_records if args.shard_records is not None
+                                               else config.get("export_shard_records", 250000)))
         else:
             from data_synthesis.publication import audit as audit_text
             value = audit_text(args.dataset, tokenizer=tokenizer, require_posterior=args.require_posterior)

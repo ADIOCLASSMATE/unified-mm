@@ -1,0 +1,116 @@
+{
+  "schema": "b512_prepared_selection_v1",
+  "state": "source_scope_frozen_by_user",
+  "closed_at": 1789415400.5471573,
+  "images": 22991115,
+  "image_count_basis": "accepted_512_views_before_cross_source_identity_merge",
+  "content_uniqueness_verified": false,
+  "image_size": 512,
+  "image_tokens": 1024,
+  "compute_hashes": false,
+  "downloads_enabled": false,
+  "retry_failed": false,
+  "resume_requires_new_user_request": true,
+  "include_imagenet": false,
+  "include_old_ablation_releases": false,
+  "include_unprepared_archives": false,
+  "climbmix": "unchanged",
+  "cohorts": [
+    {
+      "cohort": "blip3o_long",
+      "images": 22115459,
+      "rejected": 7238011,
+      "batches": 116497,
+      "supply_root": "/inspire/sj-ssd3/project/high-dimensionaldata/wanjiaxin-253108030048/unified-mm-b512/preparation/supply/blip3o_long_v1",
+      "input_queue": "/inspire/sj-ssd3/project/high-dimensionaldata/wanjiaxin-253108030048/unified-mm-b512/preparation/prepared/blip3o_long_v1/input_queue",
+      "prepared_runs": "/inspire/sj-ssd3/project/high-dimensionaldata/wanjiaxin-253108030048/unified-mm-b512/preparation/supply/blip3o_long_v1/prepared_batches",
+      "percent": 96.19132869371494
+    },
+    {
+      "cohort": "pixmo_cap_a",
+      "images": 77862,
+      "rejected": 40013,
+      "batches": 9604,
+      "supply_root": "/inspire/sj-ssd3/project/high-dimensionaldata/wanjiaxin-253108030048/unified-mm-b512/preparation/legacy_v3/supply/pixmo_cap_a_20260913",
+      "input_queue": "/inspire/sj-ssd3/project/high-dimensionaldata/wanjiaxin-253108030048/unified-mm-b512/preparation/legacy_v3/prepared/pixmo_cap_a_20260913/input_queue",
+      "prepared_runs": "/inspire/sj-ssd3/project/high-dimensionaldata/wanjiaxin-253108030048/unified-mm-b512/preparation/legacy_v3/supply/pixmo_cap_a_20260913/prepared_batches",
+      "percent": 0.338661261100212
+    },
+    {
+      "cohort": "pixmo_cap_b",
+      "images": 96732,
+      "rejected": 40066,
+      "batches": 12319,
+      "supply_root": "/inspire/sj-ssd3/project/high-dimensionaldata/wanjiaxin-253108030048/unified-mm-b512/preparation/legacy_v3/supply/pixmo_cap_b_20260913",
+      "input_queue": "/inspire/sj-ssd3/project/high-dimensionaldata/wanjiaxin-253108030048/unified-mm-b512/preparation/legacy_v3/prepared/pixmo_cap_b_20260913/input_queue",
+      "prepared_runs": "/inspire/sj-ssd3/project/high-dimensionaldata/wanjiaxin-253108030048/unified-mm-b512/preparation/legacy_v3/supply/pixmo_cap_b_20260913/prepared_batches",
+      "percent": 0.42073644536161037
+    },
+    {
+      "cohort": "pixmo_points",
+      "images": 89047,
+      "rejected": 44800,
+      "batches": 11211,
+      "supply_root": "/inspire/sj-ssd3/project/high-dimensionaldata/wanjiaxin-253108030048/unified-mm-b512/preparation/legacy_v3/supply/pixmo_points_20260913_v2",
+      "input_queue": "/inspire/sj-ssd3/project/high-dimensionaldata/wanjiaxin-253108030048/unified-mm-b512/preparation/legacy_v3/prepared/pixmo_points_20260913_v2/input_queue",
+      "prepared_runs": "/inspire/sj-ssd3/project/high-dimensionaldata/wanjiaxin-253108030048/unified-mm-b512/preparation/legacy_v3/supply/pixmo_points_20260913_v2/prepared_batches",
+      "percent": 0.3873104892911892
+    },
+    {
+      "cohort": "openimages",
+      "images": 513127,
+      "rejected": 15156,
+      "batches": 17557,
+      "supply_root": "/inspire/sj-ssd3/project/high-dimensionaldata/wanjiaxin-253108030048/unified-mm-b512/preparation/legacy_v3/supply/openimages_20260913",
+      "input_queue": "/inspire/sj-ssd3/project/high-dimensionaldata/wanjiaxin-253108030048/unified-mm-b512/preparation/legacy_v3/prepared/openimages_20260913/input_queue",
+      "prepared_runs": "/inspire/sj-ssd3/project/high-dimensionaldata/wanjiaxin-253108030048/unified-mm-b512/preparation/legacy_v3/supply/openimages_20260913/prepared_batches",
+      "percent": 2.231849129544174
+    },
+    {
+      "cohort": "pd3m",
+      "images": 96603,
+      "rejected": 2037,
+      "batches": 11826,
+      "supply_root": "/inspire/sj-ssd3/project/high-dimensionaldata/wanjiaxin-253108030048/unified-mm-b512/preparation/legacy_v3/supply/pd3m_20260913",
+      "input_queue": "/inspire/sj-ssd3/project/high-dimensionaldata/wanjiaxin-253108030048/unified-mm-b512/preparation/legacy_v3/prepared/pd3m_20260913/input_queue",
+      "prepared_runs": "/inspire/sj-ssd3/project/high-dimensionaldata/wanjiaxin-253108030048/unified-mm-b512/preparation/legacy_v3/supply/pd3m_20260913/prepared_batches",
+      "percent": 0.42017535904630987
+    },
+    {
+      "cohort": "textcaps",
+      "images": 2285,
+      "rejected": 547,
+      "batches": 74,
+      "supply_root": "/inspire/sj-ssd3/project/high-dimensionaldata/wanjiaxin-253108030048/unified-mm-b512/preparation/legacy_v3/supply/textcaps_20260913",
+      "input_queue": "/inspire/sj-ssd3/project/high-dimensionaldata/wanjiaxin-253108030048/unified-mm-b512/preparation/legacy_v3/prepared/textcaps_20260913/input_queue",
+      "prepared_runs": "/inspire/sj-ssd3/project/high-dimensionaldata/wanjiaxin-253108030048/unified-mm-b512/preparation/legacy_v3/supply/textcaps_20260913/prepared_batches",
+      "percent": 0.009938621941563077
+    }
+  ],
+  "batch_index": "/inspire/sj-ssd3/project/high-dimensionaldata/wanjiaxin-253108030048/unified-mm-b512/operations/frozen_downloads_20260914/prepared_batches.jsonl",
+  "batch_index_bytes": 48195964,
+  "training_release_ready": false,
+  "next_steps": [
+    "reuse_existing_text_and_repair_missing_or_wrong_text_with_SII",
+    "merge_known_ID_URL_reference_aliases_without_hashing",
+    "posterior_encoding_and_training_export"
+  ],
+  "download_totals": {
+    "archive_objects": 3258,
+    "archive_objects_verified": 3258,
+    "archive_declared_bytes": 2046647537905,
+    "archive_verified_bytes_including_local_reuse": 2046647537905,
+    "archive_network_bytes_recorded_this_run": 2038443453488,
+    "url_images_downloaded": 1018275,
+    "url_download_failures": 113518,
+    "prepared_512_views_before_global_dedup": 22991115,
+    "preparation_rejections": 7380630
+  },
+  "excluded_from_scope": [
+    "failed_urls",
+    "unfetched_urls",
+    "unprepared_supplement_archives",
+    "old_ablation_releases",
+    "imagenet_pending_separate_accounting"
+  ]
+}

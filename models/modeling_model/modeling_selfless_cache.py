@@ -49,6 +49,12 @@ class SelflessStaticCache(Cache):
             ]
         )
         self._max_cache_len = int(max_cache_len)
+        self.visible_length = self._max_cache_len
+
+    def read(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        layer = self.layers[layer_idx]
+        return (layer.keys[:, :, :self.visible_length],
+                layer.values[:, :, :self.visible_length])
 
     def get_seq_length(self, layer_idx: int = 0) -> int:
         del layer_idx
@@ -64,6 +70,7 @@ class SelflessStaticCache(Cache):
             config=types.SimpleNamespace(num_hidden_layers=len(self.layers)),
             max_cache_len=self._max_cache_len,
         )
+        cloned.visible_length = self.visible_length
         for source, target in zip(self.layers, cloned.layers, strict=True):
             if not source.is_initialized:
                 continue
@@ -171,4 +178,4 @@ class SelflessStaticCache(Cache):
             )
         layer.keys.scatter_(2, key_indices, key_states)
         layer.values.scatter_(2, value_indices, value_states)
-        return layer.keys, layer.values
+        return self.read(layer_idx)

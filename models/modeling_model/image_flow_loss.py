@@ -1842,6 +1842,23 @@ class ContextualFlowTransformerHead(nn.Module):
             self._validate_latent_mixer_cache(latent_mixer_cache)
             context_layers = latent_mixer_cache.get("layers")
             context_mask = latent_mixer_cache.get("context_mask")
+            block_size = latent_mixer_cache.get("attention_block_size")
+            if block_size and latent_mixer_cache.get("capacity"):
+                # Keep stable storage for append operations, but attention only
+                # reads the occupied prefix rounded to a small shape bucket.
+                active = max(1, int(latent_mixer_cache["active_length"]))
+                visible = min(int(latent_mixer_cache["capacity"]),
+                    ((active + block_size - 1) // block_size) * block_size)
+                if latent_mixer_cache.get("_attention_visible_length") != visible:
+                    latent_mixer_cache["_attention_layers"] = [
+                        dict(layer, k=layer["k_storage"][:, :, :visible],
+                             v=layer["v_storage"][:, :, :visible],
+                             context_positions=layer["context_positions"][:, :visible])
+                        for layer in context_layers]
+                    latent_mixer_cache["_attention_visible_length"] = visible
+                    latent_mixer_cache.pop("_prepared_context_mask", None)
+                context_layers = latent_mixer_cache["_attention_layers"]
+                context_mask = context_mask[:, :, :visible]
             if context_layers:
                 first_layer = context_layers[0]
                 input_layout = first_layer.get("input_layout", "BNSD")

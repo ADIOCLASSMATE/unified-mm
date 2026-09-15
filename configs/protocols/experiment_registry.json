@@ -226,6 +226,41 @@
       "active_sources": [
         "t2i"
       ]
+    },
+    {
+      "run": "unified-f-on-b-flowdepth16-0p6b-100b-imagenet-split-s42-r1",
+      "id": "f_on_b_flowdepth16",
+      "label": "F · position-wise head · depth 16",
+      "group": "scaling",
+      "purpose": "formal",
+      "active_sources": [
+        "climbmix",
+        "t2i",
+        "i2t"
+      ]
+    },
+    {
+      "run": "unified-f-on-b-flowdepth30-0p6b-100b-imagenet-split-s42-r1",
+      "id": "f_on_b_flowdepth30",
+      "label": "F · position-wise head · depth 30",
+      "group": "scaling",
+      "purpose": "formal",
+      "active_sources": [
+        "climbmix",
+        "t2i",
+        "i2t"
+      ]
+    },
+    {
+      "run": "unified-b-x0content-0p6b-t2i-i2t-bmatched-s42-r1",
+      "id": "b_t2i_i2t_matched",
+      "label": "B · T2I + I2T（无 ClimbMix）",
+      "group": "data_ablation",
+      "purpose": "formal",
+      "active_sources": [
+        "t2i",
+        "i2t"
+      ]
     }
   ]
 }

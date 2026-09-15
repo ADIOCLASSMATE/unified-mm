@@ -454,7 +454,7 @@ def benchmark_summary(source: dict[str, Any], task: str) -> dict[str, Any]:
     expected = EXPECTED_BENCHMARK_RECORDS[task]
     if actual != expected:
         raise ValueError(f"{task} records mismatch: {actual} != {expected}")
-    expected_primary = (
+    expected_primary = "conditional_pairwise.win_rate" if task.startswith("aro_vg_") else (
         "language_prior_debiased_pairwise.win_rate"
         if task in PAPER_BENCHMARKS
         else (
@@ -736,7 +736,7 @@ def package_step(
     ):
         raise ValueError(f"step {step} benchmark summary is not debiased")
     if benchmark_scoring.get("reported_score_variant") != (
-        "language_prior_debiased_only"
+        "conditional_aro_debiased_other_tasks"
     ):
         raise ValueError(f"step {step} benchmark summary retains old scores")
     paper_benchmarks: dict[str, Any] = {}

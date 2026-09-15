@@ -209,6 +209,129 @@ def test_ema_source_uses_s2_module_contract(tmp_path, dual):
     assert config.model.flow_condition_contract == "backbone_noisy_image_hidden"
 
 
+@pytest.mark.parametrize("dual", [False, True])
+def test_validation_generates_s2_subset_and_reports_uncached_flow(monkeypatch, tmp_path, dual):
+    import json
+    from types import SimpleNamespace
+
+    from accelerate.utils import DistributedType
+    from omegaconf import OmegaConf
+
+    import pretrain.train_selfless_flow as training
+
+    model = tiny_model(dual).eval()
+    batch = image_batch(4)
+    batch["X0_input_ids"][:, 0] = torch.tensor([20, 21, 22, 23])
+    selected_rows = [2, 0]
+    table = torch.tensor([[row, 0, 3, 7, row] for row in selected_rows + [3]])
+    config = OmegaConf.create({
+        "experiment": {"output_dir": str(tmp_path), "val_every": 1,
+                       "validation_image_samples": 2, "validation_flow_cfg": 2.,
+                       "validation_flow_solver": "heun"},
+        "model": {"image_tokens_per_img": 4, "image_flow_solver": "heun"},
+    })
+    calls = []
+    generate = model.generate
+
+    def record_generate(task, **kwargs):
+        result = generate(task, **kwargs)
+        calls.append((kwargs, result))
+        return result
+
+    monkeypatch.setattr(model, "generate", record_generate)
+    monkeypatch.setattr(training, "_load_vae_decoder", lambda *args: None)
+    accelerator = SimpleNamespace(
+        device=torch.device("cpu"), distributed_type=DistributedType.NO,
+        is_main_process=True, unwrap_model=lambda value: value, gather=lambda value: value,
+        reduce=lambda value, reduction: value, log=lambda values, step: None,
+    )
+    training._save_validation_flow_images(
+        model=model, output=None, input_ids=batch["X0_input_ids"],
+        token_types=batch["token_types"], sigma=torch.arange(8).repeat(4, 1),
+        image_span_table=table, image_latents=batch["image_latents"],
+        accelerator=accelerator, global_step=1, config=config,
+    )
+    assert len(calls) == 1
+    kwargs, (latents, trace) = calls[0]
+    torch.testing.assert_close(kwargs["input_ids"], batch["X0_input_ids"][selected_rows])
+    assert kwargs["spans"] == [(0, 3, 7), (1, 3, 7)]
+    assert latents.shape == (2, 4, 2, 2) and torch.isfinite(latents).all()
+    assert kwargs["use_cache"] is False and trace["backbone_kv_cache_enabled"] is False
+    report = json.loads((tmp_path / "validation_generation_step_1.json").read_text())
+    assert report["use_cache"] is False and report["samples"] == 2
+    strategy = report["strategies"]["spatial_halton"]
+    assert strategy["generation_step_max"] == 2
+    assert strategy["generation_mode"] == "showo2_full_image_flow"
+    assert strategy["backbone_kv_cache_enabled"] is False
+    from utils.evaluation.model_contracts import validate_image_generation_report
+
+    assert validate_image_generation_report(report, "showo2_omni_attention") is False
+    assert validate_image_generation_report(report, "showo2_omni_attention", strategy="spatial_halton") is False
+    with pytest.raises(ValueError, match="cache"):
+        validate_image_generation_report(report, "xlnet_content_diagonal")
+    with pytest.raises(ValueError, match="cache"):
+        validate_image_generation_report(report, "showo2_omni_attention", strategy="missing")
+
+
+def test_formal_benchmark_scoring_distinguishes_exact_s2_from_mc64():
+    from utils.evaluation.model_contracts import validate_formal_image_order_scoring
+
+    exact = {
+        "dual_stream_attention_contract": "showo2_omni_attention",
+        "scoring_contract": "showo2_next_token_ar_target_aligned_v1",
+        "contract": "showo2_next_token_ar_target_aligned_v1",
+        "image_order_mc_contract": "not_applicable_full_image_ar", "mc_samples": 1,
+    }
+    assert validate_formal_image_order_scoring(exact, exact) == 1
+    assert validate_formal_image_order_scoring({"mc_samples": 64}, {"mc_samples": 64}) == 64
+    for field, value in (("mc_samples", 64), ("scoring_contract", "same_position"),
+                         ("image_order_mc_contract", "random_order")):
+        with pytest.raises(ValueError):
+            validate_formal_image_order_scoring({**exact, field: value}, exact)
+    with pytest.raises(ValueError, match="mc_samples=64"):
+        validate_formal_image_order_scoring({"mc_samples": 1}, {"mc_samples": 1})
+
+
+@pytest.mark.parametrize("dual", [False, True])
+def test_validation_caption_generation_uses_s2_ar_contract(monkeypatch, tmp_path, dual):
+    import json
+    from types import SimpleNamespace
+
+    from omegaconf import OmegaConf
+
+    import pretrain.train_selfless_flow as training
+
+    model = tiny_model(dual).eval()
+    batch = image_batch(4)
+    tokenizer = SimpleNamespace(
+        eos_token_id=39, encode=lambda text, add_special_tokens: [5, 6],
+        decode=lambda ids, skip_special_tokens: " ".join(map(str, ids)),
+    )
+    config = OmegaConf.create({
+        "experiment": {"output_dir": str(tmp_path), "validation_i2t_every": 1,
+                       "validation_i2t_samples": 2, "validation_i2t_max_new_tokens": 2},
+        "model": {"dual_stream_attention_contract": "showo2_omni_attention"},
+        "dataset": {"params": {"image": {"caption_i2t_prefix": "Describe:"}}},
+    })
+    monkeypatch.setattr(training, "_load_vae_decoder", lambda *args: None)
+    monkeypatch.setattr(training, "logger", SimpleNamespace(info=lambda *args, **kwargs: None))
+    accelerator = SimpleNamespace(device=torch.device("cpu"), is_main_process=True,
+                                  unwrap_model=lambda value: value, gather=lambda value: value,
+                                  wait_for_everyone=lambda: None)
+    assert training._save_validation_i2t_captions(
+        model=model, tokenizer=tokenizer, labels=batch["labels"],
+        task_modes=["t2i", "i2t", "t2i", "i2t"],
+        image_span_table=torch.tensor([[row, 0, 3, 7, row] for row in range(4)]),
+        image_latents=batch["image_latents"], sigma=torch.arange(8).repeat(4, 1),
+        accelerator=accelerator, global_step=1, config=config,
+    )
+    caption_path = tmp_path / "validation_i2t_captions/step-00000001/captions.jsonl"
+    rows = [json.loads(line) for line in caption_path.read_text().splitlines()]
+    assert [row["img_id"] for row in rows] == [1, 3]
+    assert all(row["backbone_kv_cache_enabled"] is False for row in rows)
+    assert all(row["generated_token_count"] <= 2 for row in rows)
+
+
 def test_semantic_block_matches_official_siglip_equations():
     from transformers.models.siglip.configuration_siglip import SiglipVisionConfig
     from transformers.models.siglip.modeling_siglip import SiglipEncoderLayer

@@ -13,10 +13,13 @@ import sys
 import time
 
 from data_synthesis.io import atomic_json, file_sha
+from data_synthesis.config import load_config
+from data_synthesis.integrity import check_file_size, hashing_enabled
 from scripts.encode_b512_supply import freeze_bank
 
 
 def prepare(args):
+    compute_hashes = hashing_enabled()
     root = Path(args.root).resolve()
     root.mkdir(parents=True, exist_ok=True)
     destination = root / "plan.json"
@@ -28,34 +31,37 @@ def prepare(args):
         work = Path(item["manifest_dir"])
         bank = json.loads((work / "bank.json").read_text())
         manifest = work / "manifest.jsonl"
-        if file_sha(manifest) != bank["manifest_sha256"]:
+        if compute_hashes and file_sha(manifest) != bank["manifest_sha256"]:
             raise ValueError(f"frozen manifest changed: {manifest}")
         banks.append({"name": item["name"], "manifest": str(manifest),
-                      "manifest_sha256": bank["manifest_sha256"], "records": bank["records"],
+                      "manifest_sha256": bank["manifest_sha256"] if compute_hashes else None,
+                      "manifest_bytes": check_file_size(manifest, bank.get("manifest_bytes")), "records": bank["records"],
                       "shards": max(1, math.ceil(bank["records"] / base.get("images_per_shard", 512))),
                       "cache_dir": str(Path(item["cache_dir"]).resolve())})
-    supply, images = Path(args.supply_root).resolve(), Path(args.image_root).resolve()
+    supply, cache = Path(args.supply_root).resolve(), Path(args.posterior_root).resolve()
     for marker in sorted((supply / "prepared_batches").glob("*/batch.json")):
         # A separate manifest directory avoids touching the CPU controller's
         # files. The canonical row order and manifest bytes remain identical.
-        bank = freeze_bank(marker.parent, root / "banks" / marker.parent.name)
+        bank = freeze_bank(marker.parent, root / "banks" / marker.parent.name, compute_hashes=compute_hashes)
         if bank["records"]:
             banks.append({"name": marker.parent.name, "manifest": bank["manifest_jsonl"],
-                          "manifest_sha256": bank["manifest_sha256"], "records": bank["records"],
-                          "shards": 1, "cache_dir": str(images / "vae_supply" / marker.parent.name / "shards")})
+                          "manifest_sha256": bank["manifest_sha256"], "manifest_bytes": bank["manifest_bytes"], "records": bank["records"],
+                          "shards": 1, "cache_dir": str(cache / "vae_supply" / marker.parent.name / "shards")})
     if getattr(args, "validation_contract", None):
         validation = json.loads(Path(args.validation_contract).read_text())
         manifest = Path(validation["manifest"])
-        if validation["image_size"] != 512 or file_sha(manifest) != validation["manifest_sha256"]:
+        if validation["image_size"] != 512 or (compute_hashes and file_sha(manifest) != validation["manifest_sha256"]):
             raise ValueError("validation image contract changed")
         banks.append({"name": "validation_imagenet512", "manifest": str(manifest),
-                      "manifest_sha256": validation["manifest_sha256"], "records": validation["records"],
+                      "manifest_sha256": validation["manifest_sha256"] if compute_hashes else None,
+                      "manifest_bytes": check_file_size(manifest, validation.get("manifest_bytes")), "records": validation["records"],
                       "shards": math.ceil(validation["records"] / 512),
-                      "cache_dir": str(manifest.parent / "vae_shards"),
+                      "cache_dir": str(cache / "validation" / validation["manifest_sha256"] / "shards"),
                       "frozen_views": False, "verify_view_hashes": False})
     atomic_json(destination, {"version": "b512_finite_npu_pass_v1", "created_at": time.time(),
         "cwd": str(Path.cwd()), "banks": banks, "records": sum(b["records"] for b in banks),
-        "encoder_sha256": file_sha("scripts/imagenet_encode_kl16_vae.py"),
+        "compute_hashes": compute_hashes,
+        "encoder_sha256": file_sha("scripts/imagenet_encode_kl16_vae.py") if compute_hashes else None,
         "policy": "fp32; reuse completed shards; require a recorded handoff from paused CPU controllers"})
     print(json.dumps({"plan": str(destination), "banks": len(banks),
                       "records": sum(b["records"] for b in banks)}))
@@ -66,15 +72,16 @@ def run(args):
     lock = (root / "controller.lock").open("a")
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     plan = json.loads((root / "plan.json").read_text())
+    compute_hashes = hashing_enabled() and hashing_enabled(plan)
     handoff_path = Path(args.cpu_handoff).resolve()
     handoff = json.loads(handoff_path.read_text())
     if (handoff.get("state") != "cpu_writers_paused" or not handoff.get("controllers")
             or any(p.get("confirmed_process_state") != "T"
                    for p in handoff["controllers"] + handoff["writers"])):
         raise ValueError("pause and record CPU controllers and writers before starting an NPU pass")
-    handoff_sha256 = file_sha(handoff_path)
+    handoff_sha256 = file_sha(handoff_path) if compute_hashes else None
     os.chdir(plan["cwd"])
-    if file_sha("scripts/imagenet_encode_kl16_vae.py") != plan["encoder_sha256"]:
+    if compute_hashes and file_sha("scripts/imagenet_encode_kl16_vae.py") != plan["encoder_sha256"]:
         raise ValueError("encoder changed after the acceleration plan was frozen")
     import torch
     import torch_npu  # noqa: F401
@@ -82,8 +89,9 @@ def run(args):
         raise RuntimeError(f"this pass requires {args.workers} visible Ascend devices")
     queue, records = deque(), []
     for bank in plan["banks"]:
-        if file_sha(bank["manifest"]) != bank["manifest_sha256"]:
+        if compute_hashes and file_sha(bank["manifest"]) != bank["manifest_sha256"]:
             raise ValueError(f"input manifest changed: {bank['manifest']}")
+        check_file_size(bank["manifest"], bank.get("manifest_bytes"))
         cache = Path(bank["cache_dir"])
         cache.mkdir(parents=True, exist_ok=True)
         for shard in range(bank["shards"]):
@@ -100,7 +108,8 @@ def run(args):
     env.update(OMP_NUM_THREADS="4", MKL_NUM_THREADS="4", OPENBLAS_NUM_THREADS="1",
                TOKENIZERS_PARALLELISM="false")
     status = {"controller_pid": os.getpid(), "state": "running", "started_at": time.time(),
-              "plan_sha256": file_sha(root / "plan.json"), "workers": args.workers,
+              "plan_sha256": file_sha(root / "plan.json") if compute_hashes else None, "workers": args.workers,
+              "compute_hashes": compute_hashes,
               "cpu_handoff": str(handoff_path), "cpu_handoff_sha256": handoff_sha256}
 
     def report(state="running"):
@@ -114,7 +123,8 @@ def run(args):
     signal.signal(signal.SIGTERM, stop)
     try:
         while queue or active:
-            if file_sha(handoff_path) != handoff_sha256:
+            if ((compute_hashes and file_sha(handoff_path) != handoff_sha256)
+                    or (not compute_hashes and json.loads(handoff_path.read_text()) != handoff)):
                 raise ValueError("CPU handoff changed while the NPU pass was running")
             while queue and free:
                 bank, unit = queue.popleft()
@@ -128,8 +138,10 @@ def run(args):
                     "--shard_index", str(unit["shard"])]
                 if bank.get("frozen_views", True):
                     argv.append("--frozen_views")
-                if bank.get("verify_view_hashes", True):
+                if compute_hashes and bank.get("verify_view_hashes", True):
                     argv.append("--verify_view_hashes")
+                if not compute_hashes:
+                    argv.append("--no_hash")
                 log = root / "logs" / f"{unit['bank']}-{unit['shard']:05d}.log"
                 log.parent.mkdir(exist_ok=True)
                 with log.open("a") as handle:
@@ -148,7 +160,7 @@ def run(args):
                 if not present and "Skipped busy posterior shard:" not in log.read_text():
                     raise RuntimeError(f"successful encoder produced no shard: {log}")
                 records.append({**unit, "state": "available" if present else "deferred_external_writer",
-                    "command": argv, "log": str(log), "log_sha256": file_sha(log),
+                    "command": argv, "log": str(log), "log_sha256": file_sha(log) if compute_hashes else None,
                     "seconds": time.time() - started})
                 atomic_json(root / "results.json", {"units": records})
             report()
@@ -184,7 +196,7 @@ def main():
     prepare_parser.add_argument("--root", required=True)
     prepare_parser.add_argument("--base-plan", required=True)
     prepare_parser.add_argument("--supply-root", required=True)
-    prepare_parser.add_argument("--image-root", required=True)
+    prepare_parser.add_argument("--posterior-root", default=load_config()["posterior_root"])
     prepare_parser.add_argument("--validation-contract", help="Also fill the separate, frozen validation cache")
     run_parser = commands.add_parser("run")
     run_parser.add_argument("--root", required=True)

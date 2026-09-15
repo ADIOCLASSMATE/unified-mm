@@ -2462,6 +2462,7 @@ def _generate_i2t_caption_batch(
     image_end_id = getattr(model.config, "im_end_token_id", None)
     if image_end_id is not None:
         stop_ids.add(int(image_end_id))
+    use_cache = getattr(model.config, "dual_stream_attention_contract", "selfless_strict") != "showo2_omni_attention"
     output_ids, trace = model.generate(
         "i2t",
         input_ids=input_ids,
@@ -2472,11 +2473,13 @@ def _generate_i2t_caption_batch(
         max_new_tokens=int(max_new_tokens),
         temperature=float(temperature),
         eos_token_id=sorted(stop_ids),
-        use_cache=True,
+        use_cache=use_cache,
         return_trace=True,
     )
-    if trace.get("backbone_kv_cache_enabled") is not True:
-        raise RuntimeError("I2T validation must use the model KV cache")
+    if trace.get("backbone_kv_cache_enabled") is not use_cache:
+        raise RuntimeError("I2T validation cache differs from the model contract")
+    if not use_cache and trace.get("generation_mode") != "showo2_text_ar":
+        raise RuntimeError("S2 I2T validation requires autoregressive generation")
 
     generated: list[list[int]] = []
     stop_reasons: list[str] = []
@@ -2645,7 +2648,10 @@ def _save_validation_i2t_captions(
                 "generated_token_count": len(generated_ids[index]),
                 "stop_reason": stop_reasons[index],
                 "generation_entry": "model.generate",
-                "backbone_kv_cache_enabled": True,
+                "backbone_kv_cache_enabled": (
+                    getattr(unwrapped.config, "dual_stream_attention_contract", "selfless_strict")
+                    != "showo2_omni_attention"
+                ),
                 "dual_stream_attention_contract": str(
                     config.model.get(
                         "dual_stream_attention_contract",
@@ -2713,7 +2719,7 @@ def _save_validation_flow_images(
     global_step,
     config,
 ) -> None:
-    """Generate held-out images exclusively through the cached public API."""
+    """Generate held-out images through the model's public generation API."""
 
     del output
     if config is None:
@@ -2817,6 +2823,26 @@ def _save_validation_flow_images(
             for batch_idx, start, end in selected_spans
         ]
     )
+    attention_contract = str(getattr(
+        unwrapped.config, "dual_stream_attention_contract",
+        config.model.get("dual_stream_attention_contract", "selfless_strict"),
+    ))
+    use_cache = attention_contract != "showo2_omni_attention"
+    generation_ids, generation_types, generation_sigma = input_ids, token_types, sigma
+    generation_spans = selected_spans
+    if not use_cache:
+        # S2 refreshes a complete image in every row on each ODE evaluation.
+        # Keep only the requested rows and reindex their spans together.
+        selected_rows = [row for row, _, _ in selected_spans]
+        if len(set(selected_rows)) != len(selected_rows):
+            raise ValueError("S2 validation requires one image span per selected row")
+        row_index = torch.tensor(selected_rows, device=input_ids.device)
+        generation_ids = input_ids.index_select(0, row_index)
+        generation_types = token_types.index_select(0, row_index)
+        generation_sigma = None if sigma is None else sigma.index_select(0, row_index)
+        generation_spans = [
+            (row, start, end) for row, (_, start, end) in enumerate(selected_spans)
+        ]
     flow_temperature = float(
         config.experiment.get("validation_flow_temperature", 1.0)
     )
@@ -2850,10 +2876,10 @@ def _save_validation_flow_images(
     for strategy in strategies:
         pred_latents, trace = unwrapped.generate(
             "t2i",
-            input_ids=input_ids,
-            token_types=token_types,
-            sigma=sigma,
-            spans=selected_spans,
+            input_ids=generation_ids,
+            token_types=generation_types,
+            sigma=generation_sigma,
+            spans=generation_spans,
             image_latent_dim=image_latents.shape[-1],
             flow_temperature=flow_temperature,
             flow_cfg=flow_cfg,
@@ -2861,13 +2887,19 @@ def _save_validation_flow_images(
             flow_solver=flow_solver,
             parallel_rate=parallel_rate,
             order_strategy=strategy,
-            use_cache=True,
+            use_cache=use_cache,
             return_trace=True,
         )
-        if trace.get("backbone_kv_cache_enabled") is not True:
+        if trace.get("backbone_kv_cache_enabled") is not use_cache:
             raise RuntimeError(
-                "validation generation unexpectedly disabled backbone cache"
+                "validation generation cache does not match the model contract"
             )
+        if use_cache:
+            generation_step_max = int(trace["generation_step"].max().item())
+        else:
+            if trace.get("generation_mode") != "showo2_full_image_flow":
+                raise RuntimeError("S2 validation requires full-image flow generation")
+            generation_step_max = int(trace["steps"])
         if tuple(pred_latents.shape) != tuple(target_latents.shape):
             raise RuntimeError(
                 "validation generation shape mismatch: "
@@ -2885,9 +2917,7 @@ def _save_validation_flow_images(
                 f"{prefix}/latent_rms": (
                     pred_latents.float().pow(2).mean().sqrt().item()
                 ),
-                f"{prefix}/generation_step_max": (
-                    trace["generation_step"].float().max().item()
-                ),
+                f"{prefix}/generation_step_max": generation_step_max,
                 f"{prefix}/backbone_kv_cache_peak_mib": (
                     float(trace.get("backbone_kv_cache_peak_bytes", 0))
                     / (1024.0 * 1024.0)
@@ -2895,17 +2925,16 @@ def _save_validation_flow_images(
             }
         )
         report_strategies[strategy] = {
-            "attention_contract": trace.get("attention_contract"),
+            "attention_contract": trace.get("attention_contract", attention_contract),
+            "generation_mode": trace.get("generation_mode"),
             "content_self_diagonal": trace.get(
                 "single_stream_content_self_diagonal"
             ),
-            "backbone_kv_cache_enabled": True,
+            "backbone_kv_cache_enabled": use_cache,
             "backbone_kv_cache_peak_bytes": int(
                 trace.get("backbone_kv_cache_peak_bytes", 0)
             ),
-            "generation_step_max": int(
-                trace["generation_step"].max().item()
-            ),
+            "generation_step_max": generation_step_max,
         }
 
     metric_keys = sorted(local_logs)
@@ -3006,11 +3035,14 @@ def _save_validation_flow_images(
             )
 
         report = {
-            "schema": "selfless_cached_validation_generation_v1",
+            "schema": (
+                "selfless_cached_validation_generation_v1" if use_cache
+                else "showo2_validation_generation_v1"
+            ),
             "global_step": int(global_step),
             "generation_entry": "model.generate",
             "task": "t2i",
-            "use_cache": True,
+            "use_cache": use_cache,
             "cfg": flow_cfg,
             "cfg_schedule": flow_cfg_schedule,
             "flow_solver": flow_solver,

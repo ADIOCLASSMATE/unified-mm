@@ -31,7 +31,15 @@ bash script/selfless/pretraining_unified_ablation_b_0p6b_formal_ascend64.sh
 ```
 
 C–F 使用 `script/selfless/pretraining_unified_ablation_{c,d,e,f}_on_b_0p6b_formal_ascend64.sh`。
-深度扩展配置为 `configs/selfless/unified_b_x0_flow_depth{16,30}_100b_ascend64.yaml`。
+B 深度扩展配置为 `configs/selfless/unified_b_x0_flow_depth{16,30}_100b_ascend64.yaml`。
+F 参数匹配扩展配置为 `configs/selfless/unified_f_on_b_flow_depth{16,30}_100b_ascend64.yaml`，在随机序语言建模项目各提交一个 64 卡任务：
+
+```bash
+bash script/selfless/pretraining_unified_positionwise_flow_head_scaling_ascend64.sh --depth 16
+bash script/selfless/pretraining_unified_positionwise_flow_head_scaling_ascend64.sh --depth 30
+```
+
+两档 F 均从基座 step 0 开始，完整执行同一 95,415-step 配方。固定 16 卡开发机验收入口为 `script/selfless/smoke_unified_positionwise_flow_head_scaling_ascend16.sh --output-dir <report-dir> --label <unique-label>`，保持正式每卡 batch，先训练 12 步，再从完整 checkpoint 恢复到 14 步，检查 raw/EMA 重载与完整 256-latent 生成。
 
 单任务入口：
 
@@ -43,6 +51,14 @@ bash script/selfless/pretraining_unified_b_t2i_only_0p6b_ascend16.sh
 两项 image-only 均为 16 卡、每卡 batch 32、GA2、95,415 updates，分别对齐 B 对应任务的数据与曝光。T2I 保留 RF4，共享 X0 content/KV，并对 flow block 做 activation checkpointing。开发机实测 I2T 约 1.77 秒/update、T2I 约 2.5 秒/update；记录位于 [only launch](../output/experiments/unified-b-image-only-matched/launch-20260910-r1/)。
 
 S2 与 B+SigLIP 的入口及当前设置见 [S2](SHOWO2_UNIFIED_ABLATION_DESIGN.md)和 [B+SigLIP](B_SIGLIP_UNIFIED_ABLATION.md)。
+
+无 ClimbMix 的 T2I + I2T 对照在随机序语言建模项目使用 2 节点 × 16 卡，配置为 [joint 32 卡](../configs/selfless/unified_b_t2i_i2t_matched_ascend32.yaml)：
+
+```bash
+bash script/selfless/pretraining_unified_b_t2i_i2t_ascend32.sh
+```
+
+该入口读取平台 PET 多节点环境，使用 ZeRO-2、每卡 batch 32 和 GA2。两个图文流共享只读图像缓存，独立保存和恢复数据游标。固定 16 卡开发机验收使用同一入口加 `--smoke-suite --output-dir <report-dir> --label <unique-label>`，训练 12 步、恢复到 14 步，并验证 raw/EMA 重载及完整生成。正式与 smoke 输出目录独立。
 
 ## 权重与续训
 

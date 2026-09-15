@@ -30,6 +30,10 @@ class Tokenizer:
 
 def config():
     c = load_config()
+    c["sii"]["vision_models"] = ["qwen3.8-max"]  # Preserve explicit historical fixture provenance.
+    c["sii"]["max_attempts"] = 3
+    c["codex_fallback"]["enabled"] = True  # Explicit legacy routing contract, independent of SII-only production defaults.
+    c["compute_hashes"] = True  # These legacy-contract tests deliberately exercise checksum verification.
     c["minimum_images"] = 2
     c["sii"].update(concurrency_start=2, concurrency_max=4, retry_base_seconds=0.001,
                     retry_max_seconds=0.002, circuit_seconds=0.005, circuit_failures=2,
@@ -151,6 +155,71 @@ def test_short_caption_reuse_has_no_api_or_codex_call_and_no_word_floor(tmp_path
     assert result['run_counters']['reuse']==2
     with State(root,readonly=True) as state:
         assert state.db.execute('SELECT count(*) FROM attempts').fetchone()[0]==0
+
+
+def test_no_hash_pool_reuses_and_publishes_by_explicit_image_reference(tmp_path, monkeypatch):
+    c = config()
+    c["compute_hashes"] = False
+    a, b = source(tmp_path, 0, caption="A red rectangle."), source(tmp_path, 1)
+    # Equal pixels under different source IDs/references are deliberately not content-deduplicated.
+    Path(b[1]["source_path"]).write_bytes(Path(a[1]["source_path"]).read_bytes())
+    duplicate = copy.deepcopy(a)
+    duplicate[0]["source_id"] = "alias"
+    a[0]["url"] = duplicate[0]["url"] = "https://example.invalid/same-original"
+
+    def no_digest(*args, **kwargs):
+        raise AssertionError("content/file hashing must remain disabled")
+
+    for module in ("sources", "publication"):
+        monkeypatch.setattr(f"data_synthesis.{module}.file_sha", no_digest)
+    for module in ("clients", "reuse", "state", "publication"):
+        monkeypatch.setattr(f"data_synthesis.{module}.sha", no_digest)
+    root, c = pool(tmp_path, [a, b, duplicate], c)
+    with State(root, readonly=True) as state:
+        assert state.meta("frozen")["images"] == 2
+        assert state.db.execute("SELECT count(*) FROM items WHERE view_sha256 IS NULL AND source_sha256 IS NULL").fetchone()[0] == 2
+
+    class ReferenceClient(FakeClient):
+        async def generate(self, item, number):
+            result = await super().generate(item, number)
+            result.update(view_id=item["view"]["view_id"], prompt_sha256=None)
+            return result
+
+    sii, codex = ReferenceClient(), FakeClient("codex_fallback")
+    result = asyncio.run(run(root, c, tokenizer=Tokenizer(), sii=sii, codex=codex))
+    assert result["state"] == "completed" and len(sii.calls) == 1 and not codex.calls
+    destination = tmp_path / "release"
+    report = export(root, destination, tokenizer=Tokenizer())
+    assert report["verified_images"] == 2 and report["compute_hashes"] is False
+    assert report["manifest_sha256"] is None and not report["all_source_and_view_sha256_verified"]
+    assert report["all_image_references_verified"]
+    assert json.loads((destination / "publication.json").read_text())["file_sha256"] == {}
+    with State(root) as state:
+        attempt = state.db.execute("SELECT id,raw_sha256,result_sha256 FROM attempts").fetchone()
+        assert attempt["raw_sha256"] is None and attempt["result_sha256"] is None
+        response = state.raw(attempt["id"])
+        response["view_id"] = "wrong-image-reference"
+        import gzip
+        state.db.execute("UPDATE attempts SET raw_gzip=? WHERE id=?",
+                         (gzip.compress(dumps(response).encode()), attempt["id"]))
+        state.db.commit()
+    with pytest.raises(ValueError, match="attachment provenance"):
+        audit(destination, tokenizer=Tokenizer())
+
+
+def test_no_hash_annotation_requires_reference_binding(tmp_path):
+    c = config()
+    c["compute_hashes"] = False
+    row, view = source(tmp_path, 0)
+    view.update(view_sha256=None, source_sha256=None, hashes_computed=False, view_id=view["source_path"])
+    fact = {"type": "count", "entity": "red squares", "count": 3, "verified": True,
+            "view_sha256": None, "fully_visible": True, "exhaustive_for_referent": True,
+            "provenance": {"annotator": "human"}}
+    row["verified_facts"] = [fact]
+    item = {"key": "item", "identity": "pixmo_cap:0", "row": row, "view": view}
+    assert choose_reuse(item, Tokenizer(), c)[0] is None
+    fact["view_id"] = view["view_id"]
+    assert choose_reuse(item, Tokenizer(), c)[1]["route"] == "annotation"
 
 
 def test_crop_or_unverified_ocr_does_not_blindly_reuse_caption(tmp_path):

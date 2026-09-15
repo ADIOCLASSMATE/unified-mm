@@ -196,10 +196,12 @@ def main():
     config = OmegaConf.load(args.config)
     flow_head_scaling = None
     if args.flow_head_scaling:
-        from utils.flow_head_scaling import validate_scaling_config
-
-        if args.ablation != "b":
-            raise ValueError("flow-head scaling is defined only on B")
+        if args.ablation == "b":
+            from utils.flow_head_scaling import validate_scaling_config
+        elif args.ablation == "f":
+            from utils.positionwise_flow_head_scaling import validate_scaling_config
+        else:
+            raise ValueError("flow-head scaling is defined only on B and F")
         flow_head_scaling = validate_scaling_config(config)
     validate_wsd_contract(config)
     if str(config.dataset.class_name) != "UnifiedMixedDataset":
@@ -256,8 +258,10 @@ def main():
         raise ValueError("baseline must initialize from Qwen pretrained weights")
     if str(config.model.backbone_attention_output_gate) != "none":
         raise ValueError("baseline backbone attention output gate must be none")
-    if str(config.model.architecture_variant) != "selfless_contextual":
-        raise ValueError("base config must use the baseline-b architecture")
+    is_f_scaling = flow_head_scaling is not None and args.ablation == "f"
+    expected_input_architecture = "positionwise_flow_head_on_b" if is_f_scaling else "selfless_contextual"
+    if str(config.model.architecture_variant) != expected_input_architecture:
+        raise ValueError(f"config must use architecture {expected_input_architecture}")
     if str(config.model.training_objective) != "selfless_dual_stream":
         raise ValueError("base config must use the baseline-b training objective")
     if (
@@ -269,19 +273,17 @@ def main():
         )
     if (
         str(config.model.flow_head_attention_contract)
-        != "xlnet_content_diagonal"
+        != ("not_applicable" if is_f_scaling else "xlnet_content_diagonal")
     ):
         raise ValueError(
-            "base config must keep the flow-head content diagonal aligned "
-            "with baseline b's backbone"
+            "config flow-head attention contract does not match its architecture"
         )
     if (
         str(config.model.flow_condition_contract)
-        != "backbone_xt_query_backbone_x0_content"
+        != ("not_applicable" if is_f_scaling else "backbone_xt_query_backbone_x0_content")
     ):
         raise ValueError(
-            "base config must use split backbone XT-query/X0-content flow "
-            "conditions"
+            "config flow condition contract does not match its architecture"
         )
     if int(config.model.image_flow_batch_mul) != 4:
         raise ValueError(
@@ -354,6 +356,8 @@ def main():
         },
     }
     ablation_contract = ablation_contracts[args.ablation]
+    if flow_head_scaling is not None and args.ablation == "f":
+        ablation_contract = {**ablation_contract, "flow_width": flow_head_scaling["width"]}
     architecture_variant = ablation_contract["architecture"]
     training_objective = "selfless_dual_stream"
     attention_contract = ablation_contract["attention_contract"]
@@ -479,17 +483,19 @@ def main():
 
     flow_head_parameters = None
     if args.ablation == "f":
+        reference_depth = flow_head_scaling["reference_depth"] if flow_head_scaling else 8
+        positionwise_depth = flow_head_scaling["depth"] if flow_head_scaling else 8
         reference_parameters = _contextual_flow_parameter_count(
             latent_dim=int(config.model.image_latent_dim),
             condition_dim=int(source_model_config.hidden_size),
             width=1280,
-            depth=8,
+            depth=reference_depth,
         )
         positionwise_parameters = _positionwise_flow_parameter_count(
             latent_dim=int(config.model.image_latent_dim),
             condition_dim=int(source_model_config.hidden_size),
             width=flow_head_width,
-            depth=8,
+            depth=positionwise_depth,
         )
         relative_error = abs(
             positionwise_parameters - reference_parameters
@@ -504,6 +510,8 @@ def main():
             "parameters": positionwise_parameters,
             "reference_architecture": "contextual_dual_stream",
             "reference_parameters": reference_parameters,
+            "depth": positionwise_depth,
+            "reference_depth": reference_depth,
             "relative_error": relative_error,
             "max_relative_error": 0.005,
         }

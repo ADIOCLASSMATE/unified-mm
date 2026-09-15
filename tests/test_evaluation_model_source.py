@@ -447,8 +447,10 @@ def test_checkpoint_flow_condition_contract_is_authoritative(tmp_path):
     )
 
 
+@pytest.mark.parametrize("depth,width", [(8, 1936), (16, 1960), (30, 1968)])
+@pytest.mark.parametrize("kind", ["rank_sharded_ema", "hf_final_ema"])
 def test_f_checkpoint_owns_parameter_matched_width_and_reference_contract(
-    tmp_path,
+    tmp_path, depth, width, kind,
 ):
     checkpoint = tmp_path / "checkpoint-10"
     model_contract = _text_ar_model_contract()
@@ -457,26 +459,35 @@ def test_f_checkpoint_owns_parameter_matched_width_and_reference_contract(
             "architecture_variant": "positionwise_flow_head_on_b",
             "dual_stream_attention_contract": "xlnet_content_diagonal",
             "flow_head_attention_contract": "not_applicable",
-            "image_flow_width": 1936,
+            "image_flow_width": width,
+            "image_flow_depth": depth,
             "image_flow_batch_mul": 4,
             "positionwise_reference_flow_width": 1280,
-            "positionwise_reference_flow_depth": 8,
+            "positionwise_reference_flow_depth": depth,
             "positionwise_max_parameter_relative_error": 0.005,
             "training_image_sigma_order": "random",
         }
     )
-    _write_sharded_source(checkpoint, model_contract=model_contract)
+    if kind == "rank_sharded_ema":
+        _write_sharded_source(checkpoint, model_contract=model_contract)
+        source = resolve_evaluation_model_source(checkpoint)
+    else:
+        checkpoint.mkdir()
+        model_contract.update(mask_token_id=1, boi_token_id=2, eoi_token_id=3, image_mask_token_id=4)
+        (checkpoint / "config.json").write_text(json.dumps(model_contract))
+        source = EvaluationModelSource(checkpoint, kind, 10, 64, {})
     config = _ordered_evaluation_config()
     config.model.image_flow_batch_mul = 4
 
-    configure_model_source(config, resolve_evaluation_model_source(checkpoint))
+    configure_model_source(config, source)
 
     assert config.model.architecture_variant == "positionwise_flow_head_on_b"
     assert config.model.flow_head_attention_contract == "not_applicable"
     assert config.model.flow_condition_contract == "not_applicable"
-    assert config.model.image_flow_width == 1936
+    assert config.model.image_flow_width == width
+    assert config.model.image_flow_depth == depth
     assert config.model.positionwise_reference_flow_width == 1280
-    assert config.model.positionwise_reference_flow_depth == 8
+    assert config.model.positionwise_reference_flow_depth == depth
     assert config.model.positionwise_max_parameter_relative_error == 0.005
 
 

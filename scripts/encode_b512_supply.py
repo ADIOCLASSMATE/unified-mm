@@ -13,20 +13,24 @@ import sys
 import time
 
 from data_synthesis.io import atomic_json, cohort_id, dumps, file_sha
+from data_synthesis.config import load_config
+from data_synthesis.integrity import check_file_size, hashing_enabled, view_reference
 
 
-def freeze_bank(source, output):
+def freeze_bank(source, output, compute_hashes=True):
     source, output = Path(source), Path(output)
     output.mkdir(parents=True, exist_ok=True)
     marker = output / "bank.json"
     if marker.exists():
         value = json.loads(marker.read_text())
-        if file_sha(output / "manifest.jsonl") != value["manifest_sha256"]:
+        if compute_hashes and file_sha(output / "manifest.jsonl") != value["manifest_sha256"]:
             raise ValueError("supplemental VAE manifest changed")
+        check_file_size(output / "manifest.jsonl", value.get("manifest_bytes"))
         return value
     prepared = json.loads((source / "batch.json").read_text())
-    if file_sha(source / "state.sqlite3") != prepared["state_sha256"]:
+    if compute_hashes and file_sha(source / "state.sqlite3") != prepared["state_sha256"]:
         raise ValueError("prepared batch changed before VAE encoding")
+    check_file_size(source / "state.sqlite3", prepared.get("state_bytes"))
     db = sqlite3.connect(f"file:{source / 'state.sqlite3'}?mode=ro", uri=True)
     count = 0
     temporary = output / "manifest.jsonl.tmp"
@@ -34,6 +38,10 @@ def freeze_bank(source, output):
         with temporary.open("w") as handle:
             for key, row, view in db.execute("SELECT key,row,view FROM tasks WHERE status='prepared' ORDER BY key"):
                 row, view = json.loads(row), json.loads(view)
+                if not compute_hashes:
+                    view.update(source_sha256=None, view_sha256=None, hashes_computed=False,
+                                view_id=view_reference(view))
+                    view.pop("perceptual_hashes", None)
                 count += 1
                 handle.write(dumps({**view, "img_id": count, "key": key, "source": row["source"],
                                     "source_id": row["source_id"], "split": "train"}) + "\n")
@@ -43,13 +51,15 @@ def freeze_bank(source, output):
         raise ValueError("prepared/VAE manifest counts differ")
     temporary.replace(output / "manifest.jsonl")
     value = {"schema": "b512_frozen_image_bank_v1", "source_run": str(source), "records": count,
-             "manifest_sha256": file_sha(output / "manifest.jsonl"), "manifest_jsonl": str(output / "manifest.jsonl"),
-             "source_run_contract_sha256": file_sha(source / "run.json")}
+             "manifest_sha256": file_sha(output / "manifest.jsonl") if compute_hashes else None,
+             "manifest_jsonl": str(output / "manifest.jsonl"),
+             "manifest_bytes": check_file_size(output / "manifest.jsonl"), "compute_hashes": compute_hashes,
+             "source_run_contract_sha256": file_sha(source / "run.json") if compute_hashes else None}
     atomic_json(marker, value)
     return value
 
 
-def finalize_cached_bank(bank, destination, work, vae_hashes):
+def finalize_cached_bank(bank, destination, work, vae_hashes, compute_hashes=True):
     """Verify an NPU-completed bank and index it without two Python startups."""
     shard = destination / "shards/shard-00000-of-00001.pt"
     if not shard.exists():
@@ -58,31 +68,37 @@ def finalize_cached_bank(bank, destination, work, vae_hashes):
     from pretrain.merge_flow_latent_shards import main as merge_index
 
     manifest = Path(bank["manifest_jsonl"])
-    if file_sha(manifest) != bank["manifest_sha256"]:
+    if compute_hashes and file_sha(manifest) != bank["manifest_sha256"]:
         raise ValueError("cached bank manifest changed")
+    check_file_size(manifest, bank.get("manifest_bytes"))
     samples = load_samples_from_manifest(manifest, -1, None)
     if len(samples) != bank["records"]:
         raise ValueError("cached bank sample count changed")
     validate_reusable_shard(shard, samples, num_shards=1, shard_index=0,
         scaling_factor=0.2325, vae_checkpoint_sha256=vae_hashes[0], vae_module_sha256=vae_hashes[1],
-        source_manifest_sha256=bank["manifest_sha256"], source_image_root=None, image_size=512,
-        frozen_views=True, verify_view_hashes=True)
+        source_manifest_sha256=bank["manifest_sha256"] if compute_hashes else None,
+        source_image_root=None, image_size=512, frozen_views=True, verify_view_hashes=compute_hashes,
+        source_manifest_jsonl=str(manifest))
     if not (destination / "posterior_index.json").exists():
         with (work / "index.log").open("a") as log, redirect_stdout(log), redirect_stderr(log):
             merge_index(["--shard_dir", str(destination / "shards"), "--output_path", str(destination / "posterior_index.json"),
                          "--manifest_jsonl", str(manifest), "--index_only",
-                         "--row_index_path", str(destination / "posterior.rows.pt")])
+                         "--row_index_path", str(destination / "posterior.rows.pt")]
+                        + ([] if compute_hashes else ["--no_hash"]))
     return True
 
 
 def run(args):
-    source, images = Path(args.supply_root).resolve(), Path(args.image_root).resolve()
+    compute_hashes = hashing_enabled()
+    source = Path(args.supply_root).resolve()
+    cache = Path(args.posterior_root).resolve()
     root = source / "posterior_encoding"
     root.mkdir(exist_ok=True)
     lock = (root / "controller.lock").open("a")
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     state = {"controller_pid": os.getpid(), "state": "running", "started_at": time.time(),
-             "completed_batches": 0, "encoded_records": 0, "cpu_threads": args.cpu_threads}
+             "completed_batches": 0, "encoded_records": 0, "cpu_threads": args.cpu_threads,
+             "compute_hashes": compute_hashes}
     child = None
     env = os.environ.copy()
     env.update(TORCH_DEVICE_BACKEND_AUTOLOAD="0", OMP_NUM_THREADS=str(args.cpu_threads),
@@ -95,7 +111,8 @@ def run(args):
     try:
         import torch
         torch.set_num_threads(args.cpu_threads)
-        vae_hashes = (file_sha("public/vae/mar-kl16/kl16.ckpt"), file_sha("public/code/mar/models/vae.py"))
+        vae_hashes = ((file_sha("public/vae/mar-kl16/kl16.ckpt"), file_sha("public/code/mar/models/vae.py"))
+                      if compute_hashes else (None, None))
         while True:
             worked = False
             completed, records = 0, 0
@@ -111,20 +128,23 @@ def run(args):
                     records += value["records"]
                     continue
                 worked = True
-                bank = freeze_bank(marker.parent, work)
+                bank = freeze_bank(marker.parent, work, compute_hashes=compute_hashes)
                 if bank["records"]:
-                    destination = images / "vae_supply" / cohort_id(source) / batch_id
+                    destination = cache / "vae_supply" / cohort_id(source) / batch_id
                     destination.mkdir(parents=True, exist_ok=True)
                     commands = [
                         [sys.executable, "scripts/imagenet_encode_kl16_vae.py", "--source_mode", "manifest_jsonl",
                          "--source_manifest_jsonl", bank["manifest_jsonl"], "--cache_shard_dir", str(destination / "shards"),
-                         "--image_size", "512", "--frozen_views", "--verify_view_hashes", "--device", "cpu",
+                         "--image_size", "512", "--frozen_views", "--device", "cpu",
                          "--vae_dtype", "fp32", "--batch_size", "4", "--num_workers", "1"],
                         [sys.executable, "pretrain/merge_flow_latent_shards.py", "--shard_dir", str(destination / "shards"),
                          "--output_path", str(destination / "posterior_index.json"), "--manifest_jsonl", bank["manifest_jsonl"],
                          "--index_only", "--row_index_path", str(destination / "posterior.rows.pt")],
                     ]
-                    if finalize_cached_bank(bank, destination, work, vae_hashes):
+                    commands[0].append("--verify_view_hashes" if compute_hashes else "--no_hash")
+                    if not compute_hashes:
+                        commands[1].append("--no_hash")
+                    if finalize_cached_bank(bank, destination, work, vae_hashes, compute_hashes=compute_hashes):
                         commands = []
                     for stage, argv in zip(("encode", "index"), commands):
                         if stage == "index" and (destination / "posterior_index.json").exists():
@@ -172,7 +192,8 @@ def run(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--supply-root", required=True)
-    parser.add_argument("--image-root", required=True)
+    parser.add_argument("--posterior-root", default=load_config()["posterior_root"],
+                        help="Tensor cache destination, separate from project image storage")
     parser.add_argument("--cpu-threads", type=int, default=2)
     args = parser.parse_args()
     if args.cpu_threads < 1:

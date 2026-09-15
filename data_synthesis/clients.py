@@ -18,14 +18,17 @@ from PIL import Image
 
 from data_synthesis.contract import CONTRACT_HASH, PAIR_SCHEMA, prompt_for
 from data_synthesis.io import dumps, sha
+from data_synthesis.integrity import view_binding
 from utils.direct_network import check_direct_routes, direct_ssl_context
 from utils.image_shard_io import read_image_bytes
 
 
-def frozen_pixels(item):
+def frozen_pixels(item, *, compute_hashes=None):
     view = item["view"]
+    if compute_hashes is None:
+        compute_hashes = view.get("hashes_computed", True)
     data = read_image_bytes(view["source_path"])
-    if sha(data) != view["view_sha256"]:
+    if compute_hashes and sha(data) != view["view_sha256"]:
         raise ValueError("frozen image bytes changed")
     with Image.open(io.BytesIO(data)) as image:
         image.load()
@@ -52,12 +55,24 @@ class RequestPacer:
 
 
 class SIIClient:
-    def __init__(self, settings, config, *, transport=None):
+    def __init__(self, settings, config, *, transport=None, prompt_factory=None, contract_id=None):
         if transport is None:
             check_direct_routes()
         self.settings, self.config = settings, config
+        self.prompt_factory = prompt_factory or prompt_for
+        self.contract_id = contract_id or CONTRACT_HASH
         context = direct_ssl_context()
         context.maximum_version = getattr(ssl.TLSVersion, config["tls_maximum_version"])
+        if transport is None and config.get("tcp_mss_before_connect"):
+            from data_synthesis.direct_backend import DirectMSSBackend
+            transport = httpx.AsyncHTTPTransport(
+                verify=context, trust_env=False, http2=config["http2"],
+                limits=httpx.Limits(max_connections=config["concurrency_max"],
+                                   max_keepalive_connections=config["concurrency_max"]),
+            )
+            # httpx's socket_options are applied AFTER connect and cannot
+            # negotiate MSS. Use a scoped backend that sets it before SYN.
+            transport._pool._network_backend = DirectMSSBackend(config["tcp_mss_before_connect"])
         self.client = httpx.AsyncClient(
             trust_env=False, proxy=None, verify=context,
             http2=config["http2"], follow_redirects=False, transport=transport,
@@ -70,7 +85,7 @@ class SIIClient:
     async def generate(self, item, attempt):
         started = time.time()
         data, mime = await asyncio.to_thread(frozen_pixels, item)
-        prompt = prompt_for(item, item.get("candidate"), item.get("issues", []))
+        prompt = self.prompt_factory(item, item.get("candidate"), item.get("issues", []))
         model = self.config["vision_models"][(attempt - 1) % len(self.config["vision_models"])]
         protocol = self.config["protocol"]
         encoded = base64.b64encode(data).decode("ascii")
@@ -90,12 +105,14 @@ class SIIClient:
             headers = {"x-api-key": self.settings.api_key, "anthropic-version": "2023-06-01"}
         evidence = {"backend": "sii", "requested_model": model, "protocol": protocol,
                     "endpoint": self.settings.endpoint(protocol), "proxy": False,
-                    "image_id": item["key"], "view_sha256": item["view"]["view_sha256"],
+                    "image_id": item["key"], **view_binding(item["view"], item["view"].get("hashes_computed", True)),
                     "decoded_size": [512, 512], "mime_type": mime, "image_attached": True,
-                    "prompt": prompt, "prompt_sha256": sha(prompt.encode()),
-                    "request_sha256": sha(dumps(body).encode()), "contract_hash": CONTRACT_HASH,
+                    "prompt": prompt, "prompt_sha256": sha(prompt.encode()) if item["view"].get("hashes_computed", True) else None,
+                    "request_sha256": sha(dumps(body).encode()) if item["view"].get("hashes_computed", True) else None,
+                    "contract_hash": self.contract_id,
                     "tls_policy": {"curve": "prime256v1", "maximum_version": self.config["tls_maximum_version"],
                                    "certificate_verification": True, "http2": self.config["http2"]},
+                    "tcp_mss_before_connect": self.config.get("tcp_mss_before_connect"),
                     "started_at": started, "attempt": attempt, "request_options": self.config.get("request_options", {})}
         await self.pacer.wait()
         evidence["network_events"] = []
@@ -146,9 +163,12 @@ class SIIClient:
 
 
 class CodexFallback:
-    def __init__(self, config):
+    def __init__(self, config, *, prompt_factory=None, contract_id=None, schema=None):
         self.config = config
         self.version = None
+        self.prompt_factory = prompt_factory or prompt_for
+        self.contract_id = contract_id or CONTRACT_HASH
+        self.schema = schema or PAIR_SCHEMA
 
     async def generate(self, item, attempt):
         """Called only after persisted item API attempts have reached their limit."""
@@ -156,7 +176,7 @@ class CodexFallback:
         if shutil.which(executable) is None:
             raise ValueError("Codex fallback executable is unavailable")
         data, mime = await asyncio.to_thread(frozen_pixels, item)
-        prompt = prompt_for(item, item.get("candidate"), item.get("issues", []))
+        prompt = self.prompt_factory(item, item.get("candidate"), item.get("issues", []))
         started = time.time()
         if self.version is None:
             check = await asyncio.create_subprocess_exec(executable, "--version", stdout=asyncio.subprocess.PIPE)
@@ -167,7 +187,7 @@ class CodexFallback:
             attachment = root / ("image.png" if mime == "image/png" else "image.jpg")
             attachment.write_bytes(data)
             schema, result = root / "schema.json", root / "result.json"
-            schema.write_text(dumps(PAIR_SCHEMA))
+            schema.write_text(dumps(self.schema))
             command = [executable, "exec", "--ignore-user-config", "--ephemeral", "--skip-git-repo-check",
                        "--sandbox", "read-only", "--model", "gpt-5.6-sol",
                        "-c", 'model_reasoning_effort="low"', "-c", 'approval_policy="never"',
@@ -198,9 +218,9 @@ class CodexFallback:
                 stdout, stderr = b"", b"Codex fallback deadline exceeded"
                 timed_out = True
             return {"backend": "codex_fallback", "requested_model": "gpt-5.6-sol", "reasoning_effort": "low",
-                    "cli_version": self.version, "command": command, "contract_hash": CONTRACT_HASH,
-                    "prompt": prompt, "prompt_sha256": sha(prompt.encode()),
-                    "image_id": item["key"], "view_sha256": item["view"]["view_sha256"],
+                    "cli_version": self.version, "command": command, "contract_hash": self.contract_id,
+                    "prompt": prompt, "prompt_sha256": sha(prompt.encode()) if item["view"].get("hashes_computed", True) else None,
+                    "image_id": item["key"], **view_binding(item["view"], item["view"].get("hashes_computed", True)),
                     "decoded_size": [512, 512], "image_attached": True, "started_at": started,
                     "elapsed_seconds": time.time() - started, "attempt": attempt,
                     "status": "completed" if process.returncode == 0 and result.is_file() and not timed_out else "failed",

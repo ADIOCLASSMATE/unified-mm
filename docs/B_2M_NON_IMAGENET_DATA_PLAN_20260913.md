@@ -1,3 +1,5 @@
+> 历史起始配额方案。当前已选择 [Long 主库方案](B_BLIP3O_LONG_DATA_PLAN_20260913.md)，运行和存储路径以 [DATA_SYNTHESIS.md](DATA_SYNTHESIS.md) 为准。
+
 **B 大规模训练的数据选择：ImageNet 之外至少 200 万张，配额为起点，优先复用文本（2026-09-13）**
 
 执行入口与运行合同已统一到 [DATA_SYNTHESIS.md](DATA_SYNTHESIS.md) 和 [b512_sii_v1.json](../configs/data_synthesis/b512_sii_v1.json)。本文维护来源选择及覆盖目标；完整下载、512px 验收与资格报告仍是正式批量合成的前置条件。

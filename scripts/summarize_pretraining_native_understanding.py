@@ -13,6 +13,8 @@ from pathlib import Path
 import tempfile
 from typing import Any
 
+from utils.evaluation.model_contracts import validate_formal_image_order_scoring
+from utils.evaluation.aro import ARO_TASKS, ARO_PRIMARY, CONDITIONAL_SCORE, ARO_SCORE_VARIANT
 from utils.evaluation_model_source import resolve_evaluation_model_source
 
 
@@ -201,7 +203,7 @@ def require_benchmark_metric_contract(
     metrics = summary.get("metrics") or {}
     if int(metrics.get("records", -1)) != FORMAL_BENCHMARK_RECORDS[task]:
         raise ValueError(f"retained benchmark {task} has invalid record count")
-    expected_primary = (
+    expected_primary = ARO_PRIMARY if task in ARO_TASKS else (
         "language_prior_debiased_pairwise.win_rate"
         if task in PAPER_BENCHMARK_TASKS
         else (
@@ -235,8 +237,10 @@ def require_null_image_calibrated_protocol(
         "language_prior_debiased_mean_token_loglikelihood"
     ):
         raise ValueError(f"{label} does not use the required debiased score")
-    if scoring.get("reported_score_variant") != "language_prior_debiased_only":
+    if scoring.get("reported_score_variant") != ARO_SCORE_VARIANT:
         raise ValueError(f"{label} retains a removed score variant")
+    if scoring.get("task_primary_candidate_scores") != {task: CONDITIONAL_SCORE for task in sorted(ARO_TASKS)}:
+        raise ValueError(f"{label} must retain text priors for ARO")
     if float(scoring.get("language_prior_alpha", -1.0)) != 1.0:
         raise ValueError(f"{label} does not fix language-prior alpha to one")
     if scoring.get("language_prior_estimator") != (
@@ -330,13 +334,12 @@ def main() -> None:
         benchmark_summary, "retained external benchmark summary"
     )
     if benchmark_manifest.get("project_formal_protocol") is not True:
-        raise ValueError("retained benchmark evaluation is not a formal MC64 run")
+        raise ValueError("retained benchmark evaluation is not a formal run")
     if benchmark_summary.get("project_formal_protocol") is not True:
-        raise ValueError("retained benchmark summary is not a formal MC64 run")
-    if int(benchmark_manifest.get("mc_samples", -1)) != 64:
-        raise ValueError("retained benchmark evaluation does not use MC64")
-    if int(benchmark_summary.get("scoring", {}).get("mc_samples", -1)) != 64:
-        raise ValueError("retained benchmark summary does not use MC64")
+        raise ValueError("retained benchmark summary is not a formal run")
+    validate_formal_image_order_scoring(
+        benchmark_manifest, benchmark_summary.get("scoring", {}),
+    )
     if Path(native_manifest["checkpoint"]).resolve() != checkpoint:
         raise ValueError("ImageNet classification checkpoint mismatch")
     if Path(benchmark_manifest["checkpoint"]).resolve() != checkpoint:
@@ -459,9 +462,8 @@ def main() -> None:
         "selection_contract": {
             "imagenet_zero_shot_metrics": ["top_1_accuracy", "top_5_accuracy"],
             "imagenet_validation_images": 50_000,
-            "image_text_matching_score_variant": (
-                "language_prior_debiased_mean_token_loglikelihood_only"
-            ),
+            "image_text_matching_score_variant": ARO_SCORE_VARIANT,
+            "aro_primary_candidate_score": CONDITIONAL_SCORE,
             "language_prior_alpha": 1.0,
             "dense_retrieval_language_prior_estimator": (
                 "candidate_image_logmeanexp"

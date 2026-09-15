@@ -11,7 +11,8 @@ CRITICAL = {"counting", "ocr", "text", "relation", "spatial", "attribute_binding
 VIEW_VERSION = "rgb512-safe-crop-v1"
 
 
-def prepare_view(data: bytes, row: dict, min_short_side: int = 512, include_phashes: bool = False):
+def prepare_view(data: bytes, row: dict, min_short_side: int = 512, include_phashes: bool = False,
+                 compute_hashes: bool = True):
     with Image.open(io.BytesIO(data)) as source:
         if getattr(source, "n_frames", 1) != 1:
             raise ValueError("animated/multi-page source")
@@ -82,7 +83,7 @@ def prepare_view(data: bytes, row: dict, min_short_side: int = 512, include_phas
             left, top = (width - side) // 2, (height - side) // 2
         crop = (left, top, left + side, top + side)
         hashes = []
-        if include_phashes:
+        if include_phashes and compute_hashes:
             from utils.image_near_duplicates import image_perceptual_hashes
             hashes = image_perceptual_hashes(image)
         content_box = None
@@ -104,8 +105,9 @@ def prepare_view(data: bytes, row: dict, min_short_side: int = 512, include_phas
         encoded = output.getvalue()
     metadata = {
         "view_version": "rgb512-full-frame-pad-v1" if fit_pad else VIEW_VERSION,
-        "view_sha256": hashlib.sha256(encoded).hexdigest(),
-        "source_sha256": hashlib.sha256(data).hexdigest(),
+        "view_sha256": hashlib.sha256(encoded).hexdigest() if compute_hashes else None,
+        "source_sha256": hashlib.sha256(data).hexdigest() if compute_hashes else None,
+        "hashes_computed": compute_hashes,
         "original_size": [width, height], "crop": list(crop),
         "upsampled": side < 512,
         "image_size": 512, "extension": "png" if text_image else "jpg",
@@ -113,7 +115,7 @@ def prepare_view(data: bytes, row: dict, min_short_side: int = 512, include_phas
     if content_box is not None:
         metadata["content_box"] = content_box
         metadata["padding_rgb"] = [127, 127, 127]
-    if include_phashes:
+    if include_phashes and compute_hashes:
         from utils.image_near_duplicates import perceptual_hashes
         metadata["perceptual_hashes"] = sorted(set(hashes + perceptual_hashes(encoded)))
     return encoded, metadata

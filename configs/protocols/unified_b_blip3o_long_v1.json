@@ -1,0 +1,137 @@
+{
+  "schema": "unified_b_blip3o_long_plan_v1",
+  "status": "prepared_source_scope_frozen_by_user_not_training_release",
+  "image_size": 512,
+  "image_tokens": 1024,
+  "primary": {
+    "name": "Long-Caption",
+    "repo_id": "BLIP3o/BLIP3o-Pretrain-Long-Caption",
+    "revision": "e4d07091a466d1a1e35a9b0c61caddc78d14a059",
+    "publisher_nominal_records": 27000000,
+    "actual_full_image_count": 29353470,
+    "archive_files": 2891,
+    "archive_bytes": 1374049964032,
+    "accepted_512_images": 22115459
+  },
+  "nominal_primary_plus_supplement_and_imagenet_records": 29881167,
+  "imagenet_raw_train_images": 1281167,
+  "minimum_unique_non_imagenet_images": 2000000,
+  "targets_are_caps": false,
+  "global_dedup_required": false,
+  "compute_hashes": false,
+  "integrity_policy": {
+    "updated_at": "2026-09-14",
+    "requested_by": "user",
+    "image_and_file_checksums": false,
+    "perceptual_hashes": false,
+    "content_deduplication": false,
+    "identity_deduplication": "source_id_url_original_reference",
+    "benchmark_exclusion": "known_image_ids_urls_and_normalized_test_prompt_text",
+    "remaining_checks": [
+      "pinned_source_revision",
+      "file_lengths",
+      "rgb_512_decode",
+      "image_text_reference_binding",
+      "posterior_shape_and_row_ids"
+    ],
+    "image_count_note": "Counts are distinct known identities; cross-source content uniqueness is not verified."
+  },
+  "climbmix": "unchanged",
+  "sources": [
+    {
+      "id": "pixmo_cap",
+      "name": "PixMo-Cap train",
+      "initial_coverage_target": 500000,
+      "is_cap": false
+    },
+    {
+      "id": "openimages_relations_narratives",
+      "name": "Open Images 关系 + Localized Narratives",
+      "initial_coverage_target": 300000,
+      "is_cap": false
+    },
+    {
+      "id": "pixmo_points",
+      "name": "PixMo-Points train",
+      "initial_coverage_target": 180000,
+      "is_cap": false
+    },
+    {
+      "id": "anyword3m",
+      "name": "AnyWord-3M / AnyText2 更新标注",
+      "initial_coverage_target": 350000,
+      "is_cap": false
+    },
+    {
+      "id": "wikiart",
+      "name": "WikiArt",
+      "initial_coverage_target": 70000,
+      "is_cap": false
+    },
+    {
+      "id": "generated_composition",
+      "name": "BLIP3o-60k + ShareGPT-4o-Image T2I",
+      "initial_coverage_target": 80000,
+      "is_cap": false
+    },
+    {
+      "id": "textcaps_docci",
+      "name": "TextCaps + DOCCI train",
+      "initial_coverage_target": 30000,
+      "is_cap": false
+    },
+    {
+      "id": "structured_graphics",
+      "name": "DIM 已配 caption 的 PixMo-Docs / ChartQA train",
+      "initial_coverage_target": 40000,
+      "is_cap": false
+    },
+    {
+      "id": "pd3m",
+      "name": "PD3M",
+      "initial_coverage_target": 50000,
+      "is_cap": false
+    }
+  ],
+  "initial_image_task_sampling": {
+    "blip_primary_and_unique_increments": 0.75,
+    "supplements": 0.2,
+    "imagenet": 0.05,
+    "validated_on_B": false
+  },
+  "optional_only": [
+    "BLIP3o-Pretrain-Short-Caption",
+    "BLIP3o-Pretrain-JourneyDB"
+  ],
+  "existing_supplement_downloads": "closed_by_user; only qualified prepared cohorts in active_prepared_selection are selected",
+  "runtime_config": "configs/data_synthesis/b512_sii_v1.json",
+  "storage": {
+    "project_root": "/inspire/sj-ssd3/project/high-dimensionaldata/wanjiaxin-253108030048/unified-mm-b512",
+    "image_root": "/inspire/sj-ssd3/project/high-dimensionaldata/wanjiaxin-253108030048/unified-mm-b512/images",
+    "text_root": "/inspire/sj-ssd3/project/high-dimensionaldata/wanjiaxin-253108030048/unified-mm-b512/texts",
+    "preparation_root": "/inspire/sj-ssd3/project/high-dimensionaldata/wanjiaxin-253108030048/unified-mm-b512/preparation",
+    "state_root": "/inspire/sj-ssd3/project/high-dimensionaldata/wanjiaxin-253108030048/unified-mm-b512/preparation/synthesis/long_v1",
+    "posterior_root": "/inspire/sj-ssd3/global_user/wanjiaxin-253108030048/datasets/unified_b512_posterior_cache"
+  },
+  "caption_policy": {
+    "priority": [
+      "reuse_exact",
+      "normalize_without_new_facts",
+      "render_verified_annotations",
+      "api_fill_or_repair"
+    ],
+    "reuse_same_caption_for_i2t_and_t2i": true,
+    "reuse_original_generator_and_text_hash": false,
+    "preserve_original_generator_and_text": true,
+    "force_two_separate_api_generations": false,
+    "force_minimum_word_count": false,
+    "preserve_original_ocr_language": true,
+    "target_reuse_rate": null,
+    "expected_api_image_count": null,
+    "explanation": "Actual reuse/call counts require a source join and final-view audit. Source counts are not token or task-exposure weights."
+  },
+  "final_accepted_images": null,
+  "active_prepared_selection": "configs/protocols/unified_b_prepared_frozen_20260914.json",
+  "downloads_enabled": false,
+  "retry_failed": false
+}

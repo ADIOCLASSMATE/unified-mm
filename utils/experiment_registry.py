@@ -17,7 +17,8 @@ REGISTRY_PATH = Path(__file__).resolve().parents[1] / "configs/protocols/experim
 GROUPS = {"main": "正式 A / B", "ablation": "B 上的消融（C–F）",
           "showo2": "Show-o2-style · 语义分支",
           "legacy": "历史消融", "single": "单任务对照",
-          "scaling": "B · Flow-head 深度", "lr": "历史 1.7B 学习率扫描"}
+          "data_ablation": "训练数据消融",
+          "scaling": "Flow-head 扩展（B/F）", "lr": "历史 1.7B 学习率扫描"}
 SOURCES = {"climbmix", "t2i", "i2t"}
 
 

@@ -141,9 +141,12 @@ def main(argv=None) -> None:
         "source_mode",
         "source_manifest_jsonl",
         "source_manifest_sha256",
+        "source_manifest_bytes",
         "source_image_root",
         "vae_checkpoint_sha256",
         "vae_module_sha256",
+        "vae_checkpoint",
+        "vae_module_root",
         "scaling_factor",
         "image_size",
         "storage_dtype",
@@ -185,6 +188,13 @@ def main(argv=None) -> None:
         raise ValueError(
             "--no_hash requires shards prepared with --no_hash"
         )
+    if (args.no_hash and manifest_path is not None
+            and (reference_metadata.get("source_mode") == "manifest_jsonl" or reference_metadata.get("frozen_views"))):
+        source_path = reference_metadata.get("source_manifest_jsonl")
+        if not source_path or Path(source_path).resolve() != manifest_path.resolve():
+            raise ValueError("posterior manifest reference changed before merge")
+        if reference_metadata.get("source_manifest_bytes", manifest_path.stat().st_size) != manifest_path.stat().st_size:
+            raise ValueError("posterior manifest length changed before merge")
     metadata = {
         "format": POSTERIOR_CACHE_FORMAT,
         "stats_layout": POSTERIOR_STATS_LAYOUT,
@@ -217,6 +227,7 @@ def main(argv=None) -> None:
     }
     if manifest_path is not None:
         metadata["manifest_jsonl"] = str(manifest_path)
+        metadata["manifest_bytes"] = manifest_path.stat().st_size
         metadata["manifest_sha256"] = (
             None if args.no_hash else sha256_file(manifest_path)
         )

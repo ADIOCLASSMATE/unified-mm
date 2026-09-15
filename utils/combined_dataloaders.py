@@ -6,6 +6,7 @@ The combined baseline remains exactly four microbatches in this order::
 
 Single-source controls may instead repeat one source for the complete optimizer
 update.  In that mode, inactive datasets and cursors are never constructed.
+The image-only joint control alternates T2I and I2T without constructing ClimbMix.
 
 The ClimbMix worker may prefetch, but only the cursor attached to a batch that
 the trainer consumed is committed.  Image streams keep independent epoch and
@@ -39,6 +40,7 @@ from utils.imagenet_flow_batching import collate_imagenet_flow_cache
 
 MIXED_DATA_STATE_SCHEMA = "unified_mixed_data_state_v1"
 BASELINE_SOURCE_SCHEDULE = ("climbmix", "t2i", "climbmix", "i2t")
+IMAGE_JOINT_SOURCE_SCHEDULE = ("t2i", "i2t")
 SUPPORTED_SOURCE_NAMES = frozenset(("climbmix", "t2i", "i2t"))
 
 
@@ -49,12 +51,13 @@ def _normalize_source_schedule(schedule) -> tuple[str, ...]:
     unsupported = sorted(set(normalized).difference(SUPPORTED_SOURCE_NAMES))
     if unsupported:
         raise ValueError(f"unsupported training sources: {unsupported}")
-    if normalized == BASELINE_SOURCE_SCHEDULE:
+    if normalized in (BASELINE_SOURCE_SCHEDULE, IMAGE_JOINT_SOURCE_SCHEDULE):
         return normalized
     if len(set(normalized)) == 1:
         return normalized
     raise ValueError(
-        "dataset.params.schedule must be the frozen combined baseline or one "
+        "dataset.params.schedule must be the frozen combined baseline, "
+        "the T2I/I2T joint schedule, or one "
         "source repeated for the complete optimizer update; got "
         f"{list(normalized)}"
     )
@@ -838,7 +841,7 @@ def build_unified_mixed_dataloaders(config, tokenizer):
     active_sources = tuple(dict.fromkeys(schedule))
     image_loaders = {}
     validation_loader = None
-    if schedule == BASELINE_SOURCE_SCHEDULE:
+    if schedule in (BASELINE_SOURCE_SCHEDULE, IMAGE_JOINT_SOURCE_SCHEDULE):
         t2i_train, t2i_validation = _build_image_source(
             config, tokenizer, "t2i"
         )
@@ -866,6 +869,7 @@ def build_unified_mixed_dataloaders(config, tokenizer):
 
 __all__ = [
     "BASELINE_SOURCE_SCHEDULE",
+    "IMAGE_JOINT_SOURCE_SCHEDULE",
     "MIXED_DATA_STATE_SCHEMA",
     "SUPPORTED_SOURCE_NAMES",
     "PairedImageTaskValidationDataset",

@@ -21,10 +21,18 @@ from utils.flow_head_scaling import config_path, validate_scaling_config
 from utils.experiment_registry import experiment_identity
 
 
-def launch_plan(depth: int, *, smoke: bool, label: str, steps: int, environment: dict) -> dict:
-    config_file = config_path(depth)
+def launch_plan(depth: int, *, smoke: bool, label: str, steps: int, environment: dict,
+                ablation: str = "b") -> dict:
+    if ablation == "f":
+        from utils.positionwise_flow_head_scaling import config_path as arm_config_path
+        from utils.positionwise_flow_head_scaling import validate_scaling_config as validate_arm
+    elif ablation == "b":
+        arm_config_path, validate_arm = config_path, validate_scaling_config
+    else:
+        raise ValueError("flow-head scaling is defined only for B and F")
+    config_file = arm_config_path(depth)
     config = OmegaConf.load(config_file)
-    contract = validate_scaling_config(config)
+    contract = validate_arm(config)
     if not re.fullmatch(r"[a-z0-9-]+", label):
         raise ValueError("smoke label must contain only lowercase letters, digits and hyphens")
     if not 2 <= steps <= 100:
@@ -76,7 +84,7 @@ def launch_plan(depth: int, *, smoke: bool, label: str, steps: int, environment:
         sys.executable, "scripts/validate_unified_baseline.py",
         "--config", config_file, "--formal-world-size", "64",
         "--require-npu-count", "16", "--run-project", project,
-        "--ablation", "b", "--flow-head-scaling",
+        "--ablation", ablation, "--flow-head-scaling",
     ]
     if rank == 0:
         preflight.append("--tokenizer-probe")
@@ -90,6 +98,7 @@ def launch_plan(depth: int, *, smoke: bool, label: str, steps: int, environment:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--ablation", choices=("b", "f"), default="b")
     parser.add_argument("--depth", type=int, choices=(16, 30), required=True)
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--label", default="memory-r1")
@@ -98,7 +107,7 @@ def main():
     args = parser.parse_args()
     os.chdir(ROOT)
     plan = launch_plan(args.depth, smoke=args.smoke, label=args.label, steps=args.steps,
-                       environment=dict(os.environ))
+                       environment=dict(os.environ), ablation=args.ablation)
     if args.dry_run:
         print(json.dumps(plan, indent=2))
         return

@@ -16,6 +16,7 @@ from torch.nn.attention.flex_attention import create_block_mask
 from .image_position_utils import build_row_col_position_ids
 from .modeling_selfless_cache import SelflessStaticCache, _SelflessStaticCacheLayer
 from .image_generation_backbone import ImageBackboneQuery
+from utils.image_token_order import halton_image_positions
 from utils.image_order_strategies import (
     CONFIDENCE_BLOCK_SIZE, CONFIDENCE_PROBE_DT, CONFIDENCE_STRATEGIES,
     confidence_scores, order_policy,
@@ -193,35 +194,10 @@ class SelflessGenerationMixin:
         side: int,
         device: torch.device,
     ) -> torch.Tensor:
-        def halton(index: int, base: int) -> float:
-            value = 0.0
-            scale = 1.0 / float(base)
-            while index > 0:
-                value += (index % base) * scale
-                index //= base
-                scale /= float(base)
-            return value
-
-        seen: set[int] = set()
-        order: list[int] = []
-        index = 1
-        while (
-            len(order) < image_tokens_per_img
-            and index < image_tokens_per_img * 32
-        ):
-            row = min(side - 1, int(halton(index, 2) * side))
-            col = min(side - 1, int(halton(index, 3) * side))
-            position = row * side + col
-            if position not in seen:
-                seen.add(position)
-                order.append(position)
-            index += 1
-        order.extend(
-            position
-            for position in range(image_tokens_per_img)
-            if position not in seen
+        return torch.tensor(
+            halton_image_positions(image_tokens_per_img, side),
+            device=device, dtype=torch.long,
         )
-        return torch.tensor(order, device=device, dtype=torch.long)
 
     def _image_generation_orders(
         self,
@@ -333,6 +309,9 @@ class SelflessGenerationMixin:
         return_trace: bool = False,
         debug_finite: bool = False,
         _debug_max_generation_steps: int | None = None,
+        cache_diagnostics: bool = True,
+        compact_backbone_cache: bool = False,
+        cache_attention_block_size: int = 32,
     ):
         """Generate image latents with one single-stream decoder.
 
@@ -343,6 +322,12 @@ class SelflessGenerationMixin:
 
         if not spans:
             return (None, {}) if return_trace else None
+        if compact_backbone_cache and (not use_cache or
+                not self._supports_paired_backbone_cfg or
+                order_strategy in CONFIDENCE_STRATEGIES):
+            raise ValueError("compact cache requires static cached generation with a fixed order")
+        if int(cache_attention_block_size) < 1:
+            raise ValueError("cache_attention_block_size must be positive")
         if input_ids.ndim != 2 or token_types.shape != input_ids.shape:
             raise ValueError("input_ids and token_types must be aligned [B,L]")
         if sigma.shape != input_ids.shape:
@@ -670,6 +655,8 @@ class SelflessGenerationMixin:
             batch_size=selected_batch * (2 if use_flow_cfg else 1),
             capacity=image_tokens_per_img,
         )
+        if compact_backbone_cache and isinstance(flow_cache, dict):
+            flow_cache["attention_block_size"] = int(cache_attention_block_size)
         conditional_cache = None
         unconditional_cache = None
         key_sigma = None
@@ -677,6 +664,11 @@ class SelflessGenerationMixin:
         key_is_target_image = None
         context_length = int(context_counts.max().item())
         backbone_cache_peak_bytes = 0
+        cache_position_map = None
+        cache_length = sequence_length
+        if compact_backbone_cache:
+            block = int(cache_attention_block_size)
+            cache_length = ((context_length + image_tokens_per_img + block - 1) // block) * block
 
         def gather_position_ids(indices: torch.Tensor) -> torch.Tensor:
             return torch.gather(
@@ -703,16 +695,23 @@ class SelflessGenerationMixin:
             ).values
             context_valid = context_indices.ne(sequence_length)
             context_indices.clamp_max_(sequence_length - 1)
+            context_cache_indices = context_indices
+            if compact_backbone_cache:
+                context_cache_indices = torch.arange(context_length, device=device).unsqueeze(0).expand(selected_batch, -1)
+                cache_position_map = torch.zeros_like(selected_input_ids, dtype=torch.long)
+                cache_position_map.scatter_(1, context_indices, context_cache_indices)
+                cache_position_map.scatter_(1, span_starts[:, None] + generation_orders,
+                    context_length + torch.arange(image_tokens_per_img, device=device).unsqueeze(0).expand(selected_batch, -1))
 
             key_sigma = torch.full(
-                (selected_batch, sequence_length),
+                (selected_batch, cache_length),
                 torch.inf,
                 device=device,
                 dtype=torch.float32,
             )
             key_valid = torch.zeros(
                 selected_batch,
-                sequence_length,
+                cache_length,
                 device=device,
                 dtype=torch.bool,
             )
@@ -724,13 +723,13 @@ class SelflessGenerationMixin:
             )
             key_sigma.scatter_(
                 1,
-                context_indices,
+                context_cache_indices,
                 gathered_context_sigma.masked_fill(
                     ~context_valid,
                     torch.inf,
                 ),
             )
-            key_valid.scatter_(1, context_indices, context_valid)
+            key_valid.scatter_(1, context_cache_indices, context_valid)
             context_mask = self._build_generation_cache_mask(
                 key_sigma=key_sigma,
                 key_valid=key_valid,
@@ -740,14 +739,14 @@ class SelflessGenerationMixin:
                     torch.inf,
                 ),
                 query_valid=context_valid,
-                query_positions=context_indices,
+                query_positions=context_cache_indices,
                 content_query_mask=context_valid,
                 image_uncond_rows=None,
                 content_self_diagonal=content_self_diagonal,
             )
             conditional_cache = SelflessStaticCache(
                 config=self.model.config,
-                max_cache_len=sequence_length,
+                max_cache_len=cache_length,
             )
             context_latent_indices = context_indices.unsqueeze(-1).expand(
                 -1,
@@ -764,7 +763,7 @@ class SelflessGenerationMixin:
                 position_ids=gather_position_ids(context_indices),
                 past_key_values=conditional_cache,
                 use_cache=True,
-                cache_position=context_indices,
+                cache_position=context_cache_indices,
                 cache_write_mask=context_valid,
                 token_types=torch.gather(
                     selected_token_types,
@@ -798,7 +797,7 @@ class SelflessGenerationMixin:
                 selected_batch
                 * int(self.config.num_hidden_layers)
                 * int(self.config.num_key_value_heads)
-                * sequence_length
+                * cache_length
                 * int(
                     getattr(
                         self.config,
@@ -851,6 +850,7 @@ class SelflessGenerationMixin:
             use_x0_content_condition=use_x0_content_condition,
             confidence_order=confidence_order,
             debug_finite=debug_finite,
+            cache_position_map=cache_position_map,
         )
 
         def cached_query(
@@ -984,12 +984,18 @@ class SelflessGenerationMixin:
             unconditional_pending_x0_hidden = None
 
             if use_cache:
+                if compact_backbone_cache:
+                    block = int(cache_attention_block_size)
+                    conditional_cache.visible_length = min(cache_length,
+                        ((context_length + step_index + block - 1) // block) * block)
                 if pending_local_positions is not None:
                     pending_positions = span_starts + pending_local_positions
                     pending_indices = pending_positions.unsqueeze(1)
+                    pending_cache_indices = (pending_indices if cache_position_map is None else
+                        torch.gather(cache_position_map, 1, pending_indices))
                     key_sigma.scatter_(
                         1,
-                        pending_indices,
+                        pending_cache_indices,
                         current_sigma[
                             batch_indices,
                             pending_positions,
@@ -997,12 +1003,12 @@ class SelflessGenerationMixin:
                     )
                     key_valid.scatter_(
                         1,
-                        pending_indices,
+                        pending_cache_indices,
                         torch.ones_like(pending_indices, dtype=torch.bool),
                     )
                     key_is_target_image.scatter_(
                         1,
-                        pending_indices,
+                        pending_cache_indices,
                         torch.ones_like(pending_indices, dtype=torch.bool),
                     )
                 if confidence_order and step_index % CONFIDENCE_BLOCK_SIZE == 0:
@@ -1333,13 +1339,14 @@ class SelflessGenerationMixin:
             )
             flow_cache_peak_bytes = (
                 sum(
-                    layer[name].numel() * layer[name].element_size()
+                    layer.get(name + "_storage", layer[name]).numel()
+                    * layer[name].element_size()
                     for layer in flow_cache["layers"]
                     for name in ("k", "v")
                 )
                 // selected_batch
             )
-            if use_flow_cfg and flow_cache["layers"]:
+            if cache_diagnostics and use_flow_cfg and flow_cache["layers"]:
                 cfg_cache_divergence = [
                     float(
                         (
@@ -1404,6 +1411,8 @@ class SelflessGenerationMixin:
             ),
             "segment_isolation_enabled": True,
             "backbone_kv_cache_enabled": bool(use_cache),
+            "compact_backbone_cache": bool(compact_backbone_cache),
+            "backbone_cache_capacity": cache_length if use_cache else 0,
             "backbone_cfg_batched": pair_backbone_cfg,
             "backbone_kv_cache_context_tokens": context_length if use_cache else 0,
             "backbone_kv_cache_tokens_committed": (

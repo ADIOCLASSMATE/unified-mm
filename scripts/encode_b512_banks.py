@@ -15,11 +15,13 @@ import time
 
 from scripts.prepare_b512_posterior_bank import prepare_bank
 from data_synthesis.io import atomic_json
+from data_synthesis.integrity import check_file_size, hashing_enabled
 
 
 def run_plan(path):
     path = Path(path).resolve()
     plan = json.loads(path.read_text())
+    compute_hashes = hashing_enabled() and hashing_enabled(plan)
     root = path.parent
     lock = (root / "encoding.lock").open("a")
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -40,7 +42,7 @@ def run_plan(path):
 
     def report(state="running", error=None):
         record(root / "job_status.json", {"controller_pid": os.getpid(), "started_at": started,
-               "state": state, "error": error, "active_children": sorted(active),
+               "state": state, "error": error, "active_children": sorted(active), "compute_hashes": compute_hashes,
                "completed_banks": [b["name"] for b in banks if b["merged"]]})
         for bank in banks:
             directory = Path(bank["manifest_dir"])
@@ -84,17 +86,21 @@ def run_plan(path):
                         if dependency["state"] not in {"running", "queued"}:
                             raise RuntimeError(f"source dependency failed: {bank['wait_for']}")
                         continue
-                contract = prepare_bank(bank["run"], bank["manifest_dir"])
+                contract = prepare_bank(bank["run"], bank["manifest_dir"], compute_hashes=compute_hashes)
                 bank["records"] = contract["records"]
                 bank["shards"] = max(1, math.ceil(bank["records"] / int(plan.get("images_per_shard", 512))))
                 bank["pending"] = deque(range(bank["shards"]))
                 existing = Path(bank["cache_dir"]) / "posterior_index.json"
                 if existing.exists():
                     value = json.loads(existing.read_text())
-                    if (value["metadata"].get("source_manifest_sha256") != contract["manifest_sha256"]
-                            or not value["metadata"].get("source_view_hashes_verified")
+                    meta = value["metadata"]
+                    if ((compute_hashes and (meta.get("source_manifest_sha256") != contract["manifest_sha256"]
+                                             or not meta.get("source_view_hashes_verified")))
+                            or (not compute_hashes and Path(meta["manifest_jsonl"]).resolve()
+                                != Path(contract["manifest_jsonl"]).resolve())
                             or not all(Path(p).exists() for p in value["shards"])):
                         raise ValueError(f"existing bank index contract changed: {existing}")
+                    check_file_size(contract["manifest_jsonl"], meta.get("manifest_bytes"))
                     bank.update(merged=True, done=bank["shards"], pending=deque())
             for bank in banks:
                 if bank["merged"] or bank["pending"] is None:
@@ -105,7 +111,7 @@ def run_plan(path):
                     launch(bank, [sys.executable, "-u", "scripts/imagenet_encode_kl16_vae.py",
                            "--source_mode", "manifest_jsonl", "--source_manifest_jsonl", manifest,
                            "--cache_shard_dir", bank["cache_dir"], "--image_size", "512",
-                           "--frozen_views", "--verify_view_hashes", "--batch_size", "4",
+                           "--frozen_views", "--verify_view_hashes" if compute_hashes else "--no_hash", "--batch_size", "4",
                            "--num_workers", "1", "--device", "cpu", "--vae_dtype", "fp32",
                            "--num_shards", str(bank["shards"]), "--shard_index", str(shard)],
                            f"shard-{shard:05d}", "encode")
@@ -113,7 +119,8 @@ def run_plan(path):
                 if not bank["pending"] and not own_tasks and len(active) < workers:
                     launch(bank, [sys.executable, "pretrain/merge_flow_latent_shards.py",
                            "--shard_dir", bank["cache_dir"], "--manifest_jsonl", manifest,
-                           "--index_only", "--output_path", str(Path(bank["cache_dir"]) / "posterior_index.json")],
+                           "--index_only", "--output_path", str(Path(bank["cache_dir"]) / "posterior_index.json")]
+                           + ([] if compute_hashes else ["--no_hash"]),
                            "merge", "merge")
             report()
             if active or not all(bank["merged"] for bank in banks):

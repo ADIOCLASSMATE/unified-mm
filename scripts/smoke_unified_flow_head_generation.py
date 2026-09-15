@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reload a depth-scaling smoke EMA and exercise complete cached generation."""
+"""Reload B/F smoke weights and exercise complete cached generation."""
 
 from __future__ import annotations
 
@@ -28,7 +28,9 @@ from utils.utils import load_model_tokenizer
 @torch.inference_mode()
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--depth", type=int, choices=(16, 30), required=True)
+    parser.add_argument("--ablation", choices=("b", "f"), default="b")
+    parser.add_argument("--depth", type=int, choices=(8, 16, 30), required=True)
+    parser.add_argument("--image-joint", action="store_true")
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--weights", choices=("ema", "current"), default="ema")
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -37,7 +39,20 @@ def main():
     assert torch.npu.is_available() and torch.npu.device_count() == 16
     torch.npu.set_device(0)
     device = torch.device("npu", 0)
-    config = OmegaConf.load(config_path(args.depth))
+    if args.image_joint:
+        if args.ablation != "b" or args.depth != 8:
+            parser.error("--image-joint requires B with depth 8")
+        from utils.image_joint_training import CONFIG, HEAD_PARAMETERS as joint_parameters, validate_config
+        arm_parameters = {8: joint_parameters}
+        config = OmegaConf.load(CONFIG)
+        validate_config(config)
+    elif args.ablation == "f":
+        from utils.positionwise_flow_head_scaling import HEAD_PARAMETERS as arm_parameters
+        from utils.positionwise_flow_head_scaling import config_path as arm_config_path
+        config = OmegaConf.load(arm_config_path(args.depth))
+    else:
+        arm_parameters, arm_config_path = HEAD_PARAMETERS, config_path
+        config = OmegaConf.load(arm_config_path(args.depth))
     source = None
     if args.weights == "ema":
         source = resolve_evaluation_model_source(args.checkpoint)
@@ -59,11 +74,13 @@ def main():
             expected = saved.get_tensor(key).flatten()[:16].to(dtype=actual.dtype)
             torch.testing.assert_close(actual, expected, rtol=0, atol=0, msg=key)
     del reloaded_state
-    assert len(model.image_flow_head.net.blocks) == args.depth
+    blocks = model.image_flow_head.net.res_blocks if args.ablation == "f" else model.image_flow_head.net.blocks
+    assert len(blocks) == args.depth
     assert model.image_flow_head.net.grad_checkpointing is True
-    assert model.config.image_flow_share_content is True
-    assert sum(p.numel() for p in model.image_flow_head.parameters()) == HEAD_PARAMETERS[args.depth]
-    assert model.config.flow_condition_contract == "backbone_xt_query_backbone_x0_content"
+    assert model.config.image_flow_share_content is (args.ablation == "b")
+    assert sum(p.numel() for p in model.image_flow_head.parameters()) == arm_parameters[args.depth]
+    expected_condition = "not_applicable" if args.ablation == "f" else "backbone_xt_query_backbone_x0_content"
+    assert model.config.flow_condition_contract == expected_condition
     prompt = "A golden retriever sitting on green grass beside a red ball."
     item = build_t2i_item(tokenizer, model, prompt, 0, 42, "random")
     batch = collate_imagenet_flow_cache([item], pad_to_length=512)
@@ -84,6 +101,11 @@ def main():
     assert tuple(latents.shape) == (1, 16, 16, 16)
     assert bool(torch.isfinite(latents).all().item())
     assert trace.get("backbone_kv_cache_enabled") is True
+    if args.ablation == "f":
+        assert trace["architecture_variant"] == "positionwise_flow_head_on_b"
+        assert trace["flow_head_content_stream"] is False
+        assert trace["flow_head_consumes_prior_latents"] is False
+        assert trace["flow_content_cache_peak_bytes_per_sample"] == 0
     reference_report = None
     if args.reference_generation_file is not None:
         spec = importlib.util.spec_from_file_location(
@@ -100,7 +122,9 @@ def main():
                             "generation_order_equal": True, "same_model_weights_and_noise": True}
     args.output_dir.mkdir(parents=True, exist_ok=True)
     torch.save(latents.cpu(), args.output_dir / "latents.pt")
-    config.experiment.validation_vae_module_root = "public/code/mar"
+    config.experiment.validation_vae_module_root = (
+        "external/mar" if (ROOT / "external/mar/models/vae.py").is_file() else "public/code/mar"
+    )
     config.experiment.validation_vae_path = "public/vae/mar-kl16/kl16.ckpt"
     config.experiment.validation_vae_scaling_factor = 0.2325
     vae = load_vae(config, device, "fp32")
@@ -108,7 +132,8 @@ def main():
     assert bool(torch.isfinite(decoded).all().item())
     save_png(decoded[0], args.output_dir / "generated.png")
     report = {"schema": "flow_head_scaling_generation_smoke_v1", "passed": True,
-              "depth": args.depth, "head_parameters": HEAD_PARAMETERS[args.depth],
+              "ablation": args.ablation,
+              "depth": args.depth, "head_parameters": arm_parameters[args.depth],
               "checkpoint": str(args.checkpoint), "weights": weights,
               "export_tensor_samples_verified": len(checked_keys),
               "flow_checkpointing": True, "sampling_steps": 10, "solver": "heun",

@@ -1,5 +1,6 @@
 """Shared bounded direct downloads, image archives and atomic metadata writes."""
 import asyncio
+import fcntl
 import hashlib
 import io
 import json
@@ -151,4 +152,27 @@ def training_image_id(view):
 
 
 def cohort_id(root):
-    return sha(str(Path(root).resolve()).encode())[:16]
+    root = Path(root).resolve()
+    marker = root / "cohort_identity.json"
+    if marker.exists():
+        value = json.loads(marker.read_text())
+        identity = value.get("id", "")
+        if (value.get("schema") != "b512_cohort_identity_v1" or len(identity) != 16
+                or any(c not in "0123456789abcdef" for c in identity)):
+            raise ValueError("invalid persisted cohort identity")
+        return identity
+    return sha(str(root).encode())[:16]
+
+
+def pin_cohort_id(root):
+    """Keep pre-existing batch/archive IDs stable across storage relocation."""
+    root = Path(root).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    marker = root / "cohort_identity.json"
+    with marker.with_suffix(".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        identity = cohort_id(root)
+        if not marker.exists():
+            atomic_json(marker, {"schema": "b512_cohort_identity_v1", "id": identity,
+                                 "original_root": str(root)})
+    return identity

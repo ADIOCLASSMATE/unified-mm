@@ -25,6 +25,7 @@ from scripts.summarize_pretraining_native_understanding import (
     require_unit_interval,
 )
 from utils.evaluation_model_source import resolve_evaluation_model_source
+from utils.evaluation.aro import ARO_SCORE_VARIANT, CONDITIONAL_SCORE
 
 
 GENERATION_PROTOCOL = "imagenet_val_fid50k_torch_fidelity_stratified_is"
@@ -174,9 +175,8 @@ def validate_formal_native(native: dict[str, Any]) -> None:
     selection = native.get("selection_contract") or {}
     expected_selection = {
         "imagenet_validation_images": 50_000,
-        "image_text_matching_score_variant": (
-            "language_prior_debiased_mean_token_loglikelihood_only"
-        ),
+        "image_text_matching_score_variant": ARO_SCORE_VARIANT,
+        "aro_primary_candidate_score": CONDITIONAL_SCORE,
         "language_prior_alpha": 1.0,
         "dense_retrieval_language_prior_estimator": (
             "candidate_image_logmeanexp"

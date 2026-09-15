@@ -113,7 +113,8 @@ def test_whatsup_normalizer_preserves_four_image_sets(tmp_path):
     assert all(row["label"] == 0 and len(row["candidates"]) == 4 for row in rows)
 
 
-def test_pretraining_native_summary_merges_required_components(tmp_path, monkeypatch):
+@pytest.mark.parametrize("s2", [False, True])
+def test_pretraining_native_summary_merges_required_components(tmp_path, monkeypatch, s2):
     checkpoint = tmp_path / "checkpoint"
     native_root = tmp_path / "native"
     benchmark_root = tmp_path / "benchmarks"
@@ -167,13 +168,22 @@ def test_pretraining_native_summary_merges_required_components(tmp_path, monkeyp
         "primary_candidate_score": (
             "language_prior_debiased_mean_token_loglikelihood"
         ),
-        "reported_score_variant": "language_prior_debiased_only",
+        "reported_score_variant": "conditional_aro_debiased_other_tasks",
+        "task_primary_candidate_scores": {task: "conditional_mean_token_loglikelihood" for task in ("aro_vg_relation", "aro_vg_attribution")},
         "language_prior_alpha": 1.0,
         "language_prior_estimator": "content_free_gaussian_image_logmeanexp",
         "language_prior_null_image_count": 3,
         "language_prior_uses_labels": False,
         "mc_samples": 64,
     }
+    if s2:
+        benchmark_scoring.update({
+            "dual_stream_attention_contract": "showo2_omni_attention",
+            "scoring_contract": "showo2_next_token_ar_target_aligned_v1",
+            "contract": "showo2_next_token_ar_target_aligned_v1",
+            "image_order_mc_contract": "not_applicable_full_image_ar",
+            "mc_samples": 1,
+        })
     (benchmark_root / "manifest.json").write_text(
         json.dumps(
             {
@@ -250,6 +260,9 @@ def test_pretraining_native_summary_merges_required_components(tmp_path, monkeyp
                 "primary_metric": "accuracy_language_prior_debiased",
                 "accuracy_language_prior_debiased": value,
             }
+        elif task.startswith("aro_vg_"):
+            metrics = {"records": records, "primary_metric": "conditional_pairwise.win_rate",
+                       "conditional_pairwise": {"win_rate": value}}
         else:
             metrics = {
                 "records": records,

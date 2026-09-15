@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from utils.evaluation.model_contracts import validate_image_generation_report
 from utils.evaluation_model_source import (
     EvaluationModelSource,
     resolve_evaluation_model_source,
@@ -301,18 +302,11 @@ def main() -> None:
         validation_root / f"validation_generation_step_{step}.json"
     )
     generation = load_json(generation_path)
-    strategy_generation = generation.get("strategies", {}).get(
-        strategy_name,
-        {},
+    generation_cache_enabled = validate_image_generation_report(
+        generation,
+        validation_run.get("dual_stream_attention_contract", "selfless_strict"),
+        strategy=strategy_name,
     )
-    if (
-        generation.get("generation_entry") != "model.generate"
-        or generation.get("use_cache") is not True
-        or strategy_generation.get("backbone_kv_cache_enabled") is not True
-    ):
-        raise ValueError(
-            "held-out T2I generation did not use the unified cached entry"
-        )
     image_paths = sorted(
         (validation_root / "validation_flow_images").glob(
             f"step-{step:08d}-*.png"
@@ -353,7 +347,7 @@ def main() -> None:
             "caption_jsonl": str(caption_path.resolve()),
             "generation_report": str(generation_path.resolve()),
             "generation_entry": "model.generate",
-            "backbone_kv_cache_enabled": True,
+            "backbone_kv_cache_enabled": generation_cache_enabled,
             "flow_image_count": len(image_paths),
             "flow_images": [str(path.resolve()) for path in image_paths],
         },

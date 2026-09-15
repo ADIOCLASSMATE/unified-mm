@@ -28,7 +28,9 @@ S'[i,c] = S[i,c] - b[c]      # alpha = 1
 
 ImageNet 分类与 COCO/Flickr 检索在全体评测图像上估计列先验，使用 `S'` 排名。这是基于评测图像分布的语言先验校准。I2T 横向比较不同文本，校准会改变排序；T2I 对固定文本减去同一常数，排序保持一致。
 
-SugarCrepe / ARO 使用三张固定 Gaussian null image 估计先验：VAE 输入空间 `mean=0, std=0.25`，clamp 至 `[-1,1]`。正负例按严格胜率汇总，并单列平局。
+SugarCrepe 使用三张固定 Gaussian null image 估计先验：VAE 输入空间 `mean=0, std=0.25`，clamp 至 `[-1,1]`，使用去先验分数 `S'` 排名。
+
+ARO Relation / Attribution 使用含文本先验的原始条件分数 `S = S' + b`，即平均 token `log P(text | image)`，主指标为 `conditional_pairwise.win_rate`。按全部保留样本的严格胜率汇总，平局不计正确，另列平局率和分类别指标。该汇总未改为官方类别宏平均及 Attribution 小类别过滤口径。历史预测通过保存的去先验分数与文本先验恢复，原始预测和旧去先验指标保留用于追溯。
 
 | 任务 | 规模 | 主指标 |
 | --- | --- | --- |
@@ -36,7 +38,7 @@ SugarCrepe / ARO 使用三张固定 Gaussian null image 估计先验：VAE 输�
 | COCO Karpathy | 5,000 图、25,010 caption | I2T / T2I R@1/5/10 |
 | Flickr30K Karpathy | 1,000 图、5,000 caption | I2T / T2I R@1/5/10 |
 | SugarCrepe | 7,511 对，七类 | 总体及分类别严格胜率 |
-| ARO Relation / Attribution | 23,937 / 28,748 对 | 严格胜率 |
+| ARO Relation / Attribution | 23,937 / 28,748 对 | 含文本先验的条件似然严格胜率 |
 | MMBench Dev-EN / SEED image | 4,329 / 14,233 条 | 项目内候选似然诊断 |
 
 ImageNet 使用 CLIP 类名表和单模板，分数来自本模型的生成式似然。MMBench / SEED 的评分方式是候选似然，区别于官方答案生成协议。资产和命令见 [图像理解](PRETRAINING_NATIVE_EVALUATION.md)。

@@ -6,7 +6,7 @@ import torch
 
 from scripts.generate_unified_qualitative import (
     build_t2i_item, caption_sigmas, decode_suffix, fixed_posterior,
-    noise_for, render, task_training,
+    noise_for, render, task_training, validate_generation_trace,
 )
 from utils.imagenet_flow_batching import collate_imagenet_flow_cache
 
@@ -164,7 +164,7 @@ def test_complete_gallery_validates_workers_and_produces_portable_zip(tmp_path):
         assert len(bundle.read("results.jsonl").splitlines()) == 2
 
 
-@pytest.mark.parametrize("variant", ["b", "c", "d", "e", "f"])
+@pytest.mark.parametrize("variant", ["b", "c", "d", "e", "f", "s2"])
 def test_actual_tiny_architectures_accept_all_three_generation_inputs(variant):
     from test_dynamic_xt_contract import tiny_config
     from test_positionwise_flow_on_b import _tiny_config as f_config
@@ -175,7 +175,11 @@ def test_actual_tiny_architectures_accept_all_three_generation_inputs(variant):
     from models.modeling_model.modeling_selfless_flow_positionwise_on_b import PositionwiseFlowOnBQwen3ForCausalLM
     from pretrain.train_selfless_flow import _generate_i2t_caption_batch
 
-    if variant == "d":
+    if variant == "s2":
+        from test_showo2_unified import tiny_config as s2_config
+        from models.modeling_model.modeling_showo2_unified import Showo2UnifiedForCausalLM
+        config, cls = s2_config(), Showo2UnifiedForCausalLM
+    elif variant == "d":
         config, cls = tiny_config(), DynamicXtQwen3ForCausalLM
     elif variant == "f":
         config, cls = f_config(), PositionwiseFlowOnBQwen3ForCausalLM
@@ -198,11 +202,21 @@ def test_actual_tiny_architectures_accept_all_three_generation_inputs(variant):
             flow_num_steps=2, parallel_rate=1, order_strategy="sequential" if variant == "e" else "spatial_halton",
             use_cache=True, return_trace=True)
         assert image.shape == (1, 4, 2, 2)
-        assert torch.isfinite(image).all() and trace["backbone_kv_cache_enabled"]
+        assert torch.isfinite(image).all()
+        validate_generation_trace(trace, use_cache=variant != "s2", task="t2i")
         captions, ids, reasons = _generate_i2t_caption_batch(model, tokenizer, torch.zeros(1, 4, 4),
             text_prefix="Describe this image in one detailed caption:", max_new_tokens=2, temperature=0,
             base_sigma_batch=caption_sigmas(tokenizer, model, [{"posterior_seed": 42}], order))
         assert len(captions) == len(ids) == len(reasons) == 1
         text, trace = model.generate("text", input_ids=torch.tensor([[4, 5, 6]]), max_new_tokens=2,
             temperature=0, eos_token_id=9, use_cache=True, return_trace=True)
-        assert text.shape[1] >= 4 and trace["backbone_kv_cache_enabled"]
+        assert text.shape[1] >= 4
+        validate_generation_trace(trace, use_cache=variant != "s2", task="text")
+
+
+def test_s2_trace_requires_correct_generation_mode_and_cache():
+    with pytest.raises(RuntimeError, match="cache differs"):
+        validate_generation_trace({"backbone_kv_cache_enabled": True}, use_cache=False, task="t2i")
+    with pytest.raises(RuntimeError, match="expected S2 generation mode"):
+        validate_generation_trace({"backbone_kv_cache_enabled": False, "generation_mode": "showo2_text_ar"},
+                                  use_cache=False, task="t2i")

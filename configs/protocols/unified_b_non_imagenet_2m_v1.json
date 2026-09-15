@@ -1,7 +1,7 @@
 {
   "schema": "unified_b_non_imagenet_quota_plan_v1",
   "updated_at": "2026-09-13",
-  "status": "source_selection_plan_not_a_dataset_release",
+  "status": "historical_initial_coverage_plan_superseded",
   "target_unique_non_imagenet_images": 2000000,
   "imagenet_train_base": 1281167,
   "combined_target_before_imagenet_exclusions": 3281167,
@@ -232,5 +232,6 @@
   "runtime_config": "configs/data_synthesis/b512_sii_v1.json",
   "pipeline_document": "docs/DATA_SYNTHESIS.md",
   "pipeline_entry": "python -m scripts.synthesize_image_text",
-  "implementation_status": "reuse_sii_bounded_fallback_implemented; bulk_data_and_visual_qualification_pending"
+  "implementation_status": "reuse_sii_bounded_fallback_implemented; bulk_data_and_visual_qualification_pending",
+  "superseded_by": "configs/protocols/unified_b_blip3o_long_v1.json"
 }

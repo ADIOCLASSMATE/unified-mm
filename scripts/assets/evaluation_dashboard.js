@@ -9,9 +9,14 @@ const metricGroups={
 for(const dataset of ['coco','flickr'])metricGroups[dataset]=['i2t','t2i'].flatMap(dir=>[1,5,10].map(k=>`${dataset}_${dir}_r${k}`));
 const fmt=metric=>metric?(metric.percent?(metric.value*100).toFixed(2)+'%':metric.value.toFixed(3))+(metric.std===undefined?'':` ± ${metric.std.toFixed(2)}`):'—';
 const smallerIsBetter=key=>key==='fid'||key.endsWith('loss')||key.endsWith('ppl');
+let s2CfgSweep=D.s2_cfg_sweep??null;
 
 function modelMetric(model,key,protocol='cfg2'){
  if(!['fid','is'].includes(key)||protocol==='cfg3p5')return model.metrics[key]??null;
+ if(model.id==='s2_single'){
+  const point=s2CfgSweep?.rows.find(row=>row.cfg===2.0)?.s2;
+  return point?{value:point[key],source:point.source,...(key==='is'?{std:point.is_std}:{})}:null;
+ }
  const entry=D.matrix_sweeps?.[0]?.models.find(m=>m.model===model.id);
  const result=entry?.strategies[entry.native_strategy];
  // Missing CFG=2 results must never silently fall back to CFG=3.5.
@@ -25,22 +30,23 @@ function metricLeader(models,key,protocol='cfg2'){
 }
 function metricLink(metric){return metric?`<a href="${esc(metric.source)}" title="查看原始结果">${fmt(metric)}</a>`:'<span class="missing">—</span>'}
 function inModelGroup(model,group){
- return group==='all'||model.group===group||(group==='ablation'&&model.id==='b_x0');
+ return group==='all'||model.group===group||(['ablation','showo2'].includes(group)&&model.id==='b_x0');
 }
 function metricScope(scope){
  return D.models.filter(m=>scope==='formal'?(Object.keys(m.metrics).length>0||modelMetric(m,'fid')):inModelGroup(m,scope));
 }
 
-function renderMetrics(){
+function renderMetrics(refreshSweep=true){
+ if(refreshSweep)renderS2CfgSweep();
  const group=$('metric-group').value,protocol=$('metric-protocol').value,models=metricScope($('metric-scope').value),keys=metricGroups[group];
  const includesGeneration=keys.some(k=>['fid','is'].includes(k));
  $('metric-protocol').disabled=!includesGeneration;
  $('metric-protocol-note').textContent=includesGeneration?
-  `当前 ${models.length} 个模型。FID / IS：CFG=${protocol==='cfg2'?'2.0':'3.5'}、Heun=10、ImageNet-val 50K；E 使用原生 Sequential，其余使用 Halton。文本与图像理解分数来自同一模型最终 checkpoint 的各自评测。`:
+  `当前 ${models.length} 个模型。FID / IS：CFG=${protocol==='cfg2'?'2.0':'3.5'}、Heun=10、ImageNet-val 50K；S2 使用整图 Flow，E 使用原生 Sequential，其他模型使用 Halton。文本与图像理解分数来自同一模型最终 checkpoint 的各自评测。`:
   `当前 ${models.length} 个模型。${group==='diagnostics'?'此处为最终评测诊断，不是训练过程中的验证曲线。':'此指标组使用自身的固定评测协议，不受 CFG / Heun 选择影响。'}`;
  const best=Object.fromEntries(keys.map(k=>[k,metricLeader(models,k,protocol)?.metric.value]));
  $('metrics').innerHTML='<table><thead><tr><th class="model-name">模型 / 完成情况</th>'+keys.map(k=>`<th class="metric">${esc(D.labels[k])}${['fid','is'].includes(k)?`<span class="status">CFG ${protocol==='cfg2'?'2.0':'3.5'}</span>`:''}</th>`).join('')+'</tr></thead><tbody>'+models.map(m=>{
-  const order=m.id==='e_on_b'?'Sequential':'Halton';
+  const order=m.architecture==='showo2_unified'?'整图 Flow':m.id==='e_on_b'?'Sequential':'Halton';
   return `<tr data-model="${esc(m.id)}" class="${mainModelIds.has(m.id)?'focus-row':''}"><td class="model-name">${esc(m.label)}<span class="status">${esc(m.status)}${includesGeneration&&modelMetric(m,'fid',protocol)?' · '+order:''}</span></td>`+keys.map(k=>{
    const metric=modelMetric(m,k,protocol);
    return `<td data-metric="${esc(k)}" class="metric ${metric&&metric.value===best[k]?'best':''}">${metricLink(metric)}</td>`;
@@ -58,11 +64,68 @@ function renderMetrics(){
  $('model-metric-conclusion').innerHTML='<strong>当前范围的结果</strong><p>'+(findings.length?findings.join('；')+'。':'尚无足够的已完成记录。')+'</p>'+`<p class="note">${includesGeneration?'生成指标、文本能力与图像理解的领先模型可能不同。固定生成协议后的分数用于结构消融；参数变化带来的收益和代价见“采样与解码消融”。':'这些结果对应当前选中的模型范围。不同任务分别报告，不把跨任务平均值当作统一质量评分。'}</p>`;
 }
 
+async function renderS2CfgSweep(){
+ const box=$('s2-cfg-sweep'),selected=D.selection?.s2_cfg_sweep;
+ box.hidden=!selected||$('metric-scope').value!=='showo2';
+ if(!selected)return;
+ try{
+  const response=await fetch(selected.output+'/comparison.json',{cache:'no-store'});
+  if(!response.ok)throw new Error('结果汇总暂不可用');
+  const sweep=await response.json(),prefix=selected.output+'/';
+  const changed=s2CfgSweep?.updated_at!==sweep.updated_at;
+  s2CfgSweep=sweep;
+  if(changed)renderMetrics(false);
+  const value=(row,side,key)=>row[side]?`<a href="${esc(row[side].source)}">${row[side][key].toFixed(3)}${key==='is'?' ± '+row[side].is_std.toFixed(2):''}</a>`:'—';
+  const rows=sweep.rows.map(row=>[row.cfg.toFixed(1),value(row,'b','fid'),value(row,'b','is'),value(row,'s2','fid'),value(row,'s2','is')]);
+  let conclusion='未完成档位保留空白；扫描完成后再报告区间内最优 CFG。';
+  if(sweep.complete){
+   const bestFid=sweep.rows.reduce((a,b)=>a.s2.fid<b.s2.fid?a:b),bestIs=sweep.rows.reduce((a,b)=>a.s2.is>b.s2.is?a:b);
+   conclusion=`S2-single 在本次扫描范围内：最低 FID ${bestFid.s2.fid.toFixed(3)}（CFG=${bestFid.cfg.toFixed(1)}）；最高 IS ${bestIs.s2.is.toFixed(3)}（CFG=${bestIs.cfg.toFixed(1)}）。`;
+  }
+  box.innerHTML=`<h3>S2-single · CFG sweep</h3><p>已完成 <strong>${sweep.completed} / ${sweep.total}</strong> 档。CFG=1.0–6.0，间隔 0.5；Heun=10，ImageNet-val 50K，seed 42。</p><p class="note">S2 使用整图 flow，全局 batch 2048；B 使用 Halton，全局 batch 4096。CFG=3.5 复用完整评测。IS 阴影为十个类别分层 split 的标准差。${sweep.complete?"全部档位已完成。":"曲线每分钟检查更新。"}</p><a href="${esc(prefix)}cfg-sweep.png"><img style="width:100%;height:auto" src="${esc(prefix)}cfg-sweep.png?v=${encodeURIComponent(sweep.updated_at)}" alt="B 与 S2-single 的 FID、IS 随 CFG 变化曲线"></a><p>${esc(conclusion)}</p>${summaryTable(['CFG','B FID ↓','B IS ↑','S2 FID ↓','S2 IS ↑'],rows)}<p><a href="${esc(prefix)}cfg-sweep.png">PNG</a> · <a href="${esc(prefix)}cfg-sweep.pdf">PDF</a> · <a href="${esc(prefix)}cfg-sweep.svg">SVG</a> · <a href="${esc(prefix)}cfg-sweep.csv">CSV</a> · <a href="${esc(prefix)}comparison.json">原始汇总</a></p><p class="note">更新：${esc(sweep.updated_at)}</p>`;
+ }catch(error){box.innerHTML=`<h3>S2-single · CFG sweep</h3><p class="note">${esc(error.message)}，下一次刷新时重试。</p>`}
+}
+
+async function renderDCfgSweep(){
+ const box=$('d-cfg-sweep'),selected=D.selection?.d_cfg_sweep;
+ box.hidden=!selected;
+ if(!selected)return;
+ try{
+  const response=await fetch(selected.output+'/comparison.json',{cache:'no-store'});
+  if(!response.ok)throw new Error('结果汇总暂不可用');
+  const sweep=await response.json(),prefix=selected.output+'/';
+  const value=(row,side,key)=>row[side]?`<a href="${esc(row[side].source)}">${row[side][key].toFixed(3)}${key==='is'?' ± '+row[side].is_std.toFixed(2):''}</a>`:'—';
+  const overview=$('d-cfg-overview');
+  if(overview)overview.textContent=`${sweep.completed} / ${sweep.total}`;
+  const rows=sweep.rows.map(row=>[row.cfg.toFixed(1),value(row,'b','fid'),value(row,'b','is'),value(row,'d','fid'),value(row,'d','is')]);
+  let conclusion='未完成档位保留空白；扫描完成后再报告区间内最优 CFG。';
+  if(sweep.complete){
+   const bestFid=sweep.rows.reduce((a,b)=>a.d.fid<b.d.fid?a:b),bestIs=sweep.rows.reduce((a,b)=>a.d.is>b.d.is?a:b);
+   conclusion=`D 在本次扫描范围内：最低 FID ${bestFid.d.fid.toFixed(3)}（CFG=${bestFid.cfg.toFixed(1)}）；最高 IS ${bestIs.d.is.toFixed(3)}（CFG=${bestIs.cfg.toFixed(1)}）。`;
+  }
+  box.innerHTML=`<h3>D · CFG sweep</h3><p>已完成 <strong>${sweep.completed} / ${sweep.total}</strong> 档。CFG=1.0–6.0，间隔 0.5；Heun=10，ImageNet-val 50K，seed 42。</p><p class="note">D 与 B 均使用 Halton，全局 batch 4096；D 保留逐次更新 XT-query 的动态流条件。CFG=2.0 / 3.5 复用已通过权重加载校验的完整评测。IS 阴影为十个类别分层 split 的标准差。${sweep.complete?"全部档位已完成。":"曲线每分钟检查更新。"}</p><a href="${esc(prefix)}cfg-sweep.png"><img style="width:100%;height:auto" src="${esc(prefix)}cfg-sweep.png?v=${encodeURIComponent(sweep.updated_at)}" alt="B 与 D 的 FID、IS 随 CFG 变化曲线"></a><p>${esc(conclusion)}</p>${summaryTable(['CFG','B FID ↓','B IS ↑','D FID ↓','D IS ↑'],rows)}<p><a href="${esc(prefix)}cfg-sweep.png">PNG</a> · <a href="${esc(prefix)}cfg-sweep.pdf">PDF</a> · <a href="${esc(prefix)}cfg-sweep.svg">SVG</a> · <a href="${esc(prefix)}cfg-sweep.csv">CSV</a> · <a href="${esc(prefix)}comparison.json">原始汇总</a></p><p class="note">更新：${esc(sweep.updated_at)}</p>`;
+ }catch(error){box.innerHTML=`<h3>D · CFG sweep</h3><p class="note">${esc(error.message)}，下一次刷新时重试。</p>`}
+}
+
 function summaryTable(headers,rows){
  return '<div class="scroll"><table><thead><tr>'+headers.map(h=>`<th>${esc(h)}</th>`).join('')+'</tr></thead><tbody>'+rows.map(row=>'<tr>'+row.map(cell=>`<td>${cell}</td>`).join('')+'</tr>').join('')+'</tbody></table></div>';
 }
 function summaryCard(number,title,route,body,note,links='',wide=false){
  return `<article class="summary-card${wide?' wide':''}" data-summary="${route.split('/')[0]}"><div class="section-kicker">${number}</div><div class="card-heading"><h2>${title}</h2><a href="#${route}">查看详情 →</a></div>${body}<p class="summary-note">${note}</p>${links?`<div class="summary-links">${links}</div>`:''}</article>`;
+}
+
+function showoComparisonOverview(){
+ const models=metricScope('showo2');
+ if(!models.some(m=>m.group==='showo2'&&m.complete))return '';
+ const completeSweep=D.s2_cfg_sweep?.complete?D.s2_cfg_sweep:null;
+ const best=completeSweep?.rows.reduce((a,b)=>a.s2.fid<b.s2.fid?a:b);
+ const sweepNote=best?`<br><strong>S2 CFG sweep 已完成 11 / 11 档：最低 FID ${best.s2.fid.toFixed(3)}，CFG=${best.cfg.toFixed(1)}，对应 IS ${best.s2.is.toFixed(2)} ± ${best.s2.is_std.toFixed(2)}。</strong> 完整 B / S2 曲线与逐档结果见详情。`:'';
+ const keys=['fid','is','text_macro','top1'];
+ const rows=models.map(m=>[esc(m.label),...keys.map(k=>metricLink(modelMetric(m,k,'cfg3p5')))]);
+ return summaryCard('S2 / 完整评测','B / S2 对照','matrix/showo2',
+  summaryTable(['模型','FID ↓ · CFG 3.5','IS ↑ · CFG 3.5','文本八项均分 ↑','ImageNet Top-1 ↑'],rows),
+  '相同 final EMA 步数、ImageNet-val 50K、CFG=3.5、Heun=10、seed 42。S2 使用整图 flow 与确定性 AR 候选评分；详情包含文本八任务、分类、组合理解和 COCO / Flickr 双向检索。'+sweepNote,
+  '<a href="#matrix/showo2">S2 完整结果、CFG 曲线与 B 对照 →</a>',true);
 }
 
 function renderResearchOverview(){
@@ -74,7 +137,7 @@ function renderResearchOverview(){
  const samplingText=sweep?.conclusion&&order?.conclusion?
   `B 的采样扫描表明，最低 FID 与最高 IS 对应不同设置；固定 CFG=2.0、Heun=10 后，${esc(orderLabels[order.conclusion.best_fid.strategy])} 得到当前顺序实验中的最低 FID ${order.conclusion.best_fid.result.fid.toFixed(4)}。`:
   '采样参数与解码顺序实验单独汇总，避免将推理设置的收益混入模型结构排名。';
- $('research-abstract').innerHTML=`<div class="section-kicker">RESEARCH OVERVIEW / 研究摘要</div><h2>正式 A / B · 当前主线</h2><p>A 与 B 均使用 XT-query / X0-content 条件；A 的 content attention 严格排除自身，B 包含自身对角线。首页、指标、曲线与样例默认比较这两个模型。${resultText}</p><p>${samplingText}</p><p class="note">C–F 是在正式 B 上的消融，可按组查看；旧版 A/B 与单任务对照另列历史。全库共 ${training.run_count} 个训练实验、${D.formal_complete_models} 个完成评测的模型、${D.qualitative_records.toLocaleString()} 条定性输出。</p>`;
+ $('research-abstract').innerHTML=`<div class="section-kicker">RESEARCH OVERVIEW / 研究摘要</div><h2>正式 A / B · 当前主线</h2><p>A 与 B 均使用 XT-query / X0-content 条件；A 的 content attention 严格排除自身，B 包含自身对角线。首页、指标、曲线与样例默认比较这两个模型。${resultText}</p><p>${samplingText}</p><p class="note">C–F 是在正式 B 上的架构消融；<a href="#unified-training">Unified 训练消融</a>单独比较 B 与各任务 only，旧版 A/B 另列历史。全库共 ${training.run_count} 个训练实验、${D.formal_complete_models} 个完成评测的模型、${D.qualitative_records.toLocaleString()} 条定性输出。</p>`;
 
  const modelRows=models.map(m=>[
   `<span>${esc(m.label)}</span>`,metricLink(modelMetric(m,'fid')),metricLink(modelMetric(m,'is')),
@@ -95,6 +158,14 @@ function renderResearchOverview(){
   '<a href="#sampling/cross-model">跨模型采样与换序</a>',`${matrix.completed} / ${matrix.total}`,
   c?`Stability：${c.improved_fid_models.length} / ${matrix.models.length} 个模型 FID 降低<br><span class="note">Random：${c.random_improved_fid_models?.length??0} / ${matrix.models.length} 个模型 FID 降低</span>`:'尚无完整结论'
  ])}
+ if(D.flow_head_scale)samplingRows.push([
+  '<a href="#sampling/flow-head-scale">Flow head scale 消融</a>',`${D.flow_head_scale.completed} / ${D.flow_head_scale.total}`,
+  flowHeadScaleSummary(D.flow_head_scale)
+ ]);
+ if(D.selection?.d_cfg_sweep)samplingRows.push([
+  '<a href="#sampling/d-cfg">D · CFG sweep</a>',`<span id="d-cfg-overview">${D.d_cfg_sweep?.completed??0} / 11</span>`,
+  'CFG 1.0–6.0 · Heun 10 · ImageNet-val 50K<br><span class="note">与 B 的 FID / IS 曲线对照，结果自动更新</span>'
+ ]);
  const samplingNote=sweep?.conclusion&&matrix?.conclusion?
   '<strong>采样设置影响分数，也影响模型排名。</strong> FID 与 IS 的最优设置不同，换序收益因模型而异；E 的 Sequential 原生对照单列。解码探测的开销及 BF16 数值影响见细节，小幅差异不等于统计显著。':
   '各阶段分别报告完成情况与已测结果；实验完成后再给出该范围的最优结论。';
@@ -127,23 +198,28 @@ function renderResearchOverview(){
 
  $('research-sections').innerHTML=
   summaryCard('01 / 当前主线','正式 A / B 评测','matrix',summaryTable(['模型','FID ↓ · CFG 2.0','IS ↑ · CFG 2.0','文本八项均分 ↑','ImageNet Top-1 ↑'],modelRows),modelNote,'<a href="#matrix">完整评测指标与历史消融 →</a><a href="#qualitative/t2i">同输入样例 →</a>',true)+
-  summaryCard('02 / 推理时的实验变量','采样与解码消融','sampling/parameters',summaryTable(['实验','完成组数','主要结果'],samplingRows),samplingNote,'<a href="#sampling/parameters">CFG / 步数 →</a><a href="#sampling/strategies">解码策略 →</a><a href="#sampling/cross-model">跨模型换序 →</a>')+
-  summaryCard('03 / 优化过程与验证覆盖','训练与验证 Loss','training',summaryTable(['实验组','模型数','有训练记录','有验证记录'],trainRows),trainNote,'<a href="#training">全部模型与任务曲线 →</a>')+
-  summaryCard('04 / 同输入、同设置的输出对照','定性样例','qualitative/t2i',summaryTable(['任务','每模型输入','已保存输出'],qualRows),qualitativeNote,'<a href="#qualitative/t2i">图像生成 →</a><a href="#qualitative/i2t">图像描述 →</a><a href="#qualitative/text">文本续写 →</a>')+
-  summaryCard('05 / 数据来源与复现依据','数据与协议','sources',summaryTable(['用途','来源','规模 / 约定'],dataRows),dataNote,'<a href="#sources">数据来源、合成模板与文件 →</a>');
+  showoComparisonOverview()+
+  unifiedTrainingOverview()+
+  summaryCard('03 / 采样设置与 Head 规模','采样与解码消融','sampling/parameters',summaryTable(['实验','完成组数','主要结果'],samplingRows),samplingNote,'<a href="#sampling/parameters">CFG / 步数 →</a><a href="#sampling/strategies">解码策略 →</a><a href="#sampling/cross-model">跨模型换序 →</a><a href="#sampling/flow-head-scale">Flow head scale →</a>')+
+  summaryCard('04 / 优化过程与验证覆盖','训练与验证 Loss','training',summaryTable(['实验组','模型数','有训练记录','有验证记录'],trainRows),trainNote,'<a href="#training">全部模型与任务曲线 →</a>')+
+  summaryCard('05 / 同输入、同设置的输出对照','定性样例','qualitative/t2i',summaryTable(['任务','每模型输入','已保存输出'],qualRows),qualitativeNote,'<a href="#qualitative/t2i">图像生成 →</a><a href="#qualitative/i2t">图像描述 →</a><a href="#qualitative/text">文本续写 →</a>')+
+  summaryCard('06 / 数据来源与复现依据','数据与协议','sources',summaryTable(['用途','来源','规模 / 约定'],dataRows),dataNote,'<a href="#sources">数据来源、合成模板与文件 →</a>');
 }
 
 function normalizeReportRoute(route){
  const aliases={sweep:'sampling/parameters',order:'sampling/strategies',sampling:'sampling/parameters',
   t2i:'qualitative/t2i',i2t:'qualitative/i2t',text:'qualitative/text',qualitative:'qualitative/t2i'};
  route=aliases[route]??route;
- return ['overview','matrix','training','sources','sampling/parameters','sampling/strategies','sampling/cross-model',
+ return ['overview','matrix','matrix/showo2','unified-training','training','sources','sampling/parameters','sampling/d-cfg','sampling/strategies','sampling/cross-model','sampling/flow-head-scale',
   'qualitative/t2i','qualitative/i2t','qualitative/text'].includes(route)?route:'overview';
 }
 function showTab(requested,{scroll=true}={}){
  const route=normalizeReportRoute(requested),[tab,section]=route.split('/');
  if(location.hash!=='#'+route)history.replaceState(null,'','#'+route);
  const previousTask=state.task;state.tab=tab;
+ if(tab==='matrix'&&section==='showo2'){
+  $('metric-scope').value='showo2';$('metric-protocol').value='cfg3p5';renderMetrics();
+ }
  for(const panel of document.querySelectorAll('main > .panel'))panel.hidden=panel.id!==tab;
  for(const link of document.querySelectorAll('[data-nav]')){
   const active=link.dataset.nav===tab;link.classList.toggle('active',active);
@@ -159,6 +235,7 @@ function showTab(requested,{scroll=true}={}){
   if(previousTask!==section||!state.galleryInitialized){state.page=0;setupTask();state.galleryInitialized=true}
   renderGallery();
  }
+ if(tab==='sampling'&&section==='d-cfg')renderDCfgSweep();
  if(tab==='training')renderLossCharts();
  if(scroll)$(tab).scrollIntoView({block:'start'});
 }

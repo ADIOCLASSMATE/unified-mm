@@ -819,8 +819,7 @@ class Qwen3Attention(nn.Module):
                     "Cannot read an uninitialized backbone KV cache at "
                     f"layer {self.layer_idx}."
                 )
-            X0_key_states = cache_layer.keys
-            X0_value_states = cache_layer.values
+            X0_key_states, X0_value_states = past_key_values.read(self.layer_idx)
         elif past_key_values is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {

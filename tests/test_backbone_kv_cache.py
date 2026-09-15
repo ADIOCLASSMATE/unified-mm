@@ -77,6 +77,34 @@ def test_production_generation_defaults_to_cache_and_current_cfg():
 
 
 @torch.no_grad()
+@pytest.mark.parametrize("cfg", [1.0, 2.5])
+def test_compact_cache_preserves_positions_and_nonzero_generation(monkeypatch, cfg):
+    monkeypatch.setattr(selfless_flow, "compiled_flex_attention", _eager_flex_attention)
+    torch.manual_seed(92)
+    model = _tiny_model("xlnet_content_diagonal")
+    model.config.flow_condition_contract = "backbone_xt_query_backbone_x0_content"
+    for block in model.image_flow_head.net.blocks:
+        block.adaLN_modulation[-1].weight.normal_(0, .1)
+        block.adaLN_modulation[-1].bias.normal_(0, .1)
+    model.image_flow_head.net.final_layer.linear.weight.normal_(0, .1)
+    model.image_flow_head.net.final_layer.linear.bias.normal_(0, .1)
+    kwargs = dict(
+        input_ids=torch.tensor([[3,11,8,8,8,8,12,9,0,0,0,0], [4,5,11,8,8,8,8,12,0,0,0,0]]),
+        token_types=torch.tensor([[0,2,1,1,1,1,2,0,3,3,3,3], [0,0,2,1,1,1,1,2,3,3,3,3]], dtype=torch.uint8),
+        sigma=torch.tensor([[0,1,4,5,6,7,2,3,12,12,12,12], [0,1,2,5,6,7,8,3,12,12,12,12]]),
+        spans=[(0,2,6),(1,3,7)], initial_noise_bank=torch.randn(2,4,4),
+        flow_cfg=cfg, flow_num_steps=2, flow_solver="heun", use_cache=True,
+        return_trace=True, cache_diagnostics=False, order_strategy="spatial_halton")
+    reference, original = model.generate("t2i", **kwargs)
+    compact, trace = model.generate("t2i", **kwargs,
+        compact_backbone_cache=True, cache_attention_block_size=2)
+    torch.testing.assert_close(compact, reference, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(trace["generation_order"], original["generation_order"])
+    assert trace["backbone_kv_cache_peak_bytes"] < original["backbone_kv_cache_peak_bytes"]
+    assert trace["flow_cfg_content_cache_divergence_by_layer"] is None
+
+
+@torch.no_grad()
 @pytest.mark.parametrize(
     "attention_contract",
     ["selfless_strict", "xlnet_content_diagonal"],
