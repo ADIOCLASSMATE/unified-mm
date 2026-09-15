@@ -265,3 +265,31 @@ def test_joint_formal_scoring_has_one_exact_image_order():
     assert validate_formal_image_order_scoring(contract, contract) == 1
     with pytest.raises(ValueError, match="fixed whole-image"):
         validate_formal_image_order_scoring(contract, {**contract, "image_sigma_order": "random"})
+
+
+@pytest.mark.parametrize("image_tokens", [4, 256])
+def test_joint_classification_reuses_bidirectional_image_prefix_with_identical_scores(image_tokens):
+    from types import SimpleNamespace
+    from test_training_unified_loss_validation import Tokenizer
+    from utils.evaluation.native_understanding import score_text_candidates, score_candidates_with_backend
+
+    model = tiny_model(image_tokens=image_tokens).eval()
+    latents = torch.randn(image_tokens, 4)
+    kwargs = dict(model=model, tokenizer=Tokenizer(), cache=SimpleNamespace(sample=lambda _: latents),
+        image_id=1, item_id="z-cached-classification", prompt="Describe this image:",
+        candidates=["a cat", "a brown dog", "a bird"], device=torch.device("cpu"),
+        image_sigma_order="joint", attention_contract="xlnet_content_diagonal",
+        args=SimpleNamespace(request_chunk_size=8, batch_size_per_rank=2, lm_head_chunk_tokens=16,
+                             max_length=512, seed=42, scoring_backend="cached_prefix"))
+    with torch.no_grad():
+        reference = score_text_candidates(**kwargs)
+        calls = []
+        handle = model.model.register_forward_pre_hook(
+            lambda module, args, keywords: calls.append(dict(keywords)), with_kwargs=True)
+        cached = score_candidates_with_backend(**kwargs)
+        handle.remove()
+    assert sum(bool(row.get("_text_ar_mode")) for row in calls) == 1
+    assert all(row.get("use_cache") for row in calls)
+    assert sum(bool(row.get("token_types").eq(1).any()) for row in calls) == 1
+    for actual, expected in zip(cached, reference):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=2e-5)

@@ -649,7 +649,6 @@ def score_candidates_with_backend(**kwargs) -> tuple[torch.Tensor, torch.Tensor]
     args = kwargs["args"]
     if getattr(kwargs["model"].config, "architecture_variant", None) == "selfless_joint_dit":
         kwargs["image_sigma_order"] = "joint"
-        return score_text_candidates(**kwargs)
     if getattr(kwargs["model"].config, "architecture_variant", None) == "showo2_unified":
         kwargs["image_sigma_order"] = "sequential"
         return score_text_candidates(**kwargs)

@@ -37,7 +37,7 @@ DiT 输入是 noisy latent 的投影加固定 query 条件的投影，使用 8 �
 - 本实验按 clean context 设 `image_input_noise_strength=0`；B 的输入微噪声为 0.01。这是显式记录的额外输入差异。
 - 默认 Euler10，每个 batch 实际一次 backbone、10 次 DiT。CFG 条件／无条件分支沿 batch 维合并，调用次数不增加，计算量对应两个分支。
 - S2 的 Heun10 为 20 次速度计算；比较速度时同时报告 solver、步数、实际前向次数和 CFG。
-- 图像理解评分使用固定整图可见性，order MC=1；文本仍使用 B 的同位置 query 分数。Caption/text 生成保留 KV cache，prefill 中的 context 图像双向可见。
+- 图像理解评分使用固定整图可见性，order MC=1；文本仍使用 B 的同位置 query 分数。ImageNet 候选评分复用 B 的前缀缓存，同一幅双向可见的 context 图像只计算一次；缓存前后分数经过一致性检查。Caption/text 生成也保留 KV cache。
 - 保存完整 checkpoint、raw HF 和 EMA HF；本实验禁用旧 flow adapter 导出。
 
 配置：[unified_z_100b_ascend64.yaml](../configs/selfless/unified_z_100b_ascend64.yaml)。模型：[modeling_joint_dit.py](../models/modeling_model/modeling_joint_dit.py)。
