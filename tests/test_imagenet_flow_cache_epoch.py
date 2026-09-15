@@ -418,7 +418,7 @@ def test_sequential_image_sigma_is_strict_and_keeps_eoi_visible(tmp_path):
 
 
 def test_image_sigma_order_rejects_unknown_strategy(tmp_path):
-    with pytest.raises(ValueError, match="expected 'random' or 'sequential'"):
+    with pytest.raises(ValueError, match="Unknown image_sigma_order='diagonal'"):
         _make_dataset(tmp_path, image_sigma_order="diagonal")
 
 

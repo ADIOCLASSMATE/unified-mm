@@ -5,9 +5,49 @@ from __future__ import annotations
 import importlib.util
 from collections.abc import Mapping
 from pathlib import Path
+import os
 
 import torch
 from safetensors import safe_open
+
+T2I_PREFIX = "Generate an image matching this description:"
+
+
+def build_t2i_item(tokenizer, model, prompt, prompt_index, seed, image_order, *, prompt_prefix=T2I_PREFIX):
+    """Serialize a prompt and one full target image using the training format."""
+    prefix = torch.tensor(tokenizer.encode(f"{prompt_prefix} {prompt}", add_special_tokens=False), dtype=torch.long)
+    count, dim = int(model.config.image_tokens_per_img), int(model.config.image_latent_dim)
+    ids = torch.cat((prefix, torch.tensor([model.config.boi_token_id]),
+                     torch.full((count,), model.config.mask_token_id),
+                     torch.tensor([model.config.eoi_token_id, tokenizer.eos_token_id])))
+    types = torch.cat((torch.zeros(len(prefix), dtype=torch.uint8), torch.tensor([2], dtype=torch.uint8),
+                       torch.ones(count, dtype=torch.uint8), torch.tensor([2, 2], dtype=torch.uint8)))
+    start = len(prefix) + 1
+    loss_mask = torch.zeros_like(ids, dtype=torch.bool)
+    loss_mask[start:start + count] = True
+    return {"input_ids": ids, "token_types": types, "labels": torch.full_like(ids, -100),
+            "image_loss_mask": loss_mask, "image_latents": torch.zeros(count, dim),
+            "prompt_len": len(prefix), "suffix_len": 0, "image_start": start,
+            "img_id": prompt_index + 1, "task_mode": "t2i", "reveal_seed": seed,
+            "image_sigma_order": image_order}
+
+
+def noise_for(prompt_index, seed, count=256, dim=16):
+    """CPU FP32 noise independent of step, rank, and the training RNG stream."""
+    generator = torch.Generator(device="cpu").manual_seed(int(seed) + 1000003 * int(prompt_index))
+    return torch.randn((count, dim), generator=generator, dtype=torch.float32)
+
+
+def save_png(tensor, path):
+    from PIL import Image
+    if not bool(torch.isfinite(tensor).all()):
+        raise FloatingPointError("non-finite decoded image")
+    pixels = tensor.detach().float().clamp(0, 1).mul(255).round().to(torch.uint8).permute(1, 2, 0).cpu().numpy()
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp.png")
+    Image.fromarray(pixels).save(temporary)
+    os.replace(temporary, path)
 
 
 def _load_compatible_state(module, state: dict[str, torch.Tensor]) -> dict:

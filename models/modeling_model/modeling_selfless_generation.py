@@ -1557,7 +1557,7 @@ class SelflessGenerationMixin:
                 prompt_width,
                 image_latent_dim,
                 device=device,
-                dtype=self.image_flow_head.net.final_layer.linear.weight.dtype,
+                dtype=self.model.image_token_embedder.weight_dtype,
             )
         else:
             expected = (batch_size, prompt_width, image_latent_dim)
@@ -1568,7 +1568,7 @@ class SelflessGenerationMixin:
                 )
             image_latents = image_latents.to(
                 device=device,
-                dtype=self.image_flow_head.net.final_layer.linear.weight.dtype,
+                dtype=self.model.image_token_embedder.weight_dtype,
             )
         if image_latent_mask is None:
             image_latent_mask = token_types.eq(1)

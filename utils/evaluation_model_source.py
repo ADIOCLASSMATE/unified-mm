@@ -267,7 +267,14 @@ def _apply_checkpoint_model_contract(config, saved_model, *, label: str) -> None
         for field, value in saved_model.items():
             if field.startswith("b_siglip_"):
                 config.model[field] = value
-    if saved_architecture == "showo2_unified":
+    if saved_architecture == "selfless_joint_dit":
+        valid_flow_head_contract = flow_head_attention_contract == "joint_bidirectional"
+        for field in ("image_flow_solver", "image_input_noise_strength"):
+            config.model[field] = saved_model[field]
+        for field, value in saved_model.items():
+            if field.startswith("joint_dit_"):
+                config.model[field] = value
+    elif saved_architecture == "showo2_unified":
         valid_flow_head_contract = flow_head_attention_contract == "showo2_omni_attention"
         for field, value in saved_model.items():
             if field.startswith("s2_"):
@@ -302,6 +309,9 @@ def _apply_checkpoint_model_contract(config, saved_model, *, label: str) -> None
         )
     ).strip().lower()
     valid_flow_condition_contracts = (
+        {"backbone_xt_fixed"}
+        if saved_architecture == "selfless_joint_dit"
+        else
         {"backbone_noisy_image_hidden"}
         if saved_architecture == "showo2_unified"
         else {"not_applicable"}
@@ -341,7 +351,7 @@ def _apply_checkpoint_model_contract(config, saved_model, *, label: str) -> None
     # this as optional, but make it authoritative whenever present.
     if "training_image_sigma_order" in saved_model:
         order = str(saved_model["training_image_sigma_order"]).lower()
-        if order not in {"random", "sequential"}:
+        if order not in {"random", "sequential"} and not (saved_architecture == "selfless_joint_dit" and order == "joint"):
             raise ValueError(
                 f"{label} has invalid training_image_sigma_order={order!r}"
             )
@@ -354,7 +364,7 @@ def _apply_checkpoint_model_contract(config, saved_model, *, label: str) -> None
             )
             dataset_params.image_sigma_order = order
         generation_order = (
-            "sequential" if order == "sequential" else "spatial_halton"
+            order if order in {"sequential", "joint"} else "spatial_halton"
         )
         if config.get("experiment", None) is not None:
             config.experiment.validation_single_stream_order_strategies = [

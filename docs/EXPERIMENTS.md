@@ -48,6 +48,10 @@ F 的逐位置 head 为共享 AdaLN 残差 MLP，不含跨 token attention。两
 
 T2I + I2T 使用 32 卡、每卡 batch 32、GA2，交替执行两个任务，完全不加载 ClimbMix；从 Qwen3-0.6B-Base step 0 初始化。每次更新每个任务各 1,024 图，合计 100,049,879,040 个物理位置。沿用 only 的有效任务均值约定，GA2 下每个任务的 loss 占比为 B 的 GA4 下的两倍；此对照匹配各任务数据曝光与优化步数，不匹配 B 的总计算量或任务梯度占比。详见 [双任务协议](../configs/protocols/unified_b_image_joint_matched_ascend32.yaml)。
 
+## Z：整图联合去噪
+
+[Z](Z_EXPERIMENT.md) 保留 B 的双流 backbone，将同一图像的 sigma 设为相同值；一次 backbone 生成固定条件，单流双向 DiT 在共享 t 下联合去噪全部 256 latent，默认 Euler10。数据和训练预算对齐 B，每轮验证额外生成 16 张固定 prompt 和种子的 EMA 图像，checkpoint 使用独立身份。
+
 ## S2 与 SigLIP
 
 目标是检验额外语义／细节双路径在本项目架构和训练范式下是否必要。

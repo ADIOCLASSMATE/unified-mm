@@ -1932,8 +1932,11 @@ def main(*, model_loader=None):
     )
     flow_net = getattr(model.image_flow_head, "net", model.image_flow_head)
     is_s2 = attention_contract == "showo2_omni_attention"
-    if is_s2:
+    is_joint_dit = getattr(model.config, "architecture_variant", None) == "selfless_joint_dit"
+    if is_s2 or is_joint_dit:
         args.disable_backbone_kv_cache = True
+    if is_joint_dit and args.flow_solver != "euler":
+        raise ValueError("Joint DiT evaluation requires --flow_solver euler (one head call per step)")
     loaded_attention_contract = str(
         getattr(
             model.config,
@@ -2717,6 +2720,9 @@ def main(*, model_loader=None):
         device,
     )
 
+    model_position_contract = pure_2d_position_contract()
+    if is_joint_dit:
+        model_position_contract["flow_head"] = flow_net.position_contract()
     results = {
         "schema": "selfless_imagenet_val_t2i_fid_is_v2",
         "runtime_hashing_enabled": False,
@@ -2725,7 +2731,8 @@ def main(*, model_loader=None):
         "implementation_contracts": {
             "checkpoint_generation": checkpoint_generation_contract(model.config),
             "full_image_refresh_each_velocity": is_s2,
-            "image_generation_order_applicable": not is_s2,
+            "image_generation_order_applicable": not (is_s2 or is_joint_dit),
+            "fixed_backbone_condition": is_joint_dit,
             "evaluator_rng_contract": evaluator_rng_contract,
             "canonical_initial_noise_enabled": bool(canonical_pairing_enabled),
             "backbone_attention": {
@@ -2788,7 +2795,7 @@ def main(*, model_loader=None):
             else None
         ),
         "architecture": {
-            "position_contract": pure_2d_position_contract(),
+            "position_contract": model_position_contract,
             "image_layout": (
                 f"{int(side)}x{int(side)}x{int(config.model.image_latent_dim)}"
             ),
@@ -2819,9 +2826,9 @@ def main(*, model_loader=None):
                 "attention_contract": flow_head_attention_contract,
                 "depth": int(config.model.get("image_flow_depth", 8)),
                 "width": int(config.model.get("image_flow_width", 1280)),
-                "mlp_ratio": (float(config.model.get("s2_flow_intermediate", 1472)) / int(config.model.get("image_flow_width", 1280)) if is_s2 else 1.0),
+                "mlp_ratio": (float(config.model.get("joint_dit_intermediate" if is_joint_dit else "s2_flow_intermediate", 1472)) / int(config.model.get("image_flow_width", 1280)) if is_s2 or is_joint_dit else 1.0),
                 "attention_heads": (
-                    (int(config.model.get("image_flow_width", 1280)) // int(config.model.get("s2_flow_head_dim", 64)) if is_s2 else 8)
+                    (int(config.model.get("image_flow_width", 1280)) // int(config.model.get("joint_dit_head_dim" if is_joint_dit else "s2_flow_head_dim", 64)) if is_s2 or is_joint_dit else 8)
                     if flow_head_attention["applicable"]
                     else 0
                 ),

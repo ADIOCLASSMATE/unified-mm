@@ -98,6 +98,7 @@ def load_model_tokenizer(
 ):
     from models.modeling_model.image_backbone import validate_image_data_layout
     from models.modeling_model.modeling_showo2_unified import Showo2UnifiedConfig, Showo2UnifiedForCausalLM
+    from models.modeling_model.modeling_joint_dit import JointDiTConfig, JointDiTForCausalLM
     from models.modeling_model.modeling_selfless_siglip import SelflessSiglipConfig, SelflessSiglipForCausalLM
     from models.modeling_model.modeling_single_stream_text_ar import (
         SingleStreamTextARConfig,
@@ -150,6 +151,10 @@ def load_model_tokenizer(
         )
 
         implementation_label = "positionwise_selfless"
+    elif architecture_variant == "selfless_joint_dit":
+        Qwen3ForCausalLM = JointDiTForCausalLM
+        model_config_class = JointDiTConfig
+        implementation_label = "selfless_joint_dit"
     elif architecture_variant == "showo2_unified":
         Qwen3ForCausalLM = Showo2UnifiedForCausalLM
         model_config_class = Showo2UnifiedConfig
@@ -220,6 +225,7 @@ def load_model_tokenizer(
         )
 
     multimodal_config_keys = (
+        "joint_dit_head_dim", "joint_dit_intermediate",
         "b_siglip_path", "b_siglip_width", "b_siglip_intermediate", "b_siglip_heads",
         "b_siglip_depth", "b_siglip_gradient_checkpointing", "b_siglip_initialization_seed",
         "b_siglip_visibility_contract",
@@ -305,7 +311,11 @@ def load_model_tokenizer(
     for key in multimodal_config_keys:
         if key == "architecture_variant" and model_class is None:
             value = architecture_variant
-        elif key.startswith(("s2_", "b_siglip_")) and source_has_image_flow:
+        elif architecture_variant == "selfless_joint_dit" and source_has_image_flow and key in {
+            "image_flow_solver", "image_input_noise_strength", "training_image_sigma_order",
+        }:
+            value = getattr(model_config, key)
+        elif key.startswith(("s2_", "b_siglip_", "joint_dit_")) and source_has_image_flow:
             value = getattr(model_config, key, None)
         elif key == "flow_head_attention_contract" and source_has_image_flow:
             # A trained checkpoint owns this numerical contract. Legacy A/B

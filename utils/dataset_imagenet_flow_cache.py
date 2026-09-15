@@ -161,10 +161,10 @@ class ImageNetFlowCacheDataset(Dataset):
         )
         self.seed = int(seed)
         self.image_sigma_order = str(image_sigma_order).strip().lower()
-        if self.image_sigma_order not in {"random", "sequential"}:
+        if self.image_sigma_order not in {"random", "sequential", "joint"}:
             raise ValueError(
                 f"Unknown image_sigma_order={image_sigma_order!r}; "
-                "expected 'random' or 'sequential'."
+                "expected 'random', 'sequential' or 'joint'."
             )
         # DataLoader workers keep their own Dataset object, so a plain Python
         # integer would become stale when persistent_workers=True.  Tensor

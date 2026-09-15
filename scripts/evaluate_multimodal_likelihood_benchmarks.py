@@ -175,7 +175,14 @@ def main() -> None:
     if attention_contract == "showo2_omni_attention":
         image_sigma_order = "sequential"
         args.mc = 1  # Exact AR score; no image-order Monte Carlo distribution.
-    if image_sigma_order not in {"random", "sequential", "spatial_halton", "spatial_halton_shifted"}:
+    is_joint_dit = config.model.get("architecture_variant") == "selfless_joint_dit"
+    if is_joint_dit:
+        image_sigma_order = "joint"
+        args.mc = 1
+    image_order_mc_contract = (
+        "not_applicable_joint_image" if is_joint_dit else
+        "not_applicable_full_image_ar" if attention_contract == "showo2_omni_attention" else IMAGE_ORDER_MC_CONTRACT)
+    if image_sigma_order not in {"random", "sequential", "spatial_halton", "spatial_halton_shifted", "joint"}:
         raise ValueError(f"unknown image sigma order: {image_sigma_order}")
     if int(args.mc) > 1 and image_sigma_order not in {"random", "spatial_halton_shifted"}:
         raise ValueError(
@@ -267,7 +274,8 @@ def main() -> None:
             ),
             "mc_aggregation": "mean_loglikelihood",
             "mc_common_random_numbers_across_candidates": True,
-            "image_order_mc_contract": ("not_applicable_full_image_ar" if attention_contract == "showo2_omni_attention" else IMAGE_ORDER_MC_CONTRACT),
+            "image_order_mc_contract": image_order_mc_contract,
+            "architecture_variant": config.model.get("architecture_variant"),
             "language_prior_alpha": LANGUAGE_PRIOR_ALPHA,
             "language_prior_estimator": LANGUAGE_PRIOR_ESTIMATOR,
             "language_prior_null_image_ids": list(null_image_ids),
@@ -370,7 +378,8 @@ def main() -> None:
                         "mc_samples": int(args.mc),
                         "mc_aggregation": "mean_loglikelihood",
                         "mc_common_random_numbers_across_candidates": True,
-                        "image_order_mc_contract": ("not_applicable_full_image_ar" if attention_contract == "showo2_omni_attention" else IMAGE_ORDER_MC_CONTRACT),
+                        "image_order_mc_contract": image_order_mc_contract,
+                        "architecture_variant": config.model.get("architecture_variant"),
                         "primary_candidate_score": DEBIASED_SCORE,
                         "reported_score_variant": ARO_SCORE_VARIANT,
                         "task_primary_candidate_scores": {task: CONDITIONAL_SCORE for task in sorted(ARO_TASKS)},

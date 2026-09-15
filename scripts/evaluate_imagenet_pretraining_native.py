@@ -152,7 +152,10 @@ def main() -> None:
     if attention_contract == "showo2_omni_attention":
         image_sigma_order = "sequential"
         args.scoring_backend = "repeated_full_sequence"
-    if image_sigma_order not in {"random", "sequential"}:
+    if config.model.get("architecture_variant") == "selfless_joint_dit":
+        image_sigma_order = "joint"
+        args.scoring_backend = "repeated_full_sequence"
+    if image_sigma_order not in {"random", "sequential", "joint"}:
         raise ValueError(f"unknown image sigma order: {image_sigma_order}")
 
     records = load_imagenet_records(args.image_manifest, args.classes)

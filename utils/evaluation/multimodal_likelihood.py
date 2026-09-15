@@ -410,6 +410,8 @@ def build_image_sigma(
     order: str,
     seed: int,
 ) -> list[int]:
+    if order == "joint":
+        return [0] * int(image_tokens)
     if order == "sequential":
         return list(range(int(image_tokens)))
     if order in {"halton", "spatial_halton", "spatial_halton_shifted"}:

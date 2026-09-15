@@ -32,7 +32,10 @@ def validate_flow_head_attention_contract(config, *, label: str = "model") -> st
     contract = str(
         _config_value(config, "flow_head_attention_contract", default_contract)
     ).strip().lower()
-    if architecture == "showo2_unified":
+    if architecture == "selfless_joint_dit":
+        if contract != "joint_bidirectional":
+            raise ValueError("Joint DiT requires flow_head_attention_contract=joint_bidirectional")
+    elif architecture == "showo2_unified":
         if contract != "showo2_omni_attention":
             raise ValueError("Show-o2 requires flow_head_attention_contract=showo2_omni_attention")
     elif architecture == POSITIONWISE_ON_B_ARCHITECTURE:
@@ -58,6 +61,12 @@ def flow_head_attention_report(config) -> dict[str, object]:
         _config_value(config, "architecture_variant", "selfless_contextual")
     ).strip().lower()
     contract = validate_flow_head_attention_contract(config)
+    if architecture == "selfless_joint_dit":
+        return {"applicable": True, "architecture": "single_stream_dit",
+                "flow_head_attention_contract": contract, "cross_token_attention": True,
+                "query_stream_input": "x_t_plus_fixed_backbone_xt", "query_stream_diagonal": True,
+                "content_stream_input": None, "content_stream_diagonal": None,
+                "shared_time_per_image": True}
     if architecture == "showo2_unified":
         return {"applicable": True, "architecture": "showo2_modulated_single_stream",
                 "flow_head_attention_contract": contract, "cross_token_attention": True,

@@ -261,6 +261,18 @@
         "t2i",
         "i2t"
       ]
+    },
+    {
+      "run": "unified-z-0p6b-100b-imagenet-split-s42-r1",
+      "id": "z",
+      "label": "Z",
+      "group": "ablation",
+      "purpose": "formal",
+      "active_sources": [
+        "climbmix",
+        "t2i",
+        "i2t"
+      ]
     }
   ]
 }

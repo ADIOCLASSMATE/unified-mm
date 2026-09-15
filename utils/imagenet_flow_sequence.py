@@ -32,7 +32,8 @@ def build_selfless_sigma(
     cannot see image content, and image queries can see prefix/BOI/EOI plus
     only image tokens revealed earlier by the configured image order. The
     default ``random`` order is a deterministic per-sample permutation;
-    ``sequential`` follows the serialized latent-token order.
+    ``sequential`` follows the serialized latent-token order; ``joint`` assigns
+    every image token the same sigma for whole-image denoising.
     """
 
     length = int(item["input_ids"].shape[0])
@@ -74,10 +75,12 @@ def build_selfless_sigma(
         ).argsort()
     elif image_sigma_order == "sequential":
         reveal_order = torch.arange(int(image_tokens), dtype=torch.long)
+    elif image_sigma_order == "joint":
+        reveal_order = torch.zeros(int(image_tokens), dtype=torch.long)
     else:
         raise ValueError(
             f"Unknown image_sigma_order={image_sigma_order!r}; "
-            "expected 'random' or 'sequential'."
+            "expected 'random', 'sequential' or 'joint'."
         )
     sigma[image_start:eoi_pos] = prompt_len + 2 + reveal_order
 

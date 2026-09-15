@@ -40,7 +40,7 @@ from pretrain.train_selfless_flow import _build_i2t_generation_prefix, _generate
 from utils.evaluation_model_source import (
     configure_model_source, load_model_source_weights, resolve_evaluation_model_source,
 )
-from utils.image_generation_io import decode_latents, load_vae
+from utils.image_generation_io import decode_latents, load_vae, build_t2i_item, noise_for, save_png, T2I_PREFIX
 from utils.experiment_registry import is_temporary_training_run, model_labels, experiment_identity, task_training_labels, read_run_identity, current_presentation, presentation_sort_key
 from utils.imagenet_flow_batching import collate_imagenet_flow_cache
 from utils.imagenet_synthetic_text_index import ImageNetSyntheticTextIndex
@@ -49,7 +49,6 @@ from utils.utils import load_model_tokenizer
 SCHEMA = "unified_qualitative_generation_v1"
 BASE_CONFIG = "configs/selfless/unified_baseline_100b_ascend_64npu.yaml"
 PROMPT_CONFIG = "configs/protocols/unified_qualitative_prompts_v1.json"
-T2I_PREFIX = "Generate an image matching this description:"
 I2T_PREFIX = "Describe this image in one detailed caption:"
 MODEL_LABELS = model_labels()
 
@@ -154,8 +153,9 @@ def prepare(args):
             raise ValueError("invalid CFG override")
         manifest["contract"]["model_cfg"] = overrides
         manifest["contract"]["model_generation"] = {
-            spec["id"]: {"use_cache": spec["backbone_attention"] != "showo2_omni_attention",
-                         "image_order": "whole_image" if spec["backbone_attention"] == "showo2_omni_attention" else "checkpoint_native"}
+            spec["id"]: {"use_cache": spec["backbone_attention"] != "showo2_omni_attention" and spec["architecture"] != "selfless_joint_dit",
+                         "flow_solver": "euler" if spec["architecture"] == "selfless_joint_dit" else "heun",
+                         "image_order": "whole_image" if spec["backbone_attention"] == "showo2_omni_attention" or spec["architecture"] == "selfless_joint_dit" else "checkpoint_native"}
             for spec in models}
         manifest["contract"]["timing"] = {"warmup_batches": 1, "measured_repeats": args.timing_repeats,
             "batch_size_per_device": 8, "scope": "synchronized model.generate including device transfer; excludes VAE and PNG IO",
@@ -253,29 +253,6 @@ def prepare(args):
     print(json.dumps({"prepared": str(root), "models": len(models), "expected_per_model": manifest["expected_per_model"]}, ensure_ascii=False), flush=True)
 
 
-def build_t2i_item(tokenizer, model, prompt, prompt_index, seed, image_order):
-    prefix = torch.tensor(tokenizer.encode(f"{T2I_PREFIX} {prompt}", add_special_tokens=False), dtype=torch.long)
-    count, dim = int(model.config.image_tokens_per_img), int(model.config.image_latent_dim)
-    ids = torch.cat((prefix, torch.tensor([model.config.boi_token_id]),
-                     torch.full((count,), model.config.mask_token_id),
-                     torch.tensor([model.config.eoi_token_id, tokenizer.eos_token_id])))
-    types = torch.cat((torch.zeros(len(prefix), dtype=torch.uint8), torch.tensor([2], dtype=torch.uint8),
-                       torch.ones(count, dtype=torch.uint8), torch.tensor([2, 2], dtype=torch.uint8)))
-    start = len(prefix) + 1
-    loss_mask = torch.zeros_like(ids, dtype=torch.bool)
-    loss_mask[start:start + count] = True
-    return {"input_ids": ids, "token_types": types, "labels": torch.full_like(ids, -100),
-            "image_loss_mask": loss_mask, "image_latents": torch.zeros(count, dim),
-            "prompt_len": len(prefix), "suffix_len": 0, "image_start": start,
-            "img_id": prompt_index + 1, "task_mode": "t2i", "reveal_seed": seed,
-            "image_sigma_order": image_order}
-
-
-def noise_for(prompt_index, seed, count=256, dim=16):
-    g = torch.Generator(device="cpu").manual_seed(int(seed) + 1000003 * int(prompt_index))
-    return torch.randn((count, dim), generator=g, dtype=torch.float32)
-
-
 def caption_sigmas(tokenizer, model, rows, order):
     _, _, base, start = _build_i2t_generation_prefix(tokenizer, text_prefix=I2T_PREFIX,
         boi_token_id=model.config.boi_token_id, eoi_token_id=model.config.eoi_token_id,
@@ -287,6 +264,8 @@ def caption_sigmas(tokenizer, model, rows, order):
         if order == "random":
             g = torch.Generator(device="cpu").manual_seed(int(row["posterior_seed"]) + 53)
             sigma[start:start + count] = float(start + 1) + torch.rand(count, generator=g).argsort().float()
+        elif order == "joint":
+            sigma[start:start + count] = sigma[start]
         elif order != "sequential":
             raise ValueError(order)
         values.append(sigma)
@@ -303,17 +282,6 @@ def decode_suffix(tokenizer, suffix, stop_ids):
         ids.append(value)
     return {"text": tokenizer.decode(ids, skip_special_tokens=True).strip(), "token_ids": ids,
             "stop_reason": reason, "generated_tokens": len(ids)}
-
-
-def save_png(tensor, path):
-    from PIL import Image
-    if not bool(torch.isfinite(tensor).all()):
-        raise FloatingPointError("non-finite decoded image")
-    pixels = tensor.detach().float().clamp(0, 1).mul(255).round().to(torch.uint8).permute(1, 2, 0).cpu().numpy()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(".tmp.png")
-    Image.fromarray(pixels).save(temporary)
-    os.replace(temporary, path)
 
 
 def check_loaded_values(model, checkpoint):
@@ -341,6 +309,10 @@ def validate_generation_trace(trace, *, use_cache, task):
     if trace.get("backbone_kv_cache_enabled") is not use_cache:
         raise RuntimeError("generation cache differs from the model contract")
     if not use_cache:
+        if task == "t2i" and trace.get("generation_mode") == "joint_dit_full_image_flow":
+            if trace.get("backbone_calls") != 1 or trace.get("flow_head_calls") != trace.get("steps"):
+                raise RuntimeError("Joint DiT generation must use one backbone pass and one head call per step")
+            return
         expected = "showo2_full_image_flow" if task == "t2i" else "showo2_text_ar"
         if trace.get("generation_mode") != expected:
             raise RuntimeError(f"expected S2 generation mode: {expected}")
@@ -419,6 +391,8 @@ def run(args):
         write_json(model_root / "load_reports" / f"rank-{rank:02d}.json", weights)
         model.to(device).eval()
         use_cache = spec["backbone_attention"] != "showo2_omni_attention"
+        image_use_cache = use_cache and spec["architecture"] != "selfless_joint_dit"
+        image_solver = "euler" if spec["architecture"] == "selfless_joint_dit" else "heun"
         flow_cfg = float(manifest["contract"].get("model_cfg", {}).get(spec["id"], manifest["contract"]["cfg"]))
         order = str(getattr(model.config, "training_image_sigma_order", "random"))
         if order != spec["image_order"]:
@@ -473,20 +447,20 @@ def run(args):
                      for row, (idx, seed) in zip(rows, selected)]
             batch = collate_imagenet_flow_cache(items, pad_to_length=512)
             noise = torch.stack([noise_for(idx, seed) for idx, seed in selected])
-            def generate_images():
-                return model.generate("t2i", input_ids=batch["input_ids"].to(device),
+            def generate_images(current_model=model):
+                return current_model.generate("t2i", input_ids=batch["input_ids"].to(device),
                 token_types=batch["token_types"].to(device), sigma=batch["sigma"].to(device),
                 spans=[(b, item["image_start"], item["image_start"] + 256) for b, item in enumerate(items)],
                 image_latent_dim=16, initial_noise_bank=noise, flow_temperature=1.0, flow_cfg=flow_cfg,
-                flow_cfg_schedule="constant", flow_solver="heun", flow_num_steps=10, parallel_rate=1,
+                flow_cfg_schedule="constant", flow_solver=image_solver, flow_num_steps=10, parallel_rate=1,
                 order_strategy="sequential" if order == "sequential" else "spatial_halton",
-                use_cache=use_cache, return_trace=True)
+                use_cache=image_use_cache, return_trace=True)
             timing = manifest["contract"].get("timing", {})
             repeats = int(timing.get("measured_repeats", 1))
             if offset == 0 and timing.get("warmup_batches", 0):
                 warmup, warmup_trace = generate_images()
                 torch.npu.synchronize()
-                validate_generation_trace(warmup_trace, use_cache=use_cache, task="t2i")
+                validate_generation_trace(warmup_trace, use_cache=image_use_cache, task="t2i")
                 del warmup
             timings = []
             for repeat in range(repeats):
@@ -495,7 +469,7 @@ def run(args):
                 generated, trace = generate_images()
                 torch.npu.synchronize()
                 timings.append(time.monotonic() - started)
-                validate_generation_trace(trace, use_cache=use_cache, task="t2i")
+                validate_generation_trace(trace, use_cache=image_use_cache, task="t2i")
                 if generated is None or not bool(torch.isfinite(generated).all()):
                     raise RuntimeError("invalid T2I generation")
                 if repeat == 0:
@@ -530,7 +504,7 @@ def run(args):
             write_json(model_root / "timing" / f"rank-{rank:02d}-batch-{offset // 8:03d}.json", {
                 "model": spec["id"], "rank": rank, "world_size": world, "batch_size": len(rows),
                 "samples": [{"id": row["id"], "seed": seed} for row, (_, seed) in zip(rows, selected)],
-                "cfg": flow_cfg, "solver": "heun", "steps": 10,
+                "cfg": flow_cfg, "solver": image_solver, "steps": 10,
                 "generation_seconds": timings, "vae_decode_seconds": decode_seconds,
                 "png_save_seconds": save_seconds, "trace": trace, "timing_contract": timing,
                 "torch_version": torch.__version__, "torch_npu_version": torch_npu.__version__})

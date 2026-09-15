@@ -411,6 +411,9 @@ def _prepare_loss_forward_batch(batch, *, config, device, source_name, mixed_sou
     if config.model.get("architecture_variant") == "showo2_unified":
         forward_kwargs["s2_image_uncond_rows"] = image_uncond_rows
         forward_kwargs["s2_image_uncond_mask"] = image_uncond_mask
+    elif config.model.get("architecture_variant") == "selfless_joint_dit":
+        forward_kwargs["joint_image_uncond_rows"] = image_uncond_rows
+        forward_kwargs["joint_image_uncond_mask"] = image_uncond_mask
     return forward_kwargs, {
         "image_uncond_rows": image_uncond_rows,
         "image_uncond_mask": image_uncond_mask,
@@ -2087,10 +2090,12 @@ def main(*, model_loader=None):
                     )
                     accelerator.log(validation["metrics"], step=global_step)
                     logger.info(
-                        "Training validation: complete=%s, total=%.2fs, loss=%.2fs, downstream=%.2fs, cache_hit=%s",
+                        "Training validation: complete=%s, total=%.2fs, loss=%.2fs, downstream=%.2fs, images=%s, cache_hit=%s",
                         validation["complete"], validation["wall_seconds"],
                         validation["loss"]["wall_seconds"] if validation["loss"] else 0.0,
-                        validation["downstream"]["wall_seconds"], validation["downstream"]["prepare_cache_hit"],
+                        validation["downstream"]["wall_seconds"],
+                        validation["generation"]["samples"] if validation["generation"] else 0,
+                        validation["downstream"]["prepare_cache_hit"],
                     )
                 elif val_dataloader is not None:
                     validate(
@@ -2827,7 +2832,8 @@ def _save_validation_flow_images(
         unwrapped.config, "dual_stream_attention_contract",
         config.model.get("dual_stream_attention_contract", "selfless_strict"),
     ))
-    use_cache = attention_contract != "showo2_omni_attention"
+    is_joint_dit = getattr(unwrapped.config, "architecture_variant", None) == "selfless_joint_dit"
+    use_cache = attention_contract != "showo2_omni_attention" and not is_joint_dit
     generation_ids, generation_types, generation_sigma = input_ids, token_types, sigma
     generation_spans = selected_spans
     if not use_cache:
@@ -2897,8 +2903,9 @@ def _save_validation_flow_images(
         if use_cache:
             generation_step_max = int(trace["generation_step"].max().item())
         else:
-            if trace.get("generation_mode") != "showo2_full_image_flow":
-                raise RuntimeError("S2 validation requires full-image flow generation")
+            expected_mode = "joint_dit_full_image_flow" if is_joint_dit else "showo2_full_image_flow"
+            if trace.get("generation_mode") != expected_mode:
+                raise RuntimeError("Validation requires the checkpoint's full-image generation mode")
             generation_step_max = int(trace["steps"])
         if tuple(pred_latents.shape) != tuple(target_latents.shape):
             raise RuntimeError(
@@ -2936,6 +2943,10 @@ def _save_validation_flow_images(
             ),
             "generation_step_max": generation_step_max,
         }
+        if is_joint_dit:
+            report_strategies[strategy].update({key: trace[key] for key in (
+                "steps", "backbone_calls", "flow_head_calls", "backbone_streams",
+                "flow_head_streams", "cfg_batched", "shared_time_per_image")})
 
     metric_keys = sorted(local_logs)
     metric_values = torch.tensor(
@@ -3037,10 +3048,12 @@ def _save_validation_flow_images(
         report = {
             "schema": (
                 "selfless_cached_validation_generation_v1" if use_cache
+                else "joint_dit_validation_generation_v1" if is_joint_dit
                 else "showo2_validation_generation_v1"
             ),
             "global_step": int(global_step),
             "generation_entry": "model.generate",
+            "architecture_variant": getattr(unwrapped.config, "architecture_variant", "selfless_contextual"),
             "task": "t2i",
             "use_cache": use_cache,
             "cfg": flow_cfg,

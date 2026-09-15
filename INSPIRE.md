@@ -20,6 +20,7 @@
 | --- | --- |
 | A/B、C、LR sweep、only、B/F flow-head scaling、B+SigLIP | `随机序语言建模-统一自回归与掩码扩散的随机顺序生成框架` |
 | D/E/F 基础档、S2-single、S2-dual-siglip | `多模态大模型新架构评测探索与scaling-law`（`high-dimensionaldata`） |
+| Z | `多模态大模型新架构评测探索与scaling-law`（`high-dimensionaldata`） |
 
 生产训练与评测使用 Ascend。开发机固定排除 `infra-gpu-npu-248.host.shzhisuan.com`，设备测试结束后停机并保留 Notebook 对象。
 
@@ -62,7 +63,16 @@ Container path: /inspire/dataset/imagenet/v1
 
 CLI 参数以 `inspire <command> --help` 为准。每次提交先查询项目、配额、镜像、节点和活跃任务，再执行 dry-run，核对规格后提交。节点排除列表使用当前资源组中的有效节点名。
 
-Notebook 和平台域名直连；命令级清理代理：
+Notebook、`qz.sii.edu.cn` 和 `keycloak-inspire-prod.sii.edu.cn` 直连。当前 CAS 的内网连接会被重置，`cas.sii.edu.cn` 登录需走现有代理；已有账号的登录刷新使用：
+
+```bash
+bash script/inspire_wjx_login.sh
+inspire config check
+```
+
+该脚本从现有 `wjx-ascend` 配置读取凭据，按域名处理 CAS 及其回跳的代理路由，保存标准 CLI 会话；只影响该进程。已有账号不需要再次 `account add`。
+
+已登录后的 Notebook 连接与平台查询可在命令级清理代理：
 
 Codex 所在 CPU Notebook 的全局 mihomo 服务必须保持运行。仅清理需要直连的命令/客户端环境，不调用全局 `clashctl off`；SII 模型与图像下载同样使用独立直连传输。
 
