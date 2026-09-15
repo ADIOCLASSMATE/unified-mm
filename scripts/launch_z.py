@@ -24,9 +24,15 @@ def launch_plan(*, smoke, label, steps, environment, resume=None):
         raise ValueError("Smoke requires a lowercase/digit/hyphen label and 2..100 steps")
     machines, world = (1, 16) if smoke else (4, 64)
     rank = 0 if smoke else int(environment.get("PET_NODE_RANK", -1))
-    if not smoke and (not 0 <= rank < 4 or int(environment.get("PET_NNODES", 0)) != 4
-                      or int(environment.get("PET_NPROC_PER_NODE", 16)) != 16):
-        raise ValueError("Formal training requires four platform instances with 16 NPUs each")
+    if not smoke:
+        nodes = int(environment.get("PET_NNODES", 0))
+        platform_processes = int(environment.get("PET_NPROC_PER_NODE", 0))
+        # Inspire uses 0 when the user command starts its own local workers,
+        # as in the existing B/S2 launchers. The preflight still checks that
+        # all 16 physical NPUs are present before starting 64 workers.
+        if not 0 <= rank < 4 or nodes != 4 or platform_processes not in (0, 16):
+            raise ValueError("Formal training requires PET_NODE_RANK=0..3, PET_NNODES=4, "
+                             f"PET_NPROC_PER_NODE=0 or 16; got {rank=}, {nodes=}, {platform_processes=}")
     project = f"{RUN}-smoke-{label}" if smoke else RUN
     output = ROOT / config.experiment.output_dir / project
     audit = output / "prelaunch_audit" / f"node-{rank}"
@@ -67,6 +73,7 @@ def launch_plan(*, smoke, label, steps, environment, resume=None):
     if rank == 0:
         preflight.append("--assets")
     return dict(contract=contract, smoke=smoke, world_size=world, rank=rank,
+                platform_nproc_per_node=None if smoke else platform_processes,
                 output_root=str(output), audit_root=str(audit), resume_step=resume_step,
                 command=command, preflight=preflight)
 

@@ -102,3 +102,7 @@ bash script/selfless/pretraining_z_ascend64.sh
 [test_joint_dit.py](../tests/test_joint_dit.py) 检查双流 attention 真值表、整图 context、目标及未来文本不泄漏、训练 CFG 丢弃、RF4 共享时间、DiT 双向依赖、Heun 的 1/20 调用次数、预测与校正数值、256-token 生成、cached/full caption 一致性、checkpoint 重载及参数／训练预算。
 
 早期原型曾在 Euler10、`image_input_noise_strength=0` 下通过 16 卡训练、恢复与生成检查，原始记录保留于 `output/experiments/joint-dit/smoke-20260915-r1/`；这不属于当前 Z 的严格对照设置。Z 的正式协议为 Heun10、输入微噪声 0.01，后续验收记录放在 `output/experiments/z/`。短程 smoke 仅验证执行正确性，不代表图像质量结果。
+
+2026-09-15 的 Heun10／0.01 验收已通过，记录位于 `output/experiments/z/heun-validation-smoke-20260915-r2/`：16 卡训练至第 5 步，在第 2、4 步完成 loss、各 16 张 EMA 图像和全部下游评分，两轮总耗时分别为 367.3 秒、358.8 秒；完整 checkpoint 恢复至第 6 步。Raw／EMA 权重重载均实测 backbone 1 次、DiT 20 次，并通过图像、文本及 caption 生成。
+
+正式启动器沿用 B/S2 的平台约定，接受 `PET_NPROC_PER_NODE=0`（由启动命令自行创建本地进程）或 `16`，始终显式启动 4 节点／64 workers；每个实例在启动前实测必须有 16 张 NPU。平台的原始进程数标记保存在 `prelaunch_audit/node-*/launch_plan.json`。
