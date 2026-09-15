@@ -152,6 +152,9 @@ def _special_token_ids(config):
 
 
 def _write_image_flow_adapter(state, config, global_step):
+    mode = config.model.get("image_flow_conditioning_mode", "adaln")
+    if mode != "adaln":
+        state["image_flow_conditioning_mode"] = mode
     path = Path(config.experiment.output_dir) / f"image_flow_adapter-{global_step}.pt"
     torch.save(state, path)
     logger.info(f"Saved image-flow adapter to {path}")

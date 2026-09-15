@@ -50,6 +50,8 @@ T2I + I2T 使用 32 卡、每卡 batch 32、GA2，交替执行两个任务，完
 
 ## Z：整图联合去噪
 
+相关独立对照：[B + S2-single 调制](B_S2_MODULATION.md)，保留 B 的双流和随机序，只改变 backbone 条件注入的位置，参数量与 B 完全一致。
+
 [Z](Z_EXPERIMENT.md) 保留 B 的双流 backbone，将同一图像的 sigma 设为相同值；一次 backbone 生成固定条件，单流双向 DiT 在共享 t 下联合去噪全部 256 latent，默认 Heun10。数据和训练预算对齐 B，每轮验证额外生成 16 张固定 prompt 和种子的 EMA 图像，checkpoint 使用独立身份。
 
 ## S2 与 SigLIP

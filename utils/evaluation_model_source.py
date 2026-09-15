@@ -328,6 +328,10 @@ def _apply_checkpoint_model_contract(config, saved_model, *, label: str) -> None
             f"{saved_architecture!r}"
         )
     config.model.flow_condition_contract = flow_condition_contract
+    conditioning_mode = str(saved_model.get("image_flow_conditioning_mode", "adaln"))
+    if conditioning_mode not in {"adaln", "s2_input"}:
+        raise ValueError(f"{label} has invalid image_flow_conditioning_mode={conditioning_mode!r}")
+    config.model.image_flow_conditioning_mode = conditioning_mode
     if saved_architecture == "positionwise_flow_head_on_b":
         # F scales against the contextual B head at the same depth. Restore
         # that budget along with capacity; model construction validates the

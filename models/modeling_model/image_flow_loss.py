@@ -508,6 +508,7 @@ class ContextualFlowTransformerHead(nn.Module):
         image_tokens_per_img=256,
         endpoint_time=1000.0,
         flow_head_attention_contract="selfless_strict",
+        conditioning_mode="adaln",
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -521,6 +522,9 @@ class ContextualFlowTransformerHead(nn.Module):
         self.zero_init_gate = True
         self.image_tokens_per_img = int(image_tokens_per_img)
         self.endpoint_time = float(endpoint_time)
+        self.conditioning_mode = str(conditioning_mode).strip().lower()
+        if self.conditioning_mode not in {"adaln", "s2_input"}:
+            raise ValueError(f"Unknown flow conditioning_mode={conditioning_mode!r}")
         self.flow_head_attention_contract = str(
             flow_head_attention_contract
         ).strip().lower()
@@ -666,7 +670,7 @@ class ContextualFlowTransformerHead(nn.Module):
         }
 
     def cache_contract(self):
-        return {
+        contract = {
             "schema": "selfless_flow_head_content_cache_v2",
             "content_update": "shared_attention_mlp",
             "query_context": "strict_sigma_causal",
@@ -675,6 +679,9 @@ class ContextualFlowTransformerHead(nn.Module):
             "query_writes_cache": False,
             "position_contract": self.position_contract(),
         }
+        if self.conditioning_mode != "adaln":
+            contract["conditioning_mode"] = self.conditioning_mode
+        return contract
 
     def _validate_latent_mixer_cache(self, cache):
         expected = self.position_contract()
@@ -697,18 +704,38 @@ class ContextualFlowTransformerHead(nn.Module):
                 f"expected={expected_cache_contract}, actual={actual_cache_contract}."
             )
 
-    def _initial_content_hidden(self, context_latents, context_positions):
-        return self.input_proj(context_latents)
+    def _initial_content_hidden(self, context_latents, context_positions, context_conditions=None):
+        hidden = self.input_proj(context_latents)
+        if self.conditioning_mode == "s2_input":
+            if context_conditions is None:
+                raise ValueError("S2 input conditioning requires a condition for each content token")
+            hidden = hidden + self.cond_embed(context_conditions.to(device=hidden.device, dtype=hidden.dtype))
+        return hidden
+
+    def _query_state(self, hidden, time_embedding, condition_embedding):
+        """Keep B's streams; move backbone conditioning from AdaLN to input for S2."""
+        if self.conditioning_mode == "s2_input":
+            condition = condition_embedding
+            if condition.dim() == 2:
+                condition = condition.unsqueeze(1)
+            hidden = hidden + condition
+            modulation = time_embedding
+        else:
+            modulation = time_embedding + condition_embedding
+        if modulation.dim() == 2:
+            modulation = modulation.unsqueeze(1)
+        return hidden, modulation
 
     def _content_condition(self, context_conditions):
-        embedded = self.cond_embed(context_conditions)
+        embedded = self.cond_embed(context_conditions) if self.conditioning_mode == "adaln" else None
         endpoint = torch.full(
             context_conditions.shape[:-1],
             self.endpoint_time,
             device=context_conditions.device,
             dtype=torch.float32,
         )
-        return self._shape_time(endpoint, context_conditions.shape[:-1]) + embedded
+        time = self._shape_time(endpoint, context_conditions.shape[:-1])
+        return time + embedded if embedded is not None else time
 
     @staticmethod
     def _clone_stat(value):
@@ -864,7 +891,7 @@ class ContextualFlowTransformerHead(nn.Module):
         context_positions = self._positions(context_positions, batch_size, context_len, model_device)
         context_rope = self._build_rope(context_positions, model_dtype)
         context_hidden = self._initial_content_hidden(
-            context_latents, context_positions
+            context_latents, context_positions, context_conditions
         )
         if context_mask is not None:
             context_mask = context_mask.to(device=model_device, dtype=torch.bool)
@@ -1051,7 +1078,7 @@ class ContextualFlowTransformerHead(nn.Module):
         if cache["layers"][0]["k"].shape[0] != batch_size:
             raise ValueError("cache batch size must match appended content batch size.")
 
-        hidden = self._initial_content_hidden(context_latents, context_positions)
+        hidden = self._initial_content_hidden(context_latents, context_positions, context_conditions)
         content_y = self._content_condition(context_conditions)
         previous_len = int(
             cache.get(
@@ -1301,6 +1328,7 @@ class ContextualFlowTransformerHead(nn.Module):
         content_hidden = self._initial_content_hidden(
             context_latents,
             context_positions,
+            context_conditions,
         )
         query_hidden = self.input_proj(x)
         content_y = self._content_condition(context_conditions)
@@ -1314,9 +1342,7 @@ class ContextualFlowTransformerHead(nn.Module):
             if condition_embedding is None
             else condition_embedding
         )
-        query_y = query_time + query_condition
-        if query_y.dim() == 2:
-            query_y = query_y.unsqueeze(1)
+        query_hidden, query_y = self._query_state(query_hidden, query_time, query_condition)
         combined_y = torch.cat([content_y, query_y], dim=1)
 
         previous_len = int(
@@ -1553,7 +1579,8 @@ class ContextualFlowTransformerHead(nn.Module):
         model_dtype = self.input_proj.weight.dtype
         x = fold(x.to(device=model_device, dtype=model_dtype))
         c = fold(c.to(device=model_device, dtype=model_dtype))
-        query_y = self._shape_time(fold(t), x.shape[:-1]) + self.cond_embed(c)
+        query_time = self._shape_time(fold(t), x.shape[:-1])
+        query_condition = self.cond_embed(c)
         query_positions = fold(self._positions(
             query_positions, repeats * batch_size, context_len, model_device
         ))
@@ -1563,8 +1590,9 @@ class ContextualFlowTransformerHead(nn.Module):
         )
         context_rope = self._build_rope(context_positions, model_dtype)
         x = self.input_proj(x)
+        x, query_y = self._query_state(x, query_time, query_condition)
         content = self._initial_content_hidden(
-            context_latents.to(device=model_device, dtype=model_dtype), context_positions
+            context_latents.to(device=model_device, dtype=model_dtype), context_positions, context_conditions
         )
         initial_content = content if record_stats else None
         content_y = self._content_condition(
@@ -1689,9 +1717,7 @@ class ContextualFlowTransformerHead(nn.Module):
             if condition_embedding is None
             else condition_embedding
         )
-        y = t + c
-        if y.dim() == 2:
-            y = y.unsqueeze(1)
+        x, y = self._query_state(x, t, c)
 
         use_direct_context = latent_mixer_cache is None and context_latents is not None
         if use_direct_context:
@@ -1725,7 +1751,7 @@ class ContextualFlowTransformerHead(nn.Module):
                 else self._build_rope(context_positions, model_dtype)
             )
             content = self._initial_content_hidden(
-                context_latents, context_positions
+                context_latents, context_positions, context_conditions
             )
             initial_content = content if record_stats else None
             content_y = self._content_condition(context_conditions)
@@ -2013,6 +2039,7 @@ class FlowLoss(nn.Module):
         solver="heun",
         image_tokens_per_img=256,
         flow_head_attention_contract="selfless_strict",
+        conditioning_mode="adaln",
     ):
         super().__init__()
         self.in_channels = int(target_channels)
@@ -2044,6 +2071,7 @@ class FlowLoss(nn.Module):
             image_tokens_per_img=image_tokens_per_img,
             endpoint_time=self.time_scale,
             flow_head_attention_contract=flow_head_attention_contract,
+            conditioning_mode=conditioning_mode,
         )
         self.last_forward_stats = {}
         self._inference_time_grids = {}

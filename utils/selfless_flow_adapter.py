@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 from typing import Any, Callable
 
 import torch
@@ -32,6 +33,17 @@ def _module_summary(state: dict[str, torch.Tensor]) -> dict[str, Any]:
         "numel": sum(int(value.numel()) for value in state.values()),
         "keys": sorted(state),
     }
+
+
+def validate_adapter_conditioning(model, path, metadata=None):
+    """Identical weight shapes cannot identify the placement of conditioning."""
+    if metadata is None:
+        config_path = Path(path).parent / "config.json"
+        metadata = json.loads(config_path.read_text()) if config_path.is_file() else {}
+    saved = metadata.get("image_flow_conditioning_mode", "adaln")
+    current = getattr(getattr(model, "config", None), "image_flow_conditioning_mode", "adaln")
+    if saved != current:
+        raise ValueError(f"Adapter conditioning mismatch: saved={saved!r}, model={current!r}")
 
 
 def load_image_flow_adapter(
@@ -64,6 +76,8 @@ def load_image_flow_adapter(
 
     if resolved.suffix == ".safetensors":
         from safetensors import safe_open
+
+        validate_adapter_conditioning(model, resolved)
 
         module_states = {
             "image_flow_head": {},
@@ -98,6 +112,7 @@ def load_image_flow_adapter(
         adapter_format = "hf_safetensors_image_modules"
     else:
         state = torch.load(resolved, map_location="cpu", weights_only=True)
+        validate_adapter_conditioning(model, resolved, state)
         required = {
             "image_flow_head",
             "image_flow_condition_proj",

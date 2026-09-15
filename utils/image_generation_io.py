@@ -90,7 +90,9 @@ def load_adapter(model, adapter_path: str | Path) -> dict:
         raise FileNotFoundError(path)
 
     report = {"adapter": str(path)}
+    from utils.selfless_flow_adapter import validate_adapter_conditioning
     if path.suffix == ".safetensors":
+        validate_adapter_conditioning(model, path)
         states = {
             "image_flow_head": {},
             "image_flow_condition_proj": {},
@@ -137,6 +139,7 @@ def load_adapter(model, adapter_path: str | Path) -> dict:
                     ] = value
     else:
         payload = torch.load(path, map_location="cpu")
+        validate_adapter_conditioning(model, path, payload)
         states = {
             name: payload.get(name, {})
             for name in (

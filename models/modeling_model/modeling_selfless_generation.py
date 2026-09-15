@@ -1391,6 +1391,9 @@ class SelflessGenerationMixin:
             "flow_cfg": float(flow_cfg),
             "flow_cfg_schedule": str(flow_cfg_schedule),
             "flow_head_architecture": "dynamic_dual_stream_pure_2d",
+            "flow_conditioning_mode": getattr(self.config, "image_flow_conditioning_mode", "adaln"),
+            "flow_solver": flow_solver or self.image_flow_head.solver,
+            "flow_num_steps": int(flow_num_steps or self.image_flow_head.num_sampling_steps),
             "flow_condition_contract": str(
                 getattr(
                     self.config,

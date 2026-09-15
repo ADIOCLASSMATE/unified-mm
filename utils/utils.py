@@ -244,6 +244,7 @@ def load_model_tokenizer(
         "image_tokens_per_img",
         "image_latent_dim",
         "image_flow_width",
+        "image_flow_conditioning_mode",
         "image_flow_depth",
         "image_flow_num_sampling_steps",
         "image_flow_batch_mul",
@@ -328,6 +329,8 @@ def load_model_tokenizer(
             # shared query/content AdaLN condition. A newer YAML must not
             # silently reinterpret already-trained weights as X0-conditioned.
             value = source_flow_condition_contract
+        elif key == "image_flow_conditioning_mode" and source_has_image_flow:
+            value = getattr(model_config, key, "adaln")
         else:
             value = config.model.get(key)
         if value is not None:

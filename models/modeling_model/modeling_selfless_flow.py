@@ -1701,6 +1701,7 @@ class Qwen3ForCausalLM(
                 "flow_head_attention_contract",
                 "selfless_strict",
             ),
+            conditioning_mode=getattr(config, "image_flow_conditioning_mode", "adaln"),
         )
         if flow_condition_contract == X0_CONTENT_FLOW_CONDITION_CONTRACT:
             # No parameters or buffers are added; therefore initialization RNG,

@@ -20,7 +20,7 @@
 | --- | --- |
 | A/B、C、LR sweep、only、B/F flow-head scaling、B+SigLIP | `随机序语言建模-统一自回归与掩码扩散的随机顺序生成框架` |
 | D/E/F 基础档、S2-single、S2-dual-siglip | `多模态大模型新架构评测探索与scaling-law`（`high-dimensionaldata`） |
-| Z | `多模态大模型新架构评测探索与scaling-law`（`high-dimensionaldata`） |
+| Z、B + S2-single 调制 | `随机序语言建模-统一自回归与掩码扩散的随机顺序生成框架` |
 
 生产训练与评测使用 Ascend。开发机固定排除 `infra-gpu-npu-248.host.shzhisuan.com`，设备测试结束后停机并保留 Notebook 对象。
 

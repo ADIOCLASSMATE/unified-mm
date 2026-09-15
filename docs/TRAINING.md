@@ -54,6 +54,8 @@ S2 与 B+SigLIP 的入口及当前设置见 [S2](SHOWO2_UNIFIED_ABLATION_DESIGN.
 
 [Z](Z_EXPERIMENT.md) 使用 `bash script/selfless/pretraining_z_ascend64.sh`，保留 B 双流 backbone，同一图像共用 sigma，单流 DiT 联合去噪；正式为 64 卡、95,415 updates。
 
+[B + S2-single 调制](B_S2_MODULATION.md) 使用 `bash script/selfless/pretraining_b_s2_modulation_ascend64.sh`。Backbone 和 head 均保留 B 双流，只将 backbone 条件移到 head 输入，AdaLN 仅接收时间；64 卡、95,415 updates，每轮验证生成 16 张 EMA 图像。
+
 无 ClimbMix 的 T2I + I2T 对照在随机序语言建模项目使用 2 节点 × 16 卡，配置为 [joint 32 卡](../configs/selfless/unified_b_t2i_i2t_matched_ascend32.yaml)：
 
 ```bash

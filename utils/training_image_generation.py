@@ -1,4 +1,4 @@
-"""Fixed-prompt EMA images on every Z training validation, sharded across ranks."""
+"""Fixed-prompt EMA images on training validation, sharded across ranks."""
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
@@ -39,7 +39,7 @@ class ImageGenerationProfile:
         if self.samples < 1 or self.seed < 0 or self.steps < 1:
             raise ValueError("invalid validation image count, seed, or steps")
         if self.solver not in {"heun", "euler"} or not math.isfinite(self.cfg) or self.cfg <= 0:
-            raise ValueError("Z validation generation requires Heun/Euler and positive finite CFG")
+            raise ValueError("validation generation requires Heun/Euler and positive finite CFG")
         if not math.isfinite(self.vae_scaling_factor) or self.vae_scaling_factor <= 0:
             raise ValueError("invalid validation VAE scaling factor")
 
@@ -48,7 +48,16 @@ class ImageGenerationProfile:
         return cls(**dict(config.experiment.get("validation_generation", {})))
 
 
-def _write_gallery(directory, rows, *, step, weights):
+def serializable_trace(trace):
+    """Keep scalar contracts and actual reveal order, excluding optional tensor diagnostics."""
+    result = {key: value for key, value in trace.items()
+              if value is None or isinstance(value, (str, bool, int, float))}
+    if torch.is_tensor(trace.get("generation_order")):
+        result["generation_order"] = trace["generation_order"].detach().cpu().tolist()
+    return result
+
+
+def _write_gallery(directory, rows, *, step, weights, method="Z"):
     from PIL import Image, ImageDraw
 
     columns = min(4, len(rows))
@@ -67,10 +76,10 @@ def _write_gallery(directory, rows, *, step, weights):
     grid.save(directory / "overview.tmp.png")
     os.replace(directory / "overview.tmp.png", directory / "overview.png")
     atomic_write_text(directory / "index.html",
-        '<!doctype html><html lang="en"><meta charset="utf-8"><title>Z validation images</title>'
+        f'<!doctype html><html lang="en"><meta charset="utf-8"><title>{html.escape(method)} validation images</title>'
         '<style>body{font:16px system-ui;margin:24px}main{display:flex;flex-wrap:wrap}'
         'figure{width:256px;margin:12px}img{width:256px;height:256px}figcaption{line-height:1.4}</style>'
-        f'<h1>Z · step {step} · {html.escape(weights)}</h1>'
+        f'<h1>{html.escape(method)} · step {step} · {html.escape(weights)}</h1>'
         '<p>Fixed prompts and noise seeds. <a href="overview.png">Overview</a> · '
         '<a href="summary.json">Generation settings and traces</a></p><main>' + "".join(cards) + '</main></html>\n')
 
@@ -100,12 +109,15 @@ class TrainingImageGenerator:
         if not self.profile.enabled:
             return None
         profile = self.profile
+        joint = getattr(model.config, "architecture_variant", None) == "selfless_joint_dit"
+        method = "Z" if joint else "B + S2-single modulation"
+        image_order, generation_order = ("joint", "joint") if joint else ("random", "spatial_halton")
         rank, world = (dist.get_rank(), dist.get_world_size()) if _distributed() else (0, 1)
         directory = Path(output_dir) / "validation_generation" / f"step-{step}"
         _synchronize(device)
         started = time.monotonic()
         weights = "ema" if ema is not None else "model"
-        summary = dict(schema="training_image_generation_v1", method="Z", step=int(step),
+        summary = dict(schema="training_image_generation_v1", method=method, step=int(step),
             complete=False, weight_source=weights, world_size=world, profile=asdict(profile),
             prompt_prefix=self.prompt_prefix, samples=0, expected_samples=profile.samples,
             overview="overview.png", gallery="index.html", runtime_hashing_enabled=False)
@@ -113,8 +125,11 @@ class TrainingImageGenerator:
             summary["ema_step"] = ema.global_step
         seen = torch.zeros(profile.samples)
         with _local_phase(device):
-            if getattr(model.config, "architecture_variant", None) != "selfless_joint_dit":
-                raise ValueError("validation_generation currently implements the Z generation contract")
+            if not joint and not (
+                getattr(model.config, "architecture_variant", None) == "selfless_contextual"
+                and getattr(model.config, "image_flow_conditioning_mode", None) == "s2_input"
+            ):
+                raise ValueError("validation_generation requires Z or B + S2 modulation")
             if rank == 0:
                 atomic_write_text(directory / "summary.json", json.dumps(summary, indent=2) + "\n")
                 print(json.dumps({"event": "training_image_generation_start", "step": step,
@@ -137,7 +152,7 @@ class TrainingImageGenerator:
                     count, dim = int(model.config.image_tokens_per_img), int(model.config.image_latent_dim)
                     for index in local:
                         prompt = self.prompts[index]
-                        item = build_t2i_item(tokenizer, model, prompt["prompt"], index, profile.seed, "joint",
+                        item = build_t2i_item(tokenizer, model, prompt["prompt"], index, profile.seed, image_order,
                                               prompt_prefix=self.prompt_prefix)
                         if item["input_ids"].numel() > self.pad_to_length:
                             raise ValueError(f"validation prompt exceeds sequence length: {prompt['id']}")
@@ -147,11 +162,19 @@ class TrainingImageGenerator:
                             spans=[(0, item["image_start"], item["image_start"] + count)],
                             initial_noise_bank=noise_for(index, profile.seed, count, dim)[None],
                             flow_cfg=profile.cfg, flow_solver=profile.solver, flow_num_steps=profile.steps,
-                            flow_temperature=1., flow_cfg_schedule="constant", order_strategy="joint",
-                            use_cache=False, return_trace=True, debug_finite=True)
+                            flow_temperature=1., flow_cfg_schedule="constant", order_strategy=generation_order,
+                            use_cache=not joint, return_trace=True, debug_finite=True)
                         expected_calls = profile.steps * (2 if profile.solver == "heun" else 1)
-                        if (trace.get("backbone_calls"), trace.get("flow_head_calls")) != (1, expected_calls):
+                        if joint and (trace.get("backbone_calls"), trace.get("flow_head_calls")) != (1, expected_calls):
                             raise RuntimeError("Z validation generation violated its backbone/head call contract")
+                        if not joint:
+                            if (not trace["backbone_kv_cache_enabled"]
+                                or trace["flow_conditioning_mode"] != "s2_input"
+                                or trace["flow_solver"] != profile.solver
+                                or trace["flow_num_steps"] != profile.steps
+                                or trace["flow_content_cache_tokens_committed"] != count - 1):
+                                raise RuntimeError("B validation generation violated its conditioning/cache contract")
+                            trace = serializable_trace(trace)
                         if tuple(latents.shape) != (1, dim, math.isqrt(count), math.isqrt(count)) or not torch.isfinite(latents).all():
                             raise FloatingPointError("invalid generated validation latents")
                         filename = f"{index:02d}-{prompt['id']}.png"
@@ -169,7 +192,7 @@ class TrainingImageGenerator:
         with _local_phase(device):
             summary["images"] = [json.loads((directory / f"sample-{i:02d}.json").read_text()) for i in range(profile.samples)]
             if rank == 0:
-                _write_gallery(directory, summary["images"], step=step, weights=weights)
+                _write_gallery(directory, summary["images"], step=step, weights=weights, method=method)
         _synchronize(device)
         summary["wall_seconds"] = float(_reduce([time.monotonic() - started], device, dist.ReduceOp.MAX)[0])
         with _local_phase(device):
