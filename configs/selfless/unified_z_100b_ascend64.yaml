@@ -42,7 +42,7 @@ experiment:
     prompt_file: configs/protocols/unified_qualitative_prompts_v1.json
     cfg: 3.5
     steps: 10
-    solver: euler
+    solver: heun
     vae_module_root: public/code/mar
     vae_path: public/vae/mar-kl16/kl16.ckpt
     vae_scaling_factor: 0.2325
@@ -69,8 +69,8 @@ model:
   image_flow_logit_std: 1.0
   image_flow_time_eps: 1.0e-05
   image_flow_time_uniform_mix: 0.1
-  image_flow_solver: euler
-  image_input_noise_strength: 0.0
+  image_flow_solver: heun
+  image_input_noise_strength: 0.01
   image_uncond_prob: 0.1
   lambda_text: 0.05
   lambda_image: 1.0
@@ -198,7 +198,7 @@ evaluation:
   temperature: 1.0
   cfg: 3.5
   cfg_schedule: constant
-  flow_solver: euler
+  flow_solver: heun
   parallel_rate: 1
   strategies: joint
   seed: 42

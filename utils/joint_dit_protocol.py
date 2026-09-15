@@ -18,14 +18,12 @@ def expected_config():
     config.experiment.validation_single_stream_order_strategies = ["joint"]
     config.experiment.validation_generation = dict(enabled=True, samples=16, seed=42,
         prompt_file="configs/protocols/unified_qualitative_prompts_v1.json",
-        cfg=3.5, steps=10, solver="euler", vae_module_root="public/code/mar",
+        cfg=3.5, steps=10, solver="heun", vae_module_root="public/code/mar",
         vae_path="public/vae/mar-kl16/kl16.ckpt", vae_scaling_factor=0.2325)
     config.model.architecture_variant = "selfless_joint_dit"
     config.model.flow_head_attention_contract = "joint_bidirectional"
     config.model.flow_condition_contract = "backbone_xt_fixed"
     config.model.training_image_sigma_order = "joint"
-    config.model.image_input_noise_strength = 0.0
-    config.model.image_flow_solver = "euler"
     config.model.image_flow_grad_checkpointing = True
     config.model.joint_dit_head_dim = 64
     config.model.joint_dit_intermediate = 1472
@@ -33,7 +31,6 @@ def expected_config():
     config.training.ema_save_adapter = False
     config.dataset.params.image.image_sigma_order = "joint"
     config.evaluation.checkpoint = f"output/{RUN}/hf_model-final-ema"
-    config.evaluation.flow_solver = "euler"
     config.evaluation.strategies = "joint"
     return config
 
@@ -45,11 +42,12 @@ def validate_joint_dit_config(config):
     return {"schema": "joint_dit_experiment_v1", "method": "Z", "run_project": RUN,
             "world_size": 64, "optimizer_steps": 95415, "flow_mc_samples": 4,
             "backbone_streams": 2, "head_streams": 1, "image_sigma_order": "joint",
-            "backbone_calls_per_image_batch": 1, "head_calls_per_image_batch": 10,
+            "backbone_calls_per_image_batch": 1, "head_calls_per_image_batch": 20,
+            "solver": "heun", "sampling_steps": 10,
             "time_in_backbone": False, "shared_time_per_image": True,
-            "cfg_branches_batched": True, "image_input_noise_strength": 0.0,
+            "cfg_branches_batched": True, "image_input_noise_strength": 0.01,
             "validation_generation": {"every_validation": True, "images": 16, "weights": "ema",
-                                      "seed": 42, "cfg": 3.5, "solver": "euler", "steps": 10}}
+                                      "seed": 42, "cfg": 3.5, "solver": "heun", "steps": 10}}
 
 
 def parameter_report(config):

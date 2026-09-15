@@ -30,7 +30,7 @@ class ImageGenerationProfile:
     prompt_file: str = "configs/protocols/unified_qualitative_prompts_v1.json"
     cfg: float = 3.5
     steps: int = 10
-    solver: str = "euler"
+    solver: str = "heun"
     vae_module_root: str = "public/code/mar"
     vae_path: str = "public/vae/mar-kl16/kl16.ckpt"
     vae_scaling_factor: float = 0.2325
@@ -38,8 +38,8 @@ class ImageGenerationProfile:
     def __post_init__(self):
         if self.samples < 1 or self.seed < 0 or self.steps < 1:
             raise ValueError("invalid validation image count, seed, or steps")
-        if self.solver != "euler" or not math.isfinite(self.cfg) or self.cfg <= 0:
-            raise ValueError("Z validation generation requires Euler and positive finite CFG")
+        if self.solver not in {"heun", "euler"} or not math.isfinite(self.cfg) or self.cfg <= 0:
+            raise ValueError("Z validation generation requires Heun/Euler and positive finite CFG")
         if not math.isfinite(self.vae_scaling_factor) or self.vae_scaling_factor <= 0:
             raise ValueError("invalid validation VAE scaling factor")
 
@@ -149,8 +149,9 @@ class TrainingImageGenerator:
                             flow_cfg=profile.cfg, flow_solver=profile.solver, flow_num_steps=profile.steps,
                             flow_temperature=1., flow_cfg_schedule="constant", order_strategy="joint",
                             use_cache=False, return_trace=True, debug_finite=True)
-                        if (trace.get("backbone_calls"), trace.get("flow_head_calls")) != (1, profile.steps):
-                            raise RuntimeError("Z validation generation violated the one backbone / N head contract")
+                        expected_calls = profile.steps * (2 if profile.solver == "heun" else 1)
+                        if (trace.get("backbone_calls"), trace.get("flow_head_calls")) != (1, expected_calls):
+                            raise RuntimeError("Z validation generation violated its backbone/head call contract")
                         if tuple(latents.shape) != (1, dim, math.isqrt(count), math.isqrt(count)) or not torch.isfinite(latents).all():
                             raise FloatingPointError("invalid generated validation latents")
                         filename = f"{index:02d}-{prompt['id']}.png"

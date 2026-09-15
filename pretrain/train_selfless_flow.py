@@ -2945,7 +2945,7 @@ def _save_validation_flow_images(
         }
         if is_joint_dit:
             report_strategies[strategy].update({key: trace[key] for key in (
-                "steps", "backbone_calls", "flow_head_calls", "backbone_streams",
+                "solver", "steps", "backbone_calls", "flow_head_calls", "backbone_streams",
                 "flow_head_streams", "cfg_batched", "shared_time_per_image")})
 
     metric_keys = sorted(local_logs)

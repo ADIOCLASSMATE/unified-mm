@@ -1935,8 +1935,6 @@ def main(*, model_loader=None):
     is_joint_dit = getattr(model.config, "architecture_variant", None) == "selfless_joint_dit"
     if is_s2 or is_joint_dit:
         args.disable_backbone_kv_cache = True
-    if is_joint_dit and args.flow_solver != "euler":
-        raise ValueError("Joint DiT evaluation requires --flow_solver euler (one head call per step)")
     loaded_attention_contract = str(
         getattr(
             model.config,

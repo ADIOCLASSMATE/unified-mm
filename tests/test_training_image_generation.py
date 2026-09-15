@@ -76,7 +76,7 @@ def test_real_dit_fixed_noise_images_and_training_state_survive_two_validations(
         assert report["complete"] and report["samples"] == 2 and report["weight_source"] == "ema"
         assert [row["noise_seed"] for row in report["images"]] == [42, 1000045]
         for row in report["images"]:
-            assert row["trace"]["backbone_calls"] == 1 and row["trace"]["flow_head_calls"] == 10
+            assert row["trace"]["backbone_calls"] == 1 and row["trace"]["flow_head_calls"] == 20
         assert_rng(states)
         assert [module.training for module in model.modules()] == modes
         assert torch.equal(model.model.embed_tokens.weight.grad, torch.ones_like(model.model.embed_tokens.weight))
@@ -162,8 +162,8 @@ def test_default_disabled_and_invalid_configuration(tmp_path):
     disabled = generation.TrainingImageGenerator(OmegaConf.create({"experiment": {}}))
     assert disabled.run(None, None, device=torch.device("cpu"), step=2, output_dir=tmp_path) is None
     assert not list(tmp_path.iterdir())
-    with pytest.raises(ValueError, match="Euler"):
-        generation.ImageGenerationProfile(solver="heun")
+    with pytest.raises(ValueError, match="Heun/Euler"):
+        generation.ImageGenerationProfile(solver="invalid")
     write_prompts(tmp_path)
     with pytest.raises(ValueError, match="not enough"):
         generation.TrainingImageGenerator(config(tmp_path, samples=3))

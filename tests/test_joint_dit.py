@@ -24,7 +24,7 @@ def tiny_model(image_tokens=4):
         flow_head_attention_contract="joint_bidirectional", flow_condition_contract="backbone_xt_fixed",
         training_image_sigma_order="joint", image_tokens_per_img=image_tokens, image_latent_dim=4,
         image_flow_width=32, image_flow_depth=2, image_flow_batch_mul=4,
-        image_flow_num_sampling_steps="10", image_flow_solver="euler",
+        image_flow_num_sampling_steps="10", image_flow_solver="heun",
         image_flow_time_sampling="uniform", image_flow_time_uniform_mix=0.,
         image_input_noise_strength=0., image_flow_grad_checkpointing=False,
         joint_dit_head_dim=8, joint_dit_intermediate=48, lambda_text=.05, lambda_image=1.,
@@ -127,7 +127,8 @@ def test_dit_noise_flows_bidirectionally_and_time_is_shared():
 
 
 @pytest.mark.parametrize("cfg", [1., 3.5])
-def test_generation_reuses_one_backbone_pass_for_exactly_ten_joint_dit_calls(cfg):
+@pytest.mark.parametrize("solver,head_calls", [("heun", 20), ("euler", 10)])
+def test_generation_reuses_one_backbone_pass_and_reports_solver_head_calls(cfg, solver, head_calls):
     model = tiny_model().eval(); b = batch()
     calls = {"backbone": 0, "dit": 0}
     def count(name):
@@ -138,31 +139,39 @@ def test_generation_reuses_one_backbone_pass_for_exactly_ten_joint_dit_calls(cfg
              model.image_flow_head.net.register_forward_pre_hook(count("dit"))]
     noise = torch.randn(1, 4, 4)
     args = dict(input_ids=b["X0_input_ids"], token_types=b["token_types"], sigma=b["flow_sigma"],
-        spans=[(0, 2, 6)], initial_noise_bank=noise, flow_cfg=cfg, return_trace=True)
+        spans=[(0, 2, 6)], initial_noise_bank=noise, flow_cfg=cfg, flow_solver=solver, return_trace=True)
     result, trace = model.generate("t2i", **args)
     assert result.shape == (1, 4, 2, 2) and torch.isfinite(result).all()
-    assert calls == {"backbone": 1, "dit": 10}
-    assert trace["backbone_calls"] == 1 and trace["flow_head_calls"] == 10
+    assert calls == {"backbone": 1, "dit": head_calls}
+    assert trace["backbone_calls"] == 1 and trace["flow_head_calls"] == head_calls
+    assert trace["ode_function_evals"] == head_calls and trace["solver"] == solver
     assert trace["backbone_streams"] == 2 and trace["flow_head_streams"] == 1
     replay, _ = model.generate("t2i", initial_image_latents=b["image_latents"] + 100, **args)
     torch.testing.assert_close(result, replay, rtol=0, atol=0)
     for hook in hooks:
         hook.remove()
-    with pytest.raises(ValueError, match="Euler"):
-        model.generate("t2i", **args, flow_solver="heun")
+    with pytest.raises(ValueError, match="Heun/Euler"):
+        model.generate("t2i", **{**args, "flow_solver": "invalid"})
 
 
-def test_cfg_unconditional_branch_cannot_read_prompt():
+@pytest.mark.parametrize("solver,head_calls", [("heun", 2), ("euler", 1)])
+def test_cfg_unconditional_branch_cannot_read_prompt(solver, head_calls):
     model = tiny_model().eval(); b = batch()
     seen = []
     hook = model.image_flow_head.net.register_forward_pre_hook(lambda module, args: seen.append(args[2].detach().clone()))
     args = dict(input_ids=b["X0_input_ids"], token_types=b["token_types"], sigma=b["flow_sigma"],
-        spans=[(0, 2, 6)], flow_cfg=3.5, flow_num_steps=1)
+        spans=[(0, 2, 6)], flow_cfg=3.5, flow_num_steps=1, flow_solver=solver)
     model.generate("t2i", **args)
+    first = seen[:]
+    seen.clear()
     args["input_ids"] = args["input_ids"].clone(); args["input_ids"][:, 0] = 25
     model.generate("t2i", **args)
-    torch.testing.assert_close(seen[0][1], seen[1][1], rtol=0, atol=0)
-    assert not torch.allclose(seen[0][0], seen[1][0])
+    assert len(first) == len(seen) == head_calls
+    for before, after in zip(first, seen):
+        torch.testing.assert_close(before[1], after[1], rtol=0, atol=0)
+        assert not torch.allclose(before[0], after[0])
+        torch.testing.assert_close(before, first[0], rtol=0, atol=0)
+        torch.testing.assert_close(after, seen[0], rtol=0, atol=0)
     hook.remove()
 
 
@@ -203,6 +212,12 @@ def test_formal_recipe_preserves_b_budget_and_parameter_count():
     assert config.experiment.identity.id == "z" and config.experiment.identity.label == "Z"
     assert config.experiment.validation_generation.enabled and config.experiment.validation_generation.samples == 16
     assert report["method"] == "Z"
+    baseline = OmegaConf.load(ROOT / "configs/selfless/unified_baseline_100b_ascend_64npu.yaml")
+    assert config.model.image_input_noise_strength == baseline.model.image_input_noise_strength == .01
+    assert config.model.image_flow_solver == baseline.model.image_flow_solver == "heun"
+    assert config.model.image_flow_num_sampling_steps == baseline.model.image_flow_num_sampling_steps == "10"
+    assert config.evaluation.flow_solver == "heun" and config.experiment.validation_generation.solver == "heun"
+    assert report["head_calls_per_image_batch"] == 20
     assert report["world_size"] == 64 and report["optimizer_steps"] == 95415
     assert abs(parameter_report(config)["flow_parameter_relative_difference"]) < .005
     config.model.image_flow_batch_mul = 1
@@ -217,7 +232,7 @@ def test_complete_256_latent_grid_generation():
     out, trace = model.generate("t2i", input_ids=ids, token_types=types, sigma=None,
         spans=[(0, 2, 258)], flow_cfg=3.5, return_trace=True)
     assert out.shape == (1, 4, 16, 16) and torch.isfinite(out).all()
-    assert trace["backbone_calls"] == 1 and trace["flow_head_calls"] == 10
+    assert trace["backbone_calls"] == 1 and trace["flow_head_calls"] == 20
 
 
 def test_clean_context_image_is_bidirectional_and_conditions_later_target():
@@ -293,3 +308,30 @@ def test_joint_classification_reuses_bidirectional_image_prefix_with_identical_s
     assert sum(bool(row.get("token_types").eq(1).any()) for row in calls) == 1
     for actual, expected in zip(cached, reference):
         torch.testing.assert_close(actual, expected, rtol=0, atol=2e-5)
+
+
+def test_heun_uses_predicted_endpoint_and_shared_time_for_the_corrector(monkeypatch):
+    head = tiny_model().image_flow_head
+    observed_times = []
+    def velocity(x, t, condition):
+        observed_times.append(t.clone())
+        return x  # dx/dt=x; each Heun step multiplies x by 1+dt+dt^2/2.
+    monkeypatch.setattr(head, "velocity", velocity)
+    noise = torch.ones(1, 4, 4)
+    result, trace = head.sample(torch.zeros(1, 4, 32), num_steps=2, initial_noise=noise, return_trace=True)
+    torch.testing.assert_close(result, torch.full_like(noise, 1.625 ** 2), rtol=0, atol=0)
+    assert [t.item() for t in observed_times] == [0., .5, .5, 1.]
+    assert all(t.shape == (1,) for t in observed_times)
+    assert trace == {"solver": "heun", "steps": 2, "flow_head_calls": 4}
+    assert torch.equal(noise, torch.ones_like(noise))
+
+
+def test_heun_validation_report_cannot_claim_only_ten_head_calls():
+    from utils.evaluation.model_contracts import validate_image_generation_report
+    report = dict(architecture_variant="selfless_joint_dit", generation_entry="model.generate", use_cache=False,
+        strategies={"joint": dict(backbone_kv_cache_enabled=False, generation_mode="joint_dit_full_image_flow",
+                                  solver="heun", steps=10, backbone_calls=1, flow_head_calls=20)})
+    assert validate_image_generation_report(report, "xlnet_content_diagonal") is False
+    report["strategies"]["joint"]["flow_head_calls"] = 10
+    with pytest.raises(ValueError, match="solver-specific"):
+        validate_image_generation_report(report, "xlnet_content_diagonal")

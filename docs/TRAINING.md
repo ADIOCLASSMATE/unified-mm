@@ -97,7 +97,7 @@ output/evaluation/training-validation/<run>/
 
 当前权重计算统一 loss，EMA 计算下游指标。具体样本、耗时和文件名见 [统一 loss](UNIFIED_LOSS_VALIDATION.md)与 [下游验证](TRAINING_DOWNSTREAM_VALIDATION.md)。历史训练保存的图片、caption 和 `validation_metrics_step_*.json` 也位于该目录。
 
-Z 每轮验证额外生成 16 张固定 prompt、固定种子的 EMA 图像（CFG 3.5、Euler10）。单图、`overview.png`、`index.html` 和生成参数写入 `validation_generation/step-<step>/`；由 `experiment.validation_generation` 配置，见 [Z 验证图像](Z_EXPERIMENT.md#每轮验证的图像)。
+Z 每轮验证额外生成 16 张固定 prompt、固定种子的 EMA 图像（CFG 3.5、Heun10）。单图、`overview.png`、`index.html` 和生成参数写入 `validation_generation/step-<step>/`；由 `experiment.validation_generation` 配置，见 [Z 验证图像](Z_EXPERIMENT.md#每轮验证的图像)。
 
 ## 开发验证
 

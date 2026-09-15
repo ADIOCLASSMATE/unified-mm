@@ -23,8 +23,8 @@ flowchart LR
     N[整图 noisy latent x_t] --> D[单流双向 DiT]
     T[每图共享 t] --> D
     C --> D
-    D --> E[Euler 更新全部 256 个 latent]
-    E -->|共 10 步，仅重复 head| N
+    D --> E[Heun 预测与校正，更新全部 256 个 latent]
+    E -->|共 10 步、20 次 head，复用 backbone 条件| N
 ```
 
 每份 Monte Carlo 样本抽一个图像级 t 和一幅独立高斯噪声：`x_t = (1-t) noise + t clean`，回归速度 `clean-noise`。保持 RF4；四份样本共享一次 backbone 前向得到的条件，梯度仍回传 backbone。t 和 x_t 只进入 DiT，DiT 没有 clean content 流。
@@ -34,9 +34,9 @@ DiT 输入是 noisy latent 的投影加固定 query 条件的投影，使用 8 �
 ## 训练与生成协议
 
 - 从 Qwen3-0.6B-Base step 0 初始化，全参数训练；保留 B 的数据、任务顺序、batch、GA4、RF4、loss 权重、优化器、WSD 与 EMA，预算为 64 卡、95,415 updates。
-- 本实验按 clean context 设 `image_input_noise_strength=0`；B 的输入微噪声为 0.01。这是显式记录的额外输入差异。
-- 默认 Euler10，每个 batch 实际一次 backbone、10 次 DiT。CFG 条件／无条件分支沿 batch 维合并，调用次数不增加，计算量对应两个分支。
-- S2 的 Heun10 为 20 次速度计算；比较速度时同时报告 solver、步数、实际前向次数和 CFG。
+- `image_input_noise_strength=0.01` 与 B 一致：仅训练时对 backbone 的图像输入做轻微扰动，验证／生成时关闭；这项增强不使用 flow 时间 t。
+- 默认 Heun10，与 B 保持相同 solver 和步数；每个 batch 实际一次 backbone、20 次 DiT（每步预测与校正各一次）。CFG 条件／无条件分支沿 batch 维合并，调用次数不增加，计算量对应两个分支。
+- Heun5 才对应 10 次 head forward；它不作为默认严格对照。比较速度时同时报告 solver、步数、实际前向次数和 CFG。
 - 图像理解评分使用固定整图可见性，order MC=1；文本仍使用 B 的同位置 query 分数。ImageNet 候选评分复用 B 的前缀缓存，同一幅双向可见的 context 图像只计算一次；缓存前后分数经过一致性检查。Caption/text 生成也保留 KV cache。
 - 保存完整 checkpoint、raw HF 和 EMA HF；本实验禁用旧 flow adapter 导出。
 
@@ -44,7 +44,7 @@ DiT 输入是 noisy latent 的投影加固定 query 条件的投影，使用 8 �
 
 ## 每轮验证的图像
 
-Z 在每次训练验证时额外生成 **16 张 EMA 图像**；当前验证频率为每 10,000 个 optimizer steps。使用[固定 prompt 集](../configs/protocols/unified_qualitative_prompts_v1.json)的前 16 条，覆盖动物、物品与风景；每条 prompt 的初始噪声固定为 CPU FP32、seed `42 + 1000003 × prompt_index`，不随 step 或 rank 改变。采样为 CFG 3.5、Euler10、256 个 latent，对应 256×256 像素。
+Z 在每次训练验证时额外生成 **16 张 EMA 图像**；当前验证频率为每 10,000 个 optimizer steps。使用[固定 prompt 集](../configs/protocols/unified_qualitative_prompts_v1.json)的前 16 条，覆盖动物、物品与风景；每条 prompt 的初始噪声固定为 CPU FP32、seed `42 + 1000003 × prompt_index`，不随 step 或 rank 改变。采样为 CFG 3.5、Heun10、256 个 latent，对应 256×256 像素。
 
 实际统一验证入口依次执行当前权重 loss、EMA 图像生成、EMA 下游评分。生成不使用下游评分的时间预算，每轮都会执行；配置开关为 `experiment.validation_generation.enabled`。所有 rank 参与分片 EMA 切换，各生成 rank 一次处理一张图，空闲 rank 不加载 VAE。完成或失败均恢复训练权重、模块模式和随机数状态，VAE 在本轮后释放。
 
@@ -61,7 +61,7 @@ output/evaluation/training-validation/unified-z-0p6b-100b-imagenet-split-s42-r1/
   validation_summary_step_10000.json
 ```
 
-总览图和 HTML 展示全部样本；JSON 记录 prompt、种子、EMA step、采样参数和 1/10 前向次数。训练日志额外记录生成张数、耗时和完成状态。实现见 [training_image_generation.py](../utils/training_image_generation.py)。
+总览图和 HTML 展示全部样本；JSON 记录 prompt、种子、EMA step、采样参数和 1/20 前向次数。训练日志额外记录生成张数、耗时和完成状态。实现见 [training_image_generation.py](../utils/training_image_generation.py)。
 
 ## 复现
 
@@ -73,7 +73,7 @@ TORCH_DEVICE_BACKEND_AUTOLOAD=0 .venv/bin/python scripts/validate_z.py --assets
 bash script/check_repo.sh
 ```
 
-固定 `dev-wjx-ascend` 上验收真实数据训练 0→12 步、完整 checkpoint 恢复到 14 步、raw/EMA 重载、完整 256-latent Euler10 生成及文本生成：
+固定 `dev-wjx-ascend` 上验收真实数据训练 0→12 步、完整 checkpoint 恢复到 14 步、raw/EMA 重载、完整 256-latent Heun10 生成及文本生成：
 
 ```bash
 bash script/selfless/pretraining_z_ascend64.sh --smoke-suite \
@@ -99,6 +99,6 @@ bash script/selfless/pretraining_z_ascend64.sh
 
 ## 验证范围
 
-[test_joint_dit.py](../tests/test_joint_dit.py) 检查双流 attention 真值表、整图 context、目标及未来文本不泄漏、训练 CFG 丢弃、RF4 共享时间、DiT 双向依赖、实际 1/10 调用次数、256-token 生成、cached/full caption 一致性、checkpoint 重载及参数／训练预算。
+[test_joint_dit.py](../tests/test_joint_dit.py) 检查双流 attention 真值表、整图 context、目标及未来文本不泄漏、训练 CFG 丢弃、RF4 共享时间、DiT 双向依赖、Heun 的 1/20 调用次数、预测与校正数值、256-token 生成、cached/full caption 一致性、checkpoint 重载及参数／训练预算。
 
-命名为 Z 之前的 16 卡设备 smoke 已通过：真实数据训练 0→12 步、恢复到 14 步、raw/EMA 权重重载、256-latent 生成，hook 实测每次生成 1 次 backbone、10 次 DiT。原始记录保留于 `output/experiments/joint-dit/smoke-20260915-r1/`，其历史 run 路径保持原值。后续 Z 运行记录放在 `output/experiments/z/`。短程 smoke 仅验证执行正确性，不代表图像质量结果。
+早期原型曾在 Euler10、`image_input_noise_strength=0` 下通过 16 卡训练、恢复与生成检查，原始记录保留于 `output/experiments/joint-dit/smoke-20260915-r1/`；这不属于当前 Z 的严格对照设置。Z 的正式协议为 Heun10、输入微噪声 0.01，后续验收记录放在 `output/experiments/z/`。短程 smoke 仅验证执行正确性，不代表图像质量结果。

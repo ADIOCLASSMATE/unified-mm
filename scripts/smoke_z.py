@@ -69,14 +69,14 @@ def generation(checkpoint, weights, output):
         latents, trace = model.generate("t2i", input_ids=batch["input_ids"].to(device),
             token_types=batch["token_types"].to(device), sigma=batch["sigma"].to(device),
             spans=[(0, item["image_start"], item["image_start"] + 256)],
-            initial_noise_bank=noise_for(0, 42)[None], flow_cfg=3.5, flow_solver="euler",
+            initial_noise_bank=noise_for(0, 42)[None], flow_cfg=3.5, flow_solver="heun",
             flow_num_steps=10, order_strategy="joint", use_cache=False, return_trace=True,
             debug_finite=True)
     torch.npu.synchronize()
     elapsed = time.monotonic() - started
     for handle in handles:
         handle.remove()
-    if calls != {"backbone": 1, "dit": 10} or latents.shape != (1, 16, 16, 16):
+    if calls != {"backbone": 1, "dit": 20} or latents.shape != (1, 16, 16, 16):
         raise RuntimeError(f"Unexpected generation call counts or shape: {calls}, {latents.shape}")
     if not torch.isfinite(latents).all():
         raise FloatingPointError("Nonfinite generated image")
@@ -139,7 +139,7 @@ def validation_lifecycle(output, label):
             raise RuntimeError("Validation prompts/noise changed between steps")
         for row in images["images"]:
             trace = row["trace"]
-            if (trace["backbone_calls"], trace["flow_head_calls"]) != (1, 10):
+            if (trace["backbone_calls"], trace["flow_head_calls"]) != (1, 20) or trace["solver"] != "heun":
                 raise RuntimeError("Unexpected Z validation generation call counts")
             if not (directory / f"validation_generation/step-{step}" / row["image"]).is_file():
                 raise FileNotFoundError(row["image"])
@@ -151,9 +151,13 @@ def validation_lifecycle(output, label):
     if resumed["run_start_global_step"] != 5 or resumed["global_step"] != 6 or not math.isfinite(resumed["last_logged_loss"]):
         raise RuntimeError("Checkpoint resume after validation failed")
     _validate_checkpoint_complete(run_root / "checkpoint-6", expected_global_step=6)
+    for weights, directory in (("current", "hf_model-final"), ("ema", "hf_model-final-ema")):
+        run([sys.executable, "scripts/smoke_z.py", "--checkpoint", str(run_root / directory),
+             "--weights", weights, "--output-dir", str(output / weights)], output / f"{weights}.log")
     (output / "report.json").write_text(json.dumps(dict(passed=True, method="Z", run=RUN,
         run_root=str(run_root), world_size=16, validation_steps=[2, 4],
-        images_per_validation=16, fixed_prompts_and_noise=True,
+        images_per_validation=16, fixed_prompts_and_noise=True, raw_and_ema_generation=True,
+        solver="heun", steps=10, head_calls=20, image_input_noise_strength=0.01,
         fresh_runtime=runtime, resumed_runtime=resumed, validations=reports), indent=2) + "\n")
     (output / "SMOKE_PASSED").write_text("passed\n")
 

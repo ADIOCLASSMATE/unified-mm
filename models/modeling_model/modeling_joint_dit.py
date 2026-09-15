@@ -2,7 +2,8 @@
 
 An image is one sigma block: content sees the whole clean image, while mask
 queries cannot see any of their own image's content. Only the single-stream
-DiT receives noisy latents and flow time. Text retains B's same-position loss.
+DiT receives flow-noised latents and time. B's small image-input augmentation
+and same-position text loss are retained during training.
 """
 from __future__ import annotations
 
@@ -131,9 +132,9 @@ class JointDiTFlowLoss(PositionwiseFlowLoss):
         self.logit_std = float(getattr(config, "image_flow_logit_std", 1))
         self.time_eps = float(getattr(config, "image_flow_time_eps", 1e-5))
         self.uniform_mix = float(getattr(config, "image_flow_time_uniform_mix", .1))
-        self.solver = str(getattr(config, "image_flow_solver", "euler"))
-        if self.solver != "euler" or self.num_sampling_steps < 1:
-            raise ValueError("Joint DiT uses Euler: one head evaluation per sampling step")
+        self.solver = str(getattr(config, "image_flow_solver", "heun"))
+        if self.solver not in {"euler", "heun"} or self.num_sampling_steps < 1:
+            raise ValueError("Joint DiT requires Heun/Euler and positive sampling steps")
         if not 0 <= self.uniform_mix <= 1 or not 0 <= self.time_eps < .5:
             raise ValueError("Invalid joint flow time distribution")
         self.last_forward_stats = {}
@@ -167,8 +168,9 @@ class JointDiTFlowLoss(PositionwiseFlowLoss):
     def sample(self, z, temperature=1., cfg=1., cfg_schedule="constant", solver=None,
                num_steps=None, initial_noise=None, return_trace=False, debug_finite=False, **unused):
         steps = self.num_sampling_steps if num_steps is None else int(num_steps)
-        if (solver or self.solver) != "euler" or steps < 1:
-            raise ValueError("Joint DiT requires Euler and positive steps")
+        solver = str(solver or self.solver).lower()
+        if solver not in {"heun", "euler"} or steps < 1:
+            raise ValueError("Joint DiT requires Heun/Euler and positive steps")
         paired = float(cfg) != 1.
         if paired and z.shape[0] % 2:
             raise ValueError("CFG conditions must contain paired conditional/unconditional rows")
@@ -178,14 +180,25 @@ class JointDiTFlowLoss(PositionwiseFlowLoss):
             raise ValueError(f"initial_noise must have shape {shape}")
         x = (torch.randn(shape, device=z.device, dtype=torch.float32) if initial_noise is None
              else initial_noise.to(device=z.device, dtype=torch.float32).clone()) * float(temperature)
+        times = torch.linspace(0., 1., steps + 1, device=z.device, dtype=torch.float32)
         for step in range(steps):
-            t = torch.full((batch,), step / steps, device=z.device, dtype=torch.float32)
+            t = times[step].expand(batch)
+            t_next = times[step + 1].expand(batch)
+            dt = times[step + 1] - times[step]
             cfg_now = self._scheduled_cfg(float(cfg), cfg_schedule, step / steps)
-            x = x + self._guided_velocity(x, t, z, cfg_now).float() / steps
+            velocity = self._guided_velocity(x, t, z, cfg_now).float()
+            predictor = x + dt * velocity
+            if solver == "heun":
+                cfg_next = self._scheduled_cfg(float(cfg), cfg_schedule, (step + 1) / steps)
+                next_velocity = self._guided_velocity(predictor, t_next, z, cfg_next).float()
+                x = x + .5 * dt * (velocity + next_velocity)
+            else:
+                x = predictor
             if debug_finite and not torch.isfinite(x).all():
                 raise FloatingPointError(f"Nonfinite joint DiT state at step {step}")
         output = x.to(self.net.input_proj.weight.dtype)
-        return (output, {"solver": "euler", "steps": steps, "flow_head_calls": steps}) if return_trace else output
+        calls = steps * (2 if solver == "heun" else 1)
+        return (output, {"solver": solver, "steps": steps, "flow_head_calls": calls}) if return_trace else output
 
 
 class JointDiTForCausalLM(Qwen3ForCausalLM):
@@ -201,8 +214,6 @@ class JointDiTForCausalLM(Qwen3ForCausalLM):
         for field, expected in required.items():
             if getattr(config, field, None) != expected:
                 raise ValueError(f"Joint DiT requires {field}={expected}")
-        if float(getattr(config, "image_input_noise_strength", 0)) != 0:
-            raise ValueError("Joint DiT backbone requires clean image context")
         Qwen3PreTrainedModel.__init__(self, config)
         self.model = Qwen3Model(config)
         self.vocab_size = config.vocab_size
@@ -298,7 +309,7 @@ class JointDiTForCausalLM(Qwen3ForCausalLM):
                  "backbone_calls": 1, "backbone_kv_cache_enabled": False,
                  "backbone_condition_cached": True, "backbone_streams": 2, "flow_head_streams": 1,
                  "cfg_batched": paired, "cfg": float(flow_cfg),
-                 "ode_function_evals": head_trace["steps"], "shared_time_per_image": True}
+                 "ode_function_evals": head_trace["flow_head_calls"], "shared_time_per_image": True}
         return (output, trace) if return_trace else output
 
     def generate_text(self, input_ids, *, token_types=None, sigma=None, **kwargs):

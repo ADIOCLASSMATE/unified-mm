@@ -154,7 +154,7 @@ def prepare(args):
         manifest["contract"]["model_cfg"] = overrides
         manifest["contract"]["model_generation"] = {
             spec["id"]: {"use_cache": spec["backbone_attention"] != "showo2_omni_attention" and spec["architecture"] != "selfless_joint_dit",
-                         "flow_solver": "euler" if spec["architecture"] == "selfless_joint_dit" else "heun",
+                         "flow_solver": "heun",
                          "image_order": "whole_image" if spec["backbone_attention"] == "showo2_omni_attention" or spec["architecture"] == "selfless_joint_dit" else "checkpoint_native"}
             for spec in models}
         manifest["contract"]["timing"] = {"warmup_batches": 1, "measured_repeats": args.timing_repeats,
@@ -392,7 +392,8 @@ def run(args):
         model.to(device).eval()
         use_cache = spec["backbone_attention"] != "showo2_omni_attention"
         image_use_cache = use_cache and spec["architecture"] != "selfless_joint_dit"
-        image_solver = "euler" if spec["architecture"] == "selfless_joint_dit" else "heun"
+        image_solver = str(manifest["contract"].get("model_generation", {}).get(spec["id"], {}).get(
+            "flow_solver", manifest["contract"]["flow_solver"]))
         flow_cfg = float(manifest["contract"].get("model_cfg", {}).get(spec["id"], manifest["contract"]["cfg"]))
         order = str(getattr(model.config, "training_image_sigma_order", "random"))
         if order != spec["image_order"]:

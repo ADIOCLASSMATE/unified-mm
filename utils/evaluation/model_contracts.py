@@ -33,8 +33,11 @@ def validate_image_generation_report(report, attention_contract, *, strategy=Non
         expected_mode = "joint_dit_full_image_flow" if is_joint else "showo2_full_image_flow"
         if not use_cache and trace.get("generation_mode") != expected_mode:
             raise ValueError(f"held-out generation did not use its full-image flow contract: {name}")
-        if is_joint and (trace.get("backbone_calls") != 1 or trace.get("flow_head_calls") != trace.get("steps")):
-            raise ValueError("Joint DiT must run one backbone pass and one head evaluation per step")
+        if is_joint:
+            solver = trace.get("solver", report.get("solver", report.get("flow_solver")))
+            expected_calls = int(trace.get("steps", 0)) * (2 if solver == "heun" else 1)
+            if solver not in {"euler", "heun"} or expected_calls <= 0 or trace.get("backbone_calls") != 1 or trace.get("flow_head_calls") != expected_calls:
+                raise ValueError("Joint DiT must run one backbone pass and solver-specific head evaluations")
     return use_cache
 
 
