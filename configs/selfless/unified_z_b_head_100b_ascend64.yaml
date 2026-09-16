@@ -37,6 +37,7 @@ experiment:
   - joint
   validation_generation:
     enabled: true
+    weights: raw
     samples: 16
     seed: 42
     prompt_file: configs/protocols/unified_qualitative_prompts_v1.json

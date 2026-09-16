@@ -25,6 +25,7 @@ from utils.training_downstream_validation import (
 @dataclass(frozen=True)
 class ImageGenerationProfile:
     enabled: bool = False
+    weights: str = "raw"
     samples: int = 16
     seed: int = 42
     prompt_file: str = "configs/protocols/unified_qualitative_prompts_v1.json"
@@ -36,6 +37,8 @@ class ImageGenerationProfile:
     vae_scaling_factor: float = 0.2325
 
     def __post_init__(self):
+        if self.weights not in {"raw", "ema"}:
+            raise ValueError("validation generation weights must be raw or ema")
         if self.samples < 1 or self.seed < 0 or self.steps < 1:
             raise ValueError("invalid validation image count, seed, or steps")
         if self.solver not in {"heun", "euler"} or not math.isfinite(self.cfg) or self.cfg <= 0:
@@ -118,15 +121,21 @@ class TrainingImageGenerator:
         directory = Path(output_dir) / "validation_generation" / f"step-{step}"
         _synchronize(device)
         started = time.monotonic()
-        weights = "ema" if ema is not None else "model"
+        weights = profile.weights
+        generation_ema = ema if weights == "ema" else None
         summary = dict(schema="training_image_generation_v1", method=method, step=int(step),
-            complete=False, weight_source=weights, world_size=world, profile=asdict(profile),
+            complete=False, weight_source=weights,
+            weight_step=int(generation_ema.global_step if generation_ema is not None else step),
+            cache_mode="fixed_backbone_condition" if joint else "backbone_and_flow_kv",
+            world_size=world, profile=asdict(profile),
             prompt_prefix=self.prompt_prefix, samples=0, expected_samples=profile.samples,
             overview="overview.png", gallery="index.html", runtime_hashing_enabled=False)
-        if ema is not None:
-            summary["ema_step"] = ema.global_step
+        if generation_ema is not None:
+            summary["ema_step"] = generation_ema.global_step
         seen = torch.zeros(profile.samples)
         with _local_phase(device):
+            if weights == "ema" and generation_ema is None:
+                raise ValueError("EMA generation requested without EMA weights")
             if not joint and not (
                 getattr(model.config, "architecture_variant", None) == "selfless_contextual"
                 and getattr(model.config, "image_flow_conditioning_mode", None) == "s2_input"
@@ -136,9 +145,9 @@ class TrainingImageGenerator:
                 atomic_write_text(directory / "summary.json", json.dumps(summary, indent=2) + "\n")
                 print(json.dumps({"event": "training_image_generation_start", "step": step,
                                   "samples": profile.samples, "weights": weights}), flush=True)
-        # All ranks enter EMA collectives, including ranks with zero image work.
-        # A local failure is agreed collectively before restoring training weights.
-        with evaluation_state(model, device, ema):
+        # Raw uses the live parameters at this optimizer step, without checkpoint
+        # I/O or an EMA swap. Every rank still joins error/coverage collectives.
+        with evaluation_state(model, device, generation_ema):
             with _local_phase(device):
                 local = list(rank_indices(profile.samples, rank, world))
                 vae = None
@@ -165,6 +174,8 @@ class TrainingImageGenerator:
                             initial_noise_bank=noise_for(index, profile.seed, count, dim)[None],
                             flow_cfg=profile.cfg, flow_solver=profile.solver, flow_num_steps=profile.steps,
                             flow_temperature=1., flow_cfg_schedule="constant", order_strategy=generation_order,
+                            # Joint generation reuses one fixed backbone result;
+                            # B caches both backbone KV and head content KV.
                             use_cache=not joint, return_trace=True, debug_finite=True)
                         expected_calls = profile.steps * (2 if profile.solver == "heun" else 1)
                         if joint and (trace.get("backbone_calls"), trace.get("flow_head_calls")) != (1, expected_calls):

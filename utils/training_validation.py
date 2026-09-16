@@ -1,4 +1,4 @@
-"""Reusable orchestration of current-weight loss and EMA downstream validation."""
+"""Current-weight loss/images and EMA downstream validation."""
 from __future__ import annotations
 
 import json

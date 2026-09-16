@@ -26,7 +26,7 @@ Head 参数保持 **164,072,976**，与 B 完全相同。数据、任务混合�
 
 训练输出：`output/unified-b-s2-modulation-0p6b-100b-imagenet-split-s42-r1/`。
 
-每 10,000 updates 验证时额外生成 16 张固定 prompt 和初始噪声的 EMA 图像，CFG 3.5、Heun10、`spatial_halton`、256 个 latent。单图、`overview.png`、`index.html` 与 `summary.json` 位于：
+每 10,000 updates 验证时额外使用当前 raw 权重生成 16 张固定 prompt 和初始噪声的图像，CFG 3.5、Heun10、`spatial_halton`、256 个 latent；backbone KV 与 head content KV cache 均开启。`experiment.validation_generation.weights: raw` 控制生图权重，下游评分仍使用 EMA。单图、`overview.png`、`index.html` 与 `summary.json` 位于：
 
 ```text
 output/evaluation/training-validation/

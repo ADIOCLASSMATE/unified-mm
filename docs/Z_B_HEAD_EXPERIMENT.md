@@ -24,7 +24,7 @@ velocity = B.final_layer(x, c)
 - 每图一个共享 t，RF4；时间只进入 head。
 - 每个生成批次 backbone 前向 1 次，Heun10 对应 head 前向 20 次，CFG 两分支合批。
 - 输入微噪声 0.01、训练数据、任务混合、学习率、EMA、64 卡与 95,415 updates 沿用 Z。
-- 每 10,000 updates 验证时生成 16 张固定 prompt 和固定噪声的 EMA 图像，CFG 3.5、Heun10。
+- 每 10,000 updates 验证时使用当前 raw 权重生成 16 张固定 prompt 和固定噪声的图像，CFG 3.5、Heun10；复用一次 backbone 前向产生的固定条件。下游评分仍使用 EMA。
 
 Checkpoint 通过 `joint_dit_head_type: b_single_stream` 记录 head。旧 Z checkpoint 缺少此字段时，明确恢复原 S2 head。权重来源决定 head 类型。
 
@@ -45,6 +45,6 @@ bash script/selfless/pretraining_z_b_head_ascend64.sh \
   --smoke-suite --validation --label <unique-label> --output-dir <report-directory>
 ```
 
-验收包括第 2/4 步的完整验证和每轮 16 张 EMA 图像、从 checkpoint 5 恢复到 6、raw/EMA 重载，以及图像、caption、文本生成。
+验收包括第 2/4 步的完整验证和每轮 16 张 raw 图像、从 checkpoint 5 恢复到 6、raw/EMA 重载，以及图像、caption、文本生成。
 
 训练输出为 `output/unified-z-b-head-0p6b-100b-imagenet-split-s42-r1/`。验证画廊位于 `output/evaluation/training-validation/<run>/validation_generation/step-<step>/index.html`，同目录保留单图、`overview.png` 和 `summary.json`。

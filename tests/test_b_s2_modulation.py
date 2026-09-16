@@ -153,7 +153,7 @@ def test_formal_config_preserves_b_recipe_and_dual_streams():
         validate_b_s2_modulation_config(config)
 
 
-def test_b_validation_images_use_ema_and_restore_rng(monkeypatch, tmp_path):
+def test_b_validation_images_use_raw_cache_and_restore_rng(monkeypatch, tmp_path):
     import test_training_image_generation as image_tests
     from test_training_unified_loss_validation import Tokenizer
     from utils import training_image_generation as generation
@@ -169,10 +169,14 @@ def test_b_validation_images_use_ema_and_restore_rng(monkeypatch, tmp_path):
     rng = image_tests.rng_snapshot()
     for step in (2, 4):
         report = runner.run(model, Tokenizer(), device=torch.device("cpu"), step=step, output_dir=tmp_path, ema=ema)
-        assert report["complete"] and report["samples"] == 2 and report["weight_source"] == "ema"
+        assert report["complete"] and report["samples"] == 2 and report["weight_source"] == "raw"
+        assert report["cache_mode"] == "backbone_and_flow_kv"
+        assert "ema_step" not in report
         for row in report["images"]:
             assert row["trace"]["flow_conditioning_mode"] == "s2_input"
             assert row["trace"]["flow_solver"] == "heun"
+            assert row["trace"]["backbone_kv_cache_enabled"]
+            assert row["trace"]["flow_content_cache_tokens_committed"] == model.config.image_tokens_per_img - 1
         image_tests.assert_rng(rng)
         assert model.training
         for name, value in model.state_dict().items():

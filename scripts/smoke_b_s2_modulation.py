@@ -139,8 +139,8 @@ def validation_lifecycle(output, label):
         images = json.loads((directory / f"validation_generation/step-{step}/summary.json").read_text())
         if not whole["complete"] or not images["complete"] or images["samples"] != 16:
             raise RuntimeError("B loss, downstream, and image validation must all complete")
-        if images["weight_source"] != "ema" or images["ema_step"] != step:
-            raise RuntimeError("Validation generated from the wrong EMA step")
+        if images["weight_source"] != "raw" or images["weight_step"] != step or "ema_step" in images:
+            raise RuntimeError("Validation must generate from current raw weights")
         if whole["downstream"]["prepare_cache_hit"] != (step == 4):
             raise RuntimeError("Cold/warm validation cache contract failed")
         prompts = [(row["id"], row["prompt"], row["noise_seed"]) for row in images["images"]]

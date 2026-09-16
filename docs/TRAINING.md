@@ -56,7 +56,7 @@ S2 与 B+SigLIP 的入口及当前设置见 [S2](SHOWO2_UNIFIED_ABLATION_DESIGN.
 
 [Z + B 单流 head](Z_B_HEAD_EXPERIMENT.md) 使用 `bash script/selfless/pretraining_z_b_head_ascend64.sh`，复用 Z 的训练与整图生成流程，head 使用 B 的全部层和初始化，`proj(h) + time_embed(t)` 进入 AdaLN。
 
-[B + S2-single 调制](B_S2_MODULATION.md) 使用 `bash script/selfless/pretraining_b_s2_modulation_ascend64.sh`。Backbone 和 head 均保留 B 双流，只将 backbone 条件移到 head 输入，AdaLN 仅接收时间；64 卡、95,415 updates，每轮验证生成 16 张 EMA 图像。
+[B + S2-single 调制](B_S2_MODULATION.md) 使用 `bash script/selfless/pretraining_b_s2_modulation_ascend64.sh`。Backbone 和 head 均保留 B 双流，只将 backbone 条件移到 head 输入，AdaLN 仅接收时间；64 卡、95,415 updates，每轮验证使用 raw 权重和 KV cache 生成 16 张图像。
 
 无 ClimbMix 的 T2I + I2T 对照在随机序语言建模项目使用 2 节点 × 16 卡，配置为 [joint 32 卡](../configs/selfless/unified_b_t2i_i2t_matched_ascend32.yaml)：
 
@@ -101,7 +101,7 @@ output/evaluation/training-validation/<run>/
 
 当前权重计算统一 loss，EMA 计算下游指标。具体样本、耗时和文件名见 [统一 loss](UNIFIED_LOSS_VALIDATION.md)与 [下游验证](TRAINING_DOWNSTREAM_VALIDATION.md)。历史训练保存的图片、caption 和 `validation_metrics_step_*.json` 也位于该目录。
 
-Z 每轮验证额外生成 16 张固定 prompt、固定种子的 EMA 图像（CFG 3.5、Heun10）。单图、`overview.png`、`index.html` 和生成参数写入 `validation_generation/step-<step>/`；由 `experiment.validation_generation` 配置，见 [Z 验证图像](Z_EXPERIMENT.md#每轮验证的图像)。
+Z、Z+B 与 B+S2 每轮验证额外使用当前 raw 权重生成 16 张固定 prompt、固定种子的图像（CFG 3.5、Heun10）。B+S2 开启 backbone/head content KV cache；Z 和 Z+B 复用一次 backbone 前向产生的固定条件。单图、`overview.png`、`index.html` 和生成参数写入 `validation_generation/step-<step>/`；`experiment.validation_generation.weights: raw` 显式记录权重选择。EMA 仍用于下游评分和原有权重导出，见 [Z 验证图像](Z_EXPERIMENT.md#每轮验证的图像)。
 
 ## 开发验证
 

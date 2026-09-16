@@ -17,9 +17,9 @@ from utils import training_image_generation as generation
 from utils.sharded_ema import RankShardedEMA, build_sharded_ema_layout
 
 
-def config(directory, samples=2):
+def config(directory, samples=2, weights="raw"):
     return OmegaConf.create({"experiment": {"validation_generation": {
-        "enabled": True, "samples": samples, "prompt_file": str(Path(directory) / "prompts.json")}},
+        "enabled": True, "weights": weights, "samples": samples, "prompt_file": str(Path(directory) / "prompts.json")}},
         "dataset": {"params": {"image": {"caption_t2i_prefix": "Generate an image matching this description:",
                                          "pad_to_length": 64}}}})
 
@@ -50,7 +50,8 @@ def assert_rng(states):
     assert torch.equal(actual[2], states[2])
 
 
-def test_real_dit_fixed_noise_images_and_training_state_survive_two_validations(monkeypatch, tmp_path):
+@pytest.mark.parametrize("weights", ["raw", "ema"])
+def test_real_dit_fixed_noise_images_and_training_state_survive_two_validations(monkeypatch, tmp_path, weights):
     write_prompts(tmp_path)
     model = tiny_model().train()
     model.image_flow_head.net.layers[0].eval()
@@ -58,6 +59,7 @@ def test_real_dit_fixed_noise_images_and_training_state_survive_two_validations(
     ema = RankShardedEMA(build_sharded_ema_layout(model, world_size=1), rank=0, decay=.9, update_after_step=0)
     ema.bind(model)
     ema.initialize_from_model(global_step=2)
+    ema_weight = model.image_flow_head.net.output_proj.weight.detach().clone()
     with torch.no_grad():
         model.image_flow_head.net.output_proj.weight.add_(1)
     original = copy.deepcopy(model.state_dict())
@@ -68,12 +70,18 @@ def test_real_dit_fixed_noise_images_and_training_state_survive_two_validations(
         random.random(), np.random.rand(), torch.rand(1)
         return TinyVAE()
     monkeypatch.setattr(generation, "load_vae", load)
-    handle = model.model.register_forward_pre_hook(lambda *args: model_calls.append(1))
-    runner = generation.TrainingImageGenerator(config(tmp_path))
+    def check_weights(*args):
+        model_calls.append(1)
+        expected = original["image_flow_head.net.output_proj.weight"] if weights == "raw" else ema_weight
+        torch.testing.assert_close(model.image_flow_head.net.output_proj.weight, expected, rtol=0, atol=0)
+    handle = model.model.register_forward_pre_hook(check_weights)
+    runner = generation.TrainingImageGenerator(config(tmp_path, weights=weights))
     states = rng_snapshot()
     for step in (2, 4):
         report = runner.run(model, Tokenizer(), device=torch.device("cpu"), step=step, output_dir=tmp_path, ema=ema)
-        assert report["complete"] and report["samples"] == 2 and report["weight_source"] == "ema"
+        assert report["complete"] and report["samples"] == 2 and report["weight_source"] == weights
+        assert report["weight_step"] == (step if weights == "raw" else ema.global_step)
+        assert ("ema_step" in report) == (weights == "ema")
         assert [row["noise_seed"] for row in report["images"]] == [42, 1000045]
         for row in report["images"]:
             assert row["trace"]["backbone_calls"] == 1 and row["trace"]["flow_head_calls"] == 20
@@ -98,9 +106,11 @@ def test_coordinator_generates_on_every_validation_even_when_downstream_times_ou
     write_prompts(tmp_path)
     cfg = config(tmp_path)
     cfg.experiment.loss_validation = {"enabled": False}
+    ema = object()  # Raw image generation must not use this; downstream still receives it.
     monkeypatch.setattr(generation, "load_vae", lambda *args: TinyVAE())
     steps = []
     def downstream(*args, **kwargs):
+        assert kwargs["ema"] is ema
         step = kwargs["step"]
         assert (tmp_path / f"validation_generation/step-{step}/overview.png").is_file()
         steps.append(step)
@@ -111,14 +121,14 @@ def test_coordinator_generates_on_every_validation_even_when_downstream_times_ou
     model = tiny_model().train()
     for step in (2, 4):
         report = runner.run(model, Tokenizer(), device=torch.device("cpu"), step=step,
-                            output_dir=tmp_path, forward_batch=None)
+                            output_dir=tmp_path, forward_batch=None, ema=ema)
         assert not report["complete"] and report["generation"]["complete"]
         assert report["metrics"]["val/generation_images"] == 2
         assert (tmp_path / report["generation"]["gallery"]).is_file()
     assert steps == [2, 4] and model.training
 
 
-def _distributed_worker(rank, rendezvous, directory):
+def _distributed_worker(rank, rendezvous, directory, weights):
     torch.set_num_threads(1)
     dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2)
     try:
@@ -130,12 +140,12 @@ def _distributed_worker(rank, rendezvous, directory):
             model.image_flow_head.net.output_proj.weight.add_(.25)
         live = model.image_flow_head.net.output_proj.weight.clone()
         states = rng_snapshot()
-        runner = generation.TrainingImageGenerator(config(directory, samples=1))
+        runner = generation.TrainingImageGenerator(config(directory, samples=1, weights=weights))
         loads = []
         with pytest.MonkeyPatch.context() as patch:
             def load(*args):
                 loads.append(rank)
-                assert rank == 0  # Rank 1 has no image work but must join EMA collectives.
+                assert rank == 0  # Rank 1 has no image work but must join collectives.
                 return TinyVAE()
             patch.setattr(generation, "load_vae", load)
             result = runner.run(model, Tokenizer(), device=torch.device("cpu"), step=2, output_dir=directory, ema=ema)
@@ -153,9 +163,10 @@ def _distributed_worker(rank, rendezvous, directory):
         dist.destroy_process_group()
 
 
-def test_empty_rank_and_decoder_failure_restore_sharded_ema_without_hanging(tmp_path):
+@pytest.mark.parametrize("weights", ["raw", "ema"])
+def test_empty_rank_and_decoder_failure_restore_state_without_hanging(tmp_path, weights):
     write_prompts(tmp_path)
-    mp.spawn(_distributed_worker, args=(f"file://{tmp_path / 'rendezvous'}", str(tmp_path)), nprocs=2, join=True)
+    mp.spawn(_distributed_worker, args=(f"file://{tmp_path / 'rendezvous'}", str(tmp_path), weights), nprocs=2, join=True)
 
 
 def test_default_disabled_and_invalid_configuration(tmp_path):
@@ -164,6 +175,17 @@ def test_default_disabled_and_invalid_configuration(tmp_path):
     assert not list(tmp_path.iterdir())
     with pytest.raises(ValueError, match="Heun/Euler"):
         generation.ImageGenerationProfile(solver="invalid")
+    assert generation.ImageGenerationProfile().weights == "raw"
+    with pytest.raises(ValueError, match="raw or ema"):
+        generation.ImageGenerationProfile(weights="invalid")
     write_prompts(tmp_path)
     with pytest.raises(ValueError, match="not enough"):
         generation.TrainingImageGenerator(config(tmp_path, samples=3))
+
+
+def test_explicit_ema_requires_ema_weights(tmp_path):
+    write_prompts(tmp_path)
+    runner = generation.TrainingImageGenerator(config(tmp_path, weights="ema"))
+    with pytest.raises(RuntimeError, match="failed on a training rank") as error:
+        runner.run(tiny_model(), Tokenizer(), device=torch.device("cpu"), step=2, output_dir=tmp_path)
+    assert "without EMA" in str(error.value.__cause__)

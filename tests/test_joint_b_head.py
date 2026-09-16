@@ -168,6 +168,7 @@ def test_validation_generates_with_b_head_and_restores_rng(monkeypatch, tmp_path
     for step in (2, 4):
         result = runner.run(model, Tokenizer(), device=torch.device("cpu"), step=step, output_dir=tmp_path, ema=ema)
         assert result["complete"] and result["method"] == "Z + B head (single stream)"
+        assert result["weight_source"] == "raw" and result["cache_mode"] == "fixed_backbone_condition"
         for row in result["images"]:
             assert row["trace"]["flow_head_type"] == "b_single_stream"
             assert row["trace"]["flow_head_calls"] == 20 and row["trace"]["backbone_calls"] == 1

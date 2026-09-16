@@ -44,9 +44,11 @@ DiT 输入是 noisy latent 的投影加固定 query 条件的投影，使用 8 �
 
 ## 每轮验证的图像
 
-Z 在每次训练验证时额外生成 **16 张 EMA 图像**；当前验证频率为每 10,000 个 optimizer steps。使用[固定 prompt 集](../configs/protocols/unified_qualitative_prompts_v1.json)的前 16 条，覆盖动物、物品与风景；每条 prompt 的初始噪声固定为 CPU FP32、seed `42 + 1000003 × prompt_index`，不随 step 或 rank 改变。采样为 CFG 3.5、Heun10、256 个 latent，对应 256×256 像素。
+Z 在每次训练验证时使用当前 raw 权重额外生成 **16 张图像**；当前验证频率为每 10,000 个 optimizer steps。使用[固定 prompt 集](../configs/protocols/unified_qualitative_prompts_v1.json)的前 16 条，覆盖动物、物品与风景；每条 prompt 的初始噪声固定为 CPU FP32、seed `42 + 1000003 × prompt_index`，不随 step 或 rank 改变。采样为 CFG 3.5、Heun10、256 个 latent，对应 256×256 像素。
 
-实际统一验证入口依次执行当前权重 loss、EMA 图像生成、EMA 下游评分。生成不使用下游评分的时间预算，每轮都会执行；配置开关为 `experiment.validation_generation.enabled`。所有 rank 参与分片 EMA 切换，各生成 rank 一次处理一张图，空闲 rank 不加载 VAE。完成或失败均恢复训练权重、模块模式和随机数状态，VAE 在本轮后释放。
+实际统一验证入口依次执行当前权重 loss、raw 图像生成、EMA 下游评分。生成不使用下游评分的时间预算，每轮都会执行；配置开关为 `experiment.validation_generation.enabled`，权重选择为 `experiment.validation_generation.weights: raw`。Raw 直接读取当前 optimizer step 的模型参数，无需重载 checkpoint，也不进行 EMA 切换。各生成 rank 一次处理一张图，空闲 rank 不加载 VAE；所有 rank 参与完成状态与错误同步。完成或失败均恢复模块模式和随机数状态，VAE 在本轮后释放。显式选择 `weights: ema` 时要求提供 EMA 状态。
+
+Z 和 Z+B 在整个采样过程中复用一次 backbone 前向的输出，报告记录 `cache_mode: fixed_backbone_condition`。整图双向 head 的 noisy hidden states 随采样时间变化，每步正常重算。B+S2 的逐 token 路径使用 backbone/head content KV cache。
 
 每轮保存至：
 
@@ -61,7 +63,7 @@ output/evaluation/training-validation/unified-z-0p6b-100b-imagenet-split-s42-r1/
   validation_summary_step_10000.json
 ```
 
-总览图和 HTML 展示全部样本；JSON 记录 prompt、种子、EMA step、采样参数和 1/20 前向次数。训练日志额外记录生成张数、耗时和完成状态。实现见 [training_image_generation.py](../utils/training_image_generation.py)。
+总览图和 HTML 展示全部样本；JSON 记录 prompt、种子、`weight_source: raw`、`weight_step`、缓存方式、采样参数和 1/20 前向次数。训练日志额外记录生成张数、耗时和完成状态。实现见 [training_image_generation.py](../utils/training_image_generation.py)。
 
 ## 复现
 
@@ -81,7 +83,7 @@ bash script/selfless/pretraining_z_ascend64.sh --smoke-suite \
   --output-dir output/experiments/z/<smoke-directory>
 ```
 
-训练验证验收：训练 5 步，在第 2、4 步执行完整 loss、16 张 EMA 图像、下游评分，再从 checkpoint-5 恢复到第 6 步。
+训练验证验收：训练 5 步，在第 2、4 步执行完整 loss、16 张 raw 图像、下游评分，再从 checkpoint-5 恢复到第 6 步。
 
 ```bash
 bash script/selfless/pretraining_z_ascend64.sh --smoke-suite --validation \

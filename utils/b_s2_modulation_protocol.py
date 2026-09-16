@@ -16,7 +16,7 @@ def expected_config():
     config.experiment.identity = dict(id="b-s2-modulation", label="B + S2-single modulation",
                                       group="ablation", purpose="formal")
     config.model.image_flow_conditioning_mode = "s2_input"
-    config.experiment.validation_generation = dict(enabled=True, samples=16, seed=42,
+    config.experiment.validation_generation = dict(enabled=True, weights="raw", samples=16, seed=42,
         prompt_file="configs/protocols/unified_qualitative_prompts_v1.json",
         cfg=3.5, steps=10, solver="heun", vae_module_root="public/code/mar",
         vae_path="public/vae/mar-kl16/kl16.ckpt", vae_scaling_factor=0.2325)
@@ -36,7 +36,7 @@ def validate_b_s2_modulation_config(config):
         query_visibility="sigma_lt", content_visibility="sigma_leq",
         time_in_backbone=False, shared_time_per_image=False,
         solver="heun", sampling_steps=10, image_input_noise_strength=0.01,
-        validation_generation=dict(every_validation=True, images=16, weights="ema",
+        validation_generation=dict(every_validation=True, images=16, weights="raw",
                                    seed=42, cfg=3.5, solver="heun", steps=10,
                                    order="spatial_halton", use_cache=True))
 
