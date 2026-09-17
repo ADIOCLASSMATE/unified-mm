@@ -32,6 +32,7 @@ from omegaconf import OmegaConf
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from utils.evaluation.model_contracts import S2_ATTENTION_CONTRACTS
 from utils.evaluation.multimodal_likelihood import (  # noqa: E402
     CandidateScore,
     LIKELIHOOD_SCORING_CONTRACT,
@@ -147,9 +148,9 @@ def main() -> None:
     image_sigma_order = (
         configured_order if args.image_sigma_order == "auto" else args.image_sigma_order
     )
-    if attention_contract not in {"selfless_strict", "xlnet_content_diagonal", "showo2_omni_attention"}:
+    if attention_contract not in {"selfless_strict", "xlnet_content_diagonal", *S2_ATTENTION_CONTRACTS}:
         raise ValueError(f"unknown attention contract: {attention_contract}")
-    if attention_contract == "showo2_omni_attention":
+    if attention_contract in S2_ATTENTION_CONTRACTS:
         image_sigma_order = "sequential"
         args.scoring_backend = "repeated_full_sequence"
     if config.model.get("architecture_variant") == "selfless_joint_dit":

@@ -194,6 +194,18 @@
       ]
     },
     {
+      "run": "unified-s2-single-text-two-stream-0p6b-100b-imagenet-split-s42-r1",
+      "id": "s2_single_text_two_stream",
+      "label": "S2-single + text two-stream",
+      "group": "showo2",
+      "purpose": "formal",
+      "active_sources": [
+        "climbmix",
+        "t2i",
+        "i2t"
+      ]
+    },
+    {
       "run": "unified-s2-dual-siglip-0p6b-100b-imagenet-split-s42-r1",
       "id": "s2_dual_siglip",
       "label": "S2-dual-siglip",
@@ -266,6 +278,126 @@
       "run": "unified-z-0p6b-100b-imagenet-split-s42-r1",
       "id": "z",
       "label": "Z",
+      "group": "ablation",
+      "purpose": "formal",
+      "active_sources": [
+        "climbmix",
+        "t2i",
+        "i2t"
+      ]
+    },
+    {
+      "run": "unified-s2-single-text-two-stream-0p6b-33b-imagenet-split-s42-r1",
+      "id": "s2_single_text_two_stream_33b",
+      "label": "S2-single + text two-stream · 33B",
+      "group": "showo2",
+      "purpose": "formal",
+      "active_sources": [
+        "climbmix",
+        "t2i",
+        "i2t"
+      ]
+    },
+    {
+      "run": "unified-z-0p6b-33b-imagenet-split-s42-r1",
+      "id": "z_33b",
+      "label": "Z · 33B",
+      "group": "ablation",
+      "purpose": "formal",
+      "active_sources": [
+        "climbmix",
+        "t2i",
+        "i2t"
+      ]
+    },
+    {
+      "run": "unified-z-b-head-0p6b-33b-imagenet-split-s42-r1",
+      "id": "z_b_head_33b",
+      "label": "Z + B head · 33B",
+      "group": "ablation",
+      "purpose": "formal",
+      "active_sources": [
+        "climbmix",
+        "t2i",
+        "i2t"
+      ]
+    },
+    {
+      "run": "unified-b-s2-modulation-0p6b-33b-imagenet-split-s42-r1",
+      "id": "b_s2_modulation_33b",
+      "label": "B + S2 modulation · 33B",
+      "group": "ablation",
+      "purpose": "formal",
+      "active_sources": [
+        "climbmix",
+        "t2i",
+        "i2t"
+      ]
+    },
+    {
+      "run": "unified-s2-single-0p6b-33b-imagenet-split-s42-r1",
+      "id": "s2_single_33b",
+      "label": "S2-single · 33B",
+      "group": "showo2",
+      "purpose": "formal",
+      "active_sources": [
+        "climbmix",
+        "t2i",
+        "i2t"
+      ]
+    },
+    {
+      "run": "unified-s2-single-0p6b-33b-imagenet-split-s42-r2",
+      "id": "s2_single_33b_r2",
+      "label": "S2-single · 33B",
+      "group": "showo2",
+      "purpose": "formal",
+      "active_sources": [
+        "climbmix",
+        "t2i",
+        "i2t"
+      ]
+    },
+    {
+      "run": "unified-s2-single-text-two-stream-0p6b-33b-imagenet-split-s42-r2",
+      "id": "s2_single_text_two_stream_33b_r2",
+      "label": "S2-single + text two-stream · 33B",
+      "group": "showo2",
+      "purpose": "formal",
+      "active_sources": [
+        "climbmix",
+        "t2i",
+        "i2t"
+      ]
+    },
+    {
+      "run": "unified-z-0p6b-33b-imagenet-split-s42-r2",
+      "id": "z_33b_r2",
+      "label": "Z · 33B",
+      "group": "ablation",
+      "purpose": "formal",
+      "active_sources": [
+        "climbmix",
+        "t2i",
+        "i2t"
+      ]
+    },
+    {
+      "run": "unified-z-b-head-0p6b-33b-imagenet-split-s42-r2",
+      "id": "z_b_head_33b_r2",
+      "label": "Z + B head · 33B",
+      "group": "ablation",
+      "purpose": "formal",
+      "active_sources": [
+        "climbmix",
+        "t2i",
+        "i2t"
+      ]
+    },
+    {
+      "run": "unified-b-s2-modulation-0p6b-33b-imagenet-split-s42-r2",
+      "id": "b_s2_modulation_33b_r2",
+      "label": "B + S2 modulation · 33B",
       "group": "ablation",
       "purpose": "formal",
       "active_sources": [

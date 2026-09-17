@@ -5,7 +5,7 @@
       "root": "ablation-matrix/cfg2-heun10-order-20260909-r1"
     }
   ],
-  "qualitative": "qualitative/unified-all-final-ema-with-s2-20260915-r1",
+  "qualitative": "qualitative/unified-all-final-ema-with-b-only-20260916-r1",
   "order_sweeps": [
     {
       "model": "b_x0",
@@ -344,5 +344,6 @@
       "5.5": "unified-d-on-b-0p6b/sweeps/cfg-1-6-20260915-r1/arms/cfg-5.5-heun-010/metrics.json",
       "6.0": "unified-d-on-b-0p6b/sweeps/cfg-1-6-20260915-r1/arms/cfg-6.0-heun-010/metrics.json"
     }
-  }
+  },
+  "style_instruction": "research/style-instruction-20260916-r2"
 }

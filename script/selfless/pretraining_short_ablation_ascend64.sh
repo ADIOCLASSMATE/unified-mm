@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-if [[ "${1:-}" != "--smoke-suite" ]]; then
-  exec bash "${REPO_ROOT}/script/selfless/pretraining_short_ablation_ascend64.sh" --arm b-s2 "$@"
-fi
 set +u
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 set -u
@@ -22,8 +19,9 @@ for driver_library_dir in /usr/local/Ascend/driver/lib64/driver \
     export LD_LIBRARY_PATH="${driver_library_dir}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
   fi
 done
-if [[ "${1:-}" == "--smoke-suite" ]]; then
+if [[ "${1:-}" == "--generation-smoke" ]]; then
   shift
-  exec python scripts/smoke_b_s2_modulation.py "$@"
+  exec python -m torch.distributed.run --standalone --nproc_per_node=16 \
+    scripts/smoke_training_image_generation.py "$@"
 fi
-exec python scripts/launch_b_s2_modulation.py "$@"
+exec python scripts/launch_short_ablation.py "$@"

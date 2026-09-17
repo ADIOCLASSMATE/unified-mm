@@ -1,5 +1,7 @@
 # Z + B flow head（单流）
 
+> 当前入口已切换至 31,800-step（约 33B）配方：warmup 199、decay 7950、每 3180 步验证，随机序语言建模项目，基座 step 0 初始化。新输出目录使用 `33b`；下文 100B 配置及启动记录为原配方历史。详见[当前训练设置](TRAINING.md#当前四项短预算消融)。
+
 在 Z 的双流 backbone、整图共享 sigma 和共享 t 上，使用 B 的完整 flow-head 模块，并让 head 以单流方式双向读取全部 256 个 noisy token。改动前源码为 `ec20ff1`。
 
 ## Head

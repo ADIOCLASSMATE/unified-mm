@@ -1,4 +1,4 @@
-"""Fixed-prompt EMA images on training validation, sharded across ranks."""
+"""Fixed-prompt raw or EMA images on training validation, sharded across ranks."""
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
@@ -113,10 +113,17 @@ class TrainingImageGenerator:
             return None
         profile = self.profile
         joint = getattr(model.config, "architecture_variant", None) == "selfless_joint_dit"
+        s2 = getattr(model.config, "architecture_variant", None) == "showo2_unified"
         method = "Z" if joint else "B + S2-single modulation"
         if joint and getattr(model.config, "joint_dit_head_type", "s2") == "b_single_stream":
             method = "Z + B head (single stream)"
+        if s2:
+            method = "S2-dual-siglip" if getattr(model.config, "s2_use_siglip", False) else "S2-single"
+            if getattr(model.config, "dual_stream_attention_contract", None) == "showo2_text_two_stream":
+                method = "S2-single + text two-stream"
         image_order, generation_order = ("joint", "joint") if joint else ("random", "spatial_halton")
+        use_cache = not (joint or s2)
+        cache_mode = "full_model_refresh" if s2 else "fixed_backbone_condition" if joint else "backbone_and_flow_kv"
         rank, world = (dist.get_rank(), dist.get_world_size()) if _distributed() else (0, 1)
         directory = Path(output_dir) / "validation_generation" / f"step-{step}"
         _synchronize(device)
@@ -126,7 +133,7 @@ class TrainingImageGenerator:
         summary = dict(schema="training_image_generation_v1", method=method, step=int(step),
             complete=False, weight_source=weights,
             weight_step=int(generation_ema.global_step if generation_ema is not None else step),
-            cache_mode="fixed_backbone_condition" if joint else "backbone_and_flow_kv",
+            cache_mode=cache_mode,
             world_size=world, profile=asdict(profile),
             prompt_prefix=self.prompt_prefix, samples=0, expected_samples=profile.samples,
             overview="overview.png", gallery="index.html", runtime_hashing_enabled=False)
@@ -136,11 +143,11 @@ class TrainingImageGenerator:
         with _local_phase(device):
             if weights == "ema" and generation_ema is None:
                 raise ValueError("EMA generation requested without EMA weights")
-            if not joint and not (
+            if not (joint or s2) and not (
                 getattr(model.config, "architecture_variant", None) == "selfless_contextual"
                 and getattr(model.config, "image_flow_conditioning_mode", None) == "s2_input"
             ):
-                raise ValueError("validation_generation requires Z or B + S2 modulation")
+                raise ValueError("validation_generation requires S2, Z or B + S2 modulation")
             if rank == 0:
                 atomic_write_text(directory / "summary.json", json.dumps(summary, indent=2) + "\n")
                 print(json.dumps({"event": "training_image_generation_start", "step": step,
@@ -175,19 +182,27 @@ class TrainingImageGenerator:
                             flow_cfg=profile.cfg, flow_solver=profile.solver, flow_num_steps=profile.steps,
                             flow_temperature=1., flow_cfg_schedule="constant", order_strategy=generation_order,
                             # Joint generation reuses one fixed backbone result;
-                            # B caches both backbone KV and head content KV.
-                            use_cache=not joint, return_trace=True, debug_finite=True)
+                            # B caches backbone/head KV; S2 refreshes the whole
+                            # model for every ODE evaluation and CFG branch.
+                            use_cache=use_cache, return_trace=True, debug_finite=True)
                         expected_calls = profile.steps * (2 if profile.solver == "heun" else 1)
                         if joint and (trace.get("backbone_calls"), trace.get("flow_head_calls")) != (1, expected_calls):
                             raise RuntimeError("Z validation generation violated its backbone/head call contract")
-                        if not joint:
+                        if s2:
+                            full_calls = expected_calls * (2 if profile.cfg != 1.0 else 1)
+                            if (trace.get("generation_mode") != "showo2_full_image_flow"
+                                or trace.get("backbone_kv_cache_enabled") is not False
+                                or trace.get("solver") != profile.solver or trace.get("steps") != profile.steps
+                                or (trace.get("backbone_calls"), trace.get("flow_head_calls")) != (full_calls, full_calls)):
+                                raise RuntimeError("S2 validation generation violated its full-refresh contract")
+                        elif not joint:
                             if (not trace["backbone_kv_cache_enabled"]
                                 or trace["flow_conditioning_mode"] != "s2_input"
                                 or trace["flow_solver"] != profile.solver
                                 or trace["flow_num_steps"] != profile.steps
                                 or trace["flow_content_cache_tokens_committed"] != count - 1):
                                 raise RuntimeError("B validation generation violated its conditioning/cache contract")
-                            trace = serializable_trace(trace)
+                        trace = serializable_trace(trace)
                         if tuple(latents.shape) != (1, dim, math.isqrt(count), math.isqrt(count)) or not torch.isfinite(latents).all():
                             raise FloatingPointError("invalid generated validation latents")
                         filename = f"{index:02d}-{prompt['id']}.png"

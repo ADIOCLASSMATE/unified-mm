@@ -9,7 +9,7 @@ PROTOCOL = ROOT / "configs/protocols/showo2_unified_100b_ascend64.yaml"
 
 
 def config_path(variant):
-    if variant not in {"single", "dual-siglip"}:
+    if variant not in {"single", "dual-siglip", "single-text-two-stream"}:
         raise ValueError(f"Unknown S2 arm: {variant}")
     return f"configs/selfless/unified_s2_{variant.replace('-', '_')}_100b_ascend64.yaml"
 
@@ -20,12 +20,14 @@ def _plain(value):
 
 def validate_s2_config(config):
     protocol = OmegaConf.load(PROTOCOL)
+    text_two_stream = config.model.get("dual_stream_attention_contract") == "showo2_text_two_stream"
     for field, expected in protocol.frozen_from_b.items():
         actual = OmegaConf.select(config, field)
         if _plain(actual) != _plain(expected):
             raise ValueError(f"S2/B frozen contract differs at {field}: {actual!r} != {expected!r}")
     required = {"architecture_variant": "showo2_unified", "training_objective": "showo2_full_image_flow",
-        "dual_stream_attention_contract": "showo2_omni_attention", "flow_head_attention_contract": "showo2_omni_attention",
+        "dual_stream_attention_contract": "showo2_text_two_stream" if text_two_stream else "showo2_omni_attention",
+        "flow_head_attention_contract": "showo2_omni_attention",
         "flow_condition_contract": "backbone_noisy_image_hidden", "s2_semantic_depth": 26,
         "s2_semantic_width": 1152, "s2_semantic_intermediate": 4304, "s2_semantic_heads": 16,
         "s2_flow_intermediate": 1472, "s2_flow_head_dim": 64, "s2_initialization_seed": 42}
@@ -45,6 +47,10 @@ def validate_s2_config(config):
     if config.training.get("save_image_flow_adapter") or config.experiment.get("save_final_image_flow_adapter"):
         raise ValueError("S2 saves complete HF/raw/EMA states; Selfless-only adapters are incompatible")
     variant = "dual-siglip" if bool(config.model.s2_use_siglip) else "single"
+    if text_two_stream:
+        if config.model.s2_use_siglip:
+            raise ValueError("S2 text two-stream ablation requires the single visual frontend")
+        variant = "single-text-two-stream"
     return {"variant": variant, "run_project": str(config.experiment.project),
             "project": protocol.projects[variant], "frozen_fields_checked": len(protocol.frozen_from_b),
             "world_size": 64, "optimizer_steps": 95415, "flow_mc_samples": 4,

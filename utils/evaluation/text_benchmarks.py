@@ -35,6 +35,7 @@ from omegaconf import OmegaConf
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from utils.evaluation.model_contracts import S2_ATTENTION_CONTRACTS
 from utils.evaluation_model_source import (  # noqa: E402
     add_model_source_argument,
     configure_model_source,
@@ -574,7 +575,7 @@ def score_choice_requests(
         if attention_contract not in {
             "selfless_strict",
             "xlnet_content_diagonal",
-            "showo2_omni_attention",
+            *S2_ATTENTION_CONTRACTS,
         }:
             raise ValueError(
                 "unsupported dual-stream attention contract: "
@@ -765,7 +766,7 @@ def evaluate_multiple_choice_task(
     if attention_contract not in {
         "selfless_strict",
         "xlnet_content_diagonal",
-        "showo2_omni_attention",
+        *S2_ATTENTION_CONTRACTS,
     }:
         raise ValueError(
             "unsupported dual-stream attention contract: "

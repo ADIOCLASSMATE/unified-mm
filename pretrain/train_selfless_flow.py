@@ -36,6 +36,7 @@ from accelerate.utils import (
 )
 from safetensors import SafetensorError, safe_open
 
+from utils.evaluation.model_contracts import S2_ATTENTION_CONTRACTS
 from utils.dataset_utils import get_dataloaders
 from utils.flow_head_contract import (
     flow_head_attention_report,
@@ -483,7 +484,7 @@ def _training_objective(config) -> str:
         config.model.get("training_objective", "selfless_dual_stream")
     ).strip().lower()
     if objective == "showo2_full_image_flow" and config.model.get("architecture_variant") == "showo2_unified":
-        if config.model.get("dual_stream_attention_contract") != "showo2_omni_attention":
+        if config.model.get("dual_stream_attention_contract") not in S2_ATTENTION_CONTRACTS:
             raise ValueError("Show-o2 requires omni attention")
         validate_flow_head_attention_contract(config.model)
         return objective
@@ -2467,7 +2468,7 @@ def _generate_i2t_caption_batch(
     image_end_id = getattr(model.config, "im_end_token_id", None)
     if image_end_id is not None:
         stop_ids.add(int(image_end_id))
-    use_cache = getattr(model.config, "dual_stream_attention_contract", "selfless_strict") != "showo2_omni_attention"
+    use_cache = getattr(model.config, "dual_stream_attention_contract", "selfless_strict") not in S2_ATTENTION_CONTRACTS
     output_ids, trace = model.generate(
         "i2t",
         input_ids=input_ids,
@@ -2655,7 +2656,7 @@ def _save_validation_i2t_captions(
                 "generation_entry": "model.generate",
                 "backbone_kv_cache_enabled": (
                     getattr(unwrapped.config, "dual_stream_attention_contract", "selfless_strict")
-                    != "showo2_omni_attention"
+                    not in S2_ATTENTION_CONTRACTS
                 ),
                 "dual_stream_attention_contract": str(
                     config.model.get(
@@ -2833,7 +2834,7 @@ def _save_validation_flow_images(
         config.model.get("dual_stream_attention_contract", "selfless_strict"),
     ))
     is_joint_dit = getattr(unwrapped.config, "architecture_variant", None) == "selfless_joint_dit"
-    use_cache = attention_contract != "showo2_omni_attention" and not is_joint_dit
+    use_cache = attention_contract not in S2_ATTENTION_CONTRACTS and not is_joint_dit
     generation_ids, generation_types, generation_sigma = input_ids, token_types, sigma
     generation_spans = selected_spans
     if not use_cache:

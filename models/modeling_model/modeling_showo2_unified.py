@@ -1,8 +1,9 @@
 """Controlled Qwen3/KL16 Show-o2-style ablation, with one optional SigLIP branch.
 
 This is a full-image rectified-flow model, not the retired masked-token target.
-Text scores are target aligned (hidden[j] = raw_hidden[j-1]). Image velocities
-use unshifted hidden states and refresh the entire model at every ODE call.
+Text scores use either shifted content states or same-position text queries.
+Image velocities always use content states and refresh the entire model at
+every ODE call, including in the text two-stream ablation.
 """
 from __future__ import annotations
 
@@ -75,6 +76,20 @@ def attention_from_allowed(allowed):
         return allowed[batch, qi, ki]
     return create_block_mask(mask_mod, B=b, H=None, Q_LEN=q, KV_LEN=k,
                              device=allowed.device)
+
+
+def text_query_allowed_mask(content_allowed, token_types):
+    """Text queries read earlier content only; image queries are unused.
+
+    Intersect with the S2 content mask to retain packed-document isolation,
+    padding and CFG. Earlier image content is fully bidirectional within its
+    own block, so a caption query can still observe the entire preceding image.
+    """
+    length = token_types.shape[1]
+    positions = torch.arange(length, device=token_types.device)
+    earlier = positions[None, :] < positions[:, None]
+    text = token_types.eq(0) | token_types.eq(2)
+    return content_allowed & earlier[None] & text.unsqueeze(-1)
 
 
 def _prepared_mask(mask):
@@ -202,8 +217,24 @@ class Showo2Backbone(Qwen3Model):
                     nn.Linear(width + config.hidden_size, config.hidden_size), nn.GELU(),
                     nn.Linear(config.hidden_size, config.hidden_size))
 
-    def _needs_query_stream(self, **kwargs):
-        return False
+    @property
+    def text_two_stream(self):
+        return self.config.dual_stream_attention_contract == "showo2_text_two_stream"
+
+    def _needs_query_stream(self, *, calculate_likelihood, **kwargs):
+        return self.text_two_stream and bool(calculate_likelihood)
+
+    def _build_xt_inputs_embeds(self, input_ids, token_types, image_spans_present=None):
+        # S2 supplies precomputed content embeddings instead of input IDs.
+        # Every text query starts from the existing learned text-mask token;
+        # neither target IDs nor image features enter the query residual path.
+        return self.embed_tokens(torch.full_like(token_types, self.config.mask_token_id, dtype=torch.long))
+
+    def _finalize_stream_hidden(self, X0_hidden_states, XT_hidden_states, *, use_query_stream, **kwargs):
+        if use_query_stream:
+            text = kwargs["token_types"].eq(0) | kwargs["token_types"].eq(2)
+            return self.norm(torch.where(text.unsqueeze(-1), XT_hidden_states, X0_hidden_states))
+        return self.norm(X0_hidden_states)
 
     def forward(self, X0_input_ids=None, attention_mask=None, token_types=None,
                 image_latents=None, image_span_table=None, image_latent_mask=None,
@@ -257,9 +288,13 @@ class Showo2Backbone(Qwen3Model):
         kwargs.pop("_text_ar_mode", None)
         kwargs.pop("X0_inputs_embeds", None)
         kwargs.pop("content_attention_mask", None)
-        output = super().forward(X0_inputs_embeds=embeds, attention_mask=mask,
-            token_types=token_types, calculate_likelihood=False, _text_ar_mode=False, **kwargs)
-        if calculate_likelihood:
+        query_mode = self.text_two_stream and calculate_likelihood
+        query_mask = (attention_from_allowed(text_query_allowed_mask(allowed, token_types))
+                      if query_mode else mask)
+        output = super().forward(X0_inputs_embeds=embeds, attention_mask=query_mask,
+            content_attention_mask=mask if query_mode else None,
+            token_types=token_types, calculate_likelihood=query_mode, _text_ar_mode=False, **kwargs)
+        if calculate_likelihood and not self.text_two_stream:
             raw = output.last_hidden_state
             aligned = F.pad(raw[:, :-1], (0, 0, 1, 0))
             output.last_hidden_state = torch.where(token_types.eq(1).unsqueeze(-1), raw, aligned)
@@ -350,7 +385,12 @@ class Showo2UnifiedForCausalLM(Qwen3ForCausalLM):
         Qwen3PreTrainedModel.__init__(self, config)
         if getattr(config, "training_objective", None) != "showo2_full_image_flow":
             raise ValueError("Show-o2 requires its dedicated full-image objective")
+        if config.dual_stream_attention_contract not in {"showo2_omni_attention", "showo2_text_two_stream"}:
+            raise ValueError("Unsupported S2 backbone attention contract")
         self.model = Showo2Backbone(config)
+        if self.model.text_two_stream:
+            self.text_prediction_offset = 0
+            self.text_hidden_alignment = "target_position_contains_text_query_hidden"
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.image_flow_head = Showo2FlowHead(config)
         self.image_latent_dim = int(config.image_latent_dim)
@@ -640,15 +680,21 @@ class Showo2UnifiedForCausalLM(Qwen3ForCausalLM):
         generated = 0
         for step in range(int(max_new_tokens)):
             target_positions = lengths + step
-            width = int(target_positions.max())
+            query_mode = self.model.text_two_stream
+            width = int(target_positions.max()) + int(query_mode)
             current_types = types[:, :width].clone()
-            valid = torch.arange(width, device=ids.device)[None] < target_positions[:, None]
+            valid = torch.arange(width, device=ids.device)[None] < (target_positions[:, None] + int(query_mode))
             current_types = torch.where(valid, current_types, 3)
+            if query_mode:
+                ids[batch, target_positions] = int(self.config.mask_token_id)
+                current_types[batch, target_positions] = 0
+                segments[batch, target_positions] = last_segment
             hidden = self.model(X0_input_ids=ids[:, :width], token_types=current_types,
                 _text_segment_ids=segments[:, :width], image_span_table=table,
                 image_latents=prepared["latents"][:, :width] if image_spans else None,
-                calculate_likelihood=False).last_hidden_state
-            next_token = self._sample_token(self.lm_head(hidden[batch, target_positions - 1]), float(temperature))
+                calculate_likelihood=query_mode).last_hidden_state
+            next_token = self._sample_token(
+                self.lm_head(hidden[batch, target_positions - self.text_prediction_offset]), float(temperature))
             if stop_ids:
                 next_token = torch.where(finished, stop_ids[0], next_token)
             ids[batch, target_positions] = next_token
@@ -661,5 +707,7 @@ class Showo2UnifiedForCausalLM(Qwen3ForCausalLM):
                     break
         result = ids[:, :int(lengths.max()) + generated]
         trace = {"generation_mode": "showo2_text_ar", "backbone_kv_cache_enabled": False,
+                 "text_prediction_offset": self.text_prediction_offset,
+                 "text_hidden_alignment": self.text_hidden_alignment,
                  "generated_tokens": generated, "backbone_calls": generated}
         return (result, trace) if return_trace else result

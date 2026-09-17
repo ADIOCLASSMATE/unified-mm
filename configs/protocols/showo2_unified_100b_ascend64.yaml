@@ -143,3 +143,4 @@ new_architecture:
 projects:
   single: high-dimensionaldata
   dual-siglip: high-dimensionaldata
+  single-text-two-stream: high-dimensionaldata

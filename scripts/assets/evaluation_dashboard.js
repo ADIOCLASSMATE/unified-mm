@@ -30,6 +30,7 @@ function metricLeader(models,key,protocol='cfg2'){
 }
 function metricLink(metric){return metric?`<a href="${esc(metric.source)}" title="查看原始结果">${fmt(metric)}</a>`:'<span class="missing">—</span>'}
 function inModelGroup(model,group){
+ if(group==='only')return ['b_x0','b_t2i_only_matched','b_i2t_only_matched','b_text_only'].includes(model.id);
  return group==='all'||model.group===group||(['ablation','showo2'].includes(group)&&model.id==='b_x0');
 }
 function metricScope(scope){
@@ -162,10 +163,15 @@ function renderResearchOverview(){
   '<a href="#sampling/flow-head-scale">Flow head scale 消融</a>',`${D.flow_head_scale.completed} / ${D.flow_head_scale.total}`,
   flowHeadScaleSummary(D.flow_head_scale)
  ]);
- if(D.selection?.d_cfg_sweep)samplingRows.push([
+ if(D.selection?.d_cfg_sweep){
+ const dSweep=D.d_cfg_sweep;
+ const dBestFid=dSweep?.complete?dSweep.rows.reduce((a,b)=>a.d.fid<b.d.fid?a:b):null;
+ const dBestIs=dSweep?.complete?dSweep.rows.reduce((a,b)=>a.d.is>b.d.is?a:b):null;
+ samplingRows.push([
   '<a href="#sampling/d-cfg">D · CFG sweep</a>',`<span id="d-cfg-overview">${D.d_cfg_sweep?.completed??0} / 11</span>`,
-  'CFG 1.0–6.0 · Heun 10 · ImageNet-val 50K<br><span class="note">与 B 的 FID / IS 曲线对照，结果自动更新</span>'
+  dBestFid?`最低 FID <strong>${dBestFid.d.fid.toFixed(3)}</strong>（CFG=${dBestFid.cfg.toFixed(1)}）<br>最高 IS <strong>${dBestIs.d.is.toFixed(3)}</strong>（CFG=${dBestIs.cfg.toFixed(1)}）<br><span class="note">11 档已完成 · 完整 B / D 对照曲线见详情</span>`:'CFG 1.0–6.0 · Heun 10 · ImageNet-val 50K<br><span class="note">与 B 的 FID / IS 曲线对照，结果自动更新</span>'
  ]);
+ }
  const samplingNote=sweep?.conclusion&&matrix?.conclusion?
   '<strong>采样设置影响分数，也影响模型排名。</strong> FID 与 IS 的最优设置不同，换序收益因模型而异；E 的 Sequential 原生对照单列。解码探测的开销及 BF16 数值影响见细节，小幅差异不等于统计显著。':
   '各阶段分别报告完成情况与已测结果；实验完成后再给出该范围的最优结论。';
@@ -203,6 +209,7 @@ function renderResearchOverview(){
   summaryCard('03 / 采样设置与 Head 规模','采样与解码消融','sampling/parameters',summaryTable(['实验','完成组数','主要结果'],samplingRows),samplingNote,'<a href="#sampling/parameters">CFG / 步数 →</a><a href="#sampling/strategies">解码策略 →</a><a href="#sampling/cross-model">跨模型换序 →</a><a href="#sampling/flow-head-scale">Flow head scale →</a>')+
   summaryCard('04 / 优化过程与验证覆盖','训练与验证 Loss','training',summaryTable(['实验组','模型数','有训练记录','有验证记录'],trainRows),trainNote,'<a href="#training">全部模型与任务曲线 →</a>')+
   summaryCard('05 / 同输入、同设置的输出对照','定性样例','qualitative/t2i',summaryTable(['任务','每模型输入','已保存输出'],qualRows),qualitativeNote,'<a href="#qualitative/t2i">图像生成 →</a><a href="#qualitative/i2t">图像描述 →</a><a href="#qualitative/text">文本续写 →</a>')+
+  (D.style_instruction?summaryCard('新增 / INSTRUCTION & STYLE','Instruction 与风格泛化','style-instruction',`<p>${D.style_instruction.verified_images} 张图像 · 42 条文本探针 · B / S2-single / B T2I-only</p>`,esc(D.style_instruction.assessment?.headline??'固定噪声与词频平衡的上下文规则对照。'),'<a href="#style-instruction">图像、文本与数据证据 →</a>'): '')+
   summaryCard('06 / 数据来源与复现依据','数据与协议','sources',summaryTable(['用途','来源','规模 / 约定'],dataRows),dataNote,'<a href="#sources">数据来源、合成模板与文件 →</a>');
 }
 
@@ -210,7 +217,7 @@ function normalizeReportRoute(route){
  const aliases={sweep:'sampling/parameters',order:'sampling/strategies',sampling:'sampling/parameters',
   t2i:'qualitative/t2i',i2t:'qualitative/i2t',text:'qualitative/text',qualitative:'qualitative/t2i'};
  route=aliases[route]??route;
- return ['overview','matrix','matrix/showo2','unified-training','training','sources','sampling/parameters','sampling/d-cfg','sampling/strategies','sampling/cross-model','sampling/flow-head-scale',
+ return ['overview','research-status','matrix','matrix/showo2','unified-training','training','sources','style-instruction','sampling/parameters','sampling/d-cfg','sampling/strategies','sampling/cross-model','sampling/flow-head-scale',
   'qualitative/t2i','qualitative/i2t','qualitative/text'].includes(route)?route:'overview';
 }
 function showTab(requested,{scroll=true}={}){
@@ -237,5 +244,6 @@ function showTab(requested,{scroll=true}={}){
  }
  if(tab==='sampling'&&section==='d-cfg')renderDCfgSweep();
  if(tab==='training')renderLossCharts();
+ if(tab==='style-instruction'&&!state.styleInitialized){renderStyleInstruction(D.style_instruction,$('style-report'),(D.style_instruction?.root??'')+'/');state.styleInitialized=true}
  if(scroll)$(tab).scrollIntoView({block:'start'});
 }

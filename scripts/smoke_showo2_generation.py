@@ -49,9 +49,55 @@ def check_gradients(model, batch):
     return {"loss": float(result.loss), "gradient_l2_by_role": {k: v ** .5 for k, v in norms.items()}}
 
 
+def check_text_two_stream(model, tokenizer, batch):
+    """Check the actual NPU mask kernel, text gradients and unchanged S2 flow."""
+    if not model.model.text_two_stream:
+        return None
+    device = batch["input_ids"].device
+    ids = torch.tensor([tokenizer.encode("The scientist carefully checked every experimental result.",
+                                         add_special_tokens=False)], device=device)
+    target = ids.shape[1] // 2
+    changed = ids.clone()
+    changed[:, target:] = int(model.config.mask_token_id)
+    model.eval()
+    with torch.no_grad():
+        original = model(X0_input_ids=ids).last_hidden_state
+        other = model(X0_input_ids=changed).last_hidden_state
+        torch.testing.assert_close(original[:, :target+1], other[:, :target+1], rtol=0, atol=0)
+        times = torch.full((ids.shape[0],), .35, device=device)
+        kwargs = dict(image_span_table=batch["image_span_table"],
+                      image_uncond_rows=torch.ones(ids.shape[0], device=device, dtype=torch.bool))
+        first = model.predict_velocity(batch["input_ids"], batch["token_types"], batch["image_latents"], times, **kwargs)
+        try:
+            model.config.dual_stream_attention_contract = "showo2_omni_attention"
+            baseline = model.predict_velocity(batch["input_ids"], batch["token_types"], batch["image_latents"], times, **kwargs)
+        finally:
+            model.config.dual_stream_attention_contract = "showo2_text_two_stream"
+        torch.testing.assert_close(first, baseline, rtol=0, atol=0)
+        prefix = ids[:, :target]
+        teacher_ids = torch.cat([prefix, torch.full_like(ids[:, :1], model.config.mask_token_id)], -1)
+        expected = model(X0_input_ids=teacher_ids).logits[:, -1].argmax(-1)
+        generated = model.generate_text(prefix, max_new_tokens=1)
+        torch.testing.assert_close(generated[:, -1], expected, rtol=0, atol=0)
+    model.train()
+    output = model(X0_input_ids=ids, labels=ids, token_types=torch.zeros_like(ids))
+    output.loss.backward()
+    for name, parameter in model.named_parameters():
+        if parameter.grad is None or not torch.isfinite(parameter.grad).all():
+            raise AssertionError(f"Invalid text gradient: {name}")
+    mask_grad = float(model.model.embed_tokens.weight.grad[model.config.mask_token_id].float().norm())
+    if mask_grad <= 0:
+        raise AssertionError("Text query mask embedding received no training gradient")
+    model.zero_grad(set_to_none=True)
+    model.eval()
+    return dict(no_target_or_future_leakage=True, flow_matches_s2_single_bitwise=True,
+                generation_matches_same_position_query=True, text_mask_gradient_l2=mask_grad,
+                text_loss=float(output.per_modality_loss["text_loss"]))
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--variant", choices=("single", "dual-siglip"), required=True)
+    p.add_argument("--variant", choices=("single", "dual-siglip", "single-text-two-stream"), required=True)
     p.add_argument("--run-dir", type=Path, required=True)
     p.add_argument("--output-dir", type=Path, required=True)
     args = p.parse_args()
@@ -68,6 +114,8 @@ def main():
             config.model.model_path = str(checkpoint.resolve())
         model, tokenizer = load_model_tokenizer(config, model_dtype=torch.bfloat16)
         model.to(device).eval()
+        expected_offset = 0 if args.variant == "single-text-two-stream" else 1
+        assert model.text_prediction_offset == expected_offset
         state = model.state_dict(); verified = 0
         with safe_open(str(checkpoint / "model.safetensors"), framework="pt", device="cpu") as saved:
             for key in saved.keys():
@@ -86,6 +134,7 @@ def main():
         observed = (stats[:, :16] + stats[:, 16:] * noise_for(1, 42)).to(device)
         start = item["image_start"]
         batch["image_latents"][:, start:start+256] = observed
+        text_two_stream = check_text_two_stream(model, tokenizer, batch)
         gradients = check_gradients(model, batch) if kind == "current" else None
         torch.npu.reset_peak_memory_stats(device)
         began = time.monotonic()
@@ -116,7 +165,9 @@ def main():
         caption, caption_trace = model.generate("i2t", input_ids=image_ids[None].to(device),
             token_types=image_types[None].to(device), sigma=sigma[None].to(device),
             image_latents=image_latents, max_new_tokens=16, return_trace=True)
+        assert text_trace["text_prediction_offset"] == caption_trace["text_prediction_offset"] == expected_offset
         report = {"weights": kind, "checkpoint": str(checkpoint), "tensor_samples_verified": verified,
+            "text_two_stream": text_two_stream,
             "flow_gradients": gradients, "t2i": trace, "t2i_seconds": seconds,
             "peak_memory_allocated_bytes": torch.npu.max_memory_allocated(device),
             "text": {"trace": text_trace, "output": tokenizer.decode(text[0, ids.shape[1]:].tolist())},

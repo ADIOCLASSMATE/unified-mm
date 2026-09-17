@@ -2,9 +2,14 @@
 
 S2_ATTENTION = "showo2_omni_attention"
 S2_SCORING = "showo2_next_token_ar_target_aligned_v1"
+S2_TEXT_TWO_STREAM_ATTENTION = "showo2_text_two_stream"
+S2_TEXT_TWO_STREAM_SCORING = "showo2_text_query_same_position_v1"
+S2_ATTENTION_CONTRACTS = frozenset({S2_ATTENTION, S2_TEXT_TWO_STREAM_ATTENTION})
 
 
 def scoring_contract(attention_contract, legacy_contract):
+    if attention_contract == S2_TEXT_TWO_STREAM_ATTENTION:
+        return S2_TEXT_TWO_STREAM_SCORING
     return S2_SCORING if attention_contract == S2_ATTENTION else legacy_contract
 
 
@@ -20,7 +25,7 @@ def image_order_for_scoring(model_config, configured_order):
 def validate_image_generation_report(report, attention_contract, *, strategy=None, architecture_variant=None):
     """Require the public image generator and its architecture-specific cache mode."""
     is_joint = (architecture_variant or report.get("architecture_variant")) == "selfless_joint_dit"
-    use_cache = attention_contract != S2_ATTENTION and not is_joint
+    use_cache = attention_contract not in S2_ATTENTION_CONTRACTS and not is_joint
     if report.get("generation_entry") != "model.generate" or report.get("use_cache") is not use_cache:
         raise ValueError("held-out generation entry/cache differs from the model contract")
     strategies = report.get("strategies", {})
@@ -43,7 +48,8 @@ def validate_image_generation_report(report, attention_contract, *, strategy=Non
 
 def validate_formal_image_order_scoring(manifest, scoring):
     """Accept exact S2 AR scores or the formal Selfless MC64 estimator."""
-    is_s2 = manifest.get("dual_stream_attention_contract") == S2_ATTENTION
+    attention = manifest.get("dual_stream_attention_contract")
+    is_s2 = attention in S2_ATTENTION_CONTRACTS
     is_joint = manifest.get("architecture_variant") == "selfless_joint_dit"
     if is_joint:
         for value in (manifest, scoring):
@@ -54,14 +60,14 @@ def validate_formal_image_order_scoring(manifest, scoring):
                 raise ValueError("Joint DiT scoring must use the fixed whole-image contract")
     if is_s2:
         if (
-            scoring.get("dual_stream_attention_contract") != S2_ATTENTION
-            or manifest.get("scoring_contract") != S2_SCORING
-            or scoring.get("contract") != S2_SCORING
+            scoring.get("dual_stream_attention_contract") != attention
+            or manifest.get("scoring_contract") != scoring_contract(attention, None)
+            or scoring.get("contract") != scoring_contract(attention, None)
             or any(value.get("image_order_mc_contract") != "not_applicable_full_image_ar"
                    for value in (manifest, scoring))
         ):
             raise ValueError("S2 benchmark scoring must use the exact full-image AR contract")
-    elif scoring.get("dual_stream_attention_contract") == S2_ATTENTION:
+    elif scoring.get("dual_stream_attention_contract") in S2_ATTENTION_CONTRACTS:
         raise ValueError("benchmark manifest and scoring architecture differ")
     expected = 1 if is_s2 or is_joint else 64
     for value in (manifest, scoring):

@@ -1,6 +1,6 @@
 # 训练中下游验证
 
-`training_downstream_v1` 默认每 10,000 optimizer steps 执行。所有 rank 参与，使用固定全局样本和当前 EMA，结果保存在 `output/evaluation/training-validation/<run>/`。
+`training_downstream_v1` 的 100B 配方默认每 10,000 optimizer steps 执行；当前 31,800-step 消融每 3,180 步执行，EMA decay 按预算缩短为 0.9997。所有 rank 参与，使用固定全局样本和当前 EMA，结果保存在 `output/evaluation/training-validation/<run>/`。
 
 | 任务 | 样本 | 指标 |
 | --- | --- | --- |
@@ -17,7 +17,7 @@
 
 工作预算 540 秒，另留 60 秒用于汇总与恢复。结果分别记录 `complete`、`within_time_budget`、已处理样本数和耗时。
 
-同一验证点先用当前训练权重执行 [统一 loss](UNIFIED_LOSS_VALIDATION.md)，再用 EMA 执行下游评分。统一 loss 有独立计时；T2I/I2T loss 与分类共用 2,000 张图像清单。
+同一验证点先用当前训练权重执行 [统一 loss](UNIFIED_LOSS_VALIDATION.md)，短预算配置随后用 raw 权重生成 16 张固定 prompt/种子的图像，最后用 EMA 执行下游评分。生成统一采用 CFG 3.5、Heun10，并单独记录耗时；S2 使用完整模型刷新，Z 复用固定 backbone 条件，B+S2 使用 KV cache。统一 loss 有独立计时；T2I/I2T loss 与分类共用 2,000 张图像清单。
 
 ## 文件
 
@@ -25,8 +25,12 @@
 training-validation/<run>/
 ├── validation_summary_step_<N>.json
 ├── validation_unified_loss_metrics_step_<N>.json
-└── downstream_validation/step-<N>/
-    ├── subset.json
+├── downstream_validation/step-<N>/
+│   ├── subset.json
+│   └── summary.json
+└── validation_generation/step-<N>/
+    ├── overview.png / index.html
+    ├── <prompt-images>.png
     └── summary.json
 ```
 

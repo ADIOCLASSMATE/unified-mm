@@ -23,6 +23,8 @@ import traceback
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
+from utils.evaluation.model_contracts import S2_ATTENTION_CONTRACTS
+
 GIB = 1024 ** 3
 MODELS = ('b_x0', 's2_single')
 
@@ -102,7 +104,7 @@ def worker(args):
         cfg.experiment.validation_vae_path = 'public/vae/mar-kl16/kl16.ckpt'
         cfg.experiment.validation_vae_scaling_factor = .2325
         vae = load_vae(cfg, device, 'fp32')
-        use_cache = spec['backbone_attention'] != 'showo2_omni_attention'
+        use_cache = spec['backbone_attention'] not in S2_ATTENTION_CONTRACTS
         rows = manifest['samples']['t2i']
         order = spec['image_order']
         items, noises = [], []

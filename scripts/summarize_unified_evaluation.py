@@ -302,10 +302,18 @@ def main() -> None:
         validation_root / f"validation_generation_step_{step}.json"
     )
     generation = load_json(generation_path)
+    # Joint DiT has no image reveal order. Its held-out report uses the
+    # architecture's "joint" trace even when the shared FID runner retains
+    # its spatial_halton result key.
+    heldout_strategy = (
+        "joint"
+        if generation.get("architecture_variant") == "selfless_joint_dit"
+        else strategy_name
+    )
     generation_cache_enabled = validate_image_generation_report(
         generation,
         validation_run.get("dual_stream_attention_contract", "selfless_strict"),
-        strategy=strategy_name,
+        strategy=heldout_strategy,
     )
     image_paths = sorted(
         (validation_root / "validation_flow_images").glob(

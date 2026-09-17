@@ -37,6 +37,7 @@ from omegaconf import OmegaConf
 from safetensors import safe_open
 
 from pretrain.train_selfless_flow import _build_i2t_generation_prefix, _generate_i2t_caption_batch
+from utils.evaluation.model_contracts import S2_ATTENTION_CONTRACTS
 from utils.evaluation_model_source import (
     configure_model_source, load_model_source_weights, resolve_evaluation_model_source,
 )
@@ -153,9 +154,9 @@ def prepare(args):
             raise ValueError("invalid CFG override")
         manifest["contract"]["model_cfg"] = overrides
         manifest["contract"]["model_generation"] = {
-            spec["id"]: {"use_cache": spec["backbone_attention"] != "showo2_omni_attention" and spec["architecture"] != "selfless_joint_dit",
+            spec["id"]: {"use_cache": spec["backbone_attention"] not in S2_ATTENTION_CONTRACTS and spec["architecture"] != "selfless_joint_dit",
                          "flow_solver": "heun",
-                         "image_order": "whole_image" if spec["backbone_attention"] == "showo2_omni_attention" or spec["architecture"] == "selfless_joint_dit" else "checkpoint_native"}
+                         "image_order": "whole_image" if spec["backbone_attention"] in S2_ATTENTION_CONTRACTS or spec["architecture"] == "selfless_joint_dit" else "checkpoint_native"}
             for spec in models}
         manifest["contract"]["timing"] = {"warmup_batches": 1, "measured_repeats": args.timing_repeats,
             "batch_size_per_device": 8, "scope": "synchronized model.generate including device transfer; excludes VAE and PNG IO",
@@ -390,7 +391,7 @@ def run(args):
             weights["full_checkpoint_value_check"] = check_loaded_values(model, spec["checkpoint"])
         write_json(model_root / "load_reports" / f"rank-{rank:02d}.json", weights)
         model.to(device).eval()
-        use_cache = spec["backbone_attention"] != "showo2_omni_attention"
+        use_cache = spec["backbone_attention"] not in S2_ATTENTION_CONTRACTS
         image_use_cache = use_cache and spec["architecture"] != "selfless_joint_dit"
         image_solver = str(manifest["contract"].get("model_generation", {}).get(spec["id"], {}).get(
             "flow_solver", manifest["contract"]["flow_solver"]))

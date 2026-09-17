@@ -50,9 +50,13 @@ T2I + I2T 使用 32 卡、每卡 batch 32、GA2，交替执行两个任务，完
 
 ## Z：整图联合去噪
 
+当前启动 S2-single、S2-single 文本双流、Z、Z+B head，统一采用 31,800-step 短预算，在随机序语言建模项目从 step 0 开始；warmup 199、decay 7950、每 3180 步验证。B+S2 调制暂不启动。原 100B 配方作为架构定义保留，实际入口和新输出见 [训练](TRAINING.md#当前四项短预算消融)。
+
 [Z + B 单流 head](Z_B_HEAD_EXPERIMENT.md) 使用 B 的完整 head 模块，单流双向去噪 256 个 latent，backbone 条件和共享时间共同进入 AdaLN；其余配置沿用 Z。
 
 相关独立对照：[B + S2-single 调制](B_S2_MODULATION.md)，保留 B 的双流和随机序，只改变 backbone 条件注入的位置，参数量与 B 完全一致。
+
+[S2-single 文本双流](S2_TEXT_TWO_STREAM.md)只将 S2 backbone 的文本侧改为同位置 query 预测，消除一位 shift；S2 整图 flow 路径、head 与训练预算保持原样。
 
 [Z](Z_EXPERIMENT.md) 保留 B 的双流 backbone，将同一图像的 sigma 设为相同值；一次 backbone 生成固定条件，单流双向 DiT 在共享 t 下联合去噪全部 256 latent，默认 Heun10。数据和训练预算对齐 B，每轮验证额外生成 16 张固定 prompt 和种子的 EMA 图像，checkpoint 使用独立身份。
 

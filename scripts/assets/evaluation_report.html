@@ -33,14 +33,17 @@ nav{position:sticky;top:0;background:rgba(255,255,255,.97);border-bottom:1px sol
   <div class="stats" id="stats"></div><p class="note" id="updated"></p>
 </div></header>
 <nav aria-label="评测视图"><div class="tabs">
-  <a href="#overview" class="active" data-nav="overview">研究总览</a><a href="#matrix" data-nav="matrix">模型评测</a><a href="#unified-training" data-nav="unified-training">Unified 训练消融</a><a href="#sampling/parameters" data-nav="sampling">采样与解码消融</a><a href="#training" data-nav="training">训练与验证 Loss</a><a href="#qualitative/t2i" data-nav="qualitative">定性样例</a><a href="#sources" data-nav="sources">数据与协议</a>
+  <a href="#overview" class="active" data-nav="overview">研究总览</a><a href="#research-status" data-nav="research-status">现状与架构结论</a><a href="#matrix" data-nav="matrix">模型评测</a><a href="#unified-training" data-nav="unified-training">Unified 训练消融</a><a href="#sampling/parameters" data-nav="sampling">采样与解码消融</a><a href="#training" data-nav="training">训练与验证 Loss</a><a href="#qualitative/t2i" data-nav="qualitative">定性样例</a><a href="#style-instruction" data-nav="style-instruction">Instruction 与风格泛化</a><a href="#sources" data-nav="sources">数据与协议</a>
 </div></nav>
 <main class="wrap">
 <div id="error" hidden></div>
 <section class="panel" id="overview">
+  __FORWARD_ARCHITECTURE__
   <div class="abstract" id="research-abstract"></div>
+  <div class="box conclusion"><h2>现状与架构结论 · 从 B / S2 到 Z</h2><p>图像双向注意力、同位置文本预测，以及让 backbone 退出时间步迭代：沿实验过程查看观察、验证曲线与当前判断。</p><a href="#research-status">查看现状与证据 →</a></div>
   <div class="summary-grid" id="research-sections"></div>
 </section>
+__RESEARCH_STATUS__
 <section class="panel" id="matrix" hidden>
   <div class="section-head"><div><div class="section-kicker">01 / MODEL COMPARISON</div><h2>模型评测指标</h2><p class="note">默认比较正式 A / B；可切换 B 上的 C–F 消融、B / S2 对照或历史实验。每列保留自己的评测协议和原始结果链接。ARO Relation / Attribution 已统一为含文本先验的条件似然评分。</p></div><a class="back-overview" href="#overview">返回研究总览 ↑</a></div>
   <div class="metrics-controls"><div class="toolbar">
@@ -175,11 +178,15 @@ nav{position:sticky;top:0;background:rgba(255,255,255,.97);border-bottom:1px sol
   <div class="subnav" aria-label="定性任务"><a href="#qualitative/t2i" data-task="t2i">T2I · 图像生成</a><a href="#qualitative/i2t" data-task="i2t">I2T · 图像描述</a><a href="#qualitative/text" data-task="text">纯文本续写</a></div>
   <h3 id="gallery-title"></h3><p class="note" id="gallery-note"></p>
   <p class="note" id="gallery-speed" hidden></p>
-  <div class="toolbar"><button data-preset="main">正式 A / B</button><button data-preset="showo2">B / S2</button><button data-preset="ablation">B 上的消融（C–F）</button><button data-preset="legacy">历史消融</button><button data-preset="all">全部模型</button><span class="note" id="selected-count"></span></div>
+  <div class="toolbar"><button data-preset="main">正式 A / B</button><button data-preset="only">B / only 对照</button><button data-preset="showo2">B / S2</button><button data-preset="ablation">B 上的消融（C–F）</button><button data-preset="legacy">历史消融</button><button data-preset="all">全部模型</button><span class="note" id="selected-count"></span></div>
   <div class="selectors" id="model-selectors"></div>
   <div class="toolbar"><input type="search" id="sample-search" placeholder="搜索提示词、样本 ID 或类别" aria-label="搜索样本"><select id="sample-group" aria-label="样本组"></select><select id="sample-mode" aria-label="采样方式"></select><label>每页 <select id="page-size"><option>8</option><option>16</option><option>32</option><option value="10000">全部</option></select></label></div>
   <div class="scroll gallery-scroll" id="gallery"></div>
   <div class="pagination"><button id="previous">上一页</button><span id="page-label"></span><button id="next">下一页</button></div>
+</section>
+<section class="panel" id="style-instruction" hidden>
+  <div class="section-head"><div><div class="section-kicker">INSTRUCTION & STYLE GENERALIZATION</div><h2>Instruction 与风格泛化</h2></div><a class="back-overview" href="#overview">返回研究总览 ↑</a></div>
+  <div id="style-report"></div>
 </section>
 <section class="panel" id="sources" hidden>
   <div class="section-head"><div><div class="section-kicker">06 / DATA & PROTOCOLS</div><h2>消融数据协议与 200 万补充图像计划</h2></div><a class="back-overview" href="#overview">返回研究总览 ↑</a></div><p class="note">当前计划：完整 ImageNet train 底座之外，再准备至少 200 万张去重、512px 预处理并验收的原图；各来源配额是起点，额外合格图可以保留；优先复用 caption / prompt。下面分别记录目标配额、旧消融协议和 9 月 12 日首轮实际产物；计划数不代表已经下载或发布。</p>

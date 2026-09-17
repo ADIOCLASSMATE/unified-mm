@@ -227,3 +227,60 @@ def test_generation_summary_rejects_inconsistent_is_moments():
 
     with pytest.raises(ValueError, match="mean is inconsistent"):
         validate_t2i_generation_protocol(payload, profile="formal")
+
+
+@pytest.mark.parametrize("trace_name,head_calls,error", [
+    ("joint", 20, None),
+    ("joint", 10, "solver-specific"),
+    ("spatial_halton", 20, "cache"),
+])
+def test_joint_checkpoint_summary_uses_and_validates_its_whole_image_trace(
+    tmp_path, monkeypatch, trace_name, head_calls, error
+):
+    import json
+    from types import SimpleNamespace
+    from scripts import summarize_unified_evaluation as summary
+    from utils.evaluation_model_source import EvaluationModelSource
+
+    checkpoint = tmp_path / "hf_model-final-ema"
+    source = EvaluationModelSource(checkpoint, "hf_final_ema", 31800, 64, {})
+    root = tmp_path / "evaluation"
+    validation_root = root / "validation"
+    captions = validation_root / "validation_i2t_captions/step-00031800/captions.jsonl"
+    captions.parent.mkdir(parents=True)
+    captions.write_text('{}\n')
+    images = validation_root / "validation_flow_images"
+    images.mkdir()
+    (images / "step-00031800-joint.png").touch()
+    t2i = _formal_generation_metrics()
+    t2i.update(weight_source=source.kind, model_path=str(checkpoint),
+               evaluation_model_source=source.report(), model_source_load=source.report())
+    validation_keys = (
+        "loss", "loss_i2t", "loss_t2i", "ppl_text", "weighted_contribution_i2t",
+        "weighted_contribution_t2i", "weighted_contribution_total",
+    )
+    payloads = {
+        "evaluation_run.json": dict(complete=True, global_step=31800,
+            checkpoint=str(checkpoint), weight_source=source.kind, imagenet_split="val",
+            runtime_hashing_enabled=False, dual_stream_attention_contract="xlnet_content_diagonal"),
+        "validation_metrics_step_31800.json": {"metrics": {f"val/{key}": 1.0 for key in validation_keys}},
+        "metrics.json": t2i,
+        "validation_generation_step_31800.json": dict(
+            architecture_variant="selfless_joint_dit", generation_entry="model.generate", use_cache=False,
+            strategies={trace_name: dict(backbone_kv_cache_enabled=False,
+                generation_mode="joint_dit_full_image_flow", solver="heun", steps=10,
+                backbone_calls=1, flow_head_calls=head_calls)}),
+    }
+    monkeypatch.setattr(summary, "parse_args", lambda: SimpleNamespace(
+        checkpoint=checkpoint, output_root=root, profile="formal"))
+    monkeypatch.setattr(summary, "resolve_evaluation_model_source", lambda _: source)
+    monkeypatch.setattr(summary, "load_json", lambda path: payloads[path.name])
+    if error:
+        with pytest.raises(ValueError, match=error):
+            summary.main()
+    else:
+        summary.main()
+        result = json.loads((root / "evaluation_summary.json").read_text())
+        assert result["complete"] is True
+        assert result["qualitative_artifacts"]["backbone_kv_cache_enabled"] is False
+        assert result["t2i_fid_is"]["strategy"] == "spatial_halton"

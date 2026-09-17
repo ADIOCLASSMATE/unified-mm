@@ -1,5 +1,7 @@
 # Z
 
+> 当前入口已切换至 31,800-step（约 33B）配方：warmup 199、decay 7950、每 3180 步验证，随机序语言建模项目，基座 step 0 初始化。新输出目录使用 `33b`；下文 100B 配置及启动记录为原配方历史。详见[当前训练设置](TRAINING.md#当前四项短预算消融)。
+
 由 S2-single 相对 B 的结果提出的整图去噪实验。改动前工作区保存于 Git commit `6596710`。
 
 核心是**同一幅图的 token 共用 sigma，以及单流双向 DiT head**。沿用 B 的双流 Qwen3 backbone：query 读取 `sigma_kv < sigma_q`，content 读取 `sigma_kv <= sigma_q`，不修改 attention 层。

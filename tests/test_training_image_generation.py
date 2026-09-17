@@ -17,6 +17,14 @@ from utils import training_image_generation as generation
 from utils.sharded_ema import RankShardedEMA, build_sharded_ema_layout
 
 
+def s2_model(text_two_stream=False):
+    from test_showo2_unified import tiny_model as tiny_s2
+    model = tiny_s2()
+    if text_two_stream:
+        model.config.dual_stream_attention_contract = "showo2_text_two_stream"
+    return model
+
+
 def config(directory, samples=2, weights="raw"):
     return OmegaConf.create({"experiment": {"validation_generation": {
         "enabled": True, "weights": weights, "samples": samples, "prompt_file": str(Path(directory) / "prompts.json")}},
@@ -189,3 +197,81 @@ def test_explicit_ema_requires_ema_weights(tmp_path):
     with pytest.raises(RuntimeError, match="failed on a training rank") as error:
         runner.run(tiny_model(), Tokenizer(), device=torch.device("cpu"), step=2, output_dir=tmp_path)
     assert "without EMA" in str(error.value.__cause__)
+
+
+@pytest.mark.parametrize("text_two_stream", [False, True])
+@pytest.mark.parametrize("weights", ["raw", "ema"])
+def test_s2_full_refresh_images_restore_weights_rng_modes_and_gradients(monkeypatch, tmp_path, text_two_stream, weights):
+    write_prompts(tmp_path)
+    model = s2_model(text_two_stream).train()
+    model.image_flow_head.layers[0].eval()
+    modes = [m.training for m in model.modules()]
+    ema = RankShardedEMA(build_sharded_ema_layout(model, world_size=1), rank=0, decay=.9997, update_after_step=0)
+    ema.bind(model)
+    ema.initialize_from_model(global_step=2)
+    ema_weight = model.image_flow_head.output_proj.weight.detach().clone()
+    with torch.no_grad():
+        model.image_flow_head.output_proj.weight.add_(.1)
+    live = copy.deepcopy(model.state_dict())
+    model.model.embed_tokens.weight.grad = torch.ones_like(model.model.embed_tokens.weight)
+    calls = []
+    def check_weights(*args):
+        calls.append(1)
+        expected = live["image_flow_head.output_proj.weight"] if weights == "raw" else ema_weight
+        torch.testing.assert_close(model.image_flow_head.output_proj.weight, expected, rtol=0, atol=0)
+    handle = model.image_flow_head.register_forward_pre_hook(check_weights)
+    monkeypatch.setattr(generation, "load_vae", lambda *args: TinyVAE())
+    runner = generation.TrainingImageGenerator(config(tmp_path, weights=weights))
+    states = rng_snapshot()
+    for step in (2, 4):
+        report = runner.run(model, Tokenizer(), device=torch.device("cpu"), step=step, output_dir=tmp_path, ema=ema)
+        assert report["complete"] and report["samples"] == 2
+        assert report["weight_source"] == weights and report["cache_mode"] == "full_model_refresh"
+        assert report["method"] == ("S2-single + text two-stream" if text_two_stream else "S2-single")
+        for row in report["images"]:
+            trace = row["trace"]
+            assert trace["generation_mode"] == "showo2_full_image_flow"
+            assert trace["backbone_calls"] == trace["flow_head_calls"] == 40
+            assert trace["backbone_kv_cache_enabled"] is False
+        assert_rng(states)
+        assert [m.training for m in model.modules()] == modes
+        assert torch.equal(model.model.embed_tokens.weight.grad, torch.ones_like(model.model.embed_tokens.weight))
+        for name, value in model.state_dict().items():
+            torch.testing.assert_close(value, live[name], rtol=0, atol=0)
+    handle.remove()
+    assert len(calls) == 160
+    for index, name in enumerate(("cat", "dog")):
+        images = [tmp_path / f"validation_generation/step-{step}/{index:02d}-{name}.png" for step in (2, 4)]
+        assert images[0].read_bytes() == images[1].read_bytes()
+
+
+def _distributed_s2_worker(rank, rendezvous, directory):
+    torch.set_num_threads(1)
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2)
+    try:
+        for two_stream in (False, True):
+            output = Path(directory) / ("two-stream" if two_stream else "single")
+            model = s2_model(two_stream).train()
+            runner = generation.TrainingImageGenerator(config(directory, samples=1))
+            states = rng_snapshot()
+            with pytest.MonkeyPatch.context() as patch:
+                def load(*args):
+                    assert rank == 0
+                    return TinyVAE()
+                patch.setattr(generation, "load_vae", load)
+                report = runner.run(model, Tokenizer(), device=torch.device("cpu"), step=2, output_dir=output)
+                assert report["complete"] and report["samples"] == 1
+                def fail(*args):
+                    raise OSError("simulated S2 decoder failure")
+                patch.setattr(generation, "load_vae", fail)
+                with pytest.raises(RuntimeError, match="failed on a training rank"):
+                    runner.run(model, Tokenizer(), device=torch.device("cpu"), step=4, output_dir=output)
+            assert_rng(states)
+            assert model.training
+    finally:
+        dist.destroy_process_group()
+
+
+def test_distributed_s2_empty_ranks_and_decode_failures(tmp_path):
+    write_prompts(tmp_path)
+    mp.spawn(_distributed_s2_worker, args=(f"file://{tmp_path / 'rendezvous'}", str(tmp_path)), nprocs=2, join=True)

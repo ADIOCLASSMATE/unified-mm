@@ -5,4 +5,4 @@ if [[ "${1:-}" == "--smoke-suite" ]]; then
   shift
   exec bash "${REPO_ROOT}/script/selfless/pretraining_z_ascend64.sh" --smoke-suite --experiment z-b "$@"
 fi
-exec bash "${REPO_ROOT}/script/selfless/pretraining_z_ascend64.sh" --experiment z-b "$@"
+exec bash "${REPO_ROOT}/script/selfless/pretraining_short_ablation_ascend64.sh" --arm z-b "$@"

@@ -29,6 +29,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from utils.evaluation.model_contracts import S2_ATTENTION_CONTRACTS
 from utils.image_order_strategies import order_policy, checkpoint_generation_contract
 
 from scripts.image_evaluation_metrics import (  # noqa: E402
@@ -1874,7 +1875,7 @@ def main(*, model_loader=None):
     if attention_contract not in {
         "selfless_strict",
         "xlnet_content_diagonal",
-        "showo2_omni_attention",
+        *S2_ATTENTION_CONTRACTS,
     }:
         raise ValueError(
             "unsupported model.dual_stream_attention_contract="
@@ -1931,7 +1932,7 @@ def main(*, model_loader=None):
         model_dtype=requested_model_dtype,
     )
     flow_net = getattr(model.image_flow_head, "net", model.image_flow_head)
-    is_s2 = attention_contract == "showo2_omni_attention"
+    is_s2 = attention_contract in S2_ATTENTION_CONTRACTS
     is_joint_dit = getattr(model.config, "architecture_variant", None) == "selfless_joint_dit"
     if is_s2 or is_joint_dit:
         args.disable_backbone_kv_cache = True

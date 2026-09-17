@@ -19,4 +19,8 @@ for driver_library_dir in /usr/local/Ascend/driver/lib64/driver \
     export LD_LIBRARY_PATH="${driver_library_dir}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
   fi
 done
+if [[ "${1:-}" == "--text-two-stream-smoke-suite" ]]; then
+  shift
+  exec python scripts/smoke_s2_text_two_stream.py "$@"
+fi
 exec python scripts/launch_showo2_unified.py "$@"

@@ -35,6 +35,7 @@ from omegaconf import OmegaConf
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from utils.evaluation.model_contracts import S2_ATTENTION_CONTRACTS
 from utils.evaluation.model_contracts import scoring_contract
 from utils.evaluation.aro import ARO_TASKS, CONDITIONAL_SCORE, ARO_SCORE_VARIANT
 
@@ -164,7 +165,7 @@ def main() -> None:
     attention_contract = str(
         config.model.get("dual_stream_attention_contract", "selfless_strict")
     ).strip().lower()
-    if attention_contract not in {"selfless_strict", "xlnet_content_diagonal", "showo2_omni_attention"}:
+    if attention_contract not in {"selfless_strict", "xlnet_content_diagonal", *S2_ATTENTION_CONTRACTS}:
         raise ValueError(f"unknown dual-stream attention contract: {attention_contract}")
     configured_order = str(
         config.dataset.params.image.get("image_sigma_order", "random")
@@ -172,7 +173,7 @@ def main() -> None:
     image_sigma_order = (
         configured_order if args.image_sigma_order == "auto" else args.image_sigma_order
     )
-    if attention_contract == "showo2_omni_attention":
+    if attention_contract in S2_ATTENTION_CONTRACTS:
         image_sigma_order = "sequential"
         args.mc = 1  # Exact AR score; no image-order Monte Carlo distribution.
     is_joint_dit = config.model.get("architecture_variant") == "selfless_joint_dit"
@@ -181,7 +182,7 @@ def main() -> None:
         args.mc = 1
     image_order_mc_contract = (
         "not_applicable_joint_image" if is_joint_dit else
-        "not_applicable_full_image_ar" if attention_contract == "showo2_omni_attention" else IMAGE_ORDER_MC_CONTRACT)
+        "not_applicable_full_image_ar" if attention_contract in S2_ATTENTION_CONTRACTS else IMAGE_ORDER_MC_CONTRACT)
     if image_sigma_order not in {"random", "sequential", "spatial_halton", "spatial_halton_shifted", "joint"}:
         raise ValueError(f"unknown image sigma order: {image_sigma_order}")
     if int(args.mc) > 1 and image_sigma_order not in {"random", "spatial_halton_shifted"}:

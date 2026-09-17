@@ -24,8 +24,9 @@ from scripts.evaluation_report_training import collect_training, export_training
 from scripts.evaluation_report_provenance import collect_provenance, export_provenance
 from scripts.evaluation_report_unified import export_generation_sweep
 from scripts.evaluation_report_flow_scale import export_flow_head_sweep
+from scripts.evaluation_report_status import render_forward_architecture, render_research_status
 from utils.experiment_registry import current_presentation, presentation_sort_key, registered_experiments, experiment_identity, task_training_labels
-from utils.evaluation.model_contracts import S2_ATTENTION, S2_SCORING, validate_formal_image_order_scoring
+from utils.evaluation.model_contracts import S2_ATTENTION_CONTRACTS, scoring_contract, validate_formal_image_order_scoring
 from utils.evaluation.aro import ARO_TASKS, ARO_PRIMARY
 TEXT_TASKS = ("arc_easy", "arc_challenge", "hellaswag", "piqa", "winogrande", "boolq", "openbookqa", "mmlu")
 BENCHMARKS = {"sugarcrepe": 7511, "aro_vg_relation": 23937, "aro_vg_attribution": 28748,
@@ -187,8 +188,8 @@ def model_metrics(root: Path, spec: dict, selection: dict) -> dict:
         check_checkpoint(data, spec, selection, root)
         require(data.get("protocol", {}).get("protocol_schema") == "selfless_text_benchmark_v3",
                 f"obsolete text scoring protocol: {path}")
-        if spec.get("backbone_attention") == S2_ATTENTION:
-            require(data["protocol"].get("scoring_contract") == S2_SCORING,
+        if spec.get("backbone_attention") in S2_ATTENTION_CONTRACTS:
+            require(data["protocol"].get("scoring_contract") == scoring_contract(spec["backbone_attention"], None),
                     f"wrong S2 text scoring contract: {path}")
         if data.get("complete") is True:
             require(set(data["primary_metrics"]) == set(TEXT_TASKS), f"incomplete eight-task text result: {path}")
@@ -218,8 +219,8 @@ def model_metrics(root: Path, spec: dict, selection: dict) -> dict:
         check_checkpoint(manifest, spec, selection, root)
         require(manifest.get("schema") == "selfless_multimodal_likelihood_evaluation_v5" and
                 manifest.get("project_formal_protocol") is True, f"obsolete benchmark protocol: {manifest_path}")
-        is_s2 = spec.get("backbone_attention") == S2_ATTENTION
-        require((manifest.get("dual_stream_attention_contract") == S2_ATTENTION) == is_s2,
+        is_s2 = spec.get("backbone_attention") in S2_ATTENTION_CONTRACTS
+        require(manifest.get("dual_stream_attention_contract") == spec.get("backbone_attention"),
                 f"benchmark architecture mismatch: {manifest_path}")
         if is_s2:
             benchmark_summary = read(bench_root / "summary.json")
@@ -842,6 +843,13 @@ def build(root: Path, selection_file: Path, *, plots: bool = False, unified_plot
     selection = read(selection_file)
     require(selection.get("schema") == "unified_evaluation_report_selection_v1", "unknown report selection schema")
     gallery = gallery_data(root, selection)
+    style_instruction = None
+    if selection.get("style_instruction"):
+        study_root = within(root, selection["style_instruction"])
+        style_instruction = read(study_root / "summary.json")
+        require(style_instruction.get("complete") is True and read(study_root / "COMPLETED.json").get("complete") is True,
+                "style instruction study is incomplete")
+        style_instruction["root"] = selection["style_instruction"]
     models = []
     specs = report_model_specs(root, selection, gallery["manifest"]["models"])
     for spec in specs:
@@ -892,6 +900,7 @@ def build(root: Path, selection_file: Path, *, plots: bool = False, unified_plot
                "qualitative_records": len(gallery["records"]), "images_verified": gallery["images_verified"],
                "qualitative_contract": gallery["manifest"].get("contract", {}),
                "qualitative_speed": selection.get("qualitative_speed"),
+               "style_instruction": style_instruction,
                "generation_capacity": selection.get("generation_capacity"),
                "formal_models": sum(bool(m["metrics"]) for m in models),
                "formal_complete_models": sum(m["complete"] for m in models),
@@ -909,12 +918,17 @@ def build(root: Path, selection_file: Path, *, plots: bool = False, unified_plot
                "selection": selection, "scope": "project-native suite; external official generation scorers have separate result availability"}
     data = {**summary, "training": training, "samples": gallery["samples"], "records": gallery["records"], "labels": LABELS}
     template = (REPO / "scripts/assets/evaluation_report.html").read_text(encoding="utf-8")
+    require(template.count("__FORWARD_ARCHITECTURE__") == 1, "invalid forward architecture marker")
+    template = template.replace("__FORWARD_ARCHITECTURE__", render_forward_architecture())
+    require(template.count("__RESEARCH_STATUS__") == 1, "invalid research status marker")
+    template = template.replace("__RESEARCH_STATUS__", render_research_status(root, models))
     require(template.count("__REPORT_EXTENSIONS__") == 1, "invalid report extension marker")
     extensions = "\n".join((REPO / "scripts/assets" / name).read_text(encoding="utf-8")
                            for name in ("evaluation_dashboard.js", "evaluation_flow_head_scale.js",
                                         "evaluation_unified_training.js",
-                                        "evaluation_training.js", "evaluation_provenance.js"))
+                                        "evaluation_training.js", "evaluation_provenance.js", "evaluation_style_instruction.js"))
     template = template.replace("__REPORT_EXTENSIONS__", extensions)
+    template = template.replace("</style>", (REPO / "scripts/assets/evaluation_style_instruction.css").read_text() + "\n</style>", 1)
     # Generated text can contain HTML/script delimiters. It is data, never code.
     embedded = json.dumps(data, ensure_ascii=False, separators=(",", ":")).replace("<", "\\u003c").replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
     require(template.count("__REPORT_DATA__") == 1, "invalid report template")

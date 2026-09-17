@@ -35,6 +35,7 @@ from omegaconf import OmegaConf
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from utils.evaluation.model_contracts import S2_ATTENTION_CONTRACTS
 from utils.evaluation.model_contracts import scoring_contract
 
 from utils.evaluation_model_source import (  # noqa: E402
@@ -137,7 +138,7 @@ def main() -> None:
     if attention_contract not in {
         "selfless_strict",
         "xlnet_content_diagonal",
-        "showo2_omni_attention",
+        *S2_ATTENTION_CONTRACTS,
     }:
         raise ValueError(
             "unsupported dual-stream attention contract: "

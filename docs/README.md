@@ -43,6 +43,7 @@
 | 文档 | 内容 |
 | --- | --- |
 | [四组实验设计](SHOWO2_UNIFIED_ABLATION_DESIGN.md) | B、B+SigLIP、S2-single/dual与Show-o2阶段训练 |
+| [S2-single 文本双流](S2_TEXT_TWO_STREAM.md) | 文本 backbone 消除一位 shift，保持 S2 整图 flow head |
 | [B+SigLIP](B_SIGLIP_UNIFIED_ABLATION.md) | 实现、参数与infra |
 | [S2 infra](S2_INFRA_20260910.md) | RF4、checkpointing、吞吐和恢复验证 |
 | [Z](Z_EXPERIMENT.md) | 同图 sigma 相同、双流 backbone 一次前向、单流 DiT 联合去噪，Heun10（20 次 head） |

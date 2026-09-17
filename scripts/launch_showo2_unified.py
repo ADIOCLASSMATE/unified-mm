@@ -64,6 +64,8 @@ def launch_plan(variant: str, *, smoke: bool, label: str, steps: int, environmen
             raise ValueError("resume checkpoint belongs to a different architecture")
         if bool(saved_config.model.s2_use_siglip) != bool(config.model.s2_use_siglip):
             raise ValueError("resume checkpoint belongs to the other S2 arm")
+        if saved_config.model.dual_stream_attention_contract != config.model.dual_stream_attention_contract:
+            raise ValueError("resume checkpoint uses a different S2 text prediction contract")
         _validate_checkpoint_complete(checkpoint, expected_global_step=resume_step)
         resume_from_checkpoint = str(checkpoint)
         audit_root = output_root / "prelaunch_audit" / f"resume-{resume_step}-to-{target}" / f"node-{rank}"
@@ -113,7 +115,7 @@ def launch_plan(variant: str, *, smoke: bool, label: str, steps: int, environmen
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--variant", choices=("single", "dual-siglip"), required=True)
+    parser.add_argument("--variant", choices=("single", "dual-siglip", "single-text-two-stream"), required=True)
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--label", default="r1")
     parser.add_argument("--steps", type=int, default=6)

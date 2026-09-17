@@ -35,6 +35,7 @@ from omegaconf import OmegaConf
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from utils.evaluation.model_contracts import S2_ATTENTION_CONTRACTS
 from utils.evaluation_model_source import (  # noqa: E402
     add_model_source_argument,
     configure_model_source,
@@ -587,10 +588,15 @@ def build_attention_masks(
     attention_contract: str,
     device: torch.device,
 ) -> tuple[Any, Any | None]:
-    if attention_contract == "showo2_omni_attention":
-        from models.modeling_model.modeling_showo2_unified import omni_allowed_mask, attention_from_allowed
-        return attention_from_allowed(omni_allowed_mask(input_ids, token_types,
-            boi_token_id=boi_token_id, segment_ids=segment_ids)), None
+    if attention_contract in S2_ATTENTION_CONTRACTS:
+        from models.modeling_model.modeling_showo2_unified import (
+            omni_allowed_mask, attention_from_allowed, text_query_allowed_mask)
+        allowed = omni_allowed_mask(input_ids, token_types,
+            boi_token_id=boi_token_id, segment_ids=segment_ids)
+        content_mask = attention_from_allowed(allowed)
+        if attention_contract == "showo2_text_two_stream":
+            return attention_from_allowed(text_query_allowed_mask(allowed, token_types)), content_mask
+        return content_mask, None
     kwargs = {
         "sigma": sigma,
         "seq_len": int(sigma.shape[1]),
