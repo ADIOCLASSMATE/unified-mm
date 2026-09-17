@@ -2,7 +2,9 @@
 
 
 def joint_experiment_protocol(name):
-    if name == "z":
+    if name == "y":
+        from utils import y_protocol as protocol
+    elif name == "z":
         from utils import joint_dit_protocol as protocol
     elif name == "z-b":
         from utils import joint_b_protocol as protocol

@@ -412,6 +412,9 @@ def _prepare_loss_forward_batch(batch, *, config, device, source_name, mixed_sou
     if config.model.get("architecture_variant") == "showo2_unified":
         forward_kwargs["s2_image_uncond_rows"] = image_uncond_rows
         forward_kwargs["s2_image_uncond_mask"] = image_uncond_mask
+    elif config.model.get("architecture_variant") == "selfless_y":
+        forward_kwargs["y_image_uncond_rows"] = image_uncond_rows
+        forward_kwargs["y_image_uncond_mask"] = image_uncond_mask
     elif config.model.get("architecture_variant") == "selfless_joint_dit":
         forward_kwargs["joint_image_uncond_rows"] = image_uncond_rows
         forward_kwargs["joint_image_uncond_mask"] = image_uncond_mask
@@ -2834,7 +2837,8 @@ def _save_validation_flow_images(
         config.model.get("dual_stream_attention_contract", "selfless_strict"),
     ))
     is_joint_dit = getattr(unwrapped.config, "architecture_variant", None) == "selfless_joint_dit"
-    use_cache = attention_contract not in S2_ATTENTION_CONTRACTS and not is_joint_dit
+    is_y = getattr(unwrapped.config, "architecture_variant", None) == "selfless_y"
+    use_cache = attention_contract not in S2_ATTENTION_CONTRACTS and not (is_joint_dit or is_y)
     generation_ids, generation_types, generation_sigma = input_ids, token_types, sigma
     generation_spans = selected_spans
     if not use_cache:
@@ -2904,7 +2908,7 @@ def _save_validation_flow_images(
         if use_cache:
             generation_step_max = int(trace["generation_step"].max().item())
         else:
-            expected_mode = "joint_dit_full_image_flow" if is_joint_dit else "showo2_full_image_flow"
+            expected_mode = "y_masked_token_flow" if is_y else "joint_dit_full_image_flow" if is_joint_dit else "showo2_full_image_flow"
             if trace.get("generation_mode") != expected_mode:
                 raise RuntimeError("Validation requires the checkpoint's full-image generation mode")
             generation_step_max = int(trace["steps"])
@@ -2948,6 +2952,9 @@ def _save_validation_flow_images(
             report_strategies[strategy].update({key: trace[key] for key in (
                 "solver", "steps", "backbone_calls", "flow_head_calls", "backbone_streams",
                 "flow_head_streams", "cfg_batched", "shared_time_per_image")})
+        if is_y:
+            report_strategies[strategy].update({key: trace[key] for key in (
+                "solver", "steps", "reveal_steps", "reveal_counts", "backbone_calls", "flow_head_calls")})
 
     metric_keys = sorted(local_logs)
     metric_values = torch.tensor(

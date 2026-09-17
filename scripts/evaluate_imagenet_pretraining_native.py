@@ -153,7 +153,7 @@ def main() -> None:
     if attention_contract in S2_ATTENTION_CONTRACTS:
         image_sigma_order = "sequential"
         args.scoring_backend = "repeated_full_sequence"
-    if config.model.get("architecture_variant") == "selfless_joint_dit":
+    if config.model.get("architecture_variant") in {"selfless_joint_dit", "selfless_y"}:
         image_sigma_order = "joint"
     if image_sigma_order not in {"random", "sequential", "joint"}:
         raise ValueError(f"unknown image sigma order: {image_sigma_order}")

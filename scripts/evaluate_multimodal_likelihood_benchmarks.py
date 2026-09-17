@@ -176,7 +176,7 @@ def main() -> None:
     if attention_contract in S2_ATTENTION_CONTRACTS:
         image_sigma_order = "sequential"
         args.mc = 1  # Exact AR score; no image-order Monte Carlo distribution.
-    is_joint_dit = config.model.get("architecture_variant") == "selfless_joint_dit"
+    is_joint_dit = config.model.get("architecture_variant") in {"selfless_joint_dit", "selfless_y"}
     if is_joint_dit:
         image_sigma_order = "joint"
         args.mc = 1

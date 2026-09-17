@@ -13,7 +13,7 @@ def environment(rank=0):
                 PET_MASTER_ADDR="127.0.0.1", PET_MASTER_PORT="29500")
 
 
-@pytest.mark.parametrize("arm", ARMS)
+@pytest.mark.parametrize("arm", [arm for arm in ARMS if arm != "y"])
 def test_short_config_keeps_model_data_optimizer_and_scales_ema(arm):
     config = OmegaConf.load(ROOT / config_path(arm))
     base = OmegaConf.load(ROOT / config_path(arm, base=True))
@@ -70,7 +70,7 @@ def test_all_four_nodes_launch_the_same_fresh_short_run(arm):
         assert f"config={config_path(arm)}" in plan["command"]
         assert "experiment.resume_from_checkpoint=none" in plan["command"]
         assert ("--assets" in plan["preflight"]) == (rank == 0)
-    base = OmegaConf.load(ROOT / config_path(arm, base=True))
+    base = OmegaConf.load(ROOT / config_path("z" if arm == "y" else arm, base=True))
     with pytest.raises(ValueError, match="exact short-budget run"):
         launch_plan(arm, environment=environment(),
                     resume=str(ROOT / "output" / base.experiment.project / "checkpoint-2000"))

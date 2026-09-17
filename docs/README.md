@@ -48,6 +48,7 @@
 | [S2 infra](S2_INFRA_20260910.md) | RF4、checkpointing、吞吐和恢复验证 |
 | [Z](Z_EXPERIMENT.md) | 同图 sigma 相同、双流 backbone 一次前向、单流 DiT 联合去噪，Heun10（20 次 head） |
 | [Z + B 单流 head](Z_B_HEAD_EXPERIMENT.md) | B 的完整层与初始化，单流双向注意力，backbone 条件 + t 进入 AdaLN |
+| [Y](Y_EXPERIMENT.md) | T2I 可见集合双向、mask query 读取集合、逐 token flow head 只监督未知位置；cosine 分轮生成，I2T 保持完整图像双向 |
 
 ## 表征研究
 

@@ -239,6 +239,8 @@ def parse_args():
         ),
     )
     parser.add_argument("--sampling_steps", default="10")
+    parser.add_argument("--reveal_steps", type=int, default=None,
+                        help="Y only: outer cosine reveal rounds; independent of flow sampling steps")
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--cfg", type=float, default=1.0)
     parser.add_argument("--cfg_schedule", choices=["constant", "linear"], default="constant")
@@ -781,6 +783,7 @@ def build_evaluation_resume_contract(
             "cfg": float(args.cfg),
             "cfg_schedule": str(args.cfg_schedule),
             "sampling_steps": str(args.sampling_steps),
+            "reveal_steps": getattr(args, "reveal_steps", None),
             "temperature": float(args.temperature),
             "flow_solver": str(args.flow_solver),
             "parallel_rate": int(args.parallel_rate),
@@ -1934,8 +1937,12 @@ def main(*, model_loader=None):
     flow_net = getattr(model.image_flow_head, "net", model.image_flow_head)
     is_s2 = attention_contract in S2_ATTENTION_CONTRACTS
     is_joint_dit = getattr(model.config, "architecture_variant", None) == "selfless_joint_dit"
-    if is_s2 or is_joint_dit:
+    is_y = getattr(model.config, "architecture_variant", None) == "selfless_y"
+    if is_s2 or is_joint_dit or is_y:
         args.disable_backbone_kv_cache = True
+    if args.reveal_steps is not None:
+        if not is_y or not 1 <= args.reveal_steps <= model.config.image_tokens_per_img:
+            raise ValueError("--reveal_steps requires Y and 1..image_tokens rounds")
     loaded_attention_contract = str(
         getattr(
             model.config,
@@ -2488,6 +2495,7 @@ def main(*, model_loader=None):
                 ),
                 return_trace=True,
                 debug_finite=bool(args.debug_finite_generation),
+                **({"reveal_steps": args.reveal_steps} if is_y else {}),
             )
             require_finite_generated_latents(
                 single_latents,
@@ -2720,7 +2728,7 @@ def main(*, model_loader=None):
     )
 
     model_position_contract = pure_2d_position_contract()
-    if is_joint_dit:
+    if is_joint_dit or is_y:
         model_position_contract["flow_head"] = flow_net.position_contract()
     results = {
         "schema": "selfless_imagenet_val_t2i_fid_is_v2",

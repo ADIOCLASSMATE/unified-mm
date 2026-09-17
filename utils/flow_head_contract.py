@@ -38,7 +38,7 @@ def validate_flow_head_attention_contract(config, *, label: str = "model") -> st
     elif architecture == "showo2_unified":
         if contract != "showo2_omni_attention":
             raise ValueError("Show-o2 requires flow_head_attention_contract=showo2_omni_attention")
-    elif architecture == POSITIONWISE_ON_B_ARCHITECTURE:
+    elif architecture in {POSITIONWISE_ON_B_ARCHITECTURE, "selfless_y"}:
         if contract != POSITIONWISE_FLOW_HEAD_ATTENTION_CONTRACT:
             raise ValueError(
                 f"{label} architecture {architecture!r} has no flow-head "
@@ -72,7 +72,7 @@ def flow_head_attention_report(config) -> dict[str, object]:
                 "flow_head_attention_contract": contract, "cross_token_attention": True,
                 "query_stream_input": "backbone_noisy_image_hidden", "query_stream_diagonal": True,
                 "content_stream_input": None, "content_stream_diagonal": None}
-    if architecture == POSITIONWISE_ON_B_ARCHITECTURE:
+    if architecture in {POSITIONWISE_ON_B_ARCHITECTURE, "selfless_y"}:
         return {
             "applicable": False,
             "architecture": "positionwise_adaln_mlp",

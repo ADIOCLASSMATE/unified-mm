@@ -16,7 +16,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--assets", action="store_true")
     parser.add_argument("--require-npu-count", type=int, default=0)
-    parser.add_argument("--experiment", choices=("z", "z-b"), default="z")
+    parser.add_argument("--experiment", choices=("z", "z-b", "y"), default="z")
     args = parser.parse_args()
     protocol = joint_experiment_protocol(args.experiment)
     config = OmegaConf.load(ROOT / protocol.CONFIG)

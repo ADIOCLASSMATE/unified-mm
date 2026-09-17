@@ -68,6 +68,8 @@ S2-single 的 31,800-step 入口为 `bash script/selfless/pretraining_s2_single_
 
 [Z + B 单流 head](Z_B_HEAD_EXPERIMENT.md) 使用 `bash script/selfless/pretraining_z_b_head_ascend64.sh`，复用 Z 的训练与整图生成流程，head 使用 B 的全部层和初始化，`proj(h) + time_embed(t)` 进入 AdaLN。
 
+[Y](Y_EXPERIMENT.md) 使用 `bash script/selfless/pretraining_y_ascend64.sh`，配置为 [Y 33B](../configs/selfless/unified_y_33b_ascend64.yaml)，从基座 step 0 开始，64 卡、31,800 updates。T2I 随机抽取可见图像集合做双向 content attention，mask query 读取文本与可见集合；逐 token MLP flow head 只优化未见 token。I2T 保持整图双向。默认生成采用 8 轮 cosine reveal，每轮 Heun10，重算 backbone 条件并固定已生成 token。`--smoke-suite --validation` 在固定开发机检查训练、验证、断点恢复和 raw/EMA 采样。
+
 [B + S2-single 调制](B_S2_MODULATION.md) 使用 `bash script/selfless/pretraining_b_s2_modulation_ascend64.sh`。Backbone 和 head 均保留 B 双流，只将 backbone 条件移到 head 输入，AdaLN 仅接收时间；当前为 64 卡、31,800 updates，每轮验证使用 raw 权重和 KV cache 生成 16 张图像。
 
 无 ClimbMix 的 T2I + I2T 对照在随机序语言建模项目使用 2 节点 × 16 卡，配置为 [joint 32 卡](../configs/selfless/unified_b_t2i_i2t_matched_ascend32.yaml)：

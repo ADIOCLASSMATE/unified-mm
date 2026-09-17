@@ -12,6 +12,7 @@ VAL_EVERY = 3180
 EMA_DECAY = 0.9997
 RUN_REVISION = "r2"
 ARMS = {
+    "y": ("unified_y", "y", "Y"),
     "s2-single": ("unified_s2_single", "s2_single", "S2-single"),
     "s2-text2stream": ("unified_s2_single_text_two_stream", "s2_single_text_two_stream", "S2-single + text two-stream"),
     "z": ("unified_z", "z", "Z"),
@@ -26,6 +27,9 @@ def config_path(arm, *, base=False):
 
 
 def expected_config(arm):
+    if arm == "y":
+        from utils.y_protocol import expected_config as y_config
+        return y_config()
     config = OmegaConf.load(ROOT / config_path(arm, base=True))
     if arm in ("s2-single", "s2-text2stream"):
         from utils.showo2_unified_protocol import validate_s2_config

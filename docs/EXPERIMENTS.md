@@ -60,6 +60,10 @@ T2I + I2T 使用 32 卡、每卡 batch 32、GA2，交替执行两个任务，完
 
 [Z](Z_EXPERIMENT.md) 保留 B 的双流 backbone，将同一图像的 sigma 设为相同值；一次 backbone 生成固定条件，单流双向 DiT 在共享 t 下联合去噪全部 256 latent，默认 Heun10。数据和训练预算对齐 B，每轮验证额外生成 16 张固定 prompt 和种子的 EMA 图像，checkpoint 使用独立身份。
 
+## Y：随机可见集合与分轮生成
+
+[Y](Y_EXPERIMENT.md) 在 T2I 中随机选取可见图像集合，由 content 流在集合内双向编码，全部 mask query 读取该集合；backbone hidden 作为逐 token AdaLN MLP flow head 的条件，只监督集合外的未知位置。I2T 继续使用完整图像双向编码，生成以 cosine 调度扩大可见集合，每轮只采样新增位置并保留已生成 latent。head 复用 F 的逐位置结构，默认 8 轮 reveal、每轮 Heun10；使用独立 Y attention 与生成循环，训练入口为 `script/selfless/pretraining_y_ascend64.sh`，配方为 64 卡、31,800 steps。
+
 ## S2 与 SigLIP
 
 目标是检验额外语义／细节双路径在本项目架构和训练范式下是否必要。

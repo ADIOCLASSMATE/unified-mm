@@ -99,6 +99,7 @@ def load_model_tokenizer(
     from models.modeling_model.image_backbone import validate_image_data_layout
     from models.modeling_model.modeling_showo2_unified import Showo2UnifiedConfig, Showo2UnifiedForCausalLM
     from models.modeling_model.modeling_joint_dit import JointDiTConfig, JointDiTForCausalLM
+    from models.modeling_model.modeling_y import YConfig, YForCausalLM
     from models.modeling_model.modeling_selfless_siglip import SelflessSiglipConfig, SelflessSiglipForCausalLM
     from models.modeling_model.modeling_single_stream_text_ar import (
         SingleStreamTextARConfig,
@@ -151,6 +152,10 @@ def load_model_tokenizer(
         )
 
         implementation_label = "positionwise_selfless"
+    elif architecture_variant == "selfless_y":
+        Qwen3ForCausalLM = YForCausalLM
+        model_config_class = YConfig
+        implementation_label = "selfless_y"
     elif architecture_variant == "selfless_joint_dit":
         Qwen3ForCausalLM = JointDiTForCausalLM
         model_config_class = JointDiTConfig
@@ -225,6 +230,7 @@ def load_model_tokenizer(
         )
 
     multimodal_config_keys = (
+        "y_empty_visible_prob", "y_reveal_steps",
         "joint_dit_head_dim", "joint_dit_intermediate", "joint_dit_head_type",
         "b_siglip_path", "b_siglip_width", "b_siglip_intermediate", "b_siglip_heads",
         "b_siglip_depth", "b_siglip_gradient_checkpointing", "b_siglip_initialization_seed",
@@ -318,7 +324,7 @@ def load_model_tokenizer(
             value = getattr(model_config, key)
         elif key == "joint_dit_head_type" and source_has_image_flow and architecture_variant == "selfless_joint_dit":
             value = getattr(model_config, key, "s2")
-        elif key.startswith(("s2_", "b_siglip_", "joint_dit_")) and source_has_image_flow:
+        elif key.startswith(("s2_", "b_siglip_", "joint_dit_", "y_")) and source_has_image_flow:
             value = getattr(model_config, key, None)
         elif key == "flow_head_attention_contract" and source_has_image_flow:
             # A trained checkpoint owns this numerical contract. Legacy A/B

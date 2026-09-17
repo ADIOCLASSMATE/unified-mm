@@ -267,7 +267,12 @@ def _apply_checkpoint_model_contract(config, saved_model, *, label: str) -> None
         for field, value in saved_model.items():
             if field.startswith("b_siglip_"):
                 config.model[field] = value
-    if saved_architecture == "selfless_joint_dit":
+    if saved_architecture == "selfless_y":
+        valid_flow_head_contract = flow_head_attention_contract == "not_applicable"
+        for field, value in saved_model.items():
+            if field.startswith("y_") or field in {"image_flow_solver", "image_input_noise_strength"}:
+                config.model[field] = value
+    elif saved_architecture == "selfless_joint_dit":
         valid_flow_head_contract = flow_head_attention_contract == "joint_bidirectional"
         head_type = saved_model.get("joint_dit_head_type", "s2")
         if head_type not in {"s2", "b_single_stream"}:
@@ -314,7 +319,7 @@ def _apply_checkpoint_model_contract(config, saved_model, *, label: str) -> None
     ).strip().lower()
     valid_flow_condition_contracts = (
         {"backbone_xt_fixed"}
-        if saved_architecture == "selfless_joint_dit"
+        if saved_architecture in {"selfless_joint_dit", "selfless_y"}
         else
         {"backbone_noisy_image_hidden"}
         if saved_architecture == "showo2_unified"
@@ -359,7 +364,7 @@ def _apply_checkpoint_model_contract(config, saved_model, *, label: str) -> None
     # this as optional, but make it authoritative whenever present.
     if "training_image_sigma_order" in saved_model:
         order = str(saved_model["training_image_sigma_order"]).lower()
-        if order not in {"random", "sequential"} and not (saved_architecture == "selfless_joint_dit" and order == "joint"):
+        if order not in {"random", "sequential"} and not (saved_architecture in {"selfless_joint_dit", "selfless_y"} and order == "joint"):
             raise ValueError(
                 f"{label} has invalid training_image_sigma_order={order!r}"
             )

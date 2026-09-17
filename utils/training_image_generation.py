@@ -57,6 +57,9 @@ def serializable_trace(trace):
               if value is None or isinstance(value, (str, bool, int, float))}
     if torch.is_tensor(trace.get("generation_order")):
         result["generation_order"] = trace["generation_order"].detach().cpu().tolist()
+    for key in ("reveal_order", "reveal_counts"):
+        if key in trace:
+            result[key] = trace[key]
     return result
 
 
@@ -113,6 +116,7 @@ class TrainingImageGenerator:
             return None
         profile = self.profile
         joint = getattr(model.config, "architecture_variant", None) == "selfless_joint_dit"
+        y_model = getattr(model.config, "architecture_variant", None) == "selfless_y"
         s2 = getattr(model.config, "architecture_variant", None) == "showo2_unified"
         method = "Z" if joint else "B + S2-single modulation"
         if joint and getattr(model.config, "joint_dit_head_type", "s2") == "b_single_stream":
@@ -122,8 +126,12 @@ class TrainingImageGenerator:
             if getattr(model.config, "dual_stream_attention_contract", None) == "showo2_text_two_stream":
                 method = "S2-single + text two-stream"
         image_order, generation_order = ("joint", "joint") if joint else ("random", "spatial_halton")
-        use_cache = not (joint or s2)
+        if y_model:
+            method, image_order, generation_order = "Y", "joint", "random"
+        use_cache = not (joint or s2 or y_model)
         cache_mode = "full_model_refresh" if s2 else "fixed_backbone_condition" if joint else "backbone_and_flow_kv"
+        if y_model:
+            cache_mode = "backbone_condition_per_reveal"
         rank, world = (dist.get_rank(), dist.get_world_size()) if _distributed() else (0, 1)
         directory = Path(output_dir) / "validation_generation" / f"step-{step}"
         _synchronize(device)
@@ -143,11 +151,11 @@ class TrainingImageGenerator:
         with _local_phase(device):
             if weights == "ema" and generation_ema is None:
                 raise ValueError("EMA generation requested without EMA weights")
-            if not (joint or s2) and not (
+            if not (joint or s2 or y_model) and not (
                 getattr(model.config, "architecture_variant", None) == "selfless_contextual"
                 and getattr(model.config, "image_flow_conditioning_mode", None) == "s2_input"
             ):
-                raise ValueError("validation_generation requires S2, Z or B + S2 modulation")
+                raise ValueError("validation_generation requires S2, Z, Y or B + S2 modulation")
             if rank == 0:
                 atomic_write_text(directory / "summary.json", json.dumps(summary, indent=2) + "\n")
                 print(json.dumps({"event": "training_image_generation_start", "step": step,
@@ -175,6 +183,10 @@ class TrainingImageGenerator:
                         if item["input_ids"].numel() > self.pad_to_length:
                             raise ValueError(f"validation prompt exceeds sequence length: {prompt['id']}")
                         batch = collate_imagenet_flow_cache([item], pad_to_length=self.pad_to_length)
+                        reveal_kwargs = {}
+                        if y_model:
+                            generator = torch.Generator().manual_seed(profile.seed + 1000003 * index)
+                            reveal_kwargs["reveal_order"] = torch.randperm(count, generator=generator)[None].to(device)
                         latents, trace = model.generate("t2i", input_ids=batch["input_ids"].to(device),
                             token_types=batch["token_types"].to(device), sigma=batch["sigma"].to(device),
                             spans=[(0, item["image_start"], item["image_start"] + count)],
@@ -184,7 +196,7 @@ class TrainingImageGenerator:
                             # Joint generation reuses one fixed backbone result;
                             # B caches backbone/head KV; S2 refreshes the whole
                             # model for every ODE evaluation and CFG branch.
-                            use_cache=use_cache, return_trace=True, debug_finite=True)
+                            use_cache=use_cache, return_trace=True, debug_finite=True, **reveal_kwargs)
                         expected_calls = profile.steps * (2 if profile.solver == "heun" else 1)
                         if joint and (trace.get("backbone_calls"), trace.get("flow_head_calls")) != (1, expected_calls):
                             raise RuntimeError("Z validation generation violated its backbone/head call contract")
@@ -195,6 +207,12 @@ class TrainingImageGenerator:
                                 or trace.get("solver") != profile.solver or trace.get("steps") != profile.steps
                                 or (trace.get("backbone_calls"), trace.get("flow_head_calls")) != (full_calls, full_calls)):
                                 raise RuntimeError("S2 validation generation violated its full-refresh contract")
+                        elif y_model:
+                            rounds = int(model.config.y_reveal_steps)
+                            if ((trace.get("backbone_calls"), trace.get("flow_head_calls")) != (rounds, rounds * expected_calls)
+                                or trace.get("generation_mode") != "y_masked_token_flow"
+                                or trace.get("backbone_kv_cache_enabled") is not False):
+                                raise RuntimeError("Y validation generation violated its reveal/head contract")
                         elif not joint:
                             if (not trace["backbone_kv_cache_enabled"]
                                 or trace["flow_conditioning_mode"] != "s2_input"
