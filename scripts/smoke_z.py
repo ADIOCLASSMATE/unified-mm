@@ -46,9 +46,9 @@ def generation(checkpoint, weights, output, experiment="z"):
     load_report = load_model_source_weights(model, source) if source else {"kind": "current"}
     model.to(device).eval()
     expected_head = "b_single_stream" if experiment == "z-b" else "s2"
-    if experiment == "y" and model.config.architecture_variant != "selfless_y":
+    if experiment in {"y", "y-marmask"} and model.config.architecture_variant != "selfless_y":
         raise RuntimeError("Checkpoint did not restore Y")
-    if experiment != "y" and getattr(model.config, "joint_dit_head_type", "s2") != expected_head:
+    if experiment not in {"y", "y-marmask"} and getattr(model.config, "joint_dit_head_type", "s2") != expected_head:
         raise RuntimeError("Checkpoint restored the wrong flow-head implementation")
     count = 0
     state = model.state_dict()
@@ -76,13 +76,13 @@ def generation(checkpoint, weights, output, experiment="z"):
             token_types=batch["token_types"].to(device), sigma=batch["sigma"].to(device),
             spans=[(0, item["image_start"], item["image_start"] + 256)],
             initial_noise_bank=noise_for(0, 42)[None], flow_cfg=3.5, flow_solver="heun",
-            flow_num_steps=10, order_strategy="random" if experiment == "y" else "joint", use_cache=False, return_trace=True,
+            flow_num_steps=10, order_strategy="random" if experiment in {"y", "y-marmask"} else "joint", use_cache=False, return_trace=True,
             debug_finite=True)
     torch.npu.synchronize()
     elapsed = time.monotonic() - started
     for handle in handles:
         handle.remove()
-    rounds = int(model.config.y_reveal_steps) if experiment == "y" else 1
+    rounds = int(model.config.y_reveal_steps) if experiment in {"y", "y-marmask"} else 1
     if calls != {"backbone": rounds, "dit": 20 * rounds} or latents.shape != (1, 16, 16, 16):
         raise RuntimeError(f"Unexpected generation call counts or shape: {calls}, {latents.shape}")
     if not torch.isfinite(latents).all():
@@ -147,12 +147,12 @@ def validation_lifecycle(output, label, experiment="z"):
             raise RuntimeError("Validation prompts/noise changed between steps")
         for row in images["images"]:
             trace = row["trace"]
-            rounds = int(protocol.expected_config().model.y_reveal_steps) if experiment == "y" else 1
+            rounds = int(protocol.expected_config().model.y_reveal_steps) if experiment in {"y", "y-marmask"} else 1
             if (trace["backbone_calls"], trace["flow_head_calls"]) != (rounds, 20 * rounds) or trace["solver"] != "heun":
                 raise RuntimeError("Unexpected Z validation generation call counts")
-            if experiment == "y" and trace.get("generation_mode") != "y_masked_token_flow":
+            if experiment in {"y", "y-marmask"} and trace.get("generation_mode") != "y_masked_token_flow":
                 raise RuntimeError("Validation did not use Y's generator")
-            if experiment != "y" and trace.get("flow_head_type", "s2") != ("b_single_stream" if experiment == "z-b" else "s2"):
+            if experiment not in {"y", "y-marmask"} and trace.get("flow_head_type", "s2") != ("b_single_stream" if experiment == "z-b" else "s2"):
                 raise RuntimeError("Validation used the wrong flow-head implementation")
             if not (directory / f"validation_generation/step-{step}" / row["image"]).is_file():
                 raise FileNotFoundError(row["image"])
@@ -181,7 +181,7 @@ def main():
     parser.add_argument("--label", default="r1")
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--weights", choices=("current", "ema"), default="ema")
-    parser.add_argument("--experiment", choices=("z", "z-b", "y"), default="z")
+    parser.add_argument("--experiment", choices=("z", "z-b", "y", "y-marmask"), default="z")
     parser.add_argument("--validation", action="store_true", help="Train five steps with full validation at 2 and 4, then resume to 6")
     args = parser.parse_args()
     experiment = args.experiment

@@ -230,7 +230,7 @@ def load_model_tokenizer(
         )
 
     multimodal_config_keys = (
-        "y_empty_visible_prob", "y_reveal_steps",
+        "y_empty_visible_prob", "y_reveal_steps", "y_mask_distribution",
         "joint_dit_head_dim", "joint_dit_intermediate", "joint_dit_head_type",
         "b_siglip_path", "b_siglip_width", "b_siglip_intermediate", "b_siglip_heads",
         "b_siglip_depth", "b_siglip_gradient_checkpointing", "b_siglip_initialization_seed",

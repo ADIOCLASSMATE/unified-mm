@@ -210,6 +210,16 @@ CPU 全仓检查 1126 项通过、2 项跳过；最后的空集合 loss 与采�
 
 11:51 UTC 已确认全部 4 个 worker 为 Running，64 卡训练到 step 10，loss 0.6423、图像 flow loss 1.9936。四节点资产检查均通过，启动日志无异常退出；[rank 0 训练日志](../output/unified-y-0p6b-33b-imagenet-split-s42-r1/prelaunch_audit/node-0/training.log)持续记录后续进度。
 
+## Step-2000 采样筛选与 masking 对照
+
+`script/selfless/screen_y_sampling_ascend16.sh --model-source <checkpoint-2000> --output-dir <fresh-dir>` 使用 checkpoint 内的 EMA，在 16 卡上筛选 K={8,20,32,64} × reveal CFG={constant,linear}。固定 S=10/Heun、temperature=1、CFG 上限=3.5。每类固定取两张 ImageNet-val 图像，共 2000 张；IS 使用两个分层 split。初始噪声与 reveal 顺序按样本独立设种子，跨配置保持一致。FID 对照现有 50k 原图统计，但标记为小样本筛选，不能直接当成正式 FID50k。报告同时保存 K/S、CFG 分支数、backbone/head 调用次数、head token 求值数和耗时。
+
+`reveal_cfg_schedule=linear` 按 MAR 的下一轮已补全比例提升 CFG；`flow_cfg_schedule` 仍单独控制 ODE 时间调度，筛选时保持 constant。
+
+`script/selfless/pretraining_y_marmask_ascend64.sh` 启动独立的 Y-MARmask。其 [配置](../configs/selfless/unified_y_marmask_33b_ascend64.yaml)只改变 mask 分布：N(1,0.25²) 截断到 [0.7,1]，ceil 得到 token 数，取消额外 10% 全 mask 混合。其余模型、数据、随机 seed、batch、优化器、EMA 和 31,800-step LR 曲线均保持 Y 的设置；`stop_after_steps=2000` 用于等步数对照，不能把 LR 日程压缩到 2000 步。自然取整仍会产生少量全 mask 样本。
+
+Flow 统计采集已改为在指定 optimizer step 的任务 microbatch 上开启，避免只在 GA4 最后的 I2T microbatch 采集而错过 T2I。新增日志为 `train/flow/unknown_fraction`、`train/flow/mask_below_70_fraction` 和 `train/flow/full_mask_fraction`。此诊断改动不改变梯度，已启动的原 Y 使用其冻结源码继续运行。
+
 ## 代码与研究依据
 
 - [Z backbone 与生成](../models/modeling_model/modeling_joint_dit.py)。

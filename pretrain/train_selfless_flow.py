@@ -1458,7 +1458,6 @@ def main(*, model_loader=None):
                 forward_kwargs["backbone_gate_stats_level"] = "summary"
             forward_kwargs["record_flow_stats"] = (
                 flow_stats_every > 0
-                and accelerator.sync_gradients
                 and (global_step + 1) % flow_stats_every == 0
             )
             model_output = model(**forward_kwargs)

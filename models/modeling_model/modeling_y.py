@@ -100,6 +100,8 @@ class YFlowLoss(PositionwiseFlowLoss):
         loss = (per_image / counts.clamp_min(1) * active).sum() / active.sum().clamp_min(1)
         self.last_forward_stats = ({"flow/loss": loss.detach(), "flow/v_mse": loss.detach(),
             "flow/unknown_fraction": weights.float().mean().detach(),
+            "flow/mask_below_70_fraction": (counts.float() / weights.shape[1] < .7).float().mean(),
+            "flow/full_mask_fraction": counts.eq(weights.shape[1]).float().mean(),
             "flow/t_mean": times.detach().mean(),
             "flow/nonfinite_count": (~torch.isfinite(prediction)).sum().float()} if record_stats else {})
         return loss
@@ -120,6 +122,9 @@ class YForCausalLM(JointDiTForCausalLM):
             if getattr(config, key, None) != expected:
                 raise ValueError(f"Y requires {key}={expected}")
         config.y_empty_visible_prob = float(getattr(config, "y_empty_visible_prob", .1))
+        config.y_mask_distribution = getattr(config, "y_mask_distribution", "cosine")
+        if config.y_mask_distribution not in {"cosine", "mar_truncnorm"}:
+            raise ValueError("Y mask distribution must be cosine or mar_truncnorm")
         config.y_reveal_steps = int(getattr(config, "y_reveal_steps", 8))
         if not 0 <= config.y_empty_visible_prob <= 1:
             raise ValueError("Y empty-visible probability must be in [0,1]")
@@ -156,7 +161,14 @@ class YForCausalLM(JointDiTForCausalLM):
             return visible
         count, n = spans.shape[0], self.config.image_tokens_per_img
         progress = torch.rand(count, device=types.device)
-        unknown = torch.floor(n * torch.cos(math.pi / 2 * progress)).long().clamp(1, n)
+        if self.config.y_mask_distribution == "mar_truncnorm":
+            # MAR: N(1, .25**2), truncated to [.7, 1], then ceil(N * ratio).
+            lower_cdf = .5 * (1 + math.erf(-1.2 / math.sqrt(2)))
+            quantile = lower_cdf + (.5 - lower_cdf) * progress
+            ratio = 1 + .25 * math.sqrt(2) * torch.erfinv(2 * quantile - 1)
+            unknown = torch.ceil(n * ratio).long().clamp(math.ceil(.7 * n), n)
+        else:
+            unknown = torch.floor(n * torch.cos(math.pi / 2 * progress)).long().clamp(1, n)
         empty = torch.rand(count, device=types.device) < self.config.y_empty_visible_prob
         unknown = torch.where(empty, n, unknown)
         ranks = torch.rand(count, n, device=types.device).argsort(-1).argsort(-1)
@@ -210,6 +222,9 @@ class YForCausalLM(JointDiTForCausalLM):
                        flow_solver=None, flow_num_steps=None, parallel_rate=1,
                        order_strategy="random", use_cache=False, return_trace=False,
                        debug_finite=False, reveal_steps=None, reveal_order=None, **kwargs):
+        reveal_cfg_schedule = kwargs.pop("reveal_cfg_schedule", "constant")
+        if reveal_cfg_schedule not in {"constant", "linear"}:
+            raise ValueError("Y reveal CFG schedule must be constant or linear")
         del parallel_rate, use_cache
         if kwargs:
             raise TypeError(f"Unsupported Y generation arguments: {sorted(kwargs)}")
@@ -265,6 +280,7 @@ class YForCausalLM(JointDiTForCausalLM):
         segments = torch.where(token_types.ne(3), 0, -1) if segment_ids is None else segment_ids
         uncond = torch.cat((torch.zeros_like(target), target), 0) if paired else None
         offset = 0
+        reveal_cfg_values = []
         for added in counts:
             query, content = y_backbone_allowed(repeat(input_ids), repeat(token_types), repeat(sigma),
                 repeat(visible), repeat(target), segment_ids=repeat(segments), uncond_mask=uncond,
@@ -279,8 +295,14 @@ class YForCausalLM(JointDiTForCausalLM):
             if paired:
                 condition = torch.cat((condition, hidden[rows + batch, indices]), 0)
             condition = self._prepare_image_flow_condition(condition)
+            # MAR uses the next mask count, clamped to at least one even in
+            # the last iteration. Keep this separate from the ODE schedule.
+            next_mask_count = max(1, n - offset - added)
+            cfg_now = (1 + (float(flow_cfg) - 1) * (n - next_mask_count) / n
+                       if reveal_cfg_schedule == "linear" else float(flow_cfg))
+            reveal_cfg_values.append(cfg_now)
             generated = self.image_flow_head.sample(condition, temperature=flow_temperature,
-                cfg=flow_cfg, cfg_schedule=flow_cfg_schedule, solver=flow_solver,
+                cfg=cfg_now, cfg_schedule=flow_cfg_schedule, solver=flow_solver,
                 num_steps=flow_num_steps, initial_noise=noise.gather(1, selected[..., None].expand(-1, -1, dim)),
                 debug_finite=debug_finite)
             latents[rows, indices] = generated.to(latents.dtype)
@@ -299,4 +321,6 @@ class YForCausalLM(JointDiTForCausalLM):
             backbone_kv_cache_enabled=False, backbone_condition_cached=True, backbone_streams=2,
             flow_head_streams=1, shared_time_per_image=False, cfg_batched=paired, cfg=float(flow_cfg),
             flow_head_architecture="positionwise_adaln_mlp", visible_tokens_preserved=True)
+        trace.update(reveal_cfg_schedule=reveal_cfg_schedule, reveal_cfg_values=reveal_cfg_values,
+                     flow_cfg_schedule=flow_cfg_schedule, flow_temperature=float(flow_temperature))
         return (output, trace) if return_trace else output

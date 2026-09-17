@@ -89,7 +89,7 @@ def main():
     parser.add_argument("--steps", type=int, default=12)
     parser.add_argument("--resume-from-checkpoint")
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--experiment", choices=("z", "z-b", "y"), default="z")
+    parser.add_argument("--experiment", choices=("z", "z-b", "y", "y-marmask"), default="z")
     args = parser.parse_args()
     os.chdir(ROOT)
     plan = launch_plan(smoke=args.smoke, label=args.label, steps=args.steps,

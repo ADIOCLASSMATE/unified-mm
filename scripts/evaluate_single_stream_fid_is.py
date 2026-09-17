@@ -121,6 +121,12 @@ EVALUATOR_RNG_CONTRACT = {
 }
 
 
+def canonical_y_reveal_order(indices, seed, tokens):
+    """Keep each image's order fixed across K, CFG, ranks and batch partitions."""
+    return torch.stack([torch.randperm(tokens, generator=torch.Generator(device="cpu").manual_seed(
+        (int(seed) + 1_000_003 * int(index)) % EVALUATOR_RNG_SEED_MODULUS)) for index in indices])
+
+
 def canonical_image_flow_initial_noise(
     evaluation_seed: int,
     global_sample_index: int,
@@ -229,6 +235,10 @@ def parse_args():
         ),
     )
     parser.add_argument("--samples", type=int, default=1024)
+    parser.add_argument("--samples_per_class", type=int, default=0,
+                        help="Small screening only: deterministic class-balanced ImageNet subset")
+    parser.add_argument("--screening_fid", action="store_true",
+                        help="Compute explicitly non-formal small-sample FID for paired screening")
     parser.add_argument(
         "--caption_sequence_mode",
         choices=("config", "t2i", "i2t"),
@@ -244,6 +254,8 @@ def parse_args():
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--cfg", type=float, default=1.0)
     parser.add_argument("--cfg_schedule", choices=["constant", "linear"], default="constant")
+    parser.add_argument("--reveal_cfg_schedule", choices=["constant", "linear"], default="constant",
+                        help="Y only: CFG schedule across reveal progress, independent of ODE time")
     parser.add_argument("--flow_solver", choices=["heun", "euler"], default="heun")
     parser.add_argument("--parallel_rate", type=int, default=1)
     parser.add_argument("--strategies", default="spatial_halton")
@@ -771,6 +783,8 @@ def build_evaluation_resume_contract(
             "batch_size": int(args.batch_size),
             "vae_decode_batch_size": int(args.vae_decode_batch_size),
             "samples": int(args.samples),
+            "samples_per_class": int(getattr(args, "samples_per_class", 0)),
+            "screening_fid": bool(getattr(args, "screening_fid", False)),
             "image_tokens": int(image_tokens),
             "target_latents_are_placeholders": bool(
                 target_latents_are_placeholders
@@ -784,6 +798,8 @@ def build_evaluation_resume_contract(
             "cfg_schedule": str(args.cfg_schedule),
             "sampling_steps": str(args.sampling_steps),
             "reveal_steps": getattr(args, "reveal_steps", None),
+            "reveal_cfg_schedule": getattr(args, "reveal_cfg_schedule", "constant"),
+            "y_order_seed_formula": "(seed + 1000003 * global_sample_index) mod 2**63",
             "temperature": float(args.temperature),
             "flow_solver": str(args.flow_solver),
             "parallel_rate": int(args.parallel_rate),
@@ -1298,6 +1314,26 @@ def get_base_dataset_and_indices(loader_dataset):
     if hasattr(loader_dataset, "dataset") and hasattr(loader_dataset, "indices"):
         return loader_dataset.dataset, list(loader_dataset.indices)
     return loader_dataset, None
+
+
+def class_balanced_screening_subset(dataset, per_class, seed):
+    from torch.utils.data import Subset
+    base, indices = get_base_dataset_and_indices(dataset)
+    if per_class < 1:
+        raise ValueError("screening samples_per_class must be positive")
+    grouped = {}
+    for index in (indices if indices is not None else range(len(base))):
+        image_id = int(base.img_ids[index])
+        grouped.setdefault(str(base.synsets[image_id]), []).append((image_id, index))
+    generator = torch.Generator(device="cpu").manual_seed(int(seed))
+    selected = []
+    for synset in sorted(grouped):
+        rows = sorted(grouped[synset])
+        if len(rows) < per_class:
+            raise ValueError(f"Not enough validation samples for {synset}")
+        order = torch.randperm(len(rows), generator=generator)[:per_class].tolist()
+        selected.extend(rows[i][1] for i in order)
+    return Subset(base, selected)
 
 
 def build_inception_score_split_plan(
@@ -1938,6 +1974,8 @@ def main(*, model_loader=None):
     is_s2 = attention_contract in S2_ATTENTION_CONTRACTS
     is_joint_dit = getattr(model.config, "architecture_variant", None) == "selfless_joint_dit"
     is_y = getattr(model.config, "architecture_variant", None) == "selfless_y"
+    if not is_y and args.reveal_cfg_schedule != "constant":
+        raise ValueError("--reveal_cfg_schedule requires Y")
     if is_s2 or is_joint_dit or is_y:
         args.disable_backbone_kv_cache = True
     if args.reveal_steps is not None:
@@ -2046,13 +2084,19 @@ def main(*, model_loader=None):
     else:
         _, val_loader = get_dataloaders(config, tokenizer)
         source_loader = val_loader
-    if len(source_loader.dataset) < int(args.samples):
+    evaluation_dataset = source_loader.dataset
+    if args.samples_per_class:
+        evaluation_dataset = class_balanced_screening_subset(
+            evaluation_dataset, args.samples_per_class, args.seed)
+        if len(evaluation_dataset) != args.samples:
+            raise ValueError("--samples must equal classes * --samples_per_class")
+    if len(evaluation_dataset) < int(args.samples):
         raise ValueError(
             f"ImageNet val has {len(source_loader.dataset)} rows, "
             f"fewer than --samples={args.samples}"
         )
     loader = DataLoader(
-        source_loader.dataset,
+        evaluation_dataset,
         batch_sampler=GlobalBatchStrideSampler(
             samples=int(args.samples),
             global_batch_size=int(args.batch_size),
@@ -2065,7 +2109,7 @@ def main(*, model_loader=None):
         collate_fn=val_loader.collate_fn,
     )
     is_split_ids, is_split_plan = build_inception_score_split_plan(
-        source_loader.dataset,
+        evaluation_dataset,
         samples=int(args.samples),
         splits=int(args.is_splits),
     )
@@ -2495,7 +2539,10 @@ def main(*, model_loader=None):
                 ),
                 return_trace=True,
                 debug_finite=bool(args.debug_finite_generation),
-                **({"reveal_steps": args.reveal_steps} if is_y else {}),
+                **({"reveal_steps": args.reveal_steps,
+                    "reveal_cfg_schedule": args.reveal_cfg_schedule,
+                    "reveal_order": canonical_y_reveal_order(selected_global_indices, args.seed,
+                        model.config.image_tokens_per_img).to(device)} if is_y else {}),
             )
             require_finite_generated_latents(
                 single_latents,
@@ -2696,7 +2743,9 @@ def main(*, model_loader=None):
                 f"expected={args.samples}"
             )
 
-    compute_fid = int(args.samples) == int(shared_real_count)
+    if args.screening_fid and (not args.samples_per_class or args.require_formal_protocol):
+        raise ValueError("screening FID requires a class-balanced subset and excludes formal mode")
+    compute_fid = int(args.samples) == int(shared_real_count) or args.screening_fid
     if is_main_process(rank) and compute_fid:
         real_reference_moments = shared_feature_moments(
             shared_real_payload,
@@ -2770,7 +2819,9 @@ def main(*, model_loader=None):
             **(pairing_manifests or {}),
         },
         "metric_protocol": {
-            "protocol_name": "imagenet_val_fid50k_torch_fidelity_stratified_is",
+            "protocol_name": ("imagenet_val_small_sample_screening_fid" if args.screening_fid else
+                              "imagenet_val_fid50k_torch_fidelity_stratified_is"),
+            "small_sample_bias_warning": bool(args.screening_fid),
             "reference_distribution": "imagenet_val_50000",
             "comparison_scope": "same_protocol_only",
             "not_adm_dit_reason": (
@@ -2891,6 +2942,7 @@ def main(*, model_loader=None):
         "seed": int(args.seed),
         "batch_size": int(args.batch_size),
         "samples_requested": int(args.samples),
+        "samples_per_class": args.samples_per_class,
         "samples_evaluated": int(total_generated),
         "distributed": {
             "enabled": bool(distributed),
@@ -2929,6 +2981,8 @@ def main(*, model_loader=None):
         ),
         "cfg": float(args.cfg),
         "cfg_schedule": str(args.cfg_schedule),
+        "reveal_cfg_schedule": str(args.reveal_cfg_schedule),
+        "reveal_steps": args.reveal_steps,
         "sampling_steps": str(args.sampling_steps),
         "order_strategy_protocols": {str(s): order_policy(str(s)) for s in strategies},
         "temperature": float(args.temperature),
@@ -2943,6 +2997,23 @@ def main(*, model_loader=None):
         } if saved_image_indices else None,
         "strategies": {},
     }
+    if is_y:
+        # These are exact structural counts per image, not equivalent FLOPs.
+        k = int(args.reveal_steps or model.config.y_reveal_steps)
+        nfe = int(args.sampling_steps) * (2 if args.flow_solver == "heun" else 1)
+        branches = 2 if args.cfg != 1 else 1
+        results["y_sampling_cost"] = dict(reveal_steps=k, flow_steps=int(args.sampling_steps),
+            velocity_evals_per_token=nfe, backbone_calls=k, backbone_streams=2,
+            cfg_branches=branches, cfg_batched=True if branches == 2 else False,
+            backbone_branch_forwards=k * branches, head_calls=k * nfe,
+            head_token_evals_per_image=nfe * model.config.image_tokens_per_img * branches)
+        results["y_reveal_order_contract"] = dict(seed=args.seed,
+            formula="(seed + 1000003 * global_sample_index) mod 2**63", generator="torch_cpu_randperm")
+        assert trace["backbone_calls"] == k and trace["flow_head_calls"] == k * nfe
+        results["y_reveal_cfg_values"] = trace["reveal_cfg_values"]
+    if args.samples_per_class:
+        results["screening_sample_records"] = ordered_eval_sample_records(evaluation_dataset,
+            loader_rows=list(range(args.samples)), global_sample_indices=list(range(args.samples)))
     for strategy, state in metrics.items():
         global_count = int(reduce_sum(float(state["count"]), device))
         global_latent_mse_sum = (

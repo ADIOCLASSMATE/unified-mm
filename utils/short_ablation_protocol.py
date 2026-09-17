@@ -12,6 +12,7 @@ VAL_EVERY = 3180
 EMA_DECAY = 0.9997
 RUN_REVISION = "r2"
 ARMS = {
+    "y-marmask": ("unified_y_marmask", "y_marmask", "Y-MARmask"),
     "y": ("unified_y", "y", "Y"),
     "s2-single": ("unified_s2_single", "s2_single", "S2-single"),
     "s2-text2stream": ("unified_s2_single_text_two_stream", "s2_single_text_two_stream", "S2-single + text two-stream"),
@@ -27,6 +28,9 @@ def config_path(arm, *, base=False):
 
 
 def expected_config(arm):
+    if arm == "y-marmask":
+        from utils.y_marmask_protocol import expected_config as y_config
+        return y_config()
     if arm == "y":
         from utils.y_protocol import expected_config as y_config
         return y_config()
@@ -69,9 +73,9 @@ def validate_short_config(arm, config):
         raise ValueError(f"{arm}: short ablation differs from the budget/EMA/validation recipe")
     return dict(schema="short_ablation_31800_v1", arm=arm, project=PROJECT,
                 run_project=str(config.experiment.project), world_size=64,
-                optimizer_steps=MAX_STEPS, warmup_steps=WARMUP_STEPS, decay_steps=DECAY_STEPS,
+                optimizer_steps=int(config.training.stop_after_steps), warmup_steps=WARMUP_STEPS, decay_steps=DECAY_STEPS,
                 decay_start=MAX_STEPS - DECAY_STEPS, val_every=VAL_EVERY,
-                validation_steps=list(range(VAL_EVERY, MAX_STEPS + 1, VAL_EVERY)),
+                validation_steps=list(range(VAL_EVERY, int(config.training.stop_after_steps) + 1, VAL_EVERY)),
                 nominal_text_targets=int(config.training.target_text_tokens),
                 ema_decay=float(config.training.ema_decay),
                 validation_generation=OmegaConf.to_container(config.experiment.validation_generation, resolve=True))
