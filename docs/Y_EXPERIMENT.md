@@ -220,6 +220,21 @@ CPU 全仓检查 1126 项通过、2 项跳过；最后的空集合 loss 与采�
 
 Flow 统计采集已改为在指定 optimizer step 的任务 microbatch 上开启，避免只在 GA4 最后的 I2T microbatch 采集而错过 T2I。新增日志为 `train/flow/unknown_fraction`、`train/flow/mask_below_70_fraction` 和 `train/flow/full_mask_fraction`。此诊断改动不改变梯度，已启动的原 Y 使用其冻结源码继续运行。
 
+### 2026-09-17 筛选结果
+
+完整 step-2000 checkpoint 已独立保留于 `output/experiments/y/step2000-preserved/checkpoint-2000`，避免原训练的 checkpoint 轮换影响复查。本次使用 EMA；[完整结果](../output/evaluation/y-step2000-screen-20260917-r2/summary.json)与[结果表](../output/evaluation/y-step2000-screen-20260917-r2/summary.md)保存每组指标和调用成本。
+
+| K | Constant FID | Linear FID | Constant 生成秒数（2000 张 / 16 卡） |
+| --- | --- | --- | --- |
+| 8 | 347.36 | 349.18 | 23.16 |
+| 20 | 347.44 | 348.72 | 48.99 |
+| 32 | 347.23 | 348.56 | 74.89 |
+| 64 | 347.28 | 348.67 | 141.07 |
+
+这是早期 checkpoint 的小样本筛选。增加 K 尚未带来明显收益，constant 的数值略好于 linear；暂保留 K=8 + constant 作为低成本设置，不据此推断收敛后的最佳配置。K=64 的生成耗时约为 K=8 的 6 倍。以上均非正式 FID50k。
+
+对照 Job `umm-y-marmask-2k-64-0917-r1` 已按顺序在筛选成功后提交，使用 4×16 张 910B，从基座训练到 step 2000。训练冻结源码对应 commit `3b208fa`；[提交回执](../output/experiments/y/ablation-20260917-r1/marmask-submission.json)和[源码记录](../output/experiments/y/ablation-20260917-r1/source_record.json)保留复现信息。原 Y 训练不停止。设备 smoke 已验证训练、恢复、raw/EMA 重载及生成通过；正式训练状态和 mask 统计见其训练日志。
+
 ## 代码与研究依据
 
 - [Z backbone 与生成](../models/modeling_model/modeling_joint_dit.py)。
