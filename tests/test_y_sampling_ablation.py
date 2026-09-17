@@ -7,6 +7,7 @@ from omegaconf import OmegaConf
 from test_y import tiny_model, batch
 from scripts.evaluate_single_stream_fid_is import (
     canonical_y_reveal_order, class_balanced_screening_subset, build_inception_score_split_plan,
+    configure_evaluation_vae,
 )
 
 
@@ -80,3 +81,14 @@ def test_marmask_recipe_only_changes_mask_and_run_identity():
     normalized.training.stop_after_steps = original.training.stop_after_steps
     normalized.evaluation.checkpoint = original.evaluation.checkpoint
     assert OmegaConf.to_container(normalized) == OmegaConf.to_container(original)
+
+
+def test_nested_vae_recipe_reaches_legacy_evaluator():
+    from utils.y_protocol import expected_config
+    config = expected_config()
+    configure_evaluation_vae(config)
+    assert config.experiment.validation_vae_path == config.experiment.validation_generation.vae_path
+    assert config.experiment.validation_vae_scaling_factor == .2325
+    config.experiment.validation_vae_path = "explicit-checkpoint.pt"
+    configure_evaluation_vae(config)
+    assert config.experiment.validation_vae_path == "explicit-checkpoint.pt"

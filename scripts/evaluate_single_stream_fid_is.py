@@ -127,6 +127,15 @@ def canonical_y_reveal_order(indices, seed, tokens):
         (int(seed) + 1_000_003 * int(index)) % EVALUATOR_RNG_SEED_MODULUS)) for index in indices])
 
 
+def configure_evaluation_vae(config):
+    """Accept the current nested validation recipe without overriding legacy fields."""
+    generation = config.experiment.get("validation_generation", {})
+    for field in ("vae_module_root", "vae_path", "vae_scaling_factor"):
+        destination = f"validation_{field}"
+        if destination not in config.experiment and field in generation:
+            config.experiment[destination] = generation[field]
+
+
 def canonical_image_flow_initial_noise(
     evaluation_seed: int,
     global_sample_index: int,
@@ -1872,6 +1881,7 @@ def main(*, model_loader=None):
         raise ValueError("--strategies must contain at least one strategy")
     validate_strategies(strategies, args.allow_sigma_strategies)
     config = OmegaConf.load(args.config)
+    configure_evaluation_vae(config)
     config.training.runtime_hashing_enabled = False
     evaluation_model_source = None
     if args.model_source is not None:
